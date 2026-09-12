@@ -101,7 +101,7 @@ export class OverviewPanelManager implements vscode.Disposable {
       ]);
       artifacts = { handoff, sparring, brief: briefText !== undefined, briefText, plan };
     }
-    return buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now());
+    return buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.runnerFor(selection.selected?.id));
   }
 
   dispose(): void {
@@ -115,7 +115,18 @@ export class OverviewPanelManager implements vscode.Disposable {
   }
 }
 
-const ACTIONS: ReadonlySet<string> = new Set<OverviewAction>(["openHandoff", "openSparring", "openBrief", "openPlan", "openDiff", "showLog", "selectRun", "runPlan"]);
+const ACTIONS: ReadonlySet<string> = new Set<OverviewAction>([
+  "openHandoff",
+  "openSparring",
+  "openBrief",
+  "openPlan",
+  "openDiff",
+  "showLog",
+  "selectRun",
+  "runPlan",
+  "runStage",
+  "stopRunner",
+]);
 
 function isActionMessage(message: unknown): message is { type: "action"; action: OverviewAction } {
   return (

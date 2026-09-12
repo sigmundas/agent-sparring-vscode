@@ -60,6 +60,11 @@
         "command": "agentSparring.diagnoseDiscovery",
         "title": "Diagnose Discovery",
         "category": "Agent Sparring"
+      },
+      {
+        "command": "agentSparring.runStage",
+        "title": "Run / Resume Stage",
+        "category": "Agent Sparring"
       }
     ],
     "configuration": {

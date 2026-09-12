@@ -15,7 +15,7 @@
 
 import { TIMELINE_STATE_WORD, type ActorCard, type HistoryEntry, type OverviewModel, type TimelineItem } from "./overviewModel";
 
-export type OverviewAction = "openHandoff" | "openSparring" | "openBrief" | "openPlan" | "openDiff" | "showLog" | "selectRun" | "runPlan";
+export type OverviewAction = "openHandoff" | "openSparring" | "openBrief" | "openPlan" | "openDiff" | "showLog" | "selectRun" | "runPlan" | "runStage" | "stopRunner";
 
 export function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch] as string);
@@ -151,6 +151,13 @@ function renderStageCard(model: OverviewModel): string {
   const statusWord = model.stageStatus ? `<span class="status ${escapeHtml(model.stageStatusKind ?? "")}">${escapeHtml(model.stageStatus)}</span>` : "";
   const cycle = model.cycle !== undefined ? `<span class="sep">·</span><span class="muted" title="loop cycle from telemetry">cycle ${model.cycle}</span>` : "";
   const buttons: string[] = [];
+  if (model.stageAction) {
+    const title = `sparring run-loop ${model.stageId ?? ""} --repo-root <project> --expected-branch <current branch>`;
+    buttons.push(button("runStage", model.stageAction.label, true, title, model.stageAction.primary ? "primary" : ""));
+  }
+  if (model.runner?.alive) {
+    buttons.push(button("stopRunner", model.runner.label, true, "Send Ctrl-C to the terminal running this stage", "danger"));
+  }
   const actions = model.actions;
   if (actions) {
     buttons.push(button("openBrief", "Brief", actions.brief, "Open brief.md"));
@@ -179,7 +186,13 @@ function renderStageCard(model: OverviewModel): string {
   }
 
   let current = `<p class="muted">No provider turn in progress.</p>`;
-  if (model.activity?.kind === "active") {
+  if (model.activity?.kind === "stopped") {
+    current = `<p class="stopped">${icon("warn", "send_back")}${escapeHtml(model.activity.text)}</p>`;
+  } else if (model.activity?.kind === "stale") {
+    current = `<p class="stale">${icon("warn", "send_back")}${escapeHtml(model.activity.text)}</p>`;
+  } else if (model.runner?.alive && model.activity?.kind !== "active") {
+    current = `<p class="muted">Runner started; waiting for the first turn.</p>`;
+  } else if (model.activity?.kind === "active") {
     // "Sparring for 12s · Codex" → "Codex sparring for 12s"
     const match = /^(Working|Sparring) for (.+) · (.+)$/.exec(model.activity.text);
     current = match
@@ -237,9 +250,10 @@ function capitalize(word: string): string {
   return word.charAt(0).toUpperCase() + word.slice(1);
 }
 
-function button(action: OverviewAction, label: string, enabled = true, title?: string): string {
+function button(action: OverviewAction, label: string, enabled = true, title?: string, cls = ""): string {
   const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
-  return `<button type="button" data-action="${action}"${titleAttr}${enabled ? "" : " disabled"}>${escapeHtml(label)}</button>`;
+  const classAttr = cls ? ` class="${cls}"` : "";
+  return `<button type="button"${classAttr} data-action="${action}"${titleAttr}${enabled ? "" : " disabled"}>${escapeHtml(label)}</button>`;
 }
 
 export type { HistoryEntry };
@@ -363,6 +377,10 @@ button { font-family: inherit; font-size: 0.92em; padding: 4px 11px; border: 1px
 button:hover:not(:disabled) { background: var(--vscode-button-secondaryHoverBackground); }
 button:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 button:disabled { opacity: 0.45; cursor: default; }
+button.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: transparent; font-weight: 600; }
+button.primary:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
+button.danger { color: var(--warn); border-color: var(--warn); }
+.stopped, .stale { display: flex; align-items: center; color: var(--warn); }
 
 .facts { display: grid; grid-template-columns: max-content 1fr; gap: 1px 12px; margin: 0; padding-top: 8px; border-top: 1px solid var(--line); font-size: 0.82em; color: var(--vscode-descriptionForeground); }
 .facts dt { color: var(--vscode-descriptionForeground); }

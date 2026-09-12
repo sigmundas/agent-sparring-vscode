@@ -37,7 +37,19 @@ export function buildResumePlanArgs(invocation: PlanInvocation & { evidence?: st
   return args;
 }
 
-function globalArgs(invocation: PlanInvocation): string[] {
+export interface LoopInvocation {
+  stageId: string;
+  repoRoot: string;
+  expectedBranch: string;
+  sparringDir?: string;
+}
+
+/** `sparring [--sparring-dir DIR] run-loop STAGE --repo-root ROOT --expected-branch BRANCH` (cli.py: run_loop). */
+export function buildRunLoopArgs(invocation: LoopInvocation): string[] {
+  return [...globalArgs(invocation), "run-loop", invocation.stageId, ...loopArgs(invocation)];
+}
+
+function globalArgs(invocation: { repoRoot: string; sparringDir?: string }): string[] {
   if (!invocation.sparringDir) {
     return [];
   }
@@ -48,7 +60,7 @@ function globalArgs(invocation: PlanInvocation): string[] {
   return ["--sparring-dir", invocation.sparringDir];
 }
 
-function loopArgs(invocation: PlanInvocation): string[] {
+function loopArgs(invocation: { repoRoot: string; expectedBranch: string }): string[] {
   return ["--repo-root", invocation.repoRoot, "--expected-branch", invocation.expectedBranch];
 }
 

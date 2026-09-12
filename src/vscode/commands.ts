@@ -7,7 +7,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { buildResumePlanArgs, buildRunPlanArgs, readGitBranch, resolveExecutable } from "../core/cli";
+import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, readGitBranch, resolveExecutable } from "../core/cli";
 import {
   BRIEF_FILENAME,
   HANDOFF_FILENAME,
@@ -18,10 +18,12 @@ import {
   type PlanRunSnapshot,
   type RunSnapshot,
   type SparringLocation,
+  type StandaloneStageSnapshot,
 } from "../core/discovery";
 import { parsePlanStages } from "../core/engineFormats";
 import type { OverviewAction } from "../core/overviewHtml";
 import { buildRunPickItems, describeRun } from "../core/runPick";
+import { pickBranch, stageRunAction, type GitRepositoryInfo } from "../core/runner";
 import type { SparringController } from "./controller";
 import { openCandidateDiff } from "./overview/gitDiff";
 import { OverviewPanelManager } from "./overview/overviewPanel";
@@ -37,6 +39,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.openOverview", () => openOverviewCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.runPlan", () => runPlanCommand(controller)),
     vscode.commands.registerCommand("agentSparring.resumePlan", () => resumePlanCommand(controller)),
+    vscode.commands.registerCommand("agentSparring.runStage", () => runStageCommand(controller)),
   );
 }
 
@@ -136,7 +139,97 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       return;
     case "runPlan":
       return runPlanCommand(controller);
+    case "runStage":
+      await runStageCommand(controller);
+      await overview.update();
+      return;
+    case "stopRunner":
+      if (run && !controller.stopRunner(run.id)) {
+        void vscode.window.showInformationMessage("Agent Sparring: no runner launched from this window is alive for the selected stage.");
+      }
+      return;
   }
+}
+
+// ---------------------------------------------------------------- run / resume stage
+
+/** Minimal surface of the built-in Git extension's API (vscode.git, API version 1). */
+interface GitApi {
+  repositories: { rootUri: vscode.Uri; state: { HEAD?: { name?: string } } }[];
+}
+
+function gitRepositories(): GitRepositoryInfo[] | undefined {
+  const extension = vscode.extensions.getExtension<{ getAPI(version: 1): GitApi }>("vscode.git");
+  if (!extension?.isActive) {
+    return undefined;
+  }
+  try {
+    return extension.exports.getAPI(1).repositories.map((repo) => ({ rootPath: repo.rootUri.fsPath, branch: repo.state.HEAD?.name }));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The current branch of the repository owning `repoRoot`: the Git
+ * extension's view first, `.git/HEAD` (worktree-aware) when the extension
+ * is unavailable or has not opened that repository. Detached HEAD → undefined.
+ */
+export async function currentBranch(repoRoot: string): Promise<string | undefined> {
+  const repos = gitRepositories();
+  if (repos) {
+    const fromApi = pickBranch(repoRoot, repos);
+    if (fromApi) {
+      return fromApi;
+    }
+    if (repos.some((repo) => isInsidePath(repoRoot, repo.rootPath) || path.resolve(repo.rootPath) === path.resolve(repoRoot))) {
+      return undefined; // the extension knows the repository and says it is detached
+    }
+  }
+  return readGitBranch(repoRoot);
+}
+
+async function runStageCommand(controller: SparringController): Promise<void> {
+  let run = controller.currentSelection.selected;
+  if (!run || run.kind !== "stage") {
+    await selectRunCommand(controller);
+    run = controller.currentSelection.selected;
+  }
+  if (!run || run.kind !== "stage") {
+    if (run) {
+      void vscode.window.showInformationMessage("Agent Sparring: the selected run is a plan run; use Run Plan / Resume Plan for it.");
+    }
+    return;
+  }
+  const runner = controller.runnerFor(run.id);
+  if (runner?.alive) {
+    void vscode.window.showInformationMessage(`Agent Sparring: a runner launched from this window is still active for ${run.stage.stageId}.`);
+    return;
+  }
+  const action = stageRunAction(run, controller.currentLive);
+  if (!action) {
+    const status = run.stage.state?.status ?? "working";
+    void vscode.window.showInformationMessage(`Agent Sparring: ${run.stage.stageId} is ${status}; the loop does not run for ${status} stages.`);
+    return;
+  }
+  await launchStageLoop(controller, run, action.label);
+}
+
+async function launchStageLoop(controller: SparringController, run: StandaloneStageSnapshot, label: string): Promise<void> {
+  const repoRoot = run.location.repoRoot;
+  const expectedBranch = await currentBranch(repoRoot);
+  if (!expectedBranch) {
+    void vscode.window.showErrorMessage(
+      `Agent Sparring: no Git branch is checked out in ${run.location.folderName} (detached HEAD or not a repository). Check out the stage's branch, then run again.`,
+    );
+    return;
+  }
+  const executable = await resolveOrExplain(run.location);
+  if (!executable) {
+    return;
+  }
+  const args = buildRunLoopArgs({ stageId: run.stage.stageId, repoRoot, expectedBranch, sparringDir: run.location.sparringDir });
+  controller.launchRunner({ executable, args, cwd: repoRoot, name: `${label}: ${run.stage.stageId}`, runId: run.id, reveal: false });
 }
 
 // ---------------------------------------------------------------- launching
@@ -257,18 +350,7 @@ function launch(controller: SparringController, location: SparringLocation, exec
   // A terminal owns the process, so the run survives an extension-host
   // reload and the user sees the engine's own output. shellPath/shellArgs
   // execute the binary directly: no shell, no quoting, argument array only.
-  const terminal = vscode.window.createTerminal({
-    name: `Agent Sparring: ${name}`,
-    shellPath: executable,
-    shellArgs: args,
-    cwd: location.repoRoot,
-    iconPath: new vscode.ThemeIcon("debug-alt"),
-  });
-  terminal.show(true);
-  controller.output.appendLine(`${timeNow()}  ${"Extension".padEnd(15)} launched ${name} in terminal (${args.length} args, cwd ${location.repoRoot})`);
-  // The engine writes its run state before the first provider turn; pick it up promptly.
-  setTimeout(() => void controller.refresh(), 1500);
-  setTimeout(() => void controller.refresh(), 6000);
+  controller.launchRunner({ executable, args, cwd: location.repoRoot, name, reveal: true });
 }
 
 async function runPlanCommand(controller: SparringController): Promise<void> {
@@ -351,10 +433,4 @@ async function resumePlanCommand(controller: SparringController): Promise<void> 
     evidence,
   });
   launch(controller, run.location, executable, args, "resume-plan");
-}
-
-function timeNow(): string {
-  const date = new Date();
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }

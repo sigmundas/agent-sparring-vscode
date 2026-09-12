@@ -29,6 +29,7 @@ navigates.
 | --- | --- |
 | `Agent Sparring: Run Plan` | Pick a plan Markdown file (`## Stage <n> — <title>` headings), confirm the branch, launch `run-plan`. |
 | `Agent Sparring: Resume Plan` | Pick a paused/running plan run, optionally record human evidence, launch `resume-plan`. |
+| `Agent Sparring: Run / Resume Stage` | For the selected standalone stage (or after picking one), launch `sparring run-loop <stage> --repo-root <project> --expected-branch <current branch>` in a terminal. The branch comes from the Git repository owning the project (built-in Git API, then `.git/HEAD`); a detached HEAD is refused, never guessed. Also offered as **Run stage** / **Resume stage** in the Overview; accepted and frozen stages have no run action, READY offers only an explicit **Run loop again**. |
 | `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / frozen / future stages), the current stage as primary content (`Stage N — title`, presentation status, routing state, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), last sparring outcome, small Stage Agent / Sparrer cards, Open diff / handoff / sparring report / brief / plan buttons, and quiet metadata. Never auto-opens; updates in place. |
 | `Agent Sparring: Show Log` | Focus the Output Channel. |
 | `Agent Sparring: Select Run` | Choose explicitly when several runs look active; the choice is remembered per workspace. |
@@ -56,6 +57,21 @@ navigates.
 | Goal paragraph in the Overview | `## Goal` in the current stage's `brief.md` (display only) |
 
 Deleting `activity.jsonl` removes the live decoration and nothing else.
+
+### Runner lifecycle
+
+A stage loop launched from the extension runs in its own terminal, which the
+extension tracks. When that terminal's process exits for any reason (normal
+completion, Ctrl-C, error, killing the terminal) the "working / sparring"
+claims derived from telemetry are cleared for presentation and everything is
+recomputed from the authoritative files; an exit without a matching
+`turn.finished` / verdict shows **Runner stopped · last run interrupted**.
+While the runner is alive the Overview offers **Stop (Ctrl-C)**, which sends
+Ctrl-C to that exact terminal. Engine state is never modified.
+
+For loops started elsewhere, process liveness is unknown: telemetry is
+trusted as before, but a busy claim with no events for 30 minutes is shown as
+stale ("the runner may have stopped") rather than as certain work.
 
 ## Develop
 

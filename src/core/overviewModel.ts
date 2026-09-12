@@ -16,6 +16,7 @@ import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
 import { formatTime } from "./logFormat";
 import { presentStage, stageDisplayName } from "./presentation";
+import { applyRunner, stageRunAction, type RunnerStatus, type StageRunAction } from "./runner";
 import { QUIET_AFTER_MS, formatAge } from "./status";
 
 export type TimelineState = "accepted" | "frozen" | "active" | "paused" | "working" | "future";
@@ -63,7 +64,8 @@ export interface Banner {
  * Channel would have shown (same filter), never suppressed noise.
  */
 export interface ActivityLine {
-  kind: "active" | "last" | "none";
+  /** `stopped`: our runner exited mid-turn; `stale`: an external busy claim with no telemetry for a long time. */
+  kind: "active" | "last" | "none" | "stopped" | "stale";
   text: string;
   /** Time of day of the last visible event (kind `last`). */
   time?: string;
@@ -112,6 +114,10 @@ export interface OverviewModel {
   status?: RunStatus;
   /** The last meaningful event, also while a turn is active. */
   lastEvent?: HistoryEntry;
+  /** Run stage / Resume stage / Run loop again for a standalone stage; hidden while our runner is alive. */
+  stageAction?: StageRunAction;
+  /** A runner the extension launched for this run. */
+  runner?: { alive: boolean; label: string };
   /** For ambiguous: the candidate labels. */
   choices?: string[];
   /** Plan journey: only for plan runs with a readable plan document. */
@@ -144,9 +150,10 @@ const NO_ARTIFACTS: OverviewArtifacts = { handoff: false, sparring: false, brief
 
 export function buildOverviewModel(
   selection: RunSelection,
-  live: LiveState | undefined,
+  rawLive: LiveState | undefined,
   artifacts: OverviewArtifacts = NO_ARTIFACTS,
   nowMs: number = Date.now(),
+  runner?: RunnerStatus,
 ): OverviewModel {
   if (!selection.selected) {
     if (selection.ambiguous.length > 0) {
@@ -157,6 +164,9 @@ export function buildOverviewModel(
   const run = selection.selected;
   const stage = currentStageOf(run);
   const halted = isHalted(run);
+  const ownRunner = runner && runner.runId === run.id ? runner : undefined;
+  const effective = applyRunner(rawLive, ownRunner, nowMs);
+  const live = effective.live;
 
   const model: OverviewModel = {
     kind: "run",
@@ -178,6 +188,19 @@ export function buildOverviewModel(
     status: runStatus(run),
   };
   model.lastEvent = model.history?.[model.history.length - 1];
+  if (effective.interrupted) {
+    model.activity = { kind: "stopped", text: "Runner stopped · last run interrupted" };
+  } else if (effective.stale) {
+    model.activity = { kind: "stale", text: `${model.activity?.text ?? "Working"} · no telemetry for ${formatAge(nowMs - Date.parse(live?.lastEventTs ?? ""))}; the runner may have stopped` };
+  }
+  if (ownRunner?.alive) {
+    model.runner = { alive: true, label: "Stop (Ctrl-C)" };
+  } else {
+    if (ownRunner && effective.interrupted) {
+      model.runner = { alive: false, label: "Runner stopped" };
+    }
+    model.stageAction = stageRunAction(run, live);
+  }
 
   const outcome = run.kind === "plan" ? run.currentOutcome : run.outcome;
   if (run.kind === "plan") {
