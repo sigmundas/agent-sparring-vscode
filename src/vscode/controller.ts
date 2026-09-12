@@ -39,6 +39,10 @@ export class SparringController implements vscode.Disposable {
   private tailer: ActivityTailer | undefined;
   private attachedRunId: string | undefined;
 
+  private readonly changeEmitter = new vscode.EventEmitter<void>();
+  /** Fires after every re-render: selection, authoritative state or live activity changed. */
+  readonly onDidChange = this.changeEmitter.event;
+
   private refreshTimer: ReturnType<typeof setTimeout> | undefined;
   private pollTimer: ReturnType<typeof setTimeout> | undefined;
   private pollInterval: ReturnType<typeof setInterval> | undefined;
@@ -50,7 +54,7 @@ export class SparringController implements vscode.Disposable {
     this.statusBar = vscode.window.createStatusBarItem("agentSparring.status", vscode.StatusBarAlignment.Left, 50);
     this.statusBar.name = "Agent Sparring";
     this.statusBar.command = "agentSparring.openOverview";
-    this.disposables.push(this.output, this.statusBar);
+    this.disposables.push(this.output, this.statusBar, this.changeEmitter);
 
     this.disposables.push(
       vscode.workspace.onDidChangeWorkspaceFolders(() => void this.start()),
@@ -272,6 +276,7 @@ export class SparringController implements vscode.Disposable {
         : view.severity === "error"
           ? new vscode.ThemeColor("statusBarItem.errorBackground")
           : undefined;
+    this.changeEmitter.fire();
   }
 
   showLog(): void {

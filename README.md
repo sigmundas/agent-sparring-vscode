@@ -25,7 +25,7 @@ navigates.
 | --- | --- |
 | `Agent Sparring: Run Plan` | Pick a plan Markdown file (`## Stage <n> — <title>` headings), confirm the branch, launch `run-plan`. |
 | `Agent Sparring: Resume Plan` | Pick a paused/running plan run, optionally record human evidence, launch `resume-plan`. |
-| `Agent Sparring: Open Overview` | Navigation Quick Pick for the current run (plan, handoff, sparring report, brief, notes). The Run Overview editor arrives in a later iteration. |
+| `Agent Sparring: Open Overview` | One editor-area Run Overview panel: stage timeline, Stage Agent / Sparrer cards, current stage line, last sparring outcome, and Open diff / handoff / sparring report / brief / plan buttons. Never auto-opens; updates in place. |
 | `Agent Sparring: Show Log` | Focus the Output Channel. |
 | `Agent Sparring: Select Run` | Choose explicitly when several runs look active; the choice is remembered per workspace. |
 | `Agent Sparring: Rediscover State` | Re-scan `.sparring` from disk. |

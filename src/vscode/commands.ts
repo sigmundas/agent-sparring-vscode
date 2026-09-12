@@ -1,8 +1,7 @@
 /**
  * Command implementations: run/resume a plan in a VS Code terminal (the
  * executable is spawned directly with an argument array, no shell), select
- * a run, and the interim overview (a navigation Quick Pick until the Run
- * Overview webview lands).
+ * a run, and open the Run Overview panel and its actions.
  */
 
 import * as fs from "node:fs/promises";
@@ -12,7 +11,6 @@ import { buildResumePlanArgs, buildRunPlanArgs, readGitBranch, resolveExecutable
 import {
   BRIEF_FILENAME,
   HANDOFF_FILENAME,
-  NOTES_FILENAME,
   SPARRING_FILENAME,
   currentStageOf,
   isOpenRun,
@@ -23,14 +21,19 @@ import {
   type SparringLocation,
 } from "../core/discovery";
 import { parsePlanStages } from "../core/engineFormats";
+import type { OverviewAction } from "../core/overviewHtml";
 import type { SparringController } from "./controller";
+import { openCandidateDiff } from "./overview/gitDiff";
+import { OverviewPanelManager } from "./overview/overviewPanel";
 
 export function registerCommands(context: vscode.ExtensionContext, controller: SparringController): void {
+  const overview: OverviewPanelManager = new OverviewPanelManager(controller, (action) => handleOverviewAction(controller, overview, action));
   context.subscriptions.push(
+    overview,
     vscode.commands.registerCommand("agentSparring.showLog", () => controller.showLog()),
     vscode.commands.registerCommand("agentSparring.refresh", () => controller.refresh()),
     vscode.commands.registerCommand("agentSparring.selectRun", () => selectRunCommand(controller)),
-    vscode.commands.registerCommand("agentSparring.openOverview", () => openOverviewCommand(controller)),
+    vscode.commands.registerCommand("agentSparring.openOverview", () => openOverviewCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.runPlan", () => runPlanCommand(controller)),
     vscode.commands.registerCommand("agentSparring.resumePlan", () => resumePlanCommand(controller)),
   );
@@ -74,50 +77,75 @@ async function selectRunCommand(controller: SparringController): Promise<void> {
   await controller.chooseRun(picked.run);
 }
 
-// ---------------------------------------------------------------- overview (interim)
+// ---------------------------------------------------------------- overview
 
-async function openOverviewCommand(controller: SparringController): Promise<void> {
-  const selection = controller.currentSelection;
-  if (!selection.selected) {
-    if (selection.ambiguous.length > 0) {
-      await selectRunCommand(controller);
-    } else {
-      const choice = await vscode.window.showInformationMessage("Agent Sparring: no active run.", "Run Plan", "Show Log");
-      if (choice === "Run Plan") {
-        await runPlanCommand(controller);
-      } else if (choice === "Show Log") {
-        controller.showLog();
-      }
-    }
-    return;
-  }
-  const run = selection.selected;
-  const stage = currentStageOf(run);
-  const items: (vscode.QuickPickItem & { action: () => Promise<void> | void })[] = [];
-  const open = (file: string) => async () => {
-    try {
-      await fs.access(file);
-    } catch {
-      void vscode.window.showWarningMessage(`Agent Sparring: ${path.basename(file)} does not exist yet for this stage.`);
+async function openOverviewCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
+  let selection = controller.currentSelection;
+  if (!selection.selected && selection.ambiguous.length > 0 && !overview.isOpen) {
+    // Ambiguity is resolved through the existing selection UX first.
+    await selectRunCommand(controller);
+    selection = controller.currentSelection;
+    if (!selection.selected) {
       return;
     }
-    await vscode.window.showTextDocument(vscode.Uri.file(file), { preview: true });
-  };
-  if (run.kind === "plan") {
-    items.push({ label: "$(book) Open plan", description: run.state.plan, action: open(run.planPath) });
   }
-  items.push(
-    { label: "$(arrow-right) Open handoff", description: HANDOFF_FILENAME, action: open(path.join(stage.dir, HANDOFF_FILENAME)) },
-    { label: "$(comment-discussion) Open sparring report", description: SPARRING_FILENAME, action: open(path.join(stage.dir, SPARRING_FILENAME)) },
-    { label: "$(note) Open brief", description: BRIEF_FILENAME, action: open(path.join(stage.dir, BRIEF_FILENAME)) },
-    { label: "$(notebook) Open notes", description: NOTES_FILENAME, action: open(path.join(stage.dir, NOTES_FILENAME)) },
-    { label: "$(output) Show log", action: () => controller.showLog() },
-    { label: "$(list-selection) Select run…", action: () => selectRunCommand(controller) },
-  );
-  const title = run.kind === "plan" ? `${runLabel(run)} · stage ${run.state.currentStageIndex + 1}/${totalStagesOf(run) ?? "?"} · ${run.state.status}` : `${stage.stageId} · ${stage.state?.status ?? "working"}`;
-  const picked = await vscode.window.showQuickPick(items, { title: `Agent Sparring — ${title}`, placeHolder: stage.title ?? stage.stageId });
-  if (picked) {
-    await picked.action();
+  await overview.show();
+}
+
+async function openStageFile(controller: SparringController, filename: string): Promise<void> {
+  const run = controller.currentSelection.selected;
+  if (!run) {
+    return;
+  }
+  await openDocument(path.join(currentStageOf(run).dir, filename), `${filename} does not exist yet for this stage.`);
+}
+
+async function openDocument(file: string, missingMessage: string): Promise<void> {
+  try {
+    await fs.access(file);
+  } catch {
+    void vscode.window.showWarningMessage(`Agent Sparring: ${missingMessage}`);
+    return;
+  }
+  await vscode.window.showTextDocument(vscode.Uri.file(file), { preview: true, viewColumn: vscode.ViewColumn.Beside });
+}
+
+async function handleOverviewAction(controller: SparringController, overview: OverviewPanelManager, action: OverviewAction): Promise<void> {
+  const run = controller.currentSelection.selected;
+  switch (action) {
+    case "openHandoff":
+      return openStageFile(controller, HANDOFF_FILENAME);
+    case "openSparring":
+      return openStageFile(controller, SPARRING_FILENAME);
+    case "openBrief":
+      return openStageFile(controller, BRIEF_FILENAME);
+    case "openPlan":
+      if (run?.kind === "plan") {
+        await openDocument(run.planPath, `the plan document ${run.state.plan} is missing.`);
+      }
+      return;
+    case "openDiff": {
+      if (!run) {
+        return;
+      }
+      const stage = currentStageOf(run);
+      const base = stage.state?.baseSha;
+      if (!base) {
+        void vscode.window.showInformationMessage("Agent Sparring: this stage has no recorded base_sha yet.");
+        return;
+      }
+      await openCandidateDiff(run.location.repoRoot, base, stage.state?.candidateSha ?? undefined, stage.title ?? stage.stageId);
+      return;
+    }
+    case "showLog":
+      controller.showLog();
+      return;
+    case "selectRun":
+      await selectRunCommand(controller);
+      await overview.update();
+      return;
+    case "runPlan":
+      return runPlanCommand(controller);
   }
 }
 
