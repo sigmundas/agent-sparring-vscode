@@ -12,34 +12,89 @@
  *    navigation only: the engine has no operation that continues a
  *    standalone stage from a plan, so nothing here claims one.
  *
+ * Which heading of an associated plan describes the stage is decided in
+ * layers, each of which must name exactly one heading or nothing: the
+ * user's own manual match first (also workspace state), then conservative
+ * automatic matching (stage id slug, a `Stage 3B` label carried by the id
+ * or by the stage's brief, the display title). Two candidates, or a weak
+ * resemblance, yield no match: the Overview then asks the user.
+ *
  * Heading parsing is deliberately lenient (any `## Stage <label> — <title>`
- * heading, labels like `3C` included; otherwise every `##` heading), unlike
- * the engine mirror in engineFormats.ts, because an associated plan is not
- * required to be a plan the engine could run.
+ * heading at levels 2–4, labels like `3C` included; otherwise every `##`
+ * heading), unlike the engine mirror in engineFormats.ts, because an
+ * associated plan is not required to be a plan the engine could run.
  *
  * No dependency on the vscode API.
  */
 
+import { parseBriefStageMarkers } from "./brief";
 import { slugify } from "./engineFormats";
 import { humanizeStageId } from "./presentation";
 
-/** workspaceState entry: run id → absolute path of the associated Markdown file. */
-export type PlanAssociations = Record<string, string>;
+// ---------------------------------------------------------------- storage
+
+/**
+ * Identity of a heading inside an associated plan, as the user matched it.
+ * Text, not a line number: the document may be edited above the heading.
+ */
+export interface HeadingRef {
+  /** `3B`; absent for a plain `##` heading. */
+  label?: string;
+  title: string;
+}
+
+export interface PlanAssociation {
+  /** Absolute path of the associated Markdown file. */
+  path: string;
+  /** The heading the user picked for this stage, when automatic matching was not enough. */
+  match?: HeadingRef;
+}
+
+/**
+ * workspaceState entry: run id → association. Older entries are the bare
+ * path string; both shapes are read.
+ */
+export type PlanAssociations = Record<string, string | PlanAssociation>;
 
 export const PLAN_ASSOCIATIONS_KEY = "agentSparring.planAssociations";
 
-export function associatedPlanFor(associations: PlanAssociations | undefined, runId: string): string | undefined {
+export function planAssociationFor(associations: PlanAssociations | undefined, runId: string): PlanAssociation | undefined {
   const value = associations?.[runId];
-  return typeof value === "string" && value.trim() ? value : undefined;
+  if (typeof value === "string") {
+    return value.trim() ? { path: value } : undefined;
+  }
+  if (value && typeof value === "object" && typeof value.path === "string" && value.path.trim()) {
+    const match = value.match;
+    const validMatch = match && typeof match === "object" && typeof match.title === "string" && match.title.trim() ? { label: typeof match.label === "string" ? match.label : undefined, title: match.title } : undefined;
+    return validMatch ? { path: value.path, match: validMatch } : { path: value.path };
+  }
+  return undefined;
 }
 
+export function associatedPlanFor(associations: PlanAssociations | undefined, runId: string): string | undefined {
+  return planAssociationFor(associations, runId)?.path;
+}
+
+/** Set, change or (with undefined) remove the association. Changing the file drops any manual match: it named a heading of the old file. */
 export function withAssociation(associations: PlanAssociations | undefined, runId: string, planPath: string | undefined): PlanAssociations {
   const next: PlanAssociations = { ...(associations ?? {}) };
   if (planPath) {
-    next[runId] = planPath;
+    const current = planAssociationFor(associations, runId);
+    next[runId] = current && current.path === planPath && current.match ? { path: planPath, match: current.match } : { path: planPath };
   } else {
     delete next[runId];
   }
+  return next;
+}
+
+/** Record (or with undefined, clear) the user's manual heading match; a no-op without an association. */
+export function withManualMatch(associations: PlanAssociations | undefined, runId: string, match: HeadingRef | undefined): PlanAssociations {
+  const current = planAssociationFor(associations, runId);
+  if (!current) {
+    return { ...(associations ?? {}) };
+  }
+  const next: PlanAssociations = { ...(associations ?? {}) };
+  next[runId] = match ? { path: current.path, match: { label: match.label, title: match.title } } : { path: current.path };
   return next;
 }
 
@@ -55,7 +110,7 @@ export interface PlanHeading {
   display: string;
 }
 
-const STAGE_HEADING_RE = /^##\s+stage\s+([A-Za-z0-9.]+)\s*[—–:-]\s*(\S.*?)\s*$/i;
+const STAGE_HEADING_RE = /^#{2,4}\s+stage\s+([A-Za-z0-9.]+)\s*[—–:-]\s*(\S.*?)\s*$/i;
 const PLAIN_HEADING_RE = /^##\s+(\S.*?)\s*$/;
 const FENCE_RE = /^\s*(```|~~~)/;
 
@@ -110,7 +165,47 @@ export function planTitle(markdown: string): string | undefined {
   return undefined;
 }
 
+export const SECTION_SUMMARY_MAX_LENGTH = 200;
+
+/**
+ * The first prose paragraph under the heading at `line` (1-based), for a
+ * one-line summary of what a plan section is about: display only. Lists
+ * and fenced code are not summaries; a section that starts with either
+ * yields undefined.
+ */
+export function sectionSummary(markdown: string, line: number, maxLength = SECTION_SUMMARY_MAX_LENGTH): string | undefined {
+  const lines = markdown.split(/\r?\n/);
+  const paragraph: string[] = [];
+  for (let index = line; index < lines.length; index++) {
+    const text = lines[index];
+    if (/^#{1,6}\s/.test(text) || FENCE_RE.test(text) || /^\s*([-*+]|\d+[.)])\s/.test(text) || /^\s*\|/.test(text)) {
+      break;
+    }
+    if (!text.trim()) {
+      if (paragraph.length > 0) {
+        break;
+      }
+      continue;
+    }
+    paragraph.push(text.trim());
+  }
+  if (paragraph.length === 0) {
+    return undefined;
+  }
+  const text = paragraph
+    .join(" ")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) {
+    return undefined;
+  }
+  return text.length > maxLength ? `${text.slice(0, Math.max(1, maxLength - 1)).trimEnd()}…` : text;
+}
+
 // ---------------------------------------------------------------- matching
+
+export type MatchSource = "manual" | "id" | "label" | "brief" | "title";
 
 export interface PlanPosition {
   /** Index into the headings of the one that describes this stage. */
@@ -118,26 +213,114 @@ export interface PlanPosition {
   current: PlanHeading;
   next?: PlanHeading;
   previous?: PlanHeading;
+  /** Which layer decided the match. */
+  source: MatchSource;
+}
+
+export interface StageIdentity {
+  stageId: string;
+  /** The stage's display title (plan title for managed stages), when it differs from the humanized id. */
+  title?: string;
+  /** Contents of the stage's brief.md, when it exists; only its `Stage <label>` markers are consulted. */
+  briefText?: string;
+  /** The user's own match, which wins over everything automatic. */
+  manual?: HeadingRef;
+}
+
+/** Headings whose label+title (or, for a stored match without label, title) equals `ref`; exact text, case-insensitive. */
+export function findHeading(headings: PlanHeading[], ref: HeadingRef): number {
+  const wantLabel = ref.label?.toLowerCase();
+  const wantTitle = ref.title.trim().toLowerCase();
+  const exact = headings.findIndex((heading) => heading.title.trim().toLowerCase() === wantTitle && (heading.label?.toLowerCase() ?? undefined) === wantLabel);
+  if (exact >= 0) {
+    return exact;
+  }
+  // The label may have been renumbered; a unique title still identifies the section.
+  const byTitle = headings.map((heading, index) => ({ heading, index })).filter(({ heading }) => heading.title.trim().toLowerCase() === wantTitle);
+  return byTitle.length === 1 ? byTitle[0].index : -1;
 }
 
 /**
- * Which heading describes `stageId`, only when the match is unambiguous:
- * the heading's slug equals the stage id's slug once the `stage-` /
- * `stage-<n>-` prefix is removed, or the humanized id equals the title.
- * Two headings matching, or none, yields undefined: no guess.
+ * Which heading describes the stage. Layers, first decisive one wins:
+ *
+ *  1. the user's manual match (still present in the document);
+ *  2. the stage id: the heading's title slug equals the id's slug once the
+ *     `stage-` / `stage-<n>-` prefix is removed, or the humanized id;
+ *  3. a stage label carried by the id (`stage-3b-…`) or by the brief's own
+ *     title/first lines (`# Stage 3B — …`), when exactly one heading has it;
+ *  4. the display title, when it slugifies to exactly one heading title.
+ *
+ * Two headings matching, or none, at every layer yields undefined: no guess.
  */
-export function locateStage(headings: PlanHeading[], stageId: string): PlanPosition | undefined {
-  const idSlug = slugify(humanizeStageId(stageId));
-  const bare = slugify(stageId.replace(/^stage-(?:\d+-)?/i, ""));
-  const matches = headings
-    .map((heading, index) => ({ heading, index }))
-    .filter(({ heading }) => {
-      const slug = slugify(heading.title);
-      return slug.length > 0 && (slug === idSlug || slug === bare);
-    });
-  if (matches.length !== 1) {
-    return undefined;
+export function locateStage(headings: PlanHeading[], identity: string | StageIdentity): PlanPosition | undefined {
+  const who: StageIdentity = typeof identity === "string" ? { stageId: identity } : identity;
+  if (who.manual) {
+    const index = findHeading(headings, who.manual);
+    if (index >= 0) {
+      return position(headings, index, "manual");
+    }
   }
-  const { index } = matches[0];
-  return { index, current: headings[index], next: headings[index + 1], previous: headings[index - 1] };
+  const idSlug = slugify(humanizeStageId(who.stageId));
+  const bare = slugify(who.stageId.replace(/^stage-(?:\d+[a-z]?-)?/i, ""));
+  const byId = unique(headings, (heading) => {
+    const slug = slugify(heading.title);
+    return slug.length > 0 && (slug === idSlug || slug === bare);
+  });
+  if (byId !== undefined) {
+    return position(headings, byId, "id");
+  }
+  const idLabel = /^stage-(\d+[a-z]?)-/i.exec(who.stageId)?.[1];
+  if (idLabel) {
+    const byIdLabel = uniqueLabel(headings, idLabel);
+    if (byIdLabel !== undefined) {
+      return position(headings, byIdLabel, "label");
+    }
+  }
+  const markers = who.briefText ? parseBriefStageMarkers(who.briefText) : undefined;
+  if (markers?.current) {
+    const byBrief = uniqueLabel(headings, markers.current);
+    if (byBrief !== undefined) {
+      return position(headings, byBrief, "brief");
+    }
+  }
+  if (who.title) {
+    const titleSlug = slugify(who.title);
+    const byTitle = unique(headings, (heading) => {
+      const slug = slugify(heading.title);
+      return slug.length > 0 && slug === titleSlug;
+    });
+    if (byTitle !== undefined) {
+      return position(headings, byTitle, "title");
+    }
+  }
+  return undefined;
+}
+
+function position(headings: PlanHeading[], index: number, source: MatchSource): PlanPosition {
+  return { index, current: headings[index], next: headings[index + 1], previous: headings[index - 1], source };
+}
+
+function unique(headings: PlanHeading[], predicate: (heading: PlanHeading) => boolean): number | undefined {
+  const matches = headings.map((heading, index) => ({ heading, index })).filter(({ heading }) => predicate(heading));
+  return matches.length === 1 ? matches[0].index : undefined;
+}
+
+/** Index of the single heading labelled `label` (case-insensitive); undefined when none or several. */
+function uniqueLabel(headings: PlanHeading[], label: string): number | undefined {
+  const want = label.toLowerCase();
+  return unique(headings, (heading) => heading.label?.toLowerCase() === want);
+}
+
+/**
+ * Headings of the plan that the stage's brief mentions as later work
+ * (`Stage 3C — …`, `Stage 4`), in document order of the plan. Display
+ * context only: the brief describes intent, the plan is the document.
+ */
+export function briefMentionedHeadings(headings: PlanHeading[], briefText: string | undefined, excludeIndex?: number): PlanHeading[] {
+  if (!briefText) {
+    return [];
+  }
+  const markers = parseBriefStageMarkers(briefText);
+  const wanted = new Set(markers.mentioned.map((label) => label.toLowerCase()));
+  return headings.filter((heading, index) => index !== excludeIndex && heading.label !== undefined && wanted.has(heading.label.toLowerCase()));
 }

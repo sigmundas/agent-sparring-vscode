@@ -23,7 +23,7 @@ import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
 import { formatTime } from "./logFormat";
 import { deriveLiveness, type ExecutionRecord, type LivenessState, type RunnerLiveness } from "./liveness";
-import { locateStage, parsePlanHeadings, planTitle, type PlanHeading } from "./planAssociation";
+import { briefMentionedHeadings, locateStage, parsePlanHeadings, planTitle, sectionSummary, type HeadingRef, type MatchSource, type PlanHeading } from "./planAssociation";
 import { actionWord, presentStage, stageDisplayName, type StagePresentation } from "./presentation";
 import { planAction, stageActions, type PlanAction, type StageRunAction } from "./runner";
 import { QUIET_AFTER_MS, formatAge } from "./status";
@@ -111,6 +111,8 @@ export interface AssociatedPlan {
   exists: boolean;
   /** Document text when readable; headings are parsed for display. */
   text?: string;
+  /** The heading the user matched this stage to (workspace state), when automatic matching was not enough. */
+  manualMatch?: HeadingRef;
 }
 
 export interface OverviewArtifacts {
@@ -118,8 +120,10 @@ export interface OverviewArtifacts {
   sparring: boolean;
   brief: boolean;
   plan: boolean;
-  /** Contents of brief.md when it exists; only the Goal paragraph is displayed. */
+  /** Contents of brief.md when it exists; the Goal paragraph is displayed and its `Stage <label>` markers help match an associated plan. */
   briefText?: string;
+  /** Contents of a managed plan run's document when readable; only used for the next stage's opening paragraph. */
+  planText?: string;
   /** Checked-out branch and HEAD of the repository owning the run, when known. */
   git?: GitContext;
   /** Extension-side plan association for a standalone stage (UI metadata, never engine state). */
@@ -138,6 +142,8 @@ export interface OverviewActions {
   choosePlan: boolean;
   /** An associated plan exists and can be changed or removed. */
   changePlan: boolean;
+  /** The associated plan is readable and has headings: the user can pick (or change) which one is this stage. */
+  matchStage: boolean;
   /** Present when base_sha is recorded; `detail` (for a tooltip) says what the diff spans. */
   diff?: { label: string; detail: string; baseSha: string; targetSha?: string };
 }
@@ -157,12 +163,40 @@ export interface PlanContext {
   source: "managed" | "associated";
   /** Display name: the document's first heading, else its file name. */
   name: string;
-  /** The heading describing this stage, when known (managed: always; associated: only on an unambiguous match). */
+  /** The heading describing this stage, when known (managed: always; associated: only on an unambiguous or manual match). */
   current?: string;
-  /** The heading after this stage; informational unless a `planAction` continues a managed run. */
-  next?: { display: string; line: number };
+  /** How the current heading was decided (associated plans only; managed runs are authoritative). */
+  matched?: MatchSource;
+  /** The heading after this stage; informational unless a `planAction` continues a managed run. `summary` is its opening paragraph. */
+  next?: { display: string; line: number; summary?: string };
+  /** Whether the document has any headings to match against at all. */
+  hasHeadings: boolean;
   /** One sentence for the tooltip / note about what this context is. */
   note: string;
+}
+
+/**
+ * The answer to "this stage is done; what should I do now?", shown in
+ * place of current-activity emphasis once a stage is accepted. Every
+ * variant says only what the recorded data supports.
+ */
+export interface WhatsNext {
+  kind:
+    | "continue" // managed run: the engine's next stage; Continue plan runs it
+    | "last-managed" // managed run: no stage follows; Continue plan closes the run
+    | "next-heading" // associated plan, matched: the following heading, for reading only
+    | "last-heading" // associated plan, matched: nothing follows this heading
+    | "match" // associated plan, unmatched: ask the user where this stage belongs
+    | "missing-plan" // associated file is gone
+    | "choose"; // no plan at all
+  /** The heading to show, e.g. `Stage 3C — Cloud schema and synchronization`. */
+  heading?: string;
+  /** Its opening paragraph, when the document has one. */
+  summary?: string;
+  /** One or two plain sentences. */
+  text: string;
+  /** Plan headings the brief lists as later work, when the stage itself could not be matched. */
+  hints?: string[];
 }
 
 export interface OverviewModel {
@@ -219,6 +253,8 @@ export interface OverviewModel {
   banner?: Banner;
   lastSparring?: { action: string; word: string; summary: string; reason?: string };
   plan?: PlanContext;
+  /** Present only for an accepted stage. */
+  whatsNext?: WhatsNext;
   actions?: OverviewActions;
   facts?: { label: string; value: string }[];
 }
@@ -247,7 +283,7 @@ export function buildOverviewModel(
   const uncertain = liveness.source === "telemetry";
   const outcome = run.kind === "plan" ? run.currentOutcome : run.outcome;
   const presentation = presentStage(stage.state?.status, outcome, live);
-  const plan = planContext(run, stage, artifacts.associatedPlan);
+  const plan = planContext(run, stage, artifacts);
 
   const model: OverviewModel = {
     kind: "run",
@@ -261,6 +297,7 @@ export function buildOverviewModel(
       plan: run.kind === "plan" ? artifacts.plan : Boolean(artifacts.associatedPlan?.exists),
       choosePlan: run.kind === "stage" && !artifacts.associatedPlan,
       changePlan: run.kind === "stage" && Boolean(artifacts.associatedPlan),
+      matchStage: run.kind === "stage" && plan?.source === "associated" && plan.hasHeadings,
       diff: diffAction(stage),
     },
     facts: facts(run, stage, artifacts.git, presentation, artifacts.associatedPlan),
@@ -332,6 +369,9 @@ export function buildOverviewModel(
     model.lastSparring = { action: outcome.action, word: actionWord(outcome.action), summary: outcome.summary, reason: outcome.needsYouReason };
   }
   Object.assign(model, currentLine(run, stage, live, presentation, liveness, Boolean(artifacts.accepting), model.planAction));
+  if (stage.state?.status === "accepted" && !(run.kind === "plan" && run.state.status === "complete")) {
+    model.whatsNext = whatsNext(run, plan, artifacts, model.planAction);
+  }
   return model;
 }
 
@@ -508,16 +548,29 @@ export function timelineState(stage: StageSnapshot, index: number, current: numb
  * stage with an associated file: the document's headings, and this stage's
  * place in them only when one heading unambiguously matches.
  */
-function planContext(run: RunSnapshot, stage: StageSnapshot, associated: AssociatedPlan | undefined): PlanContext | undefined {
+function planContext(run: RunSnapshot, stage: StageSnapshot, artifacts: OverviewArtifacts): PlanContext | undefined {
+  const associated = artifacts.associatedPlan;
   if (run.kind === "plan") {
     const stages = run.planStages;
     const index = run.state.currentStageIndex;
     const nextHeading = stages?.[index + 1];
+    let next: PlanContext["next"];
+    if (nextHeading) {
+      // The engine parsed the heading; its line and opening paragraph come
+      // from the same document, read here for display only.
+      const inDocument = artifacts.planText ? parsePlanHeadings(artifacts.planText).find((heading) => heading.label === String(nextHeading.number) && heading.title === nextHeading.title) : undefined;
+      next = {
+        display: `Stage ${nextHeading.number} — ${nextHeading.title}`,
+        line: inDocument?.line ?? 0,
+        summary: inDocument && artifacts.planText ? sectionSummary(artifacts.planText, inDocument.line) : undefined,
+      };
+    }
     return {
       source: "managed",
       name: run.state.plan,
       current: `Stage ${stage.number ?? index + 1} — ${stageDisplayName(stage)}`,
-      next: nextHeading ? { display: `Stage ${nextHeading.number} — ${nextHeading.title}`, line: 0 } : undefined,
+      next,
+      hasHeadings: Boolean(stages && stages.length > 0),
       note: "The engine's plan run: it records which stage is current and resume-plan continues it.",
     };
   }
@@ -527,17 +580,51 @@ function planContext(run: RunSnapshot, stage: StageSnapshot, associated: Associa
   const name = (associated.text ? planTitle(associated.text) : undefined) ?? basename(associated.path);
   const note = "Associated with this stage in VS Code for display only; the engine does not know about it and nothing here starts a stage from it.";
   if (!associated.exists || associated.text === undefined) {
-    return { source: "associated", name, note: associated.exists ? note : `${note} The file is currently missing.` };
+    return { source: "associated", name, hasHeadings: false, note: associated.exists ? note : `${note} The file is currently missing.` };
   }
   const headings: PlanHeading[] = parsePlanHeadings(associated.text);
-  const position = locateStage(headings, stage.stageId);
+  const position = locateStage(headings, { stageId: stage.stageId, title: stage.title, briefText: artifacts.briefText, manual: associated.manualMatch });
   return {
     source: "associated",
     name,
     current: position?.current.display,
-    next: position?.next ? { display: position.next.display, line: position.next.line } : undefined,
+    matched: position?.source,
+    next: position?.next ? { display: position.next.display, line: position.next.line, summary: sectionSummary(associated.text, position.next.line) } : undefined,
+    hasHeadings: headings.length > 0,
     note,
   };
+}
+
+/** See WhatsNext. Only called for an accepted current stage of a run that is not complete. */
+function whatsNext(run: RunSnapshot, plan: PlanContext | undefined, artifacts: OverviewArtifacts, planAction: PlanAction | undefined): WhatsNext {
+  if (run.kind === "plan") {
+    const canContinue = planAction?.kind === "continue";
+    if (plan?.next) {
+      return { kind: "continue", heading: plan.next.display, summary: plan.next.summary, text: canContinue ? "Continue plan starts it." : "The engine's next stage; Continue plan is offered once no runner is alive." };
+    }
+    return { kind: "last-managed", text: canContinue ? "No stage follows this one in the plan. Continue plan hands the finished run back to the engine." : "No stage follows this one in the plan." };
+  }
+  if (!plan) {
+    return { kind: "choose", text: "This stage has been accepted. Choose a plan to see what comes next." };
+  }
+  const associated = artifacts.associatedPlan;
+  if (!associated?.exists || associated.text === undefined) {
+    return { kind: "missing-plan", text: `The linked plan file (${basename(associated?.path ?? "")}) is missing. Choose another plan to see what comes next.` };
+  }
+  if (!plan.current) {
+    const hints = plan.hasHeadings ? briefMentionedHeadings(parsePlanHeadings(associated.text), artifacts.briefText).map((heading) => heading.display) : [];
+    return {
+      kind: "match",
+      text: plan.hasHeadings
+        ? "The plan is linked, but Agent Sparring doesn't yet know where this stage belongs in it."
+        : "The plan is linked, but it has no section headings to place this stage under.",
+      hints: hints.length > 0 ? hints : undefined,
+    };
+  }
+  if (plan.next) {
+    return { kind: "next-heading", heading: plan.next.display, summary: plan.next.summary, text: "The next section of the plan you linked. Read it in the plan; starting it is up to you." };
+  }
+  return { kind: "last-heading", text: `This stage is the last section of ${plan.name}.` };
 }
 
 function basename(file: string): string {
@@ -581,7 +668,8 @@ function currentLine(
       return { stageLine: plan?.kind === "continue" ? "Stage complete. Continue plan starts the next stage." : "Stage complete." };
     }
   } else if (stageStatus === "accepted") {
-    return { stageLine: "Stage complete.", banner: { kind: "done", text: "Stage complete" } };
+    // No banner: the header pill already says Accepted and this line says complete.
+    return { stageLine: "Stage complete." };
   } else if (presentation.kind === "needs_you") {
     return {
       stageLine: "Waiting for you. When it is done, resume the stage; the reviewer checks again.",

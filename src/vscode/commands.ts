@@ -26,7 +26,7 @@ import {
 import { parsePlanStages } from "../core/engineFormats";
 import { blocksLaunch } from "../core/liveness";
 import type { OverviewAction } from "../core/overviewHtml";
-import { locateStage, parsePlanHeadings } from "../core/planAssociation";
+import { locateStage, parsePlanHeadings, sectionSummary, type HeadingRef } from "../core/planAssociation";
 import { buildRunPickItems, describeRun } from "../core/runPick";
 import { stageActions, stageRunAction } from "../core/runner";
 import { planRunId, type SparringSubcommand } from "../core/sparringCommand";
@@ -50,6 +50,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.runStage", () => runStageCommand(controller)),
     vscode.commands.registerCommand("agentSparring.acceptStage", () => acceptStageCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.choosePlan", () => associatePlanCommand(controller, overview)),
+    vscode.commands.registerCommand("agentSparring.matchStage", () => matchStageCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.chooseExecutable", () => chooseExecutableCommand()),
     controller.onCommandNotFound((event) => void explainCommandNotFound(event.word)),
     // Not contributed in package.json (never in the palette): hooks for the
@@ -73,6 +74,13 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
         await controller.setAssociatedPlan(run.id, planPath);
       }
       return controller.associatedPlan(run?.id);
+    }),
+    vscode.commands.registerCommand("agentSparring._test.matchStage", async (match: HeadingRef | undefined) => {
+      const run = controller.currentSelection.selected;
+      if (run) {
+        await controller.setManualMatch(run.id, match);
+      }
+      return controller.planAssociation(run?.id)?.match;
     }),
     vscode.commands.registerCommand("agentSparring._test.overviewModel", () => overview.buildModel()),
     vscode.commands.registerCommand("agentSparring._test.lastCommandNotFound", () => lastCommandNotFound),
@@ -184,14 +192,7 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       if (!file) {
         return;
       }
-      let line: number | undefined;
-      try {
-        const position = locateStage(parsePlanHeadings(await fs.readFile(file, "utf8")), currentStageOf(run).stageId);
-        line = position?.next?.line;
-      } catch {
-        line = undefined;
-      }
-      await openDocument(file, `the plan document ${path.basename(file)} is missing.`, overview.documentColumn, line);
+      await openDocument(file, `the plan document ${path.basename(file)} is missing.`, overview.documentColumn, await nextHeadingLine(controller, run, file));
       return;
     }
     case "openDiff": {
@@ -230,11 +231,42 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
     case "associatePlan":
       await associatePlanCommand(controller, overview);
       return;
+    case "matchStage":
+      await matchStageCommand(controller, overview);
+      return;
     case "stopRunner":
       if (run && !controller.stopRunner(run.id)) {
         void vscode.window.showInformationMessage("Agent Sparring: no runner observed from this window is alive for the selected stage.");
       }
       return;
+  }
+}
+
+/**
+ * The line of the heading after this stage's, using the same matching the
+ * Overview used (manual match, then the brief's markers): for a managed
+ * run, the engine's next stage located in the document by number + title.
+ */
+async function nextHeadingLine(controller: SparringController, run: RunSnapshot, file: string): Promise<number | undefined> {
+  try {
+    const headings = parsePlanHeadings(await fs.readFile(file, "utf8"));
+    if (run.kind === "plan") {
+      const next = run.planStages?.[run.state.currentStageIndex + 1];
+      return next ? headings.find((heading) => heading.label === String(next.number) && heading.title === next.title)?.line : undefined;
+    }
+    const stage = currentStageOf(run);
+    const briefText = await readOptional(path.join(stage.dir, BRIEF_FILENAME));
+    return locateStage(headings, { stageId: stage.stageId, title: stage.title, briefText, manual: controller.planAssociation(run.id)?.match })?.next?.line;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readOptional(file: string): Promise<string | undefined> {
+  try {
+    return await fs.readFile(file, "utf8");
+  } catch {
+    return undefined;
   }
 }
 
@@ -441,6 +473,78 @@ async function associatePlanCommand(controller: SparringController, overview: Ov
     return;
   }
   await controller.setAssociatedPlan(run.id, file);
+  await overview.update();
+}
+
+interface HeadingItem extends vscode.QuickPickItem {
+  match?: HeadingRef;
+  action?: "clear" | "changePlan" | "remove";
+}
+
+/**
+ * Let the user say which section of the associated plan this stage is,
+ * when automatic matching could not (or chose differently). The choice is
+ * a heading identity in VS Code workspace state, never engine state.
+ */
+async function matchStageCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
+  const run = controller.currentSelection.selected;
+  if (!run) {
+    return;
+  }
+  if (run.kind === "plan") {
+    void vscode.window.showInformationMessage("Agent Sparring: this is an engine-managed plan run; the engine records which stage is current.");
+    return;
+  }
+  const association = controller.planAssociation(run.id);
+  if (!association) {
+    await associatePlanCommand(controller, overview);
+    return;
+  }
+  const text = await readOptional(association.path);
+  if (text === undefined) {
+    void vscode.window.showWarningMessage(`Agent Sparring: the plan document ${path.basename(association.path)} is missing. Choose another plan for this stage.`);
+    await associatePlanCommand(controller, overview);
+    return;
+  }
+  const headings = parsePlanHeadings(text);
+  if (headings.length === 0) {
+    void vscode.window.showInformationMessage(`Agent Sparring: ${path.basename(association.path)} has no '## Stage … — …' or '##' headings to match this stage to.`);
+    return;
+  }
+  const stage = run.stage;
+  const briefText = await readOptional(path.join(stage.dir, BRIEF_FILENAME));
+  const current = locateStage(headings, { stageId: stage.stageId, title: stage.title, briefText, manual: association.match });
+  const items: HeadingItem[] = headings.map((heading, index) => ({
+    label: `${index === current?.index ? "$(check) " : ""}${heading.display}`,
+    description: index === current?.index ? (current.source === "manual" ? "current match (yours)" : "current match (automatic)") : `line ${heading.line}`,
+    detail: sectionSummary(text, heading.line, 120),
+    match: { label: heading.label, title: heading.title },
+  }));
+  items.push({ label: "", kind: vscode.QuickPickItemKind.Separator });
+  if (association.match) {
+    items.push({ label: "$(discard) Use automatic matching again", description: "forget the section you picked", action: "clear" });
+  }
+  items.push({ label: "$(file) Choose another plan file…", description: path.basename(association.path), action: "changePlan" });
+  items.push({ label: "$(close) Remove the plan association", description: "the stage keeps its state; only the plan display goes away", action: "remove" });
+  const picked = await vscode.window.showQuickPick(items, {
+    placeHolder: `Which section of ${path.basename(association.path)} is ${stage.stageId}? (kept in VS Code only; the engine is not told)`,
+    matchOnDescription: true,
+    matchOnDetail: true,
+  });
+  if (!picked) {
+    return;
+  }
+  if (picked.action === "changePlan") {
+    await associatePlanCommand(controller, overview);
+    return;
+  }
+  if (picked.action === "remove") {
+    await controller.setAssociatedPlan(run.id, undefined);
+  } else if (picked.action === "clear") {
+    await controller.setManualMatch(run.id, undefined);
+  } else if (picked.match) {
+    await controller.setManualMatch(run.id, picked.match);
+  }
   await overview.update();
 }
 

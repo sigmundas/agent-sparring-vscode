@@ -13,7 +13,7 @@
  * meaningful event on the right); provider cards; recent events; metadata.
  */
 
-import { TIMELINE_STATE_WORD, type ActorCard, type HistoryEntry, type OverviewModel, type TimelineItem } from "./overviewModel";
+import { TIMELINE_STATE_WORD, type ActorCard, type HistoryEntry, type OverviewModel, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { StageRunAction } from "./runner";
 
 export type OverviewAction =
@@ -30,6 +30,7 @@ export type OverviewAction =
   | "runStage"
   | "acceptStage"
   | "associatePlan"
+  | "matchStage"
   | "stopRunner";
 
 export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
@@ -46,6 +47,7 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "runStage",
   "acceptStage",
   "associatePlan",
+  "matchStage",
   "stopRunner",
 ];
 
@@ -90,6 +92,7 @@ const ICON: Record<string, string> = {
   chat: '<path d="M2.5 3h11v7.5H8L4.5 13.5v-3h-2z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
   history: '<circle cx="8" cy="8" r="6.3" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8 4.5V8l2.5 1.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>',
   dot: '<circle cx="8" cy="8" r="3.2" fill="currentColor"/>',
+  arrow: '<path d="M3 8h9M8.5 4.5L12 8l-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>',
   pause: '<path d="M5.5 4.5v7M10.5 4.5v7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>',
   lock: '<rect x="3.5" y="7" width="9" height="7" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5.5 7V5a2.5 2.5 0 015 0v2" fill="none" stroke="currentColor" stroke-width="1.4"/>',
 };
@@ -190,15 +193,20 @@ function stageActionButton(action: StageRunAction, stageId: string | undefined, 
 }
 
 function renderStageCard(model: OverviewModel): string {
-  const statusWord = model.stageStatus
-    ? `<span class="status ${escapeHtml(model.stageStatusKind ?? "")}" title="${escapeHtml(model.stageRaw ? `Engine state: ${model.stageRaw}` : "")}">${escapeHtml(model.stageStatus)}</span>`
-    : "";
-  const cycle = model.cycle !== undefined ? `<span class="sep">·</span><span class="muted" title="loop cycle from telemetry">cycle ${model.cycle}</span>` : "";
+  const accepted = model.whatsNext !== undefined;
+  // Once accepted, the header pill already says Accepted: the card line
+  // says "Stage complete." once and nothing repeats it.
+  const statusWord =
+    model.stageStatus && !accepted
+      ? `<span class="status ${escapeHtml(model.stageStatusKind ?? "")}" title="${escapeHtml(model.stageRaw ? `Engine state: ${model.stageRaw}` : "")}">${escapeHtml(model.stageStatus)}</span><span class="sep">·</span>`
+      : "";
+  const cycle = model.cycle !== undefined ? `<span class="muted" title="loop cycle from telemetry">cycle ${model.cycle}</span><span class="sep">·</span>` : "";
   const buttons: string[] = [];
   if (model.stageAction) {
     buttons.push(stageActionButton(model.stageAction, model.stageId));
   }
-  if (model.planAction) {
+  if (model.planAction && !accepted) {
+    // For an accepted stage the plan action is the primary button of What's next instead.
     buttons.push(button("resumePlan", model.planAction.label, true, model.planAction.detail, model.planAction.primary ? "primary" : ""));
   }
   if (model.accepting) {
@@ -221,10 +229,10 @@ function renderStageCard(model: OverviewModel): string {
     }
     if (actions.plan) {
       buttons.push(button("openPlan", "Plan", true, model.plan ? `${model.plan.name} — ${model.plan.note}` : "Open the plan document"));
-    } else if (actions.choosePlan) {
-      buttons.push(button("associatePlan", "Choose plan…", true, "Pick the Markdown plan this stage belongs to (kept in VS Code only; the engine is not told)"));
+    } else if (actions.choosePlan && !accepted) {
+      buttons.push(button("associatePlan", "Choose plan…", true, CHOOSE_PLAN_TITLE));
     }
-    if (actions.changePlan) {
+    if (actions.changePlan && !(accepted && !actions.plan)) {
       buttons.push(button("associatePlan", "Change plan…", true, actions.plan ? "Choose another plan file or remove the association" : "The associated plan file is missing: choose another or remove the association", "quiet"));
     }
     buttons.push(button("showLog", "Log", true, "Show the Agent Sparring output channel"));
@@ -245,7 +253,7 @@ function renderStageCard(model: OverviewModel): string {
 <p><span class="verdict ${escapeHtml(action.toLowerCase())}" title="${escapeHtml(`Routing action: ${action}`)}">${escapeHtml(model.lastSparring.word)}</span>${reason}</p>
 <p>${escapeHtml(model.lastSparring.summary || "(no summary recorded)")}</p></div>`;
   }
-  const upNext = renderUpNext(model);
+  const planPlace = renderPlanPlace(model);
 
   let current = `<p class="muted">No provider turn in progress.</p>`;
   if (model.activity?.kind === "stopped") {
@@ -267,42 +275,100 @@ function renderStageCard(model: OverviewModel): string {
     ? `<p><span class="time">${escapeHtml(model.lastEvent.time)}</span><span class="sep">·</span><span class="who ${whoClass(model.lastEvent.who)}">${escapeHtml(model.lastEvent.who)}</span> ${escapeHtml(model.lastEvent.description)}</p>`
     : `<p class="muted">No activity telemetry for this stage.</p>`;
 
+  // An accepted stage has no current activity to watch; the right column
+  // answers "what should I do now?" instead. The last event stays in Recent events.
+  const right = model.whatsNext
+    ? renderWhatsNext(model, model.whatsNext)
+    : `<div class="block"><h3>${icon("pulse", "accent")}Current activity</h3>${current}</div>
+<div class="block"><h3>${icon("doc")}Last meaningful event</h3>${last}</div>`;
+
   return `<section class="card stage">
 <div class="stagehead">
 <div><h2 title="${escapeHtml(model.stageId ?? "")}">${icon("dot", `accent ${escapeHtml(model.stageStatusKind ?? "")}`)}${escapeHtml(model.stageHeading ?? "")}</h2>
-<div class="substatus">${statusWord}${cycle}<span class="sep">·</span><span class="muted">${escapeHtml(model.stageLine ?? "")}</span></div></div>
+<div class="substatus">${statusWord}${cycle}<span class="${accepted ? "complete" : "muted"}">${escapeHtml(model.stageLine ?? "")}</span></div></div>
 <div class="actions">${buttons.join("")}</div>
 </div>
 <div class="columns">
-<div class="col">${goal}${sparring}${upNext}</div>
+<div class="col">${goal}${sparring}${planPlace}</div>
 <div class="col right">
-<div class="block"><h3>${icon("pulse", "accent")}Current activity</h3>${current}</div>
-<div class="block"><h3>${icon("doc")}Last meaningful event</h3>${last}</div>
+${right}
 </div>
 </div>
 </section>`;
 }
 
+const CHOOSE_PLAN_TITLE = "Pick the Markdown plan this stage belongs to (kept in VS Code only; the engine is not told)";
+const MATCH_TITLE = "Pick which section of the linked plan this stage is (kept in VS Code only; the engine is not told)";
+
 /**
- * "Up next" for an accepted stage, from the plan document: authoritative
- * for a managed plan run (the engine's next stage), informational for an
- * associated file (a heading, nothing more). The next heading of an
- * associated plan can be opened at its line.
+ * Where this stage sits in an associated plan, for a stage that is still
+ * running: the matched heading with Change match…, or the fact that it is
+ * not matched with Match this stage…. Accepted stages carry this in What's
+ * next instead; managed runs show the journey.
  */
-function renderUpNext(model: OverviewModel): string {
+function renderPlanPlace(model: OverviewModel): string {
   const plan = model.plan;
-  if (!plan || model.stageStatusKind !== "accepted") {
+  if (!plan || plan.source !== "associated" || model.whatsNext) {
     return "";
   }
-  if (!plan.next) {
-    if (plan.source === "associated" && !plan.current) {
-      return `<div class="block"><h3>${icon("doc")}Plan</h3><p class="muted">${escapeHtml(plan.name)} · this stage was not matched to a heading in it.</p></div>`;
-    }
+  if (plan.current) {
+    const how = plan.matched === "manual" ? "matched by you" : "matched automatically";
+    return `<div class="block"><h3>${icon("doc")}In the plan</h3><p><span class="next">${escapeHtml(plan.current)}</span> <span class="muted">· ${how}</span> ${button("matchStage", "Change match…", true, MATCH_TITLE, "quiet")}</p></div>`;
+  }
+  if (!model.actions?.matchStage) {
     return "";
   }
-  const link = plan.source === "associated" ? ` ${button("openNextStage", "Open in plan", true, `Open ${plan.name} at this heading`, "quiet")}` : "";
-  const note = plan.source === "associated" ? `<p class="muted">From the plan you associated in VS Code; the engine has no next-stage operation for a standalone stage.</p>` : "";
-  return `<div class="block upnext"><h3>${icon("doc")}Up next</h3><p><span class="next">${escapeHtml(plan.next.display)}</span>${link}</p>${note}</div>`;
+  return `<div class="block"><h3>${icon("doc")}In the plan</h3><p class="muted">Agent Sparring doesn't yet know where this stage belongs in ${escapeHtml(plan.name)}. ${button("matchStage", "Match this stage…", true, MATCH_TITLE, "quiet")}</p></div>`;
+}
+
+/**
+ * The accepted screen's answer to "what should I do now?". Buttons are
+ * real operations only: Continue plan is the engine's resume-plan for a
+ * managed run; everything for an associated file opens or matches a
+ * document and never claims to start a stage.
+ */
+function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
+  const plan = model.plan;
+  const heading = next.heading ? `<p class="nextstage">${escapeHtml(next.heading)}</p>` : "";
+  const summary = next.summary ? `<p class="muted summary">${escapeHtml(next.summary)}</p>` : "";
+  const text = `<p class="${next.heading ? "muted" : ""}">${escapeHtml(next.text)}</p>`;
+  const hints = next.hints && next.hints.length > 0 ? `<p class="muted">The brief lists later work that is in this plan: ${next.hints.map((hint) => `<span class="next">${escapeHtml(hint)}</span>`).join(", ")}.</p>` : "";
+  const buttons: string[] = [];
+  const planName = plan?.name ?? "the plan";
+  switch (next.kind) {
+    case "continue":
+    case "last-managed":
+      if (model.planAction) {
+        buttons.push(button("resumePlan", model.planAction.label, true, model.planAction.detail, "primary"));
+      }
+      if (model.actions?.plan) {
+        buttons.push(button(next.kind === "continue" && plan?.next?.line ? "openNextStage" : "openPlan", "Open in plan", true, next.kind === "continue" ? `Open ${planName} at the next stage` : `Open ${planName}`));
+      }
+      break;
+    case "next-heading":
+      buttons.push(button("openNextStage", "Open next in plan", true, `Open ${planName} at this heading`, "primary"));
+      buttons.push(button("matchStage", "Change match…", true, MATCH_TITLE, "quiet"));
+      break;
+    case "last-heading":
+      buttons.push(button("openPlan", "Open plan", true, `Open ${planName}`));
+      buttons.push(button("matchStage", "Change match…", true, MATCH_TITLE, "quiet"));
+      break;
+    case "match":
+      if (model.actions?.matchStage) {
+        buttons.push(button("matchStage", "Match this stage…", true, MATCH_TITLE, "primary"));
+      }
+      buttons.push(button("openPlan", "Open plan", true, `Open ${planName}`));
+      buttons.push(button("associatePlan", "Change plan…", true, "Choose another plan file or remove the association", "quiet"));
+      break;
+    case "missing-plan":
+      buttons.push(button("associatePlan", "Choose plan…", true, CHOOSE_PLAN_TITLE, "primary"));
+      break;
+    case "choose":
+      buttons.push(button("associatePlan", "Choose plan…", true, CHOOSE_PLAN_TITLE, "primary"));
+      break;
+  }
+  const matchedBy = next.kind === "next-heading" || next.kind === "last-heading" ? `<p class="muted matched">This stage is ${escapeHtml(plan?.current ?? "")} in ${escapeHtml(planName)}${plan?.matched === "manual" ? " (matched by you)" : ""}.</p>` : "";
+  return `<div class="block whatsnext"><h3>${icon("arrow", "accent")}What's next</h3>${heading}${summary}${text}${hints}<div class="actions">${buttons.join("")}</div>${matchedBy}</div>`;
 }
 
 function renderActor(card: ActorCard): string {
@@ -426,6 +492,11 @@ h2 .icon.escalate { color: var(--bad); }
 .status.finalizing { color: var(--info); }
 .status.stopped { color: var(--warn); }
 .next { font-weight: 600; }
+.complete { color: var(--good); font-weight: 600; }
+.whatsnext .nextstage { font-size: 1.15em; font-weight: 600; margin: 2px 0 2px; }
+.whatsnext .summary { margin-bottom: 6px; }
+.whatsnext .actions { margin: 8px 0 6px; }
+.whatsnext .matched { font-size: 0.9em; }
 .columns { display: grid; grid-template-columns: 3fr 2fr; gap: 0 18px; margin-top: 12px; }
 .col.right { border-left: 1px solid var(--line); padding-left: 18px; }
 .block { padding: 6px 0 10px; }

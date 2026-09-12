@@ -113,22 +113,23 @@ export class OverviewPanelManager implements vscode.Disposable {
     if (selection.selected) {
       const run = selection.selected;
       const stage = currentStageOf(run);
-      const associatedPath = run.kind === "stage" ? this.controller.associatedPlan(run.id) : undefined;
-      const [handoff, sparring, briefText, plan, associatedText] = await Promise.all([
+      const association = run.kind === "stage" ? this.controller.planAssociation(run.id) : undefined;
+      const [handoff, sparring, briefText, planText, associatedText] = await Promise.all([
         exists(path.join(stage.dir, HANDOFF_FILENAME)),
         exists(path.join(stage.dir, SPARRING_FILENAME)),
         readHead(path.join(stage.dir, BRIEF_FILENAME)),
-        run.kind === "plan" ? exists(run.planPath) : Promise.resolve(false),
-        associatedPath ? readHead(associatedPath, PLAN_READ_LIMIT) : Promise.resolve(undefined),
+        run.kind === "plan" ? readHead(run.planPath, PLAN_READ_LIMIT) : Promise.resolve(undefined),
+        association ? readHead(association.path, PLAN_READ_LIMIT) : Promise.resolve(undefined),
       ]);
       artifacts = {
         handoff,
         sparring,
         brief: briefText !== undefined,
         briefText,
-        plan,
+        plan: planText !== undefined,
+        planText,
         git: await gitContext(run.location.repoRoot),
-        associatedPlan: associatedPath ? { path: associatedPath, exists: associatedText !== undefined, text: associatedText } : undefined,
+        associatedPlan: association ? { path: association.path, exists: associatedText !== undefined, text: associatedText, manualMatch: association.match } : undefined,
         accepting: this.controller.isAccepting(run.id),
       };
     }
@@ -159,7 +160,7 @@ function isActionMessage(message: unknown): message is { type: "action"; action:
 
 /** Only the Goal paragraph is ever displayed; a brief is never read past this many bytes. */
 const BRIEF_READ_LIMIT = 64 * 1024;
-/** An associated plan is read for its headings only; never past this many bytes. */
+/** A plan document is read for its headings and one opening paragraph only; never past this many bytes. */
 const PLAN_READ_LIMIT = 512 * 1024;
 
 /** The beginning of a text file, or undefined when it does not exist / cannot be read. */

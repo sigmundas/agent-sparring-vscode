@@ -68,3 +68,75 @@ export function parseBriefGoal(markdown: string | undefined | null, maxLength = 
   }
   return text.length > maxLength ? `${text.slice(0, Math.max(1, maxLength - 1)).trimEnd()}…` : text;
 }
+
+// ---------------------------------------------------------------- stage markers
+
+export interface BriefStageMarkers {
+  /**
+   * The label the brief gives *this* stage: the `Stage <label>` in its
+   * first heading, or failing that an opening line (before any further
+   * heading) that *starts* with `Stage <label>`. Prose that merely mentions
+   * a stage never counts. Undefined when the brief names none there.
+   */
+  current?: string;
+  /** Every other `Stage <label>` the brief mentions (deferred work, follow-ups), in order, unique. */
+  mentioned: string[];
+}
+
+const STAGE_MARKER_RE = /\bstage\s+(\d+[a-z]?)\b/gi;
+const LEADING_MARKER_RE = /^\s*[*_]*stage\s+(\d+[a-z]?)\b/i;
+const HEADING_RE = /^#{1,6}\s+(\S.*?)\s*$/;
+/** How many opening lines may name the current stage when the first heading does not. */
+const OPENING_LINES = 5;
+
+/**
+ * `Stage 3B` style markers in a brief. Display context and a matching
+ * hint only: a brief describes intent, and nothing here decides engine
+ * state. Fenced code is skipped.
+ */
+export function parseBriefStageMarkers(markdown: string | undefined | null): BriefStageMarkers {
+  const markers: BriefStageMarkers = { mentioned: [] };
+  if (typeof markdown !== "string" || !markdown.trim()) {
+    return markers;
+  }
+  const lines = markdown.split(/\r?\n/);
+  let inFence = false;
+  let headingsSeen = 0;
+  let opening = 0;
+  const seen = new Set<string>();
+  const remember = (label: string) => {
+    const key = label.toUpperCase();
+    if (key !== markers.current?.toUpperCase() && !seen.has(key)) {
+      seen.add(key);
+      markers.mentioned.push(key);
+    }
+  };
+  for (const line of lines) {
+    if (FENCE_RE.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence || !line.trim()) {
+      continue;
+    }
+    const heading = HEADING_RE.exec(line);
+    const labels = [...line.matchAll(STAGE_MARKER_RE)].map((match) => match[1].toUpperCase());
+    if (heading) {
+      headingsSeen++;
+    } else if (headingsSeen <= 1) {
+      opening++;
+    }
+    const inFirstHeading = heading !== null && headingsSeen === 1;
+    const leadsOpeningLine = heading === null && headingsSeen <= 1 && opening <= OPENING_LINES && LEADING_MARKER_RE.test(line);
+    const mayNameCurrent = markers.current === undefined && (inFirstHeading || leadsOpeningLine);
+    for (const label of labels) {
+      if (mayNameCurrent && markers.current === undefined) {
+        markers.current = label;
+      } else {
+        remember(label);
+      }
+    }
+  }
+  markers.mentioned = markers.mentioned.filter((label) => label !== markers.current);
+  return markers;
+}

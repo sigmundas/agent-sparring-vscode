@@ -33,7 +33,8 @@ navigates.
 | `Agent Sparring: Resume Plan` | Pick a paused/running plan run, optionally record human evidence, launch `resume-plan`. |
 | `Agent Sparring: Run / Resume Stage` | For the selected standalone stage (or after picking one), launch `sparring run-loop <stage> --repo-root <project> --expected-branch <current branch>` in a terminal. The branch comes from the Git repository owning the project (built-in Git API, then `.git/HEAD`); a detached HEAD is refused, never guessed. Also offered as **Run stage** / **Resume stage** in the Overview. |
 | `Agent Sparring: Accept Stage` | For a stage whose independent review passed (**Review complete**): one action that runs the engine's `freeze-candidate` and, only if that succeeds, `accept-candidate` for the selected stage, project and current branch. Refusals are translated (uncommitted changes, not pushed, wrong branch, code changed after the review); the engine's own output goes to the Output Channel. Also offered as **Accept stage** in the Overview. |
-| `Agent Sparring: Choose Plan for Stage…` | Associate a Markdown plan file (any location, ordinary file picker) with the selected standalone stage. Stored in VS Code workspace state per repository + stage id, never in engine state; gives the Overview a **Plan** button, this stage's heading and an informational **Up next**. Change or remove it the same way. |
+| `Agent Sparring: Choose Plan for Stage…` | Associate a Markdown plan file (any location, ordinary file picker) with the selected standalone stage. Stored in VS Code workspace state per repository + stage id, never in engine state; gives the Overview a **Plan** button, this stage's place in the document and, once accepted, **What's next**. Change or remove it the same way. |
+| `Agent Sparring: Match Stage to Plan Section…` | When the Overview cannot tell which section of the associated plan the selected stage is, pick it from the plan's headings (also **Match this stage…** / **Change match…** in the Overview). Stored with the association in VS Code workspace state, never in engine state. |
 | `Agent Sparring: Choose sparring Executable…` | Pick the `sparring` CLI with a file dialog and store it as `agentSparring.executable`. |
 | `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / finalizing / future stages), the current stage as primary content (`Stage N — title`, a human state word with one explaining sentence, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), latest sparring result, small Stage Agent / Sparrer cards, Brief / Handoff / Sparring report / Diff / Plan / Log buttons, and quiet metadata (where the engine's own words live). Never auto-opens; updates in place. |
 | `Agent Sparring: Show Log` | Focus the Output Channel. |
@@ -79,7 +80,7 @@ words stay in tooltips, the metadata footer and the Output Channel.
 | **Escalated** | The reviewer could not settle it; read the sparring report and decide. | routing action `ESCALATE` |
 | **Review complete** — *Independent review passed. No unresolved findings remain.* | Primary action **Accept stage**; **Run loop again** stays available as a quiet secondary action. | routing action `READY` |
 | **Finalizing stage…** | The moment between the two acceptance steps. If it persists, *Finalizing did not complete. Use Accept stage to finish it.* (re-freezing is allowed by the engine). | stage `frozen` |
-| **Accepted** — *Stage complete.* | Nothing further runs for this stage. | stage `accepted` |
+| **Accepted** — *Stage complete.* | Nothing further runs for this stage; **What's next** says what to do now (see below). | stage `accepted` |
 | **Stopped** — *The last run was interrupted.* | The runner ended mid-turn (Ctrl-C, crash, reload); **Resume stage** returns. | runner liveness, see below |
 
 ## Plans: managed runs and associated files
@@ -92,12 +93,38 @@ words stay in tooltips, the metadata footer and the Output Channel.
 - A **standalone stage** has no machine-readable plan. **Choose plan…** lets
   you pick any Markdown file (no directory convention is assumed). The
   association is VS Code workspace state keyed by repository + stage id;
-  the engine never sees it. The Overview then shows **Plan**, this stage's
-  heading when exactly one `## Stage … — …` heading matches its id, and,
-  once accepted, **Up next** with the following heading and **Open in plan**.
-  Because the engine has no operation that starts a standalone stage from a
-  plan, nothing here offers to; "Up next" is information, not a button that
-  runs something.
+  the engine never sees it. The Overview then shows **Plan** and this
+  stage's place in the document. Because the engine has no operation that
+  starts a standalone stage from a plan, nothing here offers to; the next
+  section is information you read, not a button that runs something.
+
+### Which section is this stage?
+
+Headings are read leniently (`## Stage 3B — …` at levels 2–4, labels like
+`3B` included; otherwise every `##` heading). The stage is placed under a
+heading only when exactly one qualifies, in this order: a section you
+picked yourself; a heading whose title equals the stage id (`stage-local-
+schema-barrier` ↔ `Local schema barrier`); a stage label carried by the id
+(`stage-3b-…`) or by the brief's own title (`# Stage 3B — …`); the stage's
+display title. Two candidates, or a mere resemblance, place nothing: the
+Overview then asks with **Match this stage…**, a Quick Pick of the plan's
+headings. Your pick is stored with the association (heading text, not a
+line number) and can be changed (**Change match…**) or dropped; changing
+the plan file drops it too.
+
+### After acceptance: What's next
+
+Once a stage is accepted the Overview stops watching activity and answers
+"what should I do now?" with one **Accepted** badge, one *Stage complete.*
+line and a **What's next** block:
+
+| Situation | What's next shows |
+| --- | --- |
+| Managed plan run, a stage follows | the engine's next stage, its opening paragraph from the plan, **Continue plan** (`resume-plan`), **Open in plan** |
+| Managed plan run, last stage | *No stage follows this one in the plan.* and **Continue plan** |
+| Standalone stage, plan linked and matched | the following heading and its opening paragraph, **Open next in plan**, **Change match…** |
+| Standalone stage, plan linked but not matched | *The plan is linked, but Agent Sparring doesn't yet know where this stage belongs in it.* **Match this stage…**, **Open plan**; plan headings the brief lists as later work are shown as a hint |
+| Standalone stage, no plan | *This stage has been accepted. Choose a plan to see what comes next.* **Choose plan…** |
 
 ## Source-of-truth rule
 
@@ -107,7 +134,9 @@ words stay in tooltips, the metadata footer and the Output Channel.
 | working / frozen / accepted per stage | `.sparring/stages/<id>/state.json` |
 | stage count and titles | the plan Markdown named in the run state |
 | Changes requested / Needs you / Escalated / Review complete | `## Routing outcome` in the current stage's `sparring.md` |
-| Plan button and "Up next" for a standalone stage | the Markdown file you associated (VS Code workspace state; display only) |
+| Plan button, this stage's section and "What's next" for a standalone stage | the Markdown file you associated and, when you picked one, the section you matched (VS Code workspace state; display only) |
+| Next stage's opening paragraph | the plan document itself (display only) |
+| "The brief lists later work that is in this plan" | `Stage <label>` mentions in the current stage's `brief.md`, shown only when the plan has those headings (display only) |
 | "Claude working", "Codex sparring", active-turn duration, loop cycle, last visible event, changed files, verdict chronology | `activity.jsonl` (observational only; the Overview and the Output Channel share one filter for what counts as visible activity) |
 | Goal paragraph in the Overview | `## Goal` in the current stage's `brief.md` (display only) |
 

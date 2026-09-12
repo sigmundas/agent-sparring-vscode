@@ -176,7 +176,8 @@ describe("overview view model", () => {
     assert.equal(model.title, "Local schema barrier");
     assert.equal(model.stageStatus, "Accepted");
     assert.equal(model.stageLine, "Stage complete.");
-    assert.deepEqual(model.banner, { kind: "done", text: "Stage complete" });
+    assert.equal(model.banner, undefined, "no banner: the pill says Accepted and the line says complete");
+    assert.equal(model.whatsNext?.kind, "choose");
     assert.equal(model.stageAction, undefined, "no Run / Resume / Accept for an accepted stage");
     assert.equal(model.secondaryAction, undefined);
     assert.equal(model.stageAgent?.activity, "Idle");

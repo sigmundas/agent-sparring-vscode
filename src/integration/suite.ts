@@ -194,8 +194,9 @@ interface ModelReport {
   stageAction?: { kind: string; label: string; primary: boolean };
   secondaryAction?: { kind: string; label: string };
   banner?: { kind: string; text: string };
-  actions?: { plan: boolean; choosePlan: boolean; changePlan: boolean };
-  plan?: { source: string; name: string; current?: string; next?: { display: string; line: number } };
+  actions?: { plan: boolean; choosePlan: boolean; changePlan: boolean; matchStage: boolean };
+  plan?: { source: string; name: string; current?: string; matched?: string; next?: { display: string; line: number; summary?: string } };
+  whatsNext?: { kind: string; heading?: string; summary?: string; text: string; hints?: string[] };
 }
 
 async function shellIntegrationAvailable(cwd: string): Promise<boolean> {
@@ -294,7 +295,8 @@ async function acceptStageAssertions(report: DiscoveryDiagnostic, reportedRepo: 
   assert.equal(after.stageStatus, "Accepted", "the existing Overview refreshed to the accepted state");
   assert.equal(after.stageLine, "Stage complete.");
   assert.equal(after.stageAction, undefined);
-  assert.deepEqual(after.banner, { kind: "done", text: "Stage complete" });
+  assert.equal(after.banner, undefined, "no third acceptance indicator");
+  assert.equal(after.whatsNext?.kind, "choose", "the accepted screen asks for a plan to say what comes next");
 
   // Refusal at the first step: the second command is never issued, wording is the user's.
   const dirtyId = runIdOf(report, reportedRepo, "stage-review-complete-dirty");
@@ -340,14 +342,42 @@ async function planAssociationAssertions(report: DiscoveryDiagnostic, reportedRe
   assert.equal(associated.actions?.changePlan, true);
   assert.equal(associated.plan?.source, "associated");
   assert.equal(associated.plan?.current, "Stage 1 — Review complete");
+  assert.equal(associated.plan?.matched, "id");
   assert.equal(associated.plan?.next?.display, "Stage 2 — Cloud schema and synchronization");
+  assert.equal(associated.whatsNext?.kind, "next-heading", "the stage was accepted earlier in this run");
+  assert.equal(associated.whatsNext?.heading, "Stage 2 — Cloud schema and synchronization");
   const stageDir = path.join(reportedRepo, ".sparring", "stages", "stage-review-complete");
   assert.deepEqual((await fs.readdir(stageDir)).sort(), ["sparring.md", "state.json"], "the association never touches engine state");
+
+  // A plan whose headings do not name the stage: the Overview asks; the user's pick is kept in workspace state.
+  const rangePlan = path.join(fixtureRoot, "notes", "range.md");
+  await fs.writeFile(rangePlan, "# Range semantics\n\n## Stage 3A — Contract\n\n## Stage 3B — Barrier\n\nThe barrier.\n\n## Stage 3C — Cloud schema\n\nCloud side.\n");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.associatePlan", rangePlan), rangePlan);
+  const unmatched = await model();
+  assert.equal(unmatched.plan?.current, undefined);
+  assert.equal(unmatched.actions?.matchStage, true);
+  assert.equal(unmatched.whatsNext?.kind, "match");
+  assert.deepEqual(await vscode.commands.executeCommand("agentSparring._test.matchStage", { label: "3B", title: "Barrier" }), { label: "3B", title: "Barrier" });
+  const matched = await model();
+  assert.equal(matched.plan?.current, "Stage 3B — Barrier");
+  assert.equal(matched.plan?.matched, "manual");
+  assert.deepEqual(matched.whatsNext && [matched.whatsNext.kind, matched.whatsNext.heading, matched.whatsNext.summary], ["next-heading", "Stage 3C — Cloud schema", "Cloud side."]);
+  assert.deepEqual((await fs.readdir(stageDir)).sort(), ["sparring.md", "state.json"], "a manual match never touches engine state either");
+  // Changing the match, and a match kept across a fresh discovery (the same workspace state a reload restores).
+  assert.deepEqual(await vscode.commands.executeCommand("agentSparring._test.matchStage", { label: "3C", title: "Cloud schema" }), { label: "3C", title: "Cloud schema" });
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  const changed = await model();
+  assert.equal(changed.plan?.current, "Stage 3C — Cloud schema");
+  assert.equal(changed.whatsNext?.kind, "last-heading");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.matchStage", undefined), undefined);
+  assert.equal((await model()).whatsNext?.kind, "match", "removing the match returns to asking");
+
   assert.equal(await vscode.commands.executeCommand("agentSparring._test.associatePlan", undefined), undefined);
   const removed = await model();
   assert.equal(removed.actions?.choosePlan, true);
   assert.equal(removed.plan, undefined);
-  console.log("integration: plan association stored, displayed and removed without touching engine state");
+  assert.equal(removed.whatsNext?.kind, "choose");
+  console.log("integration: plan association and manual heading match stored, displayed, changed and removed without touching engine state");
 }
 
 // ---------------------------------------------------------------- helpers

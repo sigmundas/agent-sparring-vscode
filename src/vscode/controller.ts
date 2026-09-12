@@ -27,7 +27,7 @@ import {
 import { deriveLiveness, type ExecutionRecord, type RunnerLiveness } from "../core/liveness";
 import { applyEvent, emptyLiveState, type LiveState } from "../core/liveState";
 import { LogRenderer } from "../core/logFormat";
-import { PLAN_ASSOCIATIONS_KEY, associatedPlanFor, withAssociation, type PlanAssociations } from "../core/planAssociation";
+import { PLAN_ASSOCIATIONS_KEY, planAssociationFor, withAssociation, withManualMatch, type HeadingRef, type PlanAssociation, type PlanAssociations } from "../core/planAssociation";
 import { deriveStatus } from "../core/status";
 import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
 import { ExecutionTracker, type CommandNotFound, type LaunchOptions, type LaunchResult } from "./executionTracker";
@@ -323,13 +323,27 @@ export class SparringController implements vscode.Disposable {
 
   /** The Markdown plan the user associated with a run in this workspace, if any. Never read by or written into the engine. */
   associatedPlan(runId: string | undefined): string | undefined {
-    return runId === undefined ? undefined : associatedPlanFor(this.context.workspaceState.get<PlanAssociations>(PLAN_ASSOCIATIONS_KEY), runId);
+    return this.planAssociation(runId)?.path;
+  }
+
+  /** The association with its manual heading match, if any. */
+  planAssociation(runId: string | undefined): PlanAssociation | undefined {
+    return runId === undefined ? undefined : planAssociationFor(this.context.workspaceState.get<PlanAssociations>(PLAN_ASSOCIATIONS_KEY), runId);
   }
 
   async setAssociatedPlan(runId: string, planPath: string | undefined): Promise<void> {
     const next = withAssociation(this.context.workspaceState.get<PlanAssociations>(PLAN_ASSOCIATIONS_KEY), runId, planPath);
     await this.context.workspaceState.update(PLAN_ASSOCIATIONS_KEY, next);
     this.log(planPath ? `associated plan ${path.basename(planPath)} with ${runId.split("|").pop()} (VS Code workspace state only)` : `removed the plan association of ${runId.split("|").pop()}`);
+    this.render();
+  }
+
+  /** Record which heading of the associated plan is this stage (or clear it); workspace state only. */
+  async setManualMatch(runId: string, match: HeadingRef | undefined): Promise<void> {
+    const next = withManualMatch(this.context.workspaceState.get<PlanAssociations>(PLAN_ASSOCIATIONS_KEY), runId, match);
+    await this.context.workspaceState.update(PLAN_ASSOCIATIONS_KEY, next);
+    const stage = runId.split("|").pop();
+    this.log(match ? `matched ${stage} to plan heading ${match.label ? `Stage ${match.label} — ` : ""}${match.title} (VS Code workspace state only)` : `cleared the manual plan heading match of ${stage}`);
     this.render();
   }
 
