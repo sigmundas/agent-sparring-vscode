@@ -159,6 +159,23 @@ describe("overview view model", () => {
     assert.equal(model.actions?.plan, false);
   });
 
+  it("accepted standalone stage presents as complete and keeps its actions", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("stage-local-schema-barrier", { status: "accepted", base_sha: "b".repeat(40), candidate_sha: "c".repeat(40), implementation_session_id: "82ab" }, { "sparring.md": sparringMarkdown("READY", "Done") });
+    const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
+    assert.equal(model.kind, "run");
+    assert.equal(model.title, "Local schema barrier");
+    assert.equal(model.stageStatus, "ACCEPTED · stage complete");
+    assert.deepEqual(model.banner, { kind: "done", text: "Stage complete — candidate accepted" });
+    assert.equal(model.stageAgent?.activity, "Idle");
+    assert.equal(model.actions?.diff?.label, "Diff");
+    assert.equal(model.actions?.handoff, true);
+    assert.equal(model.actions?.sparring, true);
+    assert.equal(model.actions?.brief, true);
+    assert.ok(!model.facts?.some((fact) => fact.label === "Stage"), "no low-level Stage row");
+    assert.deepEqual(model.facts?.[0], { label: "Candidate", value: "cccccccc…" });
+  });
+
   it("empty and ambiguous selections", async () => {
     assert.equal(buildOverviewModel({ ambiguous: [] }, undefined, NONE, NOW).kind, "empty");
     const ws = await Workspace.create();

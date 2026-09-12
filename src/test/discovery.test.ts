@@ -171,6 +171,75 @@ describe("selection rule", () => {
   });
 });
 
+describe("terminal selections are kept", () => {
+  it("a selected working standalone stage stays selected through frozen and accepted", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("stage-local-schema-barrier", { status: "working" });
+    const first = selectRun((await discover(ws)).runs);
+    assert.equal(first.selected?.kind, "stage");
+    const shownId = first.selected!.id;
+
+    await ws.writeStage("stage-local-schema-barrier", { status: "frozen", base_sha: "b", candidate_sha: "c" });
+    const frozen = selectRun((await discover(ws)).runs, undefined, shownId);
+    assert.equal(frozen.selected?.id, shownId);
+
+    await ws.writeStage("stage-local-schema-barrier", { status: "accepted", base_sha: "b", candidate_sha: "c" });
+    const runs = (await discover(ws)).runs;
+    assert.equal(runs.length, 1, "the accepted stage is still a recorded run");
+    const accepted = selectRun(runs, undefined, shownId);
+    assert.equal(accepted.selected?.id, shownId);
+    assert.equal(accepted.selected?.kind === "stage" && accepted.selected.stage.state?.status, "accepted");
+
+    // Rediscovery with the same remembered id keeps it too.
+    assert.equal(selectRun((await discover(ws)).runs, undefined, shownId).selected?.id, shownId);
+  });
+
+  it("an accepted selection survives a simulated reload (only the persisted id remains)", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("hotfix-1", { status: "accepted", candidate_sha: "c" });
+    const persistedId = `stage:${ws.stageDir("hotfix-1")}`;
+    const restored = selectRun((await discover(ws)).runs, undefined, persistedId);
+    assert.equal(restored.selected?.id, persistedId);
+    // An explicit persisted selection is honoured as well.
+    assert.equal(selectRun((await discover(ws)).runs, persistedId).selected?.id, persistedId);
+  });
+
+  it("with no remembered selection the most recent terminal run is the fallback", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("older", { status: "accepted" });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await ws.writeStage("newer", { status: "accepted" });
+    const selection = selectRun((await discover(ws)).runs);
+    assert.equal(selection.selected?.kind, "stage");
+    assert.equal(selection.selected?.kind === "stage" && selection.selected.stage.stageId, "newer");
+  });
+
+  it("a remembered terminal run yields to a newly started open run", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("done", { status: "accepted" });
+    const doneId = `stage:${ws.stageDir("done")}`;
+    await ws.writeStage("fresh", { status: "working" });
+    const selection = selectRun((await discover(ws)).runs, undefined, doneId);
+    assert.equal(selection.selected?.kind === "stage" && selection.selected.stage.stageId, "fresh");
+  });
+
+  it("a remembered run breaks a tie between several open runs", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("a", { status: "working" });
+    await ws.writeStage("b", { status: "working" });
+    assert.equal(selectRun((await discover(ws)).runs).selected, undefined);
+    const bId = `stage:${ws.stageDir("b")}`;
+    assert.equal(selectRun((await discover(ws)).runs, undefined, bId).selected?.id, bId);
+  });
+
+  it("a genuinely empty .sparring still selects nothing", async () => {
+    const ws = await Workspace.create();
+    const selection = selectRun((await discover(ws)).runs, undefined, "stage:/gone");
+    assert.equal(selection.selected, undefined);
+    assert.equal(selection.ambiguous.length, 0);
+  });
+});
+
 describe("reload / rediscovery", () => {
   it("a fresh discovery with no in-memory state reproduces the same selection", async () => {
     const ws = await Workspace.create();

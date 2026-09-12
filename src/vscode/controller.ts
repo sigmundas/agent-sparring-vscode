@@ -25,6 +25,8 @@ import { LogRenderer } from "../core/logFormat";
 import { deriveStatus } from "../core/status";
 
 const SELECTED_RUN_KEY = "agentSparring.selectedRunId";
+/** The run last shown, whether chosen explicitly or automatically; restores across reloads. */
+const STICKY_RUN_KEY = "agentSparring.lastShownRunId";
 const OUTPUT_CHANNEL_NAME = "Agent Sparring";
 
 export class SparringController implements vscode.Disposable {
@@ -164,7 +166,11 @@ export class SparringController implements vscode.Disposable {
     this.refreshTimer = undefined;
     this.discovery = await discoverRuns(this.locations);
     const preferred = this.context.workspaceState.get<string>(SELECTED_RUN_KEY);
-    this.selection = selectRun(this.discovery.runs, preferred);
+    const sticky = this.attachedRunId ?? this.context.workspaceState.get<string>(STICKY_RUN_KEY);
+    this.selection = selectRun(this.discovery.runs, preferred, sticky);
+    if (this.selection.selected && this.selection.selected.id !== this.context.workspaceState.get<string>(STICKY_RUN_KEY)) {
+      await this.context.workspaceState.update(STICKY_RUN_KEY, this.selection.selected.id);
+    }
     await this.attachToSelected();
     this.render();
   }

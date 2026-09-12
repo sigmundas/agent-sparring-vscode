@@ -97,6 +97,13 @@ describe("status bar derivation", () => {
     assert.equal(view.text, "$(debug-pause) Agent Sparring: Hotfix 1 · NEEDS_YOU");
   });
 
+  it("accepted standalone stage stays on the bar", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("stage-local-schema-barrier", { status: "accepted", candidate_sha: "abc" });
+    const view = deriveStatus(selectRun((await discoverRuns([ws.location])).runs), undefined, NOW);
+    assert.equal(view.text, "$(check) Agent Sparring: Local schema barrier · accepted");
+  });
+
   it("running plan with a READY outcome shows READY after the position", async () => {
     const view = deriveStatus(await planSelection("running", 1, sparringMarkdown("READY", "Good")), undefined, NOW);
     assert.equal(view.text, "$(circle-filled) Agent Sparring: Stage 2/3 · READY");

@@ -329,39 +329,47 @@ export function isOpenRun(run: RunSnapshot): boolean {
 
 /**
  * Deterministic selection:
- *  1. an explicitly preferred run (by id) that still exists wins;
+ *  1. an explicitly preferred run (by id) that still exists always wins, even
+ *     when it has become terminal (complete / accepted);
  *  2. exactly one open plan run (status running/paused) is selected;
- *  3. several open plan runs are ambiguous: nothing is selected;
- *  4. no open plan run: exactly one open standalone stage is selected,
- *     several are ambiguous;
- *  5. otherwise the most recently written complete plan run (so the bar can
- *     say "Plan complete"), else nothing.
+ *  3. several open plan runs: the remembered (`stickyId`) one if it is among
+ *     them, otherwise ambiguous and nothing is selected;
+ *  4. no open plan run: the same for open standalone stages;
+ *  5. nothing open: the remembered run if it still exists (a run that just
+ *     finished stays on screen), else the most recently written terminal run
+ *     (complete plan or accepted stage), else nothing.
+ *
+ * `stickyId` is what the caller last showed; it is a tie-breaker and a
+ * fallback, never a reason to ignore a newly started open run.
  */
-export function selectRun(runs: RunSnapshot[], preferredId?: string): RunSelection {
+export function selectRun(runs: RunSnapshot[], preferredId?: string, stickyId?: string): RunSelection {
   if (preferredId) {
     const preferred = runs.find((run) => run.id === preferredId);
     if (preferred) {
       return { selected: preferred, ambiguous: [] };
     }
   }
+  const sticky = stickyId ? runs.find((run) => run.id === stickyId) : undefined;
+
   const openPlans = runs.filter((run): run is PlanRunSnapshot => run.kind === "plan" && isOpenRun(run));
   if (openPlans.length === 1) {
     return { selected: openPlans[0], ambiguous: [] };
   }
   if (openPlans.length > 1) {
-    return { ambiguous: openPlans };
+    return sticky && openPlans.includes(sticky as PlanRunSnapshot) ? { selected: sticky, ambiguous: [] } : { ambiguous: openPlans };
   }
   const openStages = runs.filter((run): run is StandaloneStageSnapshot => run.kind === "stage" && isOpenRun(run));
   if (openStages.length === 1) {
     return { selected: openStages[0], ambiguous: [] };
   }
   if (openStages.length > 1) {
-    return { ambiguous: openStages };
+    return sticky && openStages.includes(sticky as StandaloneStageSnapshot) ? { selected: sticky, ambiguous: [] } : { ambiguous: openStages };
   }
-  const completePlans = runs
-    .filter((run): run is PlanRunSnapshot => run.kind === "plan")
-    .sort((a, b) => b.stateMtimeMs - a.stateMtimeMs);
-  return { selected: completePlans[0], ambiguous: [] };
+  if (sticky) {
+    return { selected: sticky, ambiguous: [] };
+  }
+  const terminal = runs.slice().sort((a, b) => b.stateMtimeMs - a.stateMtimeMs);
+  return { selected: terminal[0], ambiguous: [] };
 }
 
 /** The stage whose activity.jsonl should be tailed for a run. */

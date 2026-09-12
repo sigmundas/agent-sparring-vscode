@@ -64,7 +64,7 @@ export interface StagePresentation {
  */
 export function presentStage(status: StageStatus | undefined, outcome: SparringOutcome | undefined, live?: LiveState): StagePresentation {
   if (status === "accepted") {
-    return { kind: "accepted", label: "accepted", short: "accepted" };
+    return { kind: "accepted", label: "ACCEPTED · stage complete", short: "accepted" };
   }
   if (status === "frozen") {
     return { kind: "frozen", label: "frozen · awaiting acceptance", short: "frozen" };

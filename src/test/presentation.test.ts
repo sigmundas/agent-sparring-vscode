@@ -34,7 +34,7 @@ describe("stage presentation state", () => {
   });
 
   it("keeps accepted/frozen from the authoritative state ahead of any outcome", () => {
-    assert.equal(presentStage("accepted", { action: "SEND_BACK", summary: "" }).label, "accepted");
+    assert.equal(presentStage("accepted", { action: "SEND_BACK", summary: "" }).label, "ACCEPTED · stage complete");
     assert.equal(presentStage("frozen", { action: "READY", summary: "" }).label, "frozen · awaiting acceptance");
   });
 

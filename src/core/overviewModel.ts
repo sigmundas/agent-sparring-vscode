@@ -232,7 +232,7 @@ function currentLine(run: RunSnapshot, stage: StageSnapshot, live: LiveState | u
       };
     }
   } else if (stageStatus === "accepted") {
-    return { stageLine: "Candidate accepted.", banner: { kind: "done", text: "Stage accepted" } };
+    return { stageLine: "Candidate accepted; nothing further runs for this stage.", banner: { kind: "done", text: "Stage complete — candidate accepted" } };
   } else if (outcome?.action === "NEEDS_YOU" || outcome?.action === "ESCALATE") {
     if (!(live?.stage.busy || live?.sparrer.busy)) {
       return { stageLine: outcome.action === "NEEDS_YOU" ? "Waiting for you." : "Sparring escalated.", banner: { kind: "stop", text: `${outcome.action}${outcome.summary ? ` — ${outcome.summary}` : ""}` } };
@@ -280,8 +280,6 @@ function facts(run: RunSnapshot, stage: StageSnapshot, live: LiveState | undefin
   if (run.kind === "plan") {
     out.push({ label: "Plan", value: run.state.status });
     out.push({ label: "Branch", value: run.state.expectedBranch });
-  } else {
-    out.push({ label: "Stage", value: stage.state?.status ?? "working" });
   }
   if (stage.state?.candidateSha) {
     out.push({ label: "Candidate", value: shortenId(stage.state.candidateSha) ?? "" });
