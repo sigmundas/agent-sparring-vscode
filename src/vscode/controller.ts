@@ -21,7 +21,7 @@ import {
   type SparringLocation,
 } from "../core/discovery";
 import { applyEvent, emptyLiveState, type LiveState } from "../core/liveState";
-import { formatEvent } from "../core/logFormat";
+import { LogRenderer } from "../core/logFormat";
 import { deriveStatus } from "../core/status";
 
 const SELECTED_RUN_KEY = "agentSparring.selectedRunId";
@@ -37,6 +37,7 @@ export class SparringController implements vscode.Disposable {
   private selection: RunSelection = { ambiguous: [] };
   private live: LiveState | undefined;
   private tailer: ActivityTailer | undefined;
+  private readonly logRenderer = new LogRenderer();
   private attachedRunId: string | undefined;
 
   private readonly changeEmitter = new vscode.EventEmitter<void>();
@@ -207,6 +208,7 @@ export class SparringController implements vscode.Disposable {
       return;
     }
     this.tailer = new ActivityTailer(activityPath);
+    this.logRenderer.reset();
     this.live = emptyLiveState();
     this.attachedRunId = run.id;
     const stage = currentStageOf(run);
@@ -237,6 +239,7 @@ export class SparringController implements vscode.Disposable {
       const result = await this.tailer.poll();
       if (result.reset) {
         this.live = emptyLiveState();
+        this.logRenderer.reset();
         this.output.appendLine(
           `${now()}  ${"Extension".padEnd(15)} ${result.exists ? "activity log recreated; replaying" : "activity log removed; live details unavailable"}`,
         );
@@ -245,7 +248,7 @@ export class SparringController implements vscode.Disposable {
         const live = this.live ?? emptyLiveState();
         for (const event of result.events) {
           applyEvent(live, event);
-          const line = formatEvent(event);
+          const line = this.logRenderer.render(event);
           if (line) {
             this.output.appendLine(line);
           }

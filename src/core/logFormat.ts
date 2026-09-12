@@ -31,6 +31,46 @@ const PROVIDER_EVENTS = new Set([
   "sparring.failed",
 ]);
 
+/**
+ * Stateful presentation filter over the raw event stream:
+ *  - successful `command.finished` lines are hidden (a non-zero exit code is shown);
+ *  - `file.changed` under `.sparring/` (the engine's own artifacts) is hidden;
+ *  - consecutive `file.changed` events for the same actor + path collapse to one line.
+ * Purely presentational: activity.jsonl keeps every event.
+ */
+export class LogRenderer {
+  private lastFileKey: string | undefined;
+
+  /** Forget the collapse state (call when re-attaching or replaying). */
+  reset(): void {
+    this.lastFileKey = undefined;
+  }
+
+  render(event: ActivityEvent): string | undefined {
+    if (event.event === "file.changed") {
+      if (event.path && (event.path === ".sparring" || event.path.startsWith(".sparring/"))) {
+        return undefined;
+      }
+      const key = `${event.actor}\u0000${event.path ?? ""}\u0000${event.kind ?? ""}`;
+      if (key === this.lastFileKey) {
+        return undefined;
+      }
+      this.lastFileKey = key;
+      return formatEvent(event);
+    }
+    if (event.event === "command.finished" && (typeof event.exit_code !== "number" || event.exit_code === 0)) {
+      return undefined;
+    }
+    const line = formatEvent(event);
+    if (line !== undefined) {
+      // Only a visible line breaks an editing burst; hidden tool.call /
+      // command noise between two edits of the same file does not.
+      this.lastFileKey = undefined;
+    }
+    return line;
+  }
+}
+
 /** Returns the formatted line, or undefined when the event is not worth a line. */
 export function formatEvent(event: ActivityEvent): string | undefined {
   const message = describe(event);

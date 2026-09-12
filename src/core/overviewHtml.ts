@@ -52,7 +52,7 @@ function renderBody(model: OverviewModel): string {
   }
 
   const parts: string[] = [];
-  parts.push(`<header><h1>Agent Sparring</h1><span class="run muted" title="${escapeHtml(model.title)}">${escapeHtml(model.title)}</span></header>`);
+  parts.push(`<header><h1>Agent Sparring</h1><span class="run muted" title="${escapeHtml(model.stageId ?? model.title)}">${escapeHtml(model.title)}</span></header>`);
   if (model.banner) {
     parts.push(`<div class="banner ${model.banner.kind}">${escapeHtml(model.banner.text)}</div>`);
   }
@@ -64,8 +64,11 @@ function renderBody(model: OverviewModel): string {
   if (model.stageAgent && model.sparrer) {
     parts.push(`<section class="actors">${renderActor(model.stageAgent)}${renderActor(model.sparrer)}</section>`);
   }
+  const pill = model.stageStatus
+    ? ` <span class="pill ${escapeHtml(model.stageStatusKind ?? "")}" title="${escapeHtml(model.stageId ? `stage id: ${model.stageId}` : "")}">${escapeHtml(model.stageStatus)}</span>`
+    : "";
   parts.push(`<section class="stage">
-<h2>${escapeHtml(model.stageHeading ?? "")}${model.stageStatus ? ` <span class="pill">${escapeHtml(model.stageStatus)}</span>` : ""}</h2>
+<h2 title="${escapeHtml(model.stageId ?? "")}">${escapeHtml(model.stageHeading ?? "")}${pill}</h2>
 <p>${escapeHtml(model.stageLine ?? "")}</p>
 </section>`);
   if (model.lastSparring) {
@@ -79,15 +82,15 @@ function renderBody(model: OverviewModel): string {
   if (actions) {
     const buttons: string[] = [];
     if (actions.diff) {
-      buttons.push(button("openDiff", actions.diff.label));
+      buttons.push(button("openDiff", actions.diff.label, true, actions.diff.detail));
     }
-    buttons.push(button("openHandoff", "Open handoff", actions.handoff));
-    buttons.push(button("openSparring", "Open sparring report", actions.sparring));
-    buttons.push(button("openBrief", "Open brief", actions.brief));
+    buttons.push(button("openHandoff", "Handoff", actions.handoff, "Open handoff.md"));
+    buttons.push(button("openSparring", "Sparring report", actions.sparring, "Open sparring.md"));
+    buttons.push(button("openBrief", "Brief", actions.brief, "Open brief.md"));
     if (actions.plan) {
-      buttons.push(button("openPlan", "Open plan"));
+      buttons.push(button("openPlan", "Plan", true, "Open the plan document"));
     }
-    buttons.push(button("showLog", "Show log"));
+    buttons.push(button("showLog", "Log", true, "Show the Agent Sparring output channel"));
     parts.push(`<div class="actions">${buttons.join("")}</div>`);
   }
   if (model.facts && model.facts.length > 0) {
@@ -120,14 +123,14 @@ function renderActor(card: ActorCard): string {
   const session = card.sessionLabel ? `${card.sessionKind} ${escapeHtml(card.sessionLabel)}` : `no ${card.sessionKind} yet`;
   return `<div class="actor">
 <div class="role">${escapeHtml(card.role)}</div>
-<div class="provider">${escapeHtml(card.provider)}</div>
-<div class="activity ${card.activity.toLowerCase()}"><span class="dot">${dot}</span> ${escapeHtml(card.activity)}${quiet}</div>
+<div><span class="provider">${escapeHtml(card.provider)}</span><span class="activity ${card.activity.toLowerCase()}"><span class="dot">${dot}</span> ${escapeHtml(card.activity)}${quiet}</span></div>
 <div class="session muted">${session}</div>
 </div>`;
 }
 
-function button(action: OverviewAction, label: string, enabled = true): string {
-  return `<button type="button" data-action="${action}"${enabled ? "" : " disabled"}>${escapeHtml(label)}</button>`;
+function button(action: OverviewAction, label: string, enabled = true, title?: string): string {
+  const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
+  return `<button type="button" data-action="${action}"${titleAttr}${enabled ? "" : " disabled"}>${escapeHtml(label)}</button>`;
 }
 
 const STYLE = `
@@ -159,13 +162,16 @@ p { margin: 0 0 4px; }
 .name { display: block; margin-top: 4px; font-size: 0.85em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 4px; color: var(--vscode-descriptionForeground); }
 .step.current .name { color: var(--vscode-foreground); font-weight: 600; }
 .actors { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 0 0 14px; }
-.actor { border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); border-radius: 4px; padding: 8px 10px; }
-.role { font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.04em; color: var(--vscode-descriptionForeground); }
-.provider { font-weight: 600; margin: 2px 0; }
+.actor { border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); border-radius: 4px; padding: 5px 9px 6px; line-height: 1.35; }
+.role { font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.04em; color: var(--vscode-descriptionForeground); }
+.provider { font-weight: 600; display: inline; }
+.activity { display: inline; margin-left: 8px; }
 .activity .dot { color: var(--vscode-descriptionForeground); }
 .activity.working .dot, .activity.sparring .dot { color: var(--vscode-focusBorder); }
-.session { font-family: var(--vscode-editor-font-family); font-size: 0.85em; margin-top: 2px; }
+.session { font-family: var(--vscode-editor-font-family); font-size: 0.78em; opacity: 0.8; margin-top: 1px; }
 .stage, .sparring { margin: 0 0 12px; }
+.pill.ready, .pill.accepted { background: var(--vscode-testing-iconPassed, var(--vscode-charts-green)); color: var(--vscode-editor-background); }
+.pill.needs_you, .pill.escalate { background: var(--vscode-editorWarning-foreground); color: var(--vscode-editor-background); }
 .pill { display: inline-block; font-size: 0.75em; font-weight: 500; padding: 1px 6px; border-radius: 8px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); vertical-align: middle; text-transform: none; letter-spacing: 0; }
 .actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 12px; }
 button { font-family: inherit; font-size: inherit; padding: 3px 10px; border: 1px solid var(--vscode-button-border, transparent); border-radius: 2px; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); cursor: pointer; }

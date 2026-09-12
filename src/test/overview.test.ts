@@ -66,8 +66,10 @@ describe("overview view model", () => {
     const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
     assert.equal(model.stageLine, "Correcting SEND_BACK finding");
     assert.deepEqual(model.lastSparring, { action: "SEND_BACK", summary: "Empty vs missing statistics state conflated.", reason: undefined });
-    assert.equal(model.actions?.diff?.label, "Open diff aaaaaaaa… … HEAD");
+    assert.equal(model.actions?.diff?.label, "Diff");
+    assert.equal(model.actions?.diff?.detail, "base aaaaaaaa… … current HEAD");
     assert.equal(model.actions?.diff?.targetSha, undefined);
+    assert.equal(model.stageStatus, "SEND_BACK · correcting");
     assert.equal(model.sparrer?.activity, "Waiting");
   });
 
@@ -113,7 +115,8 @@ describe("overview view model", () => {
       ["accepted", "accepted", "accepted"],
     );
     assert.equal(model.stageAgent?.activity, "Idle");
-    assert.equal(model.actions?.diff?.label, "Open diff bbbbbbbb… … cccccccc…");
+    assert.equal(model.actions?.diff?.label, "Diff");
+    assert.equal(model.actions?.diff?.detail, "base bbbbbbbb… … candidate cccccccc…");
     assert.equal(model.actions?.diff?.targetSha, "c".repeat(40));
   });
 
@@ -129,7 +132,8 @@ describe("overview view model", () => {
     const model = buildOverviewModel(await selection(ws), undefined, { ...ALL, plan: false }, NOW);
     assert.equal(model.timeline, undefined);
     assert.match(model.timelineNote ?? "", /Plan document unavailable/);
-    assert.equal(model.stageHeading, `Stage 1 · ${FOO_STAGE_IDS[0]}`);
+    assert.equal(model.stageHeading, "Stage 1 — Contract", "humanized from the id, never the raw id");
+    assert.equal(model.stageId, FOO_STAGE_IDS[0]);
     assert.equal(model.actions?.plan, false);
   });
 
@@ -147,7 +151,9 @@ describe("overview view model", () => {
     const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
     assert.equal(model.timeline, undefined);
     assert.equal(model.timelineNote, undefined);
-    assert.equal(model.stageHeading, "hotfix-1");
+    assert.equal(model.stageHeading, "Hotfix 1");
+    assert.equal(model.title, "Hotfix 1");
+    assert.equal(model.stageId, "hotfix-1");
     assert.equal(model.banner?.kind, "stop");
     assert.equal(model.stageAgent?.sessionLabel, "ssssssss…");
     assert.equal(model.actions?.plan, false);
@@ -163,6 +169,17 @@ describe("overview view model", () => {
     const model = buildOverviewModel(await selection(ws), undefined, NONE, NOW);
     assert.equal(model.kind, "ambiguous");
     assert.deepEqual(model.choices, ["docs/plans/bar.md", "docs/plans/foo.md"]);
+  });
+
+  it("READY on a working stage presents as awaiting acceptance", async () => {
+    const ws = await planWorkspace("running", 1, { sparring: sparringMarkdown("READY", "Looks complete") });
+    const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
+    assert.equal(model.stageStatus, "READY · awaiting acceptance");
+    assert.equal(model.stageStatusKind, "ready");
+    assert.equal(model.stageLine, "Sparrer said READY; acceptance pending.");
+    const html = renderOverviewHtml(model, "n", "c");
+    assert.match(html, /<span class="pill ready" [^>]*>READY · awaiting acceptance<\/span>/);
+    assert.ok(!/<span class="pill[^>]*>working</.test(html));
   });
 
   it("shortens ids", () => {
@@ -202,13 +219,15 @@ describe("overview HTML", () => {
   it("shows, disables and hides buttons according to the model", async () => {
     const ws = await planWorkspace("running", 0, { stageState: { base_sha: "b".repeat(40) } });
     const withAll = renderOverviewHtml(buildOverviewModel(await selection(ws), undefined, ALL, NOW), "n", "c");
-    assert.match(withAll, /<button type="button" data-action="openDiff">Open diff bbbbbbbb… … HEAD<\/button>/);
-    assert.match(withAll, /<button type="button" data-action="openHandoff">Open handoff<\/button>/);
+    assert.match(withAll, /<button type="button" data-action="openDiff" title="base bbbbbbbb… … current HEAD">Diff<\/button>/);
+    assert.match(withAll, /<button type="button" data-action="openHandoff" title="Open handoff.md">Handoff<\/button>/);
+    assert.match(withAll, />Sparring report<\/button>/);
+    assert.match(withAll, />Log<\/button>/);
     assert.match(withAll, /data-action="openPlan"/);
 
     const withNone = renderOverviewHtml(buildOverviewModel(await selection(ws), undefined, NONE, NOW), "n", "c");
-    assert.match(withNone, /<button type="button" data-action="openHandoff" disabled>Open handoff<\/button>/);
-    assert.match(withNone, /data-action="openSparring" disabled/);
+    assert.match(withNone, /<button type="button" data-action="openHandoff" title="Open handoff.md" disabled>Handoff<\/button>/);
+    assert.match(withNone, /data-action="openSparring" title="Open sparring.md" disabled/);
     assert.ok(!withNone.includes('data-action="openPlan"'));
 
     const ws2 = await planWorkspace("running", 0);

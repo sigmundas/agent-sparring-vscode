@@ -12,6 +12,7 @@
 
 import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { providerDisplayName, type LiveState } from "./liveState";
+import { presentStage, stageDisplayName } from "./presentation";
 import { QUIET_AFTER_MS, formatAge } from "./status";
 
 export type TimelineState = "accepted" | "frozen" | "active" | "paused" | "working" | "future";
@@ -53,8 +54,8 @@ export interface OverviewActions {
   sparring: boolean;
   brief: boolean;
   plan: boolean;
-  /** Present when base_sha is recorded; label says what the diff spans. */
-  diff?: { label: string; baseSha: string; targetSha?: string };
+  /** Present when base_sha is recorded; `detail` (for a tooltip) says what the diff spans. */
+  diff?: { label: string; detail: string; baseSha: string; targetSha?: string };
 }
 
 export interface OverviewModel {
@@ -67,7 +68,11 @@ export interface OverviewModel {
   stageAgent?: ActorCard;
   sparrer?: ActorCard;
   stageHeading?: string;
+  /** Raw engine stage id, for secondary metadata / tooltips only. */
+  stageId?: string;
+  /** Derived presentation label, e.g. `READY · awaiting acceptance`. */
   stageStatus?: string;
+  stageStatusKind?: string;
   stageLine?: string;
   banner?: Banner;
   lastSparring?: { action: string; summary: string; reason?: string };
@@ -95,7 +100,7 @@ export function buildOverviewModel(
 
   const model: OverviewModel = {
     kind: "run",
-    title: runLabel(run),
+    title: run.kind === "plan" ? runLabel(run) : stageDisplayName(stage),
     stageAgent: actorCard("stage", stage, live, halted, nowMs),
     sparrer: actorCard("sparrer", stage, live, halted, nowMs),
     actions: {
@@ -108,15 +113,23 @@ export function buildOverviewModel(
     facts: facts(run, stage, live, nowMs),
   };
 
+  const outcome = run.kind === "plan" ? run.currentOutcome : run.outcome;
   if (run.kind === "plan") {
     Object.assign(model, timeline(run));
-    model.stageHeading = stage.number && stage.title ? `Stage ${stage.number} — ${stage.title}` : `Stage ${run.state.currentStageIndex + 1} · ${stage.stageId}`;
+    model.stageHeading = `Stage ${stage.number ?? run.state.currentStageIndex + 1} — ${stageDisplayName(stage)}`;
   } else {
-    model.stageHeading = stage.stageId;
+    model.stageHeading = stageDisplayName(stage);
   }
-  model.stageStatus = stage.state?.status ?? (stage.exists ? "working" : "not created");
+  model.stageId = stage.stageId;
+  if (!stage.exists) {
+    model.stageStatus = "not created";
+    model.stageStatusKind = "future";
+  } else {
+    const presentation = presentStage(stage.state?.status, outcome, live);
+    model.stageStatus = presentation.label;
+    model.stageStatusKind = presentation.kind;
+  }
 
-  const outcome = run.kind === "plan" ? run.currentOutcome : run.outcome;
   if (outcome) {
     model.lastSparring = { action: outcome.action, summary: outcome.summary, reason: outcome.needsYouReason };
   }
@@ -174,7 +187,7 @@ function timeline(run: PlanRunSnapshot): Pick<OverviewModel, "timeline" | "timel
   const current = run.state.currentStageIndex;
   const items: TimelineItem[] = run.stages.map((stage, index) => ({
     number: stage.number ?? index + 1,
-    title: stage.title ?? stage.stageId,
+    title: stageDisplayName(stage),
     current: index === current,
     state: timelineState(stage, index, current, run),
   }));
@@ -255,7 +268,8 @@ function diffAction(stage: StageSnapshot): OverviewActions["diff"] {
   }
   const target = stage.state?.candidateSha ?? undefined;
   return {
-    label: target ? `Open diff ${shortenId(base)} … ${shortenId(target)}` : `Open diff ${shortenId(base)} … HEAD`,
+    label: "Diff",
+    detail: target ? `base ${shortenId(base)} … candidate ${shortenId(target)}` : `base ${shortenId(base)} … current HEAD`,
     baseSha: base,
     targetSha: target,
   };

@@ -42,7 +42,7 @@ describe("status bar derivation", () => {
 
     live = foldEvents([event("sparrer", "verdict", { provider: "codex-cli", action: "SEND_BACK", summary: "fix it" })], live);
     view = deriveStatus(selection, live, Date.parse(live.lastEventTs!) + 1000);
-    assert.equal(view.text, "$(circle-filled) Agent Sparring: Stage 3/3 · last SEND_BACK");
+    assert.equal(view.text, "$(circle-filled) Agent Sparring: Stage 3/3", "telemetry verdicts decorate the tooltip only");
     assert.match(view.tooltip, /Last verdict SEND_BACK: fix it/);
   });
 
@@ -90,11 +90,16 @@ describe("status bar derivation", () => {
     const ws = await Workspace.create();
     await ws.writeStage("hotfix-1", { status: "frozen", candidate_sha: "abc" });
     let view = deriveStatus(selectRun((await discoverRuns([ws.location])).runs), undefined, NOW);
-    assert.equal(view.text, "$(lock) Agent Sparring: hotfix-1 · frozen");
+    assert.equal(view.text, "$(lock) Agent Sparring: Hotfix 1 · frozen");
 
     await ws.writeStage("hotfix-1", { status: "working" }, { "sparring.md": sparringMarkdown("NEEDS_YOU", "Pick a colour") });
     view = deriveStatus(selectRun((await discoverRuns([ws.location])).runs), undefined, NOW);
-    assert.equal(view.text, "$(debug-pause) Agent Sparring: hotfix-1 · NEEDS_YOU");
+    assert.equal(view.text, "$(debug-pause) Agent Sparring: Hotfix 1 · NEEDS_YOU");
+  });
+
+  it("running plan with a READY outcome shows READY after the position", async () => {
+    const view = deriveStatus(await planSelection("running", 1, sparringMarkdown("READY", "Good")), undefined, NOW);
+    assert.equal(view.text, "$(circle-filled) Agent Sparring: Stage 2/3 · READY");
   });
 
   it("formats ages", () => {

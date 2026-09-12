@@ -8,11 +8,14 @@
  * "Codex sparring") comes from the activity stream and only decorates a run
  * whose authoritative status is running/working.
  *
+ * The visible text is kept short; detail goes to the tooltip.
+ *
  * No dependency on the vscode API.
  */
 
 import { currentStageOf, runLabel, totalStagesOf, type RunSelection, type RunSnapshot } from "./discovery";
 import { providerDisplayName, type LiveState } from "./liveState";
+import { presentRunStage, stageDisplayName, truncateLabel } from "./presentation";
 
 export type StatusSeverity = "none" | "info" | "warning" | "error";
 
@@ -25,6 +28,7 @@ export interface StatusView {
 const PREFIX = "Agent Sparring";
 /** After this long without any telemetry, a "working" claim is flagged as quiet. */
 export const QUIET_AFTER_MS = 10 * 60 * 1000;
+const STANDALONE_NAME_MAX = 28;
 
 export function deriveStatus(selection: RunSelection, live: LiveState | undefined, nowMs: number): StatusView {
   if (!selection.selected) {
@@ -41,16 +45,16 @@ export function deriveStatus(selection: RunSelection, live: LiveState | undefine
 
   const run = selection.selected;
   const stage = currentStageOf(run);
-  const position = stagePosition(run);
+  const name = stageDisplayName(stage);
+  const presentation = presentRunStage(run, live);
   const tooltipLines: string[] = [runLabel(run)];
-  if (stage.title) {
-    tooltipLines.push(`Stage ${position ?? "?"} — ${stage.title}`);
-  } else {
-    tooltipLines.push(`Stage ${stage.stageId}`);
-  }
+  tooltipLines.push(run.kind === "plan" ? `Stage ${stagePosition(run)} — ${name}` : name);
+  tooltipLines.push(`Stage id: ${stage.stageId}`);
+  tooltipLines.push(`Stage state: ${presentation.label}`);
 
   if (run.kind === "plan") {
     const { status } = run.state;
+    const position = stagePosition(run);
     if (status === "complete") {
       return finish(`$(check) ${PREFIX}: Plan complete`, tooltipLines, "none");
     }
@@ -65,26 +69,26 @@ export function deriveStatus(selection: RunSelection, live: LiveState | undefine
       }
       return finish(`$(debug-pause) ${PREFIX}: Stage ${position} · ${word}`, tooltipLines, "warning");
     }
-    // running
-    const suffix = liveSuffix(live, nowMs, tooltipLines);
+    const suffix = liveSuffix(live, nowMs, tooltipLines) ?? presentation.short;
     return finish(`$(circle-filled) ${PREFIX}: Stage ${position}${suffix ? ` · ${suffix}` : ""}`, tooltipLines, "info");
   }
 
   // standalone stage
-  const stageStatus = stage.state?.status ?? "working";
-  if (stageStatus === "accepted") {
-    return finish(`$(check) ${PREFIX}: ${stage.stageId} · accepted`, tooltipLines, "none");
+  const shortName = truncateLabel(name, STANDALONE_NAME_MAX);
+  if (presentation.kind === "accepted") {
+    return finish(`$(check) ${PREFIX}: ${shortName} · accepted`, tooltipLines, "none");
   }
-  if (stageStatus === "frozen") {
-    return finish(`$(lock) ${PREFIX}: ${stage.stageId} · frozen`, tooltipLines, "none");
+  if (presentation.kind === "frozen") {
+    return finish(`$(lock) ${PREFIX}: ${shortName} · frozen`, tooltipLines, "none");
   }
-  const outcome = run.outcome;
-  if (outcome && (outcome.action === "NEEDS_YOU" || outcome.action === "ESCALATE") && !(live?.stage.busy || live?.sparrer.busy)) {
-    tooltipLines.push(`${outcome.action}: ${outcome.summary}`);
-    return finish(`$(debug-pause) ${PREFIX}: ${stage.stageId} · ${outcome.action}`, tooltipLines, "warning");
+  if (presentation.kind === "needs_you" || presentation.kind === "escalate") {
+    if (run.outcome?.summary) {
+      tooltipLines.push(`${run.outcome.action}: ${run.outcome.summary}`);
+    }
+    return finish(`$(debug-pause) ${PREFIX}: ${shortName} · ${presentation.short}`, tooltipLines, "warning");
   }
-  const suffix = liveSuffix(live, nowMs, tooltipLines);
-  return finish(`$(circle-filled) ${PREFIX}: ${stage.stageId}${suffix ? ` · ${suffix}` : " · working"}`, tooltipLines, "info");
+  const suffix = liveSuffix(live, nowMs, tooltipLines) ?? presentation.short ?? "working";
+  return finish(`$(circle-filled) ${PREFIX}: ${shortName} · ${suffix}`, tooltipLines, "info");
 }
 
 function finish(text: string, tooltipLines: string[], severity: StatusSeverity): StatusView {
@@ -106,6 +110,7 @@ function authoritativeWord(run: RunSnapshot): string {
   return run.stage.state?.status ?? "working";
 }
 
+/** The live actor word when an actor is mid-turn; detail lines go to the tooltip. */
 function liveSuffix(live: LiveState | undefined, nowMs: number, tooltipLines: string[]): string | undefined {
   if (!live || live.eventCount === 0) {
     tooltipLines.push("No activity telemetry for this stage.");
@@ -116,13 +121,11 @@ function liveSuffix(live: LiveState | undefined, nowMs: number, tooltipLines: st
     suffix = `${providerDisplayName(live.sparrer.provider, "sparrer")} sparring`;
   } else if (live.stage.busy) {
     suffix = `${providerDisplayName(live.stage.provider, "stage")} working`;
-  } else if (live.lastVerdict) {
-    suffix = `last ${live.lastVerdict.action}`;
   }
   if (live.lastEventTs) {
     const age = nowMs - Date.parse(live.lastEventTs);
     tooltipLines.push(`Last activity ${formatAge(age)} ago`);
-    if (suffix && (live.sparrer.busy || live.stage.busy) && age > QUIET_AFTER_MS) {
+    if (suffix && age > QUIET_AFTER_MS) {
       suffix += ` · quiet ${formatAge(age)}`;
     }
   }
