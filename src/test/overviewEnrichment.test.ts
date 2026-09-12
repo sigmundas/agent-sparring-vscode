@@ -3,9 +3,9 @@ import { describe, it } from "node:test";
 import { isMeaningfulActivity } from "../core/activityFilter";
 import { parseBriefGoal } from "../core/brief";
 import { discoverRuns, selectRun, type PlanRunSnapshot } from "../core/discovery";
-import { activeDurationMs, applyEvent, emptyLiveState, foldEvents, formatDuration } from "../core/liveState";
+import { RECENT_MEANINGFUL_MAX, activeDurationMs, applyEvent, emptyLiveState, foldEvents, formatDuration } from "../core/liveState";
 import { LogRenderer } from "../core/logFormat";
-import { activityLine, buildOverviewModel, timelineState, type OverviewArtifacts } from "../core/overviewModel";
+import { HISTORY_MAX, activityLine, buildOverviewModel, history, timelineState, type OverviewArtifacts } from "../core/overviewModel";
 import { renderOverviewHtml } from "../core/overviewHtml";
 import { FOO_PLAN_KEY, FOO_PLAN_LABEL, FOO_STAGE_IDS, Workspace, event, sparringMarkdown } from "./fixtures";
 
@@ -96,10 +96,69 @@ describe("meaningful-event selection", () => {
     const live = foldEvents([event("stage", "turn.started", { provider: "claude-cli" }), event("stage", "turn.finished"), ...noise]);
     const line = activityLine(live, false, Date.parse(live.lastEventTs!) + 5000);
     assert.equal(line.kind, "last");
-    assert.equal(line.text, "Claude: turn finished");
+    assert.equal(line.text, "Claude · turn finished", "a past fact, never 'Claude is editing'");
     assert.match(line.time ?? "", /^\d\d:\d\d:\d\d$/);
     assert.equal(activityLine(undefined, false, T0).kind, "none");
     assert.equal(activityLine(emptyLiveState(), false, T0).kind, "none");
+  });
+});
+
+describe("recent events résumé", () => {
+  it("keeps only the last few meaningful events, oldest first, and never the noise", () => {
+    const events = [
+      event("loop", "loop.started"),
+      event("stage", "turn.started", { provider: "claude-cli" }),
+      event("stage", "tool.call", { tool: "Read" }),
+      event("stage", "file.changed", { path: "src/a.py", kind: "modify" }),
+      event("stage", "command.finished", { exit_code: 0 }),
+      event("stage", "file.changed", { path: "src/b.py", kind: "add" }),
+      event("stage", "turn.finished"),
+      event("sparrer", "sparring.started", { provider: "codex-cli" }),
+      event("sparrer", "verdict", { action: "SEND_BACK", summary: "range handling" }),
+    ];
+    const live = foldEvents(events);
+    assert.equal(live.recentMeaningful.length, 7, "loop, turn, a.py, b.py, finished, sparring, verdict");
+    const entries = history(live)!;
+    assert.deepEqual(
+      entries.map((entry) => [entry.who, entry.description]),
+      [
+        ["Claude", "added src/b.py"],
+        ["Claude", "turn finished"],
+        ["Codex", "started"],
+        ["Codex", "SEND_BACK — range handling"],
+      ],
+    );
+    assert.ok(entries.every((entry) => /^\d\d:\d\d:\d\d$/.test(entry.time)));
+    assert.equal(history(undefined), undefined);
+    assert.equal(history(emptyLiveState()), undefined);
+  });
+
+  it("collapses a burst of edits to the same file into one entry with the latest time, like the Output Channel", () => {
+    const first = event("stage", "file.changed", { path: "src/a.py", kind: "modify" });
+    const second = event("stage", "file.changed", { path: "src/a.py", kind: "modify" });
+    const live = foldEvents([first, event("stage", "tool.call"), second]);
+    assert.equal(live.recentMeaningful.length, 1);
+    assert.equal(live.recentMeaningful[0].ts, second.ts);
+    live.recentMeaningful.length = 0;
+    for (let i = 0; i < 12; i++) {
+      applyEvent(live, event("stage", "file.changed", { path: `src/${i}.py`, kind: "add" }));
+    }
+    assert.equal(live.recentMeaningful.length, RECENT_MEANINGFUL_MAX, "bounded");
+    assert.equal(history(live)!.length, HISTORY_MAX);
+    assert.equal(history(live)![HISTORY_MAX - 1].description, "added src/11.py");
+  });
+
+  it("renders as a short list after the actors and is omitted without telemetry", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("hotfix-1", { status: "working" });
+    const selection = selectRun((await discoverRuns([ws.location])).runs);
+    const live = foldEvents([event("stage", "turn.started", { provider: "claude-cli" }), event("stage", "file.changed", { path: "src/a.py", kind: "modify" })]);
+    const html = renderOverviewHtml(buildOverviewModel(selection, live, ALL, Date.parse(live.lastEventTs!) + 1000), "n", "c");
+    assert.match(html, /<section class="history"><h3>Recent events<\/h3><ol><li><span class="time">\d\d:\d\d:\d\d<\/span><span class="who">Claude<\/span><span>turn started<\/span><\/li><li>.*changed src\/a.py<\/span><\/li><\/ol><\/section>/);
+    assert.ok(html.indexOf('<section class="actors">') < html.indexOf('<section class="history">'));
+    const quiet = renderOverviewHtml(buildOverviewModel(selection, undefined, ALL, T0), "n", "c");
+    assert.ok(!quiet.includes('class="history"'));
+    assert.ok(!/model|effort|Elapsed|Pause between|Tests passed|Pushed/i.test(quiet), "no claims the telemetry cannot back");
   });
 });
 

@@ -9,7 +9,7 @@
  * sparring), the actors as small secondary cards, actions, quiet metadata.
  */
 
-import type { ActorCard, OverviewModel, TimelineItem } from "./overviewModel";
+import { TIMELINE_STATE_WORD, type ActorCard, type OverviewModel, type TimelineItem } from "./overviewModel";
 
 export type OverviewAction = "openHandoff" | "openSparring" | "openBrief" | "openPlan" | "openDiff" | "showLog" | "selectRun" | "runPlan";
 
@@ -76,6 +76,12 @@ function renderBody(model: OverviewModel): string {
   if (model.stageAgent && model.sparrer) {
     parts.push(`<section class="actors">${renderActor(model.stageAgent)}${renderActor(model.sparrer)}</section>`);
   }
+  if (model.history && model.history.length > 0) {
+    const rows = model.history
+      .map((entry) => `<li><span class="time">${escapeHtml(entry.time)}</span><span class="who">${escapeHtml(entry.who)}</span><span>${escapeHtml(entry.description)}</span></li>`)
+      .join("");
+    parts.push(`<section class="history"><h3>Recent events</h3><ol>${rows}</ol></section>`);
+  }
   const actions = model.actions;
   if (actions) {
     const buttons: string[] = [];
@@ -107,7 +113,7 @@ function renderStage(model: OverviewModel): string {
   let activity = "";
   if (model.activity) {
     const time = model.activity.time ? `<span class="time">${escapeHtml(model.activity.time)}</span> ` : "";
-    const label = model.activity.kind === "last" ? "Last" : model.activity.kind === "active" ? "Now" : "";
+    const label = model.activity.kind === "last" ? "Last event" : model.activity.kind === "active" ? "Now" : "";
     activity = `<p class="activity ${model.activity.kind}">${label ? `<span class="label">${label}</span> ` : ""}${time}${escapeHtml(model.activity.text)}</p>`;
   }
   return `<section class="stage">
@@ -128,12 +134,14 @@ const GLYPH: Record<TimelineItem["state"], string> = {
   future: "○",
 };
 
-/** One compact row: a glyph per stage, the current stage's title spelled out. */
+/** One compact row: glyph, number and title per stage; a state word under the current one only. */
 function renderJourney(items: TimelineItem[]): string {
   const cells = items.map((item) => {
     const cls = `step ${item.state}${item.current ? " current" : ""}`;
-    const label = `Stage ${item.number} — ${item.title} (${item.state})`;
-    return `<li class="${cls}" title="${escapeHtml(label)}"><span class="glyph">${GLYPH[item.state]}</span><span class="num">${item.number}</span></li>`;
+    const word = TIMELINE_STATE_WORD[item.state];
+    const label = `Stage ${item.number} — ${item.title} (${word})`;
+    const state = item.current ? `<span class="state">${escapeHtml(word)}</span>` : "";
+    return `<li class="${cls}" title="${escapeHtml(label)}"><span class="glyph">${GLYPH[item.state]}</span><span class="num">${item.number}</span><span class="name">${escapeHtml(item.title)}</span>${state}</li>`;
   });
   return `<ol class="journey">${cells.join("")}</ol>`;
 }
@@ -173,11 +181,16 @@ p { margin: 0 0 4px; }
 .banner.warn { border-left-color: var(--vscode-editorWarning-foreground); }
 .banner.done { border-left-color: var(--vscode-testing-iconPassed, var(--vscode-charts-green)); }
 .note { margin: 6px 0 10px; }
-.journey { list-style: none; display: flex; align-items: center; gap: 0; margin: 6px 0 12px; padding: 0; }
-.step { position: relative; display: flex; flex-direction: column; align-items: center; width: 36px; }
+.journey { list-style: none; display: flex; align-items: flex-start; gap: 0; margin: 6px 0 12px; padding: 0; overflow-x: auto; }
+.step { position: relative; display: flex; flex-direction: column; align-items: center; flex: 1 1 0; min-width: 64px; max-width: 140px; }
 .step:not(:last-child)::after { content: ""; position: absolute; top: 9px; left: 50%; width: 100%; border-top: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); z-index: 0; }
 .glyph { position: relative; z-index: 1; display: inline-block; width: 18px; height: 18px; line-height: 18px; text-align: center; border-radius: 50%; background: var(--vscode-editor-background); border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); font-size: 10px; }
 .num { font-size: 0.7em; color: var(--vscode-descriptionForeground); margin-top: 1px; }
+.name { display: block; max-width: 100%; padding: 0 4px; font-size: 0.8em; color: var(--vscode-descriptionForeground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.step.current .name { color: var(--vscode-foreground); font-weight: 600; }
+.state { font-size: 0.72em; color: var(--vscode-focusBorder); }
+.step.paused .state { color: var(--vscode-editorWarning-foreground); }
+.step.accepted .state, .step.frozen .state { color: var(--vscode-descriptionForeground); }
 .step.accepted .glyph { color: var(--vscode-testing-iconPassed, var(--vscode-charts-green)); border-color: currentColor; }
 .step.frozen .glyph { color: var(--vscode-charts-blue); border-color: currentColor; }
 .step.active .glyph { color: var(--vscode-focusBorder); border-color: currentColor; }
@@ -194,6 +207,11 @@ p { margin: 0 0 4px; }
 .activity.active { color: var(--vscode-foreground); }
 .time { font-family: var(--vscode-editor-font-family); font-size: 0.9em; }
 .sparring { margin: 0 0 12px; }
+.history { margin: 0 0 10px; }
+.history ol { list-style: none; margin: 0; padding: 0; font-size: 0.88em; color: var(--vscode-descriptionForeground); }
+.history li { display: grid; grid-template-columns: max-content max-content 1fr; gap: 0 10px; line-height: 1.5; }
+.history .who { color: var(--vscode-foreground); }
+.history li:last-child span { color: var(--vscode-foreground); }
 .actors { display: flex; flex-wrap: wrap; gap: 6px 10px; margin: 0 0 10px; }
 .actor { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 8px; border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); border-radius: 4px; padding: 3px 8px; font-size: 0.9em; line-height: 1.35; flex: 1 1 240px; }
 .role { font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.04em; color: var(--vscode-descriptionForeground); }

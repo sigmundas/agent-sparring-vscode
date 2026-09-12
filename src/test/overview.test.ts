@@ -260,8 +260,9 @@ describe("overview HTML", () => {
   it("renders the compact journey, the primary stage block and the small actor cards", async () => {
     const ws = await planWorkspace("paused", 1, { sparring: sparringMarkdown("NEEDS_YOU", "Check") });
     const html = renderOverviewHtml(buildOverviewModel(await selection(ws), undefined, ALL, NOW), "n", "c");
-    assert.match(html, /<ol class="journey"><li class="step accepted" title="Stage 1 — Contract \(accepted\)"><span class="glyph">✓<\/span><span class="num">1<\/span><\/li>/);
-    assert.match(html, /<li class="step paused current"/);
+    assert.match(html, /<ol class="journey"><li class="step accepted" title="Stage 1 — Contract \(Accepted\)"><span class="glyph">✓<\/span><span class="num">1<\/span><span class="name">Contract<\/span><\/li>/);
+    assert.match(html, /<li class="step paused current" [^>]*>.*<span class="name">Schema &amp; API<\/span><span class="state">Paused<\/span><\/li>/);
+    assert.equal((html.match(/<span class="state">/g) ?? []).length, 1, "only the current stage carries a state word");
     assert.match(html, /<li class="step future"/);
     assert.match(html, /<div class="position muted">Stage 2 of 3<\/div>/);
     assert.match(html, /<h2 [^>]*>Stage 2 — Schema &amp; API <span class="pill needs_you"/);

@@ -13,12 +13,22 @@
 
 import { parseBriefGoal } from "./brief";
 import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
-import { activeDurationMs, formatDuration, providerDisplayName, type LiveState } from "./liveState";
+import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
 import { formatTime } from "./logFormat";
 import { presentStage, stageDisplayName } from "./presentation";
 import { QUIET_AFTER_MS, formatAge } from "./status";
 
 export type TimelineState = "accepted" | "frozen" | "active" | "paused" | "working" | "future";
+
+/** The word shown under a journey node; only the current stage gets one. */
+export const TIMELINE_STATE_WORD: Record<TimelineState, string> = {
+  accepted: "Accepted",
+  frozen: "Frozen",
+  active: "In progress",
+  paused: "Paused",
+  working: "Not accepted",
+  future: "Pending",
+};
 
 export interface TimelineItem {
   number: number;
@@ -58,6 +68,17 @@ export interface ActivityLine {
   /** Time of day of the last visible event (kind `last`). */
   time?: string;
 }
+
+/** One line of the glanceable résumé: a past event, never a claim about the present. */
+export interface HistoryEntry {
+  time: string;
+  /** Provider name for stage/sparrer events, else the actor (Loop, Gate, Plan). */
+  who: string;
+  description: string;
+}
+
+/** How many recent meaningful events the Overview shows. */
+export const HISTORY_MAX = 4;
 
 export interface OverviewArtifacts {
   handoff: boolean;
@@ -100,6 +121,8 @@ export interface OverviewModel {
   cycle?: number;
   goal?: string;
   activity?: ActivityLine;
+  /** The last few meaningful events, oldest first; omitted without telemetry. */
+  history?: HistoryEntry[];
   banner?: Banner;
   lastSparring?: { action: string; summary: string; reason?: string };
   actions?: OverviewActions;
@@ -139,6 +162,7 @@ export function buildOverviewModel(
     facts: facts(run, stage),
     goal: artifacts.brief ? parseBriefGoal(artifacts.briefText) : undefined,
     activity: activityLine(live, halted, nowMs),
+    history: history(live),
   };
 
   const outcome = run.kind === "plan" ? run.currentOutcome : run.outcome;
@@ -224,15 +248,27 @@ export function activityLine(live: LiveState | undefined, halted: boolean, nowMs
     }
   }
   if (live?.lastMeaningful) {
+    // Phrased as a past fact ("last event: Claude · changed x.py"), never as
+    // what an actor is doing right now; telemetry cannot support the latter.
     const last = live.lastMeaningful;
-    const who = last.actor === "stage" || last.actor === "sparrer" ? providerDisplayName(live[last.actor].provider, last.actor) : capitalize(last.actor);
-    return { kind: "last", time: formatTime(last.ts), text: `${who}: ${last.description}` };
+    return { kind: "last", time: formatTime(last.ts), text: `${whoFor(last, live)} · ${last.description}` };
   }
   return { kind: "none", text: "No activity telemetry for this stage." };
 }
 
-function capitalize(word: string): string {
-  return word.charAt(0).toUpperCase() + word.slice(1);
+/** The last HISTORY_MAX meaningful events as a résumé, oldest first. */
+export function history(live: LiveState | undefined): HistoryEntry[] | undefined {
+  if (!live || live.recentMeaningful.length === 0) {
+    return undefined;
+  }
+  return live.recentMeaningful.slice(-HISTORY_MAX).map((entry) => ({ time: formatTime(entry.ts), who: whoFor(entry, live), description: entry.description }));
+}
+
+function whoFor(entry: MeaningfulEvent, live: LiveState): string {
+  if (entry.actor === "stage" || entry.actor === "sparrer") {
+    return providerDisplayName(live[entry.actor].provider, entry.actor);
+  }
+  return entry.actor.charAt(0).toUpperCase() + entry.actor.slice(1);
 }
 
 export function shortenId(id: string | undefined | null, keep = 8): string | undefined {

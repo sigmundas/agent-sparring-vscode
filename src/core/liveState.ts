@@ -51,13 +51,21 @@ export interface LiveState {
   currentCycle?: number;
   /** Last event that passes the shared Output filter; suppressed noise never lands here. */
   lastMeaningful?: MeaningfulEvent;
+  /**
+   * The most recent meaningful events, oldest first, capped at
+   * RECENT_MEANINGFUL_MAX; consecutive repeats (same actor and description,
+   * e.g. a burst of edits to one file) collapse into one entry.
+   */
+  recentMeaningful: MeaningfulEvent[];
   lastEventTs?: string;
   eventCount: number;
   sendBackCount: number;
 }
 
+export const RECENT_MEANINGFUL_MAX = 8;
+
 export function emptyLiveState(): LiveState {
-  return { stage: { busy: false }, sparrer: { busy: false }, eventCount: 0, sendBackCount: 0 };
+  return { stage: { busy: false }, sparrer: { busy: false }, eventCount: 0, sendBackCount: 0, recentMeaningful: [] };
 }
 
 export function foldEvents(events: Iterable<ActivityEvent>, initial: LiveState = emptyLiveState()): LiveState {
@@ -87,7 +95,17 @@ export function applyEvent(state: LiveState, event: ActivityEvent): LiveState {
   }
 
   if (isMeaningfulActivity(event)) {
-    state.lastMeaningful = { ts: event.ts, actor: event.actor, event: event.event, description: describeActivity(event) ?? event.event };
+    const meaningful: MeaningfulEvent = { ts: event.ts, actor: event.actor, event: event.event, description: describeActivity(event) ?? event.event };
+    state.lastMeaningful = meaningful;
+    const previous = state.recentMeaningful[state.recentMeaningful.length - 1];
+    if (previous && previous.actor === meaningful.actor && previous.description === meaningful.description) {
+      state.recentMeaningful[state.recentMeaningful.length - 1] = meaningful; // same fact again: keep the latest time
+    } else {
+      state.recentMeaningful.push(meaningful);
+      if (state.recentMeaningful.length > RECENT_MEANINGFUL_MAX) {
+        state.recentMeaningful.splice(0, state.recentMeaningful.length - RECENT_MEANINGFUL_MAX);
+      }
+    }
   }
 
   switch (event.event) {
