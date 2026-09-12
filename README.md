@@ -34,7 +34,8 @@ navigates.
 | `Agent Sparring: Run / Resume Stage` | For the selected standalone stage (or after picking one), launch `sparring run-loop <stage> --repo-root <project> --expected-branch <current branch>` in a terminal. The branch comes from the Git repository owning the project (built-in Git API, then `.git/HEAD`); a detached HEAD is refused, never guessed. Also offered as **Run stage** / **Resume stage** in the Overview. |
 | `Agent Sparring: Accept Stage` | For a stage whose independent review passed (**Review complete**): one action that runs the engine's `freeze-candidate` and, only if that succeeds, `accept-candidate` for the selected stage, project and current branch. Refusals are translated (uncommitted changes, not pushed, wrong branch, code changed after the review); the engine's own output goes to the Output Channel. Also offered as **Accept stage** in the Overview. |
 | `Agent Sparring: Choose Plan for Stage…` | Associate a Markdown plan file (any location, ordinary file picker) with the selected standalone stage. Stored in VS Code workspace state per repository + stage id, never in engine state; gives the Overview a **Plan** button, this stage's place in the document and, once accepted, **What's next**. Change or remove it the same way. |
-| `Agent Sparring: Match Stage to Plan Section…` | When the Overview cannot tell which section of the associated plan the selected stage is, pick it from the plan's headings (also **Match this stage…** / **Change match…** in the Overview). Stored with the association in VS Code workspace state, never in engine state. |
+| `Agent Sparring: Match Stage to Plan Section…` | When the Overview cannot tell which stage of the associated plan the selected stage is, pick it from the plan's stages (also **Match this stage…** / **Change match…** in the Overview). Stored with the association in VS Code workspace state, never in engine state. |
+| `Agent Sparring: Start Next Stage from Plan…` | For an accepted standalone stage with an associated plan: create the stage that follows it (by stage label) with the engine's own `sparring new-stage <id>`, after a confirmation naming the title, the proposed id and the plan section. The Overview switches to the new stage, the plan association follows it, and its fresh `brief.md` opens beside the plan section for you to fill in before **Run stage**. Also **Start next stage** in the Overview. |
 | `Agent Sparring: Choose sparring Executable…` | Pick the `sparring` CLI with a file dialog and store it as `agentSparring.executable`. |
 | `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / finalizing / future stages), the current stage as primary content (`Stage N — title`, a human state word with one explaining sentence, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), latest sparring result, small Stage Agent / Sparrer cards, Brief / Handoff / Sparring report / Diff / Plan / Log buttons, and quiet metadata (where the engine's own words live). Never auto-opens; updates in place. |
 | `Agent Sparring: Show Log` | Focus the Output Channel. |
@@ -98,19 +99,35 @@ words stay in tooltips, the metadata footer and the Output Channel.
   starts a standalone stage from a plan, nothing here offers to; the next
   section is information you read, not a button that runs something.
 
-### Which section is this stage?
+### Which stage is this, and which comes next?
 
-Headings are read leniently (`## Stage 3B — …` at levels 2–4, labels like
-`3B` included; otherwise every `##` heading). The stage is placed under a
-heading only when exactly one qualifies, in this order: a section you
-picked yourself; a heading whose title equals the stage id (`stage-local-
-schema-barrier` ↔ `Local schema barrier`); a stage label carried by the id
-(`stage-3b-…`) or by the brief's own title (`# Stage 3B — …`); the stage's
-display title. Two candidates, or a mere resemblance, place nothing: the
-Overview then asks with **Match this stage…**, a Quick Pick of the plan's
-headings. Your pick is stored with the association (heading text, not a
-line number) and can be changed (**Change match…**) or dropped; changing
-the plan file drops it too.
+Headings are read leniently at levels `##`–`####`. A heading carries a
+stage label when it is written `## Stage 3B — …` (a *definition*) or
+names one in passing, `## Reviewer handoff — 2026-09-12 (Stage 3B)` (a
+*mention*). Every heading with the same label is one logical stage, so a
+plan that keeps a handoff and a status note per stage still has one Stage
+3B. The stage's canonical section is the single non-historical definition
+(headings with *handoff*, *accepted*, *candidate*, *status*, *history* or a
+date are records, not definitions); two plausible definitions make the
+stage ambiguous and nothing is chosen.
+
+The current stage is placed only when exactly one candidate qualifies, in
+this order: a stage you picked yourself; a heading whose title equals the
+stage id (`stage-local-schema-barrier` ↔ `Local schema barrier`); a stage
+label carried by the id (`stage-3b-…`) or by the brief's own title
+(`# Stage 3B — …`); the stage's display title. Otherwise the Overview asks
+with **Match this stage…**, a Quick Pick of the plan's stages. Your pick
+is stored with the association (label and title, not a line number),
+shown as *Current plan stage — Matched manually*, and can be changed
+(**Change match…**), dropped (**Remove match**) or unlinked (**Remove plan
+association**); changing the plan file drops it too.
+
+**The next stage is the next label, never the next heading.** Labels sort
+1 < 2 < 3 < 3A < 3B < 3C < 4, so after Stage 3B comes Stage 3C even when
+the file lists the old Stage 3A handoff right below the current one. If
+the plan has no later label it says so; if the later stage is defined
+twice, or only mentioned in a handoff, the Overview says that and does
+not start anything.
 
 ### After acceptance: What's next
 
@@ -122,9 +139,21 @@ line and a **What's next** block:
 | --- | --- |
 | Managed plan run, a stage follows | the engine's next stage, its opening paragraph from the plan, **Continue plan** (`resume-plan`), **Open in plan** |
 | Managed plan run, last stage | *No stage follows this one in the plan.* and **Continue plan** |
-| Standalone stage, plan linked and matched | the following heading and its opening paragraph, **Open next in plan**, **Change match…** |
-| Standalone stage, plan linked but not matched | *The plan is linked, but Agent Sparring doesn't yet know where this stage belongs in it.* **Match this stage…**, **Open plan**; plan headings the brief lists as later work are shown as a hint |
+| Standalone stage, plan linked and matched, next stage defined | `Stage 3C — title`, its opening paragraph, **Start next stage**, **Open in plan**, **Change match…** |
+| Standalone stage, next stage ambiguous or only mentioned historically | the label and why it cannot be started; **Open in plan** |
+| Standalone stage, no later label / plan without labels | *No later stage is defined in …* / the plan has no "Stage …" labels; **Open plan** |
+| Standalone stage, plan linked but not matched | *The plan is linked, but Agent Sparring doesn't yet know where this stage belongs in it.* **Match this stage…**, **Open plan**; plan stages the brief lists as later work are shown as a hint |
 | Standalone stage, no plan | *This stage has been accepted. Choose a plan to see what comes next.* **Choose plan…** |
+
+**Start next stage** proposes `stage-<label>-<slug>` (for example
+`stage-3c-cloud-schema-and-synchronization`), confirms *Start Stage 3C —
+…?* with the id and the plan section, and runs the engine's
+`sparring new-stage <id>` through the configured executable. The engine
+writes the stage directory, `state.json` and the template `brief.md`; the
+extension writes nothing under `.sparring`. Because the engine has no
+operation that fills a standalone stage's brief from a plan section, the
+new brief opens beside that section for you to complete, then **Run
+stage** runs it as usual.
 
 ## Source-of-truth rule
 
@@ -134,7 +163,8 @@ line and a **What's next** block:
 | working / frozen / accepted per stage | `.sparring/stages/<id>/state.json` |
 | stage count and titles | the plan Markdown named in the run state |
 | Changes requested / Needs you / Escalated / Review complete | `## Routing outcome` in the current stage's `sparring.md` |
-| Plan button, this stage's section and "What's next" for a standalone stage | the Markdown file you associated and, when you picked one, the section you matched (VS Code workspace state; display only) |
+| Plan button, this stage's section, the next stage label and "What's next" for a standalone stage | the Markdown file you associated and, when you picked one, the stage you matched (VS Code workspace state; display only) |
+| A new stage started from the plan | `sparring new-stage <id>` (the engine writes the skeleton; the extension proposes the id and confirms) |
 | Next stage's opening paragraph | the plan document itself (display only) |
 | "The brief lists later work that is in this plan" | `Stage <label>` mentions in the current stage's `brief.md`, shown only when the plan has those headings (display only) |
 | "Claude working", "Codex sparring", active-turn duration, loop cycle, last visible event, changed files, verdict chronology | `activity.jsonl` (observational only; the Overview and the Output Channel share one filter for what counts as visible activity) |

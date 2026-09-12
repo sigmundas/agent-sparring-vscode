@@ -23,7 +23,8 @@ import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
 import { formatTime } from "./logFormat";
 import { deriveLiveness, type ExecutionRecord, type LivenessState, type RunnerLiveness } from "./liveness";
-import { briefMentionedHeadings, locateStage, parsePlanHeadings, planTitle, sectionSummary, type HeadingRef, type MatchSource, type PlanHeading } from "./planAssociation";
+import { proposeNextStage, type NextStageProposal } from "./nextStage";
+import { briefMentionedStages, buildStageIndex, locateStage, parsePlanHeadings, planTitle, sectionSummary, type HeadingRef, type MatchSource, type PlanHeading } from "./planAssociation";
 import { actionWord, presentStage, stageDisplayName, type StagePresentation } from "./presentation";
 import { planAction, stageActions, type PlanAction, type StageRunAction } from "./runner";
 import { QUIET_AFTER_MS, formatAge } from "./status";
@@ -163,14 +164,30 @@ export interface PlanContext {
   source: "managed" | "associated";
   /** Display name: the document's first heading, else its file name. */
   name: string;
-  /** The heading describing this stage, when known (managed: always; associated: only on an unambiguous or manual match). */
+  /**
+   * This stage as the plan names it: managed → `Stage N — title`;
+   * associated → the canonical `Stage 3B — title` of the matched stage when
+   * the plan defines one, else the matched heading's own text.
+   */
   current?: string;
   /** How the current heading was decided (associated plans only; managed runs are authoritative). */
   matched?: MatchSource;
-  /** The heading after this stage; informational unless a `planAction` continues a managed run. `summary` is its opening paragraph. */
-  next?: { display: string; line: number; summary?: string };
+  /** The label of the current logical stage (associated plans; undefined for an unlabelled heading). */
+  currentLabel?: string;
+  /**
+   * The stage that follows in workflow order: for a managed run the engine's
+   * next stage; for an associated plan the next stage *label* found in the
+   * plan, never the next heading in the file. `defined` is false when the
+   * plan mentions the label without a clear section for it (only history,
+   * or several candidate definitions: `ambiguous`).
+   */
+  next?: { display: string; label?: string; line: number; summary?: string; defined: boolean; ambiguous?: boolean };
+  /** Why there is no `next` for a matched associated stage. */
+  nextState?: "found" | "last" | "unlabelled";
   /** Whether the document has any headings to match against at all. */
   hasHeadings: boolean;
+  /** Whether the document carries stage labels at all (without them no progression can be derived). */
+  hasStageLabels: boolean;
   /** One sentence for the tooltip / note about what this context is. */
   note: string;
 }
@@ -184,8 +201,10 @@ export interface WhatsNext {
   kind:
     | "continue" // managed run: the engine's next stage; Continue plan runs it
     | "last-managed" // managed run: no stage follows; Continue plan closes the run
-    | "next-heading" // associated plan, matched: the following heading, for reading only
-    | "last-heading" // associated plan, matched: nothing follows this heading
+    | "next-stage" // associated plan, matched: the next stage by label, with a clear section; Start next stage
+    | "next-unclear" // associated plan, matched: a later label exists but the plan defines it unclearly; read the plan
+    | "last-stage" // associated plan, matched: no later stage label in the plan
+    | "no-labels" // associated plan, matched to a plain heading: the plan has no stage labels to order by
     | "match" // associated plan, unmatched: ask the user where this stage belongs
     | "missing-plan" // associated file is gone
     | "choose"; // no plan at all
@@ -195,8 +214,10 @@ export interface WhatsNext {
   summary?: string;
   /** One or two plain sentences. */
   text: string;
-  /** Plan headings the brief lists as later work, when the stage itself could not be matched. */
+  /** Plan stages the brief lists as later work, when the stage itself could not be matched. */
   hints?: string[];
+  /** For `next-stage`: what Start next stage would create (`sparring new-stage <stageId>`). */
+  start?: NextStageProposal;
 }
 
 export interface OverviewModel {
@@ -561,8 +582,10 @@ function planContext(run: RunSnapshot, stage: StageSnapshot, artifacts: Overview
       const inDocument = artifacts.planText ? parsePlanHeadings(artifacts.planText).find((heading) => heading.label === String(nextHeading.number) && heading.title === nextHeading.title) : undefined;
       next = {
         display: `Stage ${nextHeading.number} — ${nextHeading.title}`,
+        label: String(nextHeading.number),
         line: inDocument?.line ?? 0,
         summary: inDocument && artifacts.planText ? sectionSummary(artifacts.planText, inDocument.line) : undefined,
+        defined: true,
       };
     }
     return {
@@ -571,6 +594,7 @@ function planContext(run: RunSnapshot, stage: StageSnapshot, artifacts: Overview
       current: `Stage ${stage.number ?? index + 1} — ${stageDisplayName(stage)}`,
       next,
       hasHeadings: Boolean(stages && stages.length > 0),
+      hasStageLabels: Boolean(stages && stages.length > 0),
       note: "The engine's plan run: it records which stage is current and resume-plan continues it.",
     };
   }
@@ -578,19 +602,35 @@ function planContext(run: RunSnapshot, stage: StageSnapshot, artifacts: Overview
     return undefined;
   }
   const name = (associated.text ? planTitle(associated.text) : undefined) ?? basename(associated.path);
-  const note = "Associated with this stage in VS Code for display only; the engine does not know about it and nothing here starts a stage from it.";
+  const note = "Associated with this stage in VS Code for display only; the engine does not know about it. A following stage is created with the engine's own new-stage command.";
   if (!associated.exists || associated.text === undefined) {
-    return { source: "associated", name, hasHeadings: false, note: associated.exists ? note : `${note} The file is currently missing.` };
+    return { source: "associated", name, hasHeadings: false, hasStageLabels: false, note: associated.exists ? note : `${note} The file is currently missing.` };
   }
   const headings: PlanHeading[] = parsePlanHeadings(associated.text);
   const position = locateStage(headings, { stageId: stage.stageId, title: stage.title, briefText: artifacts.briefText, manual: associated.manualMatch });
+  const text = associated.text;
+  let next: PlanContext["next"];
+  if (position?.next.state === "found") {
+    const entry = position.next.stage;
+    next = {
+      display: entry.display,
+      label: entry.label,
+      line: entry.canonical?.line ?? entry.occurrences[0]?.line ?? 0,
+      summary: entry.canonical ? sectionSummary(text, entry.canonical.line) : undefined,
+      defined: Boolean(entry.canonical),
+      ambiguous: entry.ambiguous,
+    };
+  }
   return {
     source: "associated",
     name,
-    current: position?.current.display,
+    current: position?.display,
     matched: position?.source,
-    next: position?.next ? { display: position.next.display, line: position.next.line, summary: sectionSummary(associated.text, position.next.line) } : undefined,
+    currentLabel: position?.stage?.label,
+    next,
+    nextState: position?.next.state,
     hasHeadings: headings.length > 0,
+    hasStageLabels: headings.some((heading) => heading.label !== undefined),
     note,
   };
 }
@@ -611,8 +651,13 @@ function whatsNext(run: RunSnapshot, plan: PlanContext | undefined, artifacts: O
   if (!associated?.exists || associated.text === undefined) {
     return { kind: "missing-plan", text: `The linked plan file (${basename(associated?.path ?? "")}) is missing. Choose another plan to see what comes next.` };
   }
+  if (!associated.exists) {
+    return { kind: "missing-plan", text: "The linked plan file is missing." };
+  }
+  const headings = parsePlanHeadings(associated.text);
+  const index = buildStageIndex(headings);
   if (!plan.current) {
-    const hints = plan.hasHeadings ? briefMentionedHeadings(parsePlanHeadings(associated.text), artifacts.briefText).map((heading) => heading.display) : [];
+    const hints = plan.hasHeadings ? briefMentionedStages(index, artifacts.briefText).map((entry) => entry.display) : [];
     return {
       kind: "match",
       text: plan.hasHeadings
@@ -621,10 +666,25 @@ function whatsNext(run: RunSnapshot, plan: PlanContext | undefined, artifacts: O
       hints: hints.length > 0 ? hints : undefined,
     };
   }
-  if (plan.next) {
-    return { kind: "next-heading", heading: plan.next.display, summary: plan.next.summary, text: "The next section of the plan you linked. Read it in the plan; starting it is up to you." };
+  if (plan.nextState === "unlabelled") {
+    return { kind: "no-labels", text: `${plan.name} has no "Stage …" labels, so Agent Sparring cannot tell which section comes after this one.` };
   }
-  return { kind: "last-heading", text: `This stage is the last section of ${plan.name}.` };
+  if (plan.nextState === "last" || !plan.next) {
+    return { kind: "last-stage", text: `No later stage is defined in ${plan.name}.` };
+  }
+  const next = plan.next;
+  const entry = index.find((candidate) => candidate.label === next.label);
+  const start = entry && next.defined ? proposeNextStage(entry) : undefined;
+  if (start) {
+    return { kind: "next-stage", heading: next.display, summary: next.summary, text: "Start next stage creates it with the engine; you then fill in its brief from this plan section and run it.", start };
+  }
+  return {
+    kind: "next-unclear",
+    heading: next.display,
+    text: next.ambiguous
+      ? `${plan.name} defines Stage ${next.label ?? ""} in more than one section, so Agent Sparring cannot say which one to start. Read the plan to decide.`
+      : `${plan.name} mentions Stage ${next.label ?? ""} only in passing (a handoff or status note), without a section that defines it.`,
+  };
 }
 
 function basename(file: string): string {

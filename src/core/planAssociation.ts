@@ -101,26 +101,40 @@ export function withManualMatch(associations: PlanAssociations | undefined, runI
 // ---------------------------------------------------------------- headings
 
 export interface PlanHeading {
-  /** `3`, `3C`, or undefined for a plain `##` heading. */
+  /** `3`, `3C` (normalised to upper case), or undefined for a plain `##` heading. */
   label?: string;
+  /** For `## Stage 3C — Cloud schema` the part after the dash; otherwise the heading text without its `(Stage 3C)` marker. */
   title: string;
   /** 1-based line number in the document, for revealing it. */
   line: number;
-  /** `Stage 3C — Cloud schema` or just the title for plain headings. */
+  /** `Stage 3C — Cloud schema`, or the heading's own text for mentions and plain headings. */
   display: string;
+  /**
+   * `definition`: the heading *is* the stage (`## Stage 3C — …`);
+   * `mention`: the heading names a stage in passing (`## Reviewer handoff (Stage 3B)`);
+   * `plain`: no stage label at all.
+   */
+  form: "definition" | "mention" | "plain";
+  /** The heading reads as a record of what happened (handoff, acceptance, a date) rather than as the stage's definition. */
+  historical: boolean;
 }
 
-const STAGE_HEADING_RE = /^#{2,4}\s+stage\s+([A-Za-z0-9.]+)\s*[—–:-]\s*(\S.*?)\s*$/i;
-const PLAIN_HEADING_RE = /^##\s+(\S.*?)\s*$/;
+const HEADING_RE = /^(#{2,4})\s+(\S.*?)\s*$/;
+const DEFINITION_RE = /^stage\s+(\d+[A-Za-z]?)\s*[—–:-]\s*(\S.*?)$/i;
+const MARKER_RE = /\(?\bstage\s+(\d+[A-Za-z]?)\b\)?/i;
+const HISTORICAL_RE = /\b(hand-?off|accepted|acceptance|candidate|status|history|historical|changelog)\b|\b\d{4}-\d{2}-\d{2}\b/i;
 const FENCE_RE = /^\s*(```|~~~)/;
 
 /**
- * Stage headings in document order. Falls back to every `##` heading when
- * the document uses none of the `## Stage …` form, so an arbitrary
- * Markdown plan still yields navigable sections. Fenced code is skipped.
+ * Headings in document order, levels `##`–`####`. When any heading carries
+ * a stage label (`## Stage 3C — …`, or a `(Stage 3B)` marker anywhere in
+ * the text) only labelled headings are returned; otherwise every `##`
+ * heading, so an arbitrary Markdown plan still yields navigable sections.
+ * Document order is kept for revealing lines, never for workflow order:
+ * see buildStageIndex. Fenced code is skipped.
  */
 export function parsePlanHeadings(markdown: string): PlanHeading[] {
-  const stage: PlanHeading[] = [];
+  const labelled: PlanHeading[] = [];
   const plain: PlanHeading[] = [];
   let inFence = false;
   const lines = markdown.split(/\r?\n/);
@@ -133,17 +147,120 @@ export function parsePlanHeadings(markdown: string): PlanHeading[] {
     if (inFence) {
       continue;
     }
-    const asStage = STAGE_HEADING_RE.exec(line);
-    if (asStage) {
-      stage.push({ label: asStage[1], title: asStage[2], line: index + 1, display: `Stage ${asStage[1]} — ${asStage[2]}` });
+    const heading = HEADING_RE.exec(line);
+    if (!heading) {
       continue;
     }
-    const asPlain = PLAIN_HEADING_RE.exec(line);
-    if (asPlain) {
-      plain.push({ title: asPlain[1], line: index + 1, display: asPlain[1] });
+    const text = heading[2];
+    const historical = HISTORICAL_RE.test(text);
+    const definition = DEFINITION_RE.exec(text);
+    if (definition) {
+      const label = definition[1].toUpperCase();
+      labelled.push({ label, title: definition[2], line: index + 1, display: `Stage ${label} — ${definition[2]}`, form: "definition", historical });
+      continue;
+    }
+    const marker = MARKER_RE.exec(text);
+    if (marker) {
+      const label = marker[1].toUpperCase();
+      const title = text.replace(MARKER_RE, "").replace(/\s{2,}/g, " ").replace(/\s+([—–:-])\s*$/, "").trim() || text;
+      labelled.push({ label, title, line: index + 1, display: text, form: "mention", historical });
+      continue;
+    }
+    if (heading[1].length === 2) {
+      plain.push({ title: text, line: index + 1, display: text, form: "plain", historical });
     }
   }
-  return stage.length > 0 ? stage : plain;
+  return labelled.length > 0 ? labelled : plain;
+}
+
+// ---------------------------------------------------------------- stage index (workflow order)
+
+/**
+ * One logical stage of the plan: every heading that carries its label,
+ * collapsed. `canonical` is the heading that defines the stage, chosen
+ * only when the choice is clear: among non-historical headings, the single
+ * `## Stage <label> — …` definition, else the single non-historical one.
+ * A stage mentioned only historically has no canonical section; one with
+ * several plausible definitions is `ambiguous` and gets none either.
+ */
+export interface StageEntry {
+  label: string;
+  /** The canonical section's title, when there is one. */
+  title?: string;
+  /** `Stage 3C — Cloud schema`, or just `Stage 3C` without a canonical section. */
+  display: string;
+  canonical?: PlanHeading;
+  /** All headings carrying this label, in document order. */
+  occurrences: PlanHeading[];
+  ambiguous: boolean;
+}
+
+/** Split `3B` into its numeric and letter parts; undefined for labels that are not of that shape. */
+function parseLabel(label: string): { number: number; suffix: string } | undefined {
+  const match = /^(\d+)([A-Za-z]?)$/.exec(label);
+  return match ? { number: Number(match[1]), suffix: match[2].toUpperCase() } : undefined;
+}
+
+/** Workflow order of stage labels: 1 < 2 < 3 < 3A < 3B < 3C < 4. Unparsable labels sort last, alphabetically. */
+export function compareStageLabels(a: string, b: string): number {
+  const pa = parseLabel(a);
+  const pb = parseLabel(b);
+  if (pa && pb) {
+    if (pa.number !== pb.number) {
+      return pa.number - pb.number;
+    }
+    return pa.suffix < pb.suffix ? -1 : pa.suffix > pb.suffix ? 1 : 0;
+  }
+  if (pa) {
+    return -1;
+  }
+  if (pb) {
+    return 1;
+  }
+  return a.localeCompare(b);
+}
+
+/** The plan's logical stages in workflow (label) order, built from labelled headings only. */
+export function buildStageIndex(headings: PlanHeading[]): StageEntry[] {
+  const groups = new Map<string, PlanHeading[]>();
+  for (const heading of headings) {
+    if (heading.label === undefined) {
+      continue;
+    }
+    const list = groups.get(heading.label) ?? [];
+    list.push(heading);
+    groups.set(heading.label, list);
+  }
+  const entries: StageEntry[] = [];
+  for (const [label, occurrences] of groups) {
+    const prospective = occurrences.filter((heading) => !heading.historical);
+    const definitions = prospective.filter((heading) => heading.form === "definition");
+    let canonical: PlanHeading | undefined;
+    let ambiguous = false;
+    if (definitions.length === 1) {
+      canonical = definitions[0];
+    } else if (definitions.length === 0 && prospective.length === 1) {
+      canonical = prospective[0];
+    } else if (prospective.length > 1) {
+      ambiguous = true;
+    }
+    entries.push({ label, title: canonical?.title, display: canonical ? `Stage ${label} — ${canonical.title}` : `Stage ${label}`, canonical, occurrences, ambiguous });
+  }
+  return entries.sort((a, b) => compareStageLabels(a.label, b.label));
+}
+
+export function stageEntryFor(index: StageEntry[], label: string | undefined): StageEntry | undefined {
+  return label === undefined ? undefined : index.find((entry) => entry.label === label.toUpperCase());
+}
+
+/** The stage whose label follows `label` in workflow order: `found`, `last` (none later) or `unknown` (the label is not in the plan). */
+export function nextStageAfter(index: StageEntry[], label: string | undefined): { state: "found"; next: StageEntry } | { state: "last" } | { state: "unknown" } {
+  const current = stageEntryFor(index, label);
+  if (!current) {
+    return { state: "unknown" };
+  }
+  const later = index.filter((entry) => compareStageLabels(entry.label, current.label) > 0);
+  return later.length > 0 ? { state: "found", next: later[0] } : { state: "last" };
 }
 
 /** The first `# ` heading, as a display name for the document; undefined when none. */
@@ -207,12 +324,20 @@ export function sectionSummary(markdown: string, line: number, maxLength = SECTI
 
 export type MatchSource = "manual" | "id" | "label" | "brief" | "title";
 
+/**
+ * Where a stage sits in an associated plan. `current` is the heading that
+ * was matched (revealed by Open in plan); `stage` is the logical stage it
+ * belongs to, with the canonical section's title when the plan defines
+ * one; `next` follows from stage *labels* in workflow order, never from
+ * the heading that happens to come next in the file.
+ */
 export interface PlanPosition {
-  /** Index into the headings of the one that describes this stage. */
-  index: number;
   current: PlanHeading;
-  next?: PlanHeading;
-  previous?: PlanHeading;
+  /** The logical stage of `current`; undefined for a plain, unlabelled heading. */
+  stage?: StageEntry;
+  /** Display for the current stage: the canonical `Stage 3B — title`, else the matched heading's own text. */
+  display: string;
+  next: { state: "found"; stage: StageEntry } | { state: "last" } | { state: "unlabelled" };
   /** Which layer decided the match. */
   source: MatchSource;
 }
@@ -227,15 +352,19 @@ export interface StageIdentity {
   manual?: HeadingRef;
 }
 
-/** Headings whose label+title (or, for a stored match without label, title) equals `ref`; exact text, case-insensitive. */
+/**
+ * The heading a stored match refers to: by label when the plan has that
+ * stage (whichever of its headings the user picked, the stage is the same),
+ * else by exact title (a renumbered plan), and only when that is unique.
+ */
 export function findHeading(headings: PlanHeading[], ref: HeadingRef): number {
-  const wantLabel = ref.label?.toLowerCase();
-  const wantTitle = ref.title.trim().toLowerCase();
-  const exact = headings.findIndex((heading) => heading.title.trim().toLowerCase() === wantTitle && (heading.label?.toLowerCase() ?? undefined) === wantLabel);
-  if (exact >= 0) {
-    return exact;
+  if (ref.label) {
+    const entry = stageEntryFor(buildStageIndex(headings), ref.label);
+    if (entry) {
+      return headings.indexOf(entry.canonical ?? entry.occurrences[0]);
+    }
   }
-  // The label may have been renumbered; a unique title still identifies the section.
+  const wantTitle = ref.title.trim().toLowerCase();
   const byTitle = headings.map((heading, index) => ({ heading, index })).filter(({ heading }) => heading.title.trim().toLowerCase() === wantTitle);
   return byTitle.length === 1 ? byTitle[0].index : -1;
 }
@@ -247,17 +376,18 @@ export function findHeading(headings: PlanHeading[], ref: HeadingRef): number {
  *  2. the stage id: the heading's title slug equals the id's slug once the
  *     `stage-` / `stage-<n>-` prefix is removed, or the humanized id;
  *  3. a stage label carried by the id (`stage-3b-…`) or by the brief's own
- *     title/first lines (`# Stage 3B — …`), when exactly one heading has it;
+ *     title/first lines (`# Stage 3B — …`), when the plan has that stage;
  *  4. the display title, when it slugifies to exactly one heading title.
  *
  * Two headings matching, or none, at every layer yields undefined: no guess.
  */
 export function locateStage(headings: PlanHeading[], identity: string | StageIdentity): PlanPosition | undefined {
   const who: StageIdentity = typeof identity === "string" ? { stageId: identity } : identity;
+  const index = buildStageIndex(headings);
   if (who.manual) {
-    const index = findHeading(headings, who.manual);
-    if (index >= 0) {
-      return position(headings, index, "manual");
+    const at = findHeading(headings, who.manual);
+    if (at >= 0) {
+      return position(headings, index, at, "manual");
     }
   }
   const idSlug = slugify(humanizeStageId(who.stageId));
@@ -267,21 +397,17 @@ export function locateStage(headings: PlanHeading[], identity: string | StageIde
     return slug.length > 0 && (slug === idSlug || slug === bare);
   });
   if (byId !== undefined) {
-    return position(headings, byId, "id");
+    return position(headings, index, byId, "id");
   }
   const idLabel = /^stage-(\d+[a-z]?)-/i.exec(who.stageId)?.[1];
-  if (idLabel) {
-    const byIdLabel = uniqueLabel(headings, idLabel);
-    if (byIdLabel !== undefined) {
-      return position(headings, byIdLabel, "label");
-    }
+  const byIdLabel = stageEntryFor(index, idLabel);
+  if (byIdLabel) {
+    return position(headings, index, headings.indexOf(byIdLabel.canonical ?? byIdLabel.occurrences[0]), "label");
   }
   const markers = who.briefText ? parseBriefStageMarkers(who.briefText) : undefined;
-  if (markers?.current) {
-    const byBrief = uniqueLabel(headings, markers.current);
-    if (byBrief !== undefined) {
-      return position(headings, byBrief, "brief");
-    }
+  const byBrief = stageEntryFor(index, markers?.current);
+  if (byBrief) {
+    return position(headings, index, headings.indexOf(byBrief.canonical ?? byBrief.occurrences[0]), "brief");
   }
   if (who.title) {
     const titleSlug = slugify(who.title);
@@ -290,14 +416,26 @@ export function locateStage(headings: PlanHeading[], identity: string | StageIde
       return slug.length > 0 && slug === titleSlug;
     });
     if (byTitle !== undefined) {
-      return position(headings, byTitle, "title");
+      return position(headings, index, byTitle, "title");
     }
   }
   return undefined;
 }
 
-function position(headings: PlanHeading[], index: number, source: MatchSource): PlanPosition {
-  return { index, current: headings[index], next: headings[index + 1], previous: headings[index - 1], source };
+function position(headings: PlanHeading[], index: StageEntry[], at: number, source: MatchSource): PlanPosition {
+  const current = headings[at];
+  const stage = stageEntryFor(index, current.label);
+  const after = nextStageAfter(index, current.label);
+  return {
+    current,
+    stage,
+    // The canonical title when the plan defines the stage once; a bare
+    // `Stage 3B` when it defines it several times (no title is claimed);
+    // the heading's own text when the plan only mentions the stage.
+    display: stage?.canonical || stage?.ambiguous ? stage.display : current.display,
+    next: after.state === "found" ? { state: "found", stage: after.next } : after.state === "last" ? { state: "last" } : { state: "unlabelled" },
+    source,
+  };
 }
 
 function unique(headings: PlanHeading[], predicate: (heading: PlanHeading) => boolean): number | undefined {
@@ -305,22 +443,15 @@ function unique(headings: PlanHeading[], predicate: (heading: PlanHeading) => bo
   return matches.length === 1 ? matches[0].index : undefined;
 }
 
-/** Index of the single heading labelled `label` (case-insensitive); undefined when none or several. */
-function uniqueLabel(headings: PlanHeading[], label: string): number | undefined {
-  const want = label.toLowerCase();
-  return unique(headings, (heading) => heading.label?.toLowerCase() === want);
-}
-
 /**
- * Headings of the plan that the stage's brief mentions as later work
- * (`Stage 3C — …`, `Stage 4`), in document order of the plan. Display
- * context only: the brief describes intent, the plan is the document.
+ * Stages of the plan that the stage's brief mentions as later work
+ * (`Stage 3C — …`, `Stage 4`), in workflow order. Display context only:
+ * the brief describes intent, the plan is the document.
  */
-export function briefMentionedHeadings(headings: PlanHeading[], briefText: string | undefined, excludeIndex?: number): PlanHeading[] {
+export function briefMentionedStages(index: StageEntry[], briefText: string | undefined): StageEntry[] {
   if (!briefText) {
     return [];
   }
-  const markers = parseBriefStageMarkers(briefText);
-  const wanted = new Set(markers.mentioned.map((label) => label.toLowerCase()));
-  return headings.filter((heading, index) => index !== excludeIndex && heading.label !== undefined && wanted.has(heading.label.toLowerCase()));
+  const wanted = new Set(parseBriefStageMarkers(briefText).mentioned.map((label) => label.toUpperCase()));
+  return index.filter((entry) => wanted.has(entry.label));
 }

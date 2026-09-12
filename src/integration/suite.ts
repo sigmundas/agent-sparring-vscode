@@ -196,7 +196,14 @@ interface ModelReport {
   banner?: { kind: string; text: string };
   actions?: { plan: boolean; choosePlan: boolean; changePlan: boolean; matchStage: boolean };
   plan?: { source: string; name: string; current?: string; matched?: string; next?: { display: string; line: number; summary?: string } };
-  whatsNext?: { kind: string; heading?: string; summary?: string; text: string; hints?: string[] };
+  whatsNext?: { kind: string; heading?: string; summary?: string; text: string; hints?: string[]; start?: { stageId: string; label: string } };
+}
+
+interface StartOutcome {
+  ok: boolean;
+  stageId?: string;
+  runId?: string;
+  reason?: string;
 }
 
 async function shellIntegrationAvailable(cwd: string): Promise<boolean> {
@@ -344,7 +351,7 @@ async function planAssociationAssertions(report: DiscoveryDiagnostic, reportedRe
   assert.equal(associated.plan?.current, "Stage 1 — Review complete");
   assert.equal(associated.plan?.matched, "id");
   assert.equal(associated.plan?.next?.display, "Stage 2 — Cloud schema and synchronization");
-  assert.equal(associated.whatsNext?.kind, "next-heading", "the stage was accepted earlier in this run");
+  assert.equal(associated.whatsNext?.kind, "next-stage", "the stage was accepted earlier in this run");
   assert.equal(associated.whatsNext?.heading, "Stage 2 — Cloud schema and synchronization");
   const stageDir = path.join(reportedRepo, ".sparring", "stages", "stage-review-complete");
   assert.deepEqual((await fs.readdir(stageDir)).sort(), ["sparring.md", "state.json"], "the association never touches engine state");
@@ -361,14 +368,14 @@ async function planAssociationAssertions(report: DiscoveryDiagnostic, reportedRe
   const matched = await model();
   assert.equal(matched.plan?.current, "Stage 3B — Barrier");
   assert.equal(matched.plan?.matched, "manual");
-  assert.deepEqual(matched.whatsNext && [matched.whatsNext.kind, matched.whatsNext.heading, matched.whatsNext.summary], ["next-heading", "Stage 3C — Cloud schema", "Cloud side."]);
+  assert.deepEqual(matched.whatsNext && [matched.whatsNext.kind, matched.whatsNext.heading, matched.whatsNext.summary], ["next-stage", "Stage 3C — Cloud schema", "Cloud side."]);
   assert.deepEqual((await fs.readdir(stageDir)).sort(), ["sparring.md", "state.json"], "a manual match never touches engine state either");
   // Changing the match, and a match kept across a fresh discovery (the same workspace state a reload restores).
   assert.deepEqual(await vscode.commands.executeCommand("agentSparring._test.matchStage", { label: "3C", title: "Cloud schema" }), { label: "3C", title: "Cloud schema" });
   await vscode.commands.executeCommand("agentSparring.refresh");
   const changed = await model();
   assert.equal(changed.plan?.current, "Stage 3C — Cloud schema");
-  assert.equal(changed.whatsNext?.kind, "last-heading");
+  assert.equal(changed.whatsNext?.kind, "last-stage");
   assert.equal(await vscode.commands.executeCommand("agentSparring._test.matchStage", undefined), undefined);
   assert.equal((await model()).whatsNext?.kind, "match", "removing the match returns to asking");
 
@@ -378,6 +385,44 @@ async function planAssociationAssertions(report: DiscoveryDiagnostic, reportedRe
   assert.equal(removed.plan, undefined);
   assert.equal(removed.whatsNext?.kind, "choose");
   console.log("integration: plan association and manual heading match stored, displayed, changed and removed without touching engine state");
+  await startNextStageAssertions(report, reportedRepo, rangePlan);
+}
+
+// ---------------------------------------------------------------- Start next stage: the engine's new-stage, through the configured executable
+
+async function startNextStageAssertions(report: DiscoveryDiagnostic, reportedRepo: string, rangePlan: string): Promise<void> {
+  const model = async () => (await vscode.commands.executeCommand("agentSparring._test.overviewModel")) as ModelReport;
+  const callsLog = path.join(reportedRepo, ".sparring", "fake-calls.log");
+  const runId = runIdOf(report, reportedRepo, "stage-review-complete");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.associatePlan", rangePlan), rangePlan);
+  await vscode.commands.executeCommand("agentSparring._test.matchStage", { label: "3B", title: "Barrier" });
+  const before = await model();
+  assert.equal(before.whatsNext?.kind, "next-stage");
+  assert.equal(before.whatsNext?.start?.stageId, "stage-3c-cloud-schema");
+  await fs.rm(callsLog, { force: true });
+  const outcome = (await vscode.commands.executeCommand("agentSparring._test.startNextStage")) as StartOutcome | undefined;
+  assert.ok(outcome?.ok, `Start next stage succeeded: ${JSON.stringify(outcome)}`);
+  assert.equal(outcome.stageId, "stage-3c-cloud-schema");
+  assert.deepEqual((await fs.readFile(callsLog, "utf8")).trim().split("\n"), ["new-stage stage-3c-cloud-schema"], "exactly one engine command, nothing else, via the configured fake executable");
+  const created = path.join(reportedRepo, ".sparring", "stages", "stage-3c-cloud-schema");
+  assert.deepEqual((await fs.readdir(created)).sort(), ["brief.md", "state.json"], "the engine wrote the stage; the extension wrote nothing");
+  assert.match(await fs.readFile(path.join(created, "brief.md"), "utf8"), /Describe the bounded goal/, "the brief is the engine's template, left for the user to fill in");
+  const after = await model();
+  assert.equal(after.runKind, "Standalone stage");
+  assert.equal(after.stageStatus, "Working", "the Overview switched to the new stage");
+  assert.equal(after.stageAction?.label, "Run stage");
+  assert.equal(after.plan?.current, "Stage 3C — Cloud schema", "the plan association and its match followed the new stage");
+  assert.equal(after.plan?.matched, "manual");
+  assert.equal(after.whatsNext, undefined, "not accepted yet");
+  // Starting again from the previous stage finds the existing directory and creates nothing.
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+  await fs.rm(callsLog, { force: true });
+  const again = (await vscode.commands.executeCommand("agentSparring._test.startNextStage")) as StartOutcome | undefined;
+  assert.deepEqual(again && [again.ok, again.reason, again.stageId], [false, "exists", "stage-3c-cloud-schema"]);
+  assert.equal(await fs.readFile(callsLog, "utf8").catch(() => ""), "", "no engine command was issued for an existing stage");
+  await vscode.commands.executeCommand("agentSparring._test.associatePlan", undefined);
+  console.log("integration: Start next stage created the next stage with the engine's new-stage through the configured executable and carried the plan match over");
 }
 
 // ---------------------------------------------------------------- helpers

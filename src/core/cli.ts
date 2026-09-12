@@ -10,6 +10,7 @@
  *   sparring [--sparring-dir DIR] run-loop    STAGE --repo-root ROOT --expected-branch BRANCH
  *   sparring [--sparring-dir DIR] freeze-candidate STAGE --repo-root ROOT --expected-branch BRANCH
  *   sparring [--sparring-dir DIR] accept-candidate STAGE --repo-root ROOT --expected-branch BRANCH
+ *   sparring [--sparring-dir DIR] new-stage   STAGE
  *
  * No dependency on the vscode API.
  */
@@ -60,6 +61,22 @@ export function buildFreezeCandidateArgs(invocation: LoopInvocation): string[] {
 /** `sparring [--sparring-dir DIR] accept-candidate STAGE --repo-root ROOT --expected-branch BRANCH` (cli.py: accept_candidate). */
 export function buildAcceptCandidateArgs(invocation: LoopInvocation): string[] {
   return [...globalArgs(invocation), "accept-candidate", invocation.stageId, ...loopArgs(invocation)];
+}
+
+export interface NewStageInvocation {
+  stageId: string;
+  repoRoot: string;
+  sparringDir?: string;
+}
+
+/**
+ * `sparring [--sparring-dir DIR] new-stage STAGE` (cli.py: new_stage → Stage.create):
+ * the engine writes the stage skeleton (state.json, brief.md, notes.md,
+ * handoff.md, sparring.md templates). No --repo-root: the command takes
+ * only the global --sparring-dir, resolved against cwd when omitted.
+ */
+export function buildNewStageArgs(invocation: NewStageInvocation): string[] {
+  return [...globalArgs(invocation), "new-stage", invocation.stageId];
 }
 
 function globalArgs(invocation: { repoRoot: string; sparringDir?: string }): string[] {

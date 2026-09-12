@@ -8,8 +8,11 @@ import { renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel, type OverviewArtifacts } from "../core/overviewModel";
 import {
   associatedPlanFor,
-  briefMentionedHeadings,
+  briefMentionedStages,
+  buildStageIndex,
+  compareStageLabels,
   locateStage,
+  nextStageAfter,
   parsePlanHeadings,
   planAssociationFor,
   planTitle,
@@ -84,6 +87,59 @@ const BARRIER_BRIEF = [
 
 const BARRIER_ID = "stage-reported-statistics-local-schema-barrier";
 
+/**
+ * The structure of the real reported-statistics plan: the current stage's
+ * handoff near the top, older handoffs right after it in reverse order,
+ * architecture in between, and the prospective stage definitions further
+ * down. Document order is the opposite of workflow order.
+ */
+const FIELD_PLAN = [
+  "# Reported statistics and explicit range semantics",
+  "",
+  "## Current stage / reviewer handoff — 2026-09-12 (Stage 3B)",
+  "",
+  "Accepted at c0ffee. Claims and evidence below.",
+  "",
+  "## Stage 3A handoff — 2026-09-11",
+  "",
+  "Older handoff.",
+  "",
+  "## Stage 2 handoff — 2026-09-10",
+  "",
+  "## Stage 1 handoff — 2026-09-09",
+  "",
+  "## Architecture",
+  "",
+  "Prose about layers.",
+  "",
+  "## Stage 1 — Contract",
+  "",
+  "The contract.",
+  "",
+  "## Stage 2 — Typed parser",
+  "",
+  "## Stage 3A — Local schema",
+  "",
+  "## Stage 3B — Local reported-statistics persistence",
+  "",
+  "Persist locally.",
+  "",
+  "## Stage 3C — Cloud schema and synchronization",
+  "",
+  "Cloud schema, RPC surface and sync transport.",
+  "",
+  "## Stage 3D — Snapshot transport",
+  "",
+  "## Stage 4 — UI",
+  "",
+  "## Status history",
+  "",
+  "- Stage 3C candidate pending",
+  "",
+].join("\n");
+
+const PERSISTENCE_ID = "stage-reported-statistics-local-persistence";
+
 describe("lenient plan headings", () => {
   it("accepts stage labels the engine would refuse (3A, 3B, 3C), skipping fences, with line numbers", () => {
     const headings = parsePlanHeadings(REPORTED_PLAN);
@@ -97,6 +153,22 @@ describe("lenient plan headings", () => {
     );
     assert.equal(headings[2].display, "Stage 3C — Cloud schema and synchronization");
     assert.equal(planTitle(REPORTED_PLAN), "Reported statistics");
+  });
+
+  it("reads a `(Stage 3B)` marker inside a heading as a mention of that stage, and flags handoff/date headings as historical", () => {
+    const headings = parsePlanHeadings(FIELD_PLAN);
+    const handoff = headings[0];
+    assert.deepEqual([handoff.label, handoff.form, handoff.historical, handoff.title], ["3B", "mention", true, "Current stage / reviewer handoff — 2026-09-12"]);
+    assert.equal(handoff.display, "Current stage / reviewer handoff — 2026-09-12 (Stage 3B)");
+    assert.deepEqual(headings.filter((heading) => heading.form === "definition" && !heading.historical).map((heading) => heading.label), ["1", "2", "3A", "3B", "3C", "3D", "4"]);
+    assert.deepEqual(headings.filter((heading) => heading.historical).map((heading) => heading.display), [
+      "Current stage / reviewer handoff — 2026-09-12 (Stage 3B)",
+      "Stage 3A handoff — 2026-09-11",
+      "Stage 2 handoff — 2026-09-10",
+      "Stage 1 handoff — 2026-09-09",
+    ]);
+    assert.ok(!headings.some((heading) => heading.display === "Architecture"), "unlabelled headings are dropped once the plan has stage labels");
+    assert.equal(parsePlanHeadings("## Stage 3C — Review pipeline\n")[0].historical, false, "words like review do not make a definition historical");
   });
 
   it("reads stage headings at levels ## to ####, and falls back to plain ## headings when a document has none", () => {
@@ -125,8 +197,8 @@ describe("stage matching", () => {
     const position = locateStage(headings, BARRIER_ID);
     assert.equal(position?.source, "id");
     assert.equal(position?.current.display, "Stage 3B — Reported statistics local schema barrier");
-    assert.equal(position?.next?.display, "Stage 3C — Cloud schema and synchronization");
-    assert.equal(position?.previous?.display, "Stage 3A — Reported statistics contract");
+    assert.equal(position?.display, "Stage 3B — Reported statistics local schema barrier");
+    assert.deepEqual(position?.next.state === "found" ? position.next.stage.display : position?.next.state, "Stage 3C — Cloud schema and synchronization");
     assert.equal(locateStage(headings, "stage-2-reported-statistics-contract")?.current.label, "3A", "a numbered id still matches by slug");
     assert.equal(locateStage(headings, "stage-something-else"), undefined);
     assert.equal(locateStage(parsePlanHeadings("## Stage 1 — Same\n## Stage 2 — Same\n"), "stage-same"), undefined, "two candidates: no guess");
@@ -138,7 +210,9 @@ describe("stage matching", () => {
     assert.equal(locateStage(headings, BARRIER_ID), undefined);
     assert.equal(locateStage(headings, { stageId: BARRIER_ID, title: "Reported statistics local schema barrier" }), undefined, "a display title that matches no heading exactly is not enough");
     assert.equal(locateStage(headings, { stageId: BARRIER_ID, briefText: "# Brief\n\nNo markers here.\n" }), undefined);
-    assert.equal(locateStage(parsePlanHeadings("## Stage 3B — One\n## Stage 3B — Two\n"), { stageId: BARRIER_ID, briefText: BARRIER_BRIEF }), undefined, "a duplicated label in the plan is ambiguous");
+    // A label defined twice still names one logical stage (the brief says this *is* Stage 3B); no title is claimed for it.
+    const duplicated = locateStage(parsePlanHeadings("## Stage 3B — One\n## Stage 3B — Two\n"), { stageId: BARRIER_ID, briefText: BARRIER_BRIEF });
+    assert.deepEqual([duplicated?.source, duplicated?.stage?.ambiguous, duplicated?.display], ["brief", true, "Stage 3B"]);
   });
 
   it("uses a stage label carried by the id or by the brief's own title, and the display title, before giving up", () => {
@@ -146,7 +220,7 @@ describe("stage matching", () => {
     const byIdLabel = locateStage(headings, "stage-3b-local-schema-barrier-work");
     assert.deepEqual([byIdLabel?.source, byIdLabel?.current.display], ["label", "Stage 3B — Local schema barrier"]);
     const byBrief = locateStage(headings, { stageId: BARRIER_ID, briefText: BARRIER_BRIEF });
-    assert.deepEqual([byBrief?.source, byBrief?.current.display, byBrief?.next?.display], ["brief", "Stage 3B — Local schema barrier", "Stage 3C — Cloud schema/RPC and sync transport"]);
+    assert.deepEqual([byBrief?.source, byBrief?.current.display, byBrief?.next.state === "found" && byBrief.next.stage.display], ["brief", "Stage 3B — Local schema barrier", "Stage 3C — Cloud schema/RPC and sync transport"]);
     const byTitle = locateStage(headings, { stageId: "stage-x", title: "Local schema barrier" });
     assert.deepEqual([byTitle?.source, byTitle?.current.label], ["title", "3B"]);
     // Deferred stages mentioned later in the brief never name the current stage.
@@ -156,7 +230,7 @@ describe("stage matching", () => {
   it("the user's manual match wins, survives renumbering by title, and is ignored once its heading is gone", () => {
     const headings = parsePlanHeadings(RANGE_PLAN);
     const manual = locateStage(headings, { stageId: BARRIER_ID, briefText: BARRIER_BRIEF, manual: { label: "3C", title: "Cloud schema/RPC and sync transport" } });
-    assert.deepEqual([manual?.source, manual?.current.label, manual?.next?.label], ["manual", "3C", "3D"]);
+    assert.deepEqual([manual?.source, manual?.current.label, manual?.next.state === "found" && manual.next.stage.label], ["manual", "3C", "3D"]);
     const renumbered = locateStage(headings, { stageId: "stage-x", manual: { label: "7", title: "Snapshot transport" } });
     assert.deepEqual([renumbered?.source, renumbered?.current.label], ["manual", "3D"]);
     const gone = locateStage(headings, { stageId: BARRIER_ID, briefText: BARRIER_BRIEF, manual: { label: "9", title: "Removed section" } });
@@ -171,12 +245,78 @@ describe("stage matching", () => {
     assert.deepEqual(parseBriefStageMarkers("# Brief\n\nMentions later Stage 3C and Stage 4 only.\n"), { mentioned: ["3C", "4"] });
     assert.deepEqual(parseBriefStageMarkers("# Brief\n\n```\nStage 1\n```\n\n## Notes\n\nStage 2 follows.\n"), { mentioned: ["2"] });
     assert.deepEqual(parseBriefStageMarkers(undefined), { mentioned: [] });
-    const headings = parsePlanHeadings(RANGE_PLAN);
+    const index = buildStageIndex(parsePlanHeadings(RANGE_PLAN));
     assert.deepEqual(
-      briefMentionedHeadings(headings, BARRIER_BRIEF).map((heading) => heading.display),
+      briefMentionedStages(index, BARRIER_BRIEF).map((entry) => entry.display),
       ["Stage 3C — Cloud schema/RPC and sync transport", "Stage 3D — Snapshot transport", "Stage 4 — UI"],
     );
-    assert.deepEqual(briefMentionedHeadings(headings, undefined), []);
+    assert.deepEqual(briefMentionedStages(index, undefined), []);
+  });
+});
+
+describe("stage index: workflow order from labels, never from document order", () => {
+  it("orders labels numerically with letter suffixes: 1 < 2 < 3 < 3A < 3B < 3C < 4 < 10", () => {
+    const labels = ["10", "3C", "4", "3", "1", "3A", "2", "3B", "X"];
+    assert.deepEqual(labels.sort(compareStageLabels), ["1", "2", "3", "3A", "3B", "3C", "4", "10", "X"]);
+    assert.equal(compareStageLabels("3b", "3B"), 0, "case-insensitive suffix");
+  });
+
+  it("collapses every heading that carries a label into one logical stage and prefers the prospective definition over handoffs and history", () => {
+    const index = buildStageIndex(parsePlanHeadings(FIELD_PLAN));
+    assert.deepEqual(index.map((entry) => entry.label), ["1", "2", "3A", "3B", "3C", "3D", "4"]);
+    const b = index.find((entry) => entry.label === "3B")!;
+    assert.equal(b.occurrences.length, 2, "the handoff mention and the definition are the same stage");
+    assert.equal(b.canonical?.display, "Stage 3B — Local reported-statistics persistence");
+    assert.equal(b.display, "Stage 3B — Local reported-statistics persistence");
+    assert.equal(b.ambiguous, false);
+    const c = index.find((entry) => entry.label === "3C")!;
+    assert.equal(c.occurrences.length, 1, "the status-history bullet is not a heading");
+    assert.equal(c.canonical?.line, 31);
+    const one = index.find((entry) => entry.label === "1")!;
+    assert.equal(one.canonical?.display, "Stage 1 — Contract", "the dated handoff heading is not the definition");
+  });
+
+  it("regression: after the current Stage 3B handoff the file continues with the old Stage 3A handoff, yet the next stage is 3C", () => {
+    const headings = parsePlanHeadings(FIELD_PLAN);
+    assert.equal(headings[1].display, "Stage 3A handoff — 2026-09-11", "document adjacency: 3A follows 3B in the file");
+    // The user picked the handoff heading at the top as this stage.
+    const position = locateStage(headings, { stageId: PERSISTENCE_ID, manual: { label: "3B", title: "Current stage / reviewer handoff — 2026-09-12" } });
+    assert.equal(position?.source, "manual");
+    assert.equal(position?.stage?.label, "3B");
+    assert.equal(position?.display, "Stage 3B — Local reported-statistics persistence", "the clean canonical title, not the raw handoff heading");
+    assert.equal(position?.next.state, "found");
+    assert.equal(position?.next.state === "found" && position.next.stage.display, "Stage 3C — Cloud schema and synchronization");
+    assert.ok(!(position?.next.state === "found" && /3A|handoff/.test(position.next.stage.display)), "the adjacent historical heading is never up next");
+  });
+
+  it("walks the chain by label: 3B → 3C → 3D → 4 → nothing later", () => {
+    const index = buildStageIndex(parsePlanHeadings(FIELD_PLAN));
+    const after = (label: string) => {
+      const result = nextStageAfter(index, label);
+      return result.state === "found" ? result.next.label : result.state;
+    };
+    assert.equal(after("3B"), "3C");
+    assert.equal(after("3C"), "3D");
+    assert.equal(after("3D"), "4");
+    assert.equal(after("4"), "last");
+    assert.equal(after("3"), "unknown", "a label the plan does not have");
+    assert.equal(after("1"), "2");
+  });
+
+  it("a stage defined twice is ambiguous and gets no canonical section; a stage only mentioned historically has none either", () => {
+    const twice = buildStageIndex(parsePlanHeadings("## Stage 3C — Cloud schema\n\n## Stage 3C — Cloud schema, revised\n\n## Stage 3D — Snapshot\n"));
+    const c = twice.find((entry) => entry.label === "3C")!;
+    assert.equal(c.ambiguous, true);
+    assert.equal(c.canonical, undefined);
+    assert.equal(c.display, "Stage 3C");
+    const historicalOnly = buildStageIndex(parsePlanHeadings("## Stage 3B — Barrier\n\n## Stage 4 handoff — 2026-01-01\n"));
+    const four = historicalOnly.find((entry) => entry.label === "4")!;
+    assert.equal(four.canonical, undefined);
+    assert.equal(four.ambiguous, false);
+    assert.equal(nextStageAfter(historicalOnly, "3B").state, "found", "the label is later, but What's next must say the plan does not define it");
+    // A definition plus a historical mention is not ambiguous.
+    const mixed = buildStageIndex(parsePlanHeadings("## Stage 3C — Cloud schema\n\n## Stage 3C handoff — 2026-01-01\n"));
+    assert.equal(mixed[0].canonical?.display, "Stage 3C — Cloud schema");
   });
 });
 
@@ -269,28 +409,31 @@ describe("Overview plan actions", () => {
     assert.equal(working.plan?.name, "Reported statistics");
     assert.equal(working.plan?.current, "Stage 3B — Reported statistics local schema barrier");
     assert.equal(working.plan?.matched, "id");
-    assert.deepEqual(working.plan?.next, { display: "Stage 3C — Cloud schema and synchronization", line: 12, summary: "text" });
+    assert.deepEqual(working.plan?.next, { display: "Stage 3C — Cloud schema and synchronization", label: "3C", line: 12, summary: "text", defined: true, ambiguous: false });
+    assert.equal(working.plan?.currentLabel, "3B");
     assert.deepEqual(working.facts?.[1], { label: "Plan", value: "reported.md (associated in VS Code)" });
     let html = renderOverviewHtml(working, "n", "c");
     assert.match(html, /<button type="button" data-action="openPlan" [^>]*>Plan<\/button>/);
     assert.match(html, /data-action="associatePlan" [^>]*>Change plan…<\/button>/);
-    assert.match(html, /In the plan<\/h3><p><span class="next">Stage 3B — Reported statistics local schema barrier<\/span> <span class="muted">· matched automatically<\/span> <button type="button" class="quiet" data-action="matchStage"[^>]*>Change match…<\/button>/);
+    assert.match(html, /Current plan stage<\/h3><p class="nextstage">Stage 3B — Reported statistics local schema barrier<\/p><p class="muted matched">Matched automatically <button type="button" class="quiet" data-action="matchStage"[^>]*>Change match…<\/button><\/p>/);
+    assert.ok(!html.includes("Remove match"), "nothing to remove for an automatic match");
     assert.ok(!html.includes("What's next"), "What's next is for the accepted screen");
     assert.ok(!html.includes(ws.root), "no filesystem paths in the document");
 
     await ws.writeStage(BARRIER_ID, { status: "accepted", candidate_sha: "c".repeat(40) });
     const accepted = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, { ...ALL, plan: false, associatedPlan: associated }, T0);
     assert.deepEqual(accepted.whatsNext, {
-      kind: "next-heading",
+      kind: "next-stage",
       heading: "Stage 3C — Cloud schema and synchronization",
       summary: "text",
-      text: "The next section of the plan you linked. Read it in the plan; starting it is up to you.",
+      text: "Start next stage creates it with the engine; you then fill in its brief from this plan section and run it.",
+      start: { stageId: "stage-3c-cloud-schema-and-synchronization", label: "3C", title: "Cloud schema and synchronization", display: "Stage 3C — Cloud schema and synchronization", line: 12 },
     });
     html = renderOverviewHtml(accepted, "n", "c");
     assert.match(html, /What's next<\/h3><p class="nextstage">Stage 3C — Cloud schema and synchronization<\/p><p class="muted summary">text<\/p>/);
-    assert.match(html, /<button type="button" class="primary" data-action="openNextStage"[^>]*>Open next in plan<\/button><button type="button" class="quiet" data-action="matchStage"[^>]*>Change match…<\/button>/);
-    assert.match(html, /This stage is Stage 3B — Reported statistics local schema barrier in Reported statistics\./);
-    assert.ok(!/Continue plan|Next stage|Start next stage|Create next stage/.test(html), "no button pretends to start a stage the engine cannot");
+    assert.match(html, /<button type="button" class="primary" data-action="startNextStage" title="sparring new-stage stage-3c-cloud-schema-and-synchronization[^"]*">Start next stage<\/button><button type="button" data-action="openNextStage"[^>]*>Open in plan<\/button><button type="button" class="quiet" data-action="matchStage"[^>]*>Change match…<\/button>/);
+    assert.match(html, /Current plan stage<\/h3><p class="nextstage">Stage 3B — Reported statistics local schema barrier<\/p><p class="muted matched">Matched automatically<button type="button" class="quiet" data-action="associatePlan"[^>]*>Remove plan association<\/button>/);
+    assert.ok(!/Continue plan|Open next in plan/.test(html));
     assert.ok(!html.includes("Current activity"), "the accepted screen answers what to do next instead of watching activity");
   });
 
@@ -316,21 +459,67 @@ describe("Overview plan actions", () => {
     // The same brief, once it names its own stage, lets the plan place the stage without the user.
     const viaBrief = buildOverviewModel(selection, undefined, { ...ALL, plan: false, briefText: BARRIER_BRIEF, associatedPlan: associated }, T0);
     assert.equal(viaBrief.plan?.matched, "brief");
-    assert.equal(viaBrief.whatsNext?.kind, "next-heading");
+    assert.equal(viaBrief.whatsNext?.kind, "next-stage");
     assert.equal(viaBrief.whatsNext?.heading, "Stage 3C — Cloud schema/RPC and sync transport");
     assert.equal(viaBrief.whatsNext?.summary, "Cloud schema, RPC surface and the transport that carries reported statistics upward.");
+    assert.equal(viaBrief.whatsNext?.start?.stageId, "stage-3c-cloud-schema-rpc-and-sync-transport");
 
-    // And the user's own match overrides everything, is labelled as theirs, and can point at the last section.
+    // And the user's own match overrides everything, is labelled as theirs, and can point at the last stage.
     const manual = buildOverviewModel(selection, undefined, { ...ALL, plan: false, briefText: BARRIER_BRIEF, associatedPlan: { ...associated, manualMatch: { label: "4", title: "UI" } } }, T0);
     assert.equal(manual.plan?.matched, "manual");
-    assert.deepEqual(manual.whatsNext, { kind: "last-heading", text: "This stage is the last section of Reported statistics and explicit range semantics." });
-    assert.match(renderOverviewHtml(manual, "n", "c"), /This stage is Stage 4 — UI in Reported statistics and explicit range semantics \(matched by you\)\./);
+    assert.deepEqual(manual.whatsNext, { kind: "last-stage", text: "No later stage is defined in Reported statistics and explicit range semantics." });
+    const manualHtml = renderOverviewHtml(manual, "n", "c");
+    assert.match(manualHtml, /Current plan stage<\/h3><p class="nextstage">Stage 4 — UI<\/p><p class="muted matched">Matched manually <button type="button" class="quiet" data-action="clearMatch"[^>]*>Remove match<\/button><button type="button" class="quiet" data-action="associatePlan"[^>]*>Remove plan association<\/button>/);
+    assert.match(manualHtml, /data-action="matchStage"[^>]*>Change match…<\/button>/, "Change match… stays available after matching");
+    assert.ok(!manualHtml.includes("Start next stage"));
 
     const noHeadings = buildOverviewModel(selection, undefined, { ...ALL, plan: false, associatedPlan: { path: "/p/notes.md", exists: true, text: "just prose" } }, T0);
     assert.equal(noHeadings.actions?.matchStage, false);
     assert.equal(noHeadings.whatsNext?.kind, "match");
     assert.match(noHeadings.whatsNext?.text ?? "", /no section headings/);
     assert.ok(!renderOverviewHtml(noHeadings, "n", "c").includes("Match this stage…"), "nothing to pick from: no picker offered");
+  });
+
+  it("field reproduction: manual Stage 3B match on the handoff heading shows Stage 3B by its canonical title and offers Start next stage for 3C, never the adjacent 3A handoff", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage(PERSISTENCE_ID, { status: "accepted", candidate_sha: "c".repeat(40) });
+    const selection = selectRun((await discoverRuns([ws.location])).runs);
+    const associated = { path: "/p/reported.md", exists: true, text: FIELD_PLAN };
+    const unmatched = buildOverviewModel(selection, undefined, { ...ALL, plan: false, associatedPlan: associated }, T0);
+    assert.equal(unmatched.whatsNext?.kind, "match", "the id alone cannot place it: the user is asked");
+    const matched = buildOverviewModel(selection, undefined, { ...ALL, plan: false, associatedPlan: { ...associated, manualMatch: { label: "3B", title: "Current stage / reviewer handoff — 2026-09-12" } } }, T0);
+    assert.equal(matched.plan?.current, "Stage 3B — Local reported-statistics persistence");
+    assert.equal(matched.plan?.matched, "manual");
+    assert.equal(matched.plan?.currentLabel, "3B");
+    assert.equal(matched.whatsNext?.kind, "next-stage");
+    assert.equal(matched.whatsNext?.heading, "Stage 3C — Cloud schema and synchronization");
+    assert.equal(matched.whatsNext?.summary, "Cloud schema, RPC surface and sync transport.");
+    assert.equal(matched.whatsNext?.start?.stageId, "stage-3c-cloud-schema-and-synchronization");
+    const html = renderOverviewHtml(matched, "n", "c");
+    assert.match(html, /Current plan stage<\/h3><p class="nextstage">Stage 3B — Local reported-statistics persistence<\/p><p class="muted matched">Matched manually/);
+    assert.ok(!normalUi(html).includes("reviewer handoff"), "the raw handoff heading is not the primary label");
+    assert.ok(!/Stage 3A/.test(normalUi(html)), "document-adjacent Stage 3A is not up next");
+    assert.match(html, /data-action="startNextStage"[^>]*>Start next stage<\/button>/);
+    assert.match(html, /data-action="matchStage"[^>]*>Change match…<\/button>/);
+
+    // 3C → 3D → 4 → nothing later, each by label.
+    const at = (label: string, title: string) => buildOverviewModel(selection, undefined, { ...ALL, plan: false, associatedPlan: { ...associated, manualMatch: { label, title } } }, T0).whatsNext;
+    assert.equal(at("3C", "x")?.heading, "Stage 3D — Snapshot transport");
+    assert.equal(at("3D", "x")?.heading, "Stage 4 — UI");
+    assert.deepEqual(at("4", "x"), { kind: "last-stage", text: "No later stage is defined in Reported statistics and explicit range semantics." });
+
+    // A later stage defined twice is not started silently.
+    const twice = `${FIELD_PLAN}\n## Stage 3C — Cloud schema and synchronization (revised)\n`;
+    const unclear = buildOverviewModel(selection, undefined, { ...ALL, plan: false, associatedPlan: { path: "/p/r.md", exists: true, text: twice, manualMatch: { label: "3B", title: "x" } } }, T0);
+    assert.equal(unclear.whatsNext?.kind, "next-unclear");
+    assert.match(unclear.whatsNext?.text ?? "", /defines Stage 3C in more than one section/);
+    assert.equal(unclear.whatsNext?.start, undefined);
+    assert.ok(!renderOverviewHtml(unclear, "n", "c").includes("Start next stage"));
+
+    // A plan without stage labels cannot order anything.
+    const plain = buildOverviewModel(selection, undefined, { ...ALL, plan: false, associatedPlan: { path: "/p/n.md", exists: true, text: "# Notes\n\n## Background\n\n## Rollout\n", manualMatch: { title: "Background" } } }, T0);
+    assert.equal(plain.whatsNext?.kind, "no-labels");
+    assert.equal(plain.plan?.current, "Background");
   });
 
   it("accepted stage without a plan: Stage complete plus Choose plan… guidance, and no duplicate acceptance messaging", async () => {
@@ -378,7 +567,7 @@ describe("Overview plan actions", () => {
     assert.equal(model.actions?.changePlan, false);
     assert.equal(model.actions?.matchStage, false, "the engine records the position; nothing to match by hand");
     assert.equal(model.plan?.source, "managed");
-    assert.deepEqual(model.plan?.next, { display: "Stage 3 — Device/UI check!", line: 15, summary: "Manual check." });
+    assert.deepEqual(model.plan?.next, { display: "Stage 3 — Device/UI check!", label: "3", line: 15, summary: "Manual check.", defined: true });
     assert.deepEqual(model.planAction, { kind: "continue", label: "Continue plan", primary: true, detail: "sparring resume-plan: the accepted stage is advanced past and the next stage starts." });
     assert.equal(model.stageLine, "Stage complete. Continue plan starts the next stage.");
     assert.deepEqual(model.whatsNext, { kind: "continue", heading: "Stage 3 — Device/UI check!", summary: "Manual check.", text: "Continue plan starts it." });
@@ -391,7 +580,7 @@ describe("Overview plan actions", () => {
 
     // Without the document text the engine's heading is still shown; only the summary and line are unavailable.
     const noText = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, ALL, T0);
-    assert.deepEqual(noText.plan?.next, { display: "Stage 3 — Device/UI check!", line: 0, summary: undefined });
+    assert.deepEqual(noText.plan?.next, { display: "Stage 3 — Device/UI check!", label: "3", line: 0, summary: undefined, defined: true });
     assert.match(renderOverviewHtml(noText, "n", "c"), /<button type="button" data-action="openPlan"[^>]*>Open in plan<\/button>/);
   });
 

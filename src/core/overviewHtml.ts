@@ -14,6 +14,7 @@
  */
 
 import { TIMELINE_STATE_WORD, type ActorCard, type HistoryEntry, type OverviewModel, type TimelineItem, type WhatsNext } from "./overviewModel";
+import type { MatchSource } from "./planAssociation";
 import type { StageRunAction } from "./runner";
 
 export type OverviewAction =
@@ -31,6 +32,8 @@ export type OverviewAction =
   | "acceptStage"
   | "associatePlan"
   | "matchStage"
+  | "clearMatch"
+  | "startNextStage"
   | "stopRunner";
 
 export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
@@ -48,6 +51,8 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "acceptStage",
   "associatePlan",
   "matchStage",
+  "clearMatch",
+  "startNextStage",
   "stopRunner",
 ];
 
@@ -312,13 +317,18 @@ function renderPlanPlace(model: OverviewModel): string {
     return "";
   }
   if (plan.current) {
-    const how = plan.matched === "manual" ? "matched by you" : "matched automatically";
-    return `<div class="block"><h3>${icon("doc")}In the plan</h3><p><span class="next">${escapeHtml(plan.current)}</span> <span class="muted">· ${how}</span> ${button("matchStage", "Change match…", true, MATCH_TITLE, "quiet")}</p></div>`;
+    return `<div class="block"><h3>${icon("doc")}Current plan stage</h3>${renderCurrentPlanStage(plan.current, plan.matched)}</div>`;
   }
   if (!model.actions?.matchStage) {
     return "";
   }
-  return `<div class="block"><h3>${icon("doc")}In the plan</h3><p class="muted">Agent Sparring doesn't yet know where this stage belongs in ${escapeHtml(plan.name)}. ${button("matchStage", "Match this stage…", true, MATCH_TITLE, "quiet")}</p></div>`;
+  return `<div class="block"><h3>${icon("doc")}Current plan stage</h3><p class="muted">Agent Sparring doesn't yet know where this stage belongs in ${escapeHtml(plan.name)}. ${button("matchStage", "Match this stage…", true, MATCH_TITLE, "quiet")}</p></div>`;
+}
+
+/** `Stage 3B — title` with how it was decided and the two ways to change it. */
+function renderCurrentPlanStage(current: string, matched: MatchSource | undefined): string {
+  const how = matched === "manual" ? "Matched manually" : "Matched automatically";
+  return `<p class="nextstage">${escapeHtml(current)}</p><p class="muted matched">${how} ${button("matchStage", "Change match…", true, MATCH_TITLE, "quiet")}${matched === "manual" ? button("clearMatch", "Remove match", true, "Forget the section you picked and match automatically again", "quiet") : ""}</p>`;
 }
 
 /**
@@ -335,6 +345,7 @@ function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
   const hints = next.hints && next.hints.length > 0 ? `<p class="muted">The brief lists later work that is in this plan: ${next.hints.map((hint) => `<span class="next">${escapeHtml(hint)}</span>`).join(", ")}.</p>` : "";
   const buttons: string[] = [];
   const planName = plan?.name ?? "the plan";
+  const openNext = (label: string, cls = "") => button(plan?.next?.line ? "openNextStage" : "openPlan", label, true, plan?.next?.line ? `Open ${planName} at ${plan.next.display}` : `Open ${planName}`, cls);
   switch (next.kind) {
     case "continue":
     case "last-managed":
@@ -342,14 +353,20 @@ function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
         buttons.push(button("resumePlan", model.planAction.label, true, model.planAction.detail, "primary"));
       }
       if (model.actions?.plan) {
-        buttons.push(button(next.kind === "continue" && plan?.next?.line ? "openNextStage" : "openPlan", "Open in plan", true, next.kind === "continue" ? `Open ${planName} at the next stage` : `Open ${planName}`));
+        buttons.push(openNext("Open in plan"));
       }
       break;
-    case "next-heading":
-      buttons.push(button("openNextStage", "Open next in plan", true, `Open ${planName} at this heading`, "primary"));
+    case "next-stage":
+      buttons.push(button("startNextStage", "Start next stage", true, `sparring new-stage ${next.start?.stageId ?? ""} — creates the stage; you fill in brief.md from the plan section, then Run stage`, "primary"));
+      buttons.push(openNext("Open in plan"));
       buttons.push(button("matchStage", "Change match…", true, MATCH_TITLE, "quiet"));
       break;
-    case "last-heading":
+    case "next-unclear":
+      buttons.push(openNext("Open in plan", "primary"));
+      buttons.push(button("matchStage", "Change match…", true, MATCH_TITLE, "quiet"));
+      break;
+    case "last-stage":
+    case "no-labels":
       buttons.push(button("openPlan", "Open plan", true, `Open ${planName}`));
       buttons.push(button("matchStage", "Change match…", true, MATCH_TITLE, "quiet"));
       break;
@@ -361,14 +378,16 @@ function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
       buttons.push(button("associatePlan", "Change plan…", true, "Choose another plan file or remove the association", "quiet"));
       break;
     case "missing-plan":
-      buttons.push(button("associatePlan", "Choose plan…", true, CHOOSE_PLAN_TITLE, "primary"));
-      break;
     case "choose":
       buttons.push(button("associatePlan", "Choose plan…", true, CHOOSE_PLAN_TITLE, "primary"));
       break;
   }
-  const matchedBy = next.kind === "next-heading" || next.kind === "last-heading" ? `<p class="muted matched">This stage is ${escapeHtml(plan?.current ?? "")} in ${escapeHtml(planName)}${plan?.matched === "manual" ? " (matched by you)" : ""}.</p>` : "";
-  return `<div class="block whatsnext"><h3>${icon("arrow", "accent")}What's next</h3>${heading}${summary}${text}${hints}<div class="actions">${buttons.join("")}</div>${matchedBy}</div>`;
+  const matchedKinds: WhatsNext["kind"][] = ["next-stage", "next-unclear", "last-stage", "no-labels"];
+  const current =
+    matchedKinds.includes(next.kind) && plan?.current
+      ? `<div class="block currentstage"><h3>${icon("doc")}Current plan stage</h3><p class="nextstage">${escapeHtml(plan.current)}</p><p class="muted matched">${plan.matched === "manual" ? "Matched manually" : "Matched automatically"}${plan.matched === "manual" ? ` ${button("clearMatch", "Remove match", true, "Forget the section you picked and match automatically again", "quiet")}` : ""}${button("associatePlan", "Remove plan association", true, "Unlink this plan from the stage (kept in VS Code only)", "quiet")}</p></div>`
+      : "";
+  return `<div class="block whatsnext"><h3>${icon("arrow", "accent")}What's next</h3>${heading}${summary}${text}${hints}<div class="actions">${buttons.join("")}</div></div>${current}`;
 }
 
 function renderActor(card: ActorCard): string {

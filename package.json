@@ -82,6 +82,11 @@
         "category": "Agent Sparring"
       },
       {
+        "command": "agentSparring.startNextStage",
+        "title": "Start Next Stage from Plan…",
+        "category": "Agent Sparring"
+      },
+      {
         "command": "agentSparring.chooseExecutable",
         "title": "Choose sparring Executable…",
         "category": "Agent Sparring"

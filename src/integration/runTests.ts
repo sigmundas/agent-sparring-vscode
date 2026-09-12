@@ -73,6 +73,9 @@ async function buildFixture(): Promise<{ root: string; workspaceFile: string }> 
   // A fake `sparring`. run-loop: writes loop.started + turn.started for the
   // stage (and deliberately never turn.finished), then sleeps and exits as
   // instructed by <repo>/.sparring/fake-runner.conf; SIGINT ends it with 130.
+  // new-stage: creates the stage directory with state.json and a template
+  // brief.md like Stage.create (no --repo-root: it works from cwd), or
+  // refuses an existing directory with the engine's wording.
   // freeze-candidate / accept-candidate: rewrite state.json like the engine
   // (FROZEN with a candidate, then ACCEPTED), or refuse with the engine's own
   // stderr wording when the conf sets freeze_refusal / accept_refusal. Every
@@ -85,13 +88,20 @@ async function buildFixture(): Promise<{ root: string; workspaceFile: string }> 
       "#!/bin/sh",
       'sub="$1"',
       'stage="$2"',
-      'root="$4"',
+      'root="$4"; [ -n "$root" ] || root="$PWD"',
       'conf="$root/.sparring/fake-runner.conf"',
       "sleep_for=3; exit_with=0; freeze_refusal=; accept_refusal=",
       '[ -f "$conf" ] && . "$conf"',
       'dir="$root/.sparring/stages/$stage"',
       'echo "$sub $stage" >> "$root/.sparring/fake-calls.log"',
       'sha="c0ffee0000000000000000000000000000000000"',
+      'if [ "$sub" = "new-stage" ]; then',
+      '  if [ -d "$dir" ]; then echo "could not create stage: stage \'$stage\' already exists at $dir" >&2; exit 1; fi',
+      '  mkdir -p "$dir"',
+      '  printf \'{"base_sha": null, "candidate_sha": null, "implementation_session_id": null, "sparring_session_id": null, "status": "working"}\\n\' > "$dir/state.json"',
+      '  printf \'# Stage brief: %s\\n\\n## Goal\\n\\n(Describe the bounded goal for this stage.)\\n\' "$stage" > "$dir/brief.md"',
+      '  echo "created stage \'$stage\' at $dir"; exit 0',
+      "fi",
       'if [ "$sub" = "freeze-candidate" ]; then',
       '  if [ -n "$freeze_refusal" ]; then echo "could not freeze candidate: $freeze_refusal" >&2; exit 1; fi',
       '  printf \'{"base_sha": null, "candidate_sha": "%s", "implementation_session_id": null, "sparring_session_id": null, "status": "frozen"}\\n\' "$sha" > "$dir/state.json"',
