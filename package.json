@@ -80,15 +80,23 @@
     "compile-tests": "tsc -p tsconfig.test.json",
     "test": "npm run compile-tests && node --test \"out/test/**/*.test.js\"",
     "lint": "eslint src",
-    "vscode:prepublish": "npm run build"
+    "vscode:prepublish": "npm run build",
+    "package:vsix": "vsce package --no-dependencies --allow-missing-repository"
   },
   "devDependencies": {
     "@eslint/js": "^9.9.0",
     "@types/node": "^20.14.0",
     "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.23.0",
     "eslint": "^9.9.0",
     "typescript": "^5.5.4",
     "typescript-eslint": "^8.0.0"
-  }
+  },
+  "keywords": [
+    "agent-sparring",
+    "claude",
+    "codex",
+    "orchestration"
+  ]
 }

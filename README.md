@@ -1,6 +1,6 @@
 # Agent Sparring for VS Code
 
-A thin desktop cockpit for the [`agent-sparring`](../agent-sparring) engine.
+A thin desktop cockpit for the `agent-sparring` engine (the sibling Python project).
 The engine stays the authority; this extension only observes, launches and
 navigates.
 
@@ -57,3 +57,11 @@ npm run lint
 ```
 
 Press F5 in VS Code to launch an Extension Development Host.
+
+## Install locally
+
+```sh
+npm install
+npm run package:vsix                     # writes agent-sparring-vscode-<version>.vsix
+code --install-extension agent-sparring-vscode-0.1.0.vsix
+```

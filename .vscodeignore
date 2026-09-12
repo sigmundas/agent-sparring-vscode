@@ -7,3 +7,6 @@ tsconfig*.json
 eslint.config.mjs
 **/*.map
 .gitignore
+package-lock.json
+*.vsix
+.DS_Store
