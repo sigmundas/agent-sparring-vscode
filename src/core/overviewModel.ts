@@ -16,7 +16,7 @@ import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
 import { formatTime } from "./logFormat";
 import { presentStage, stageDisplayName } from "./presentation";
-import { applyRunner, stageRunAction, type RunnerStatus, type StageRunAction } from "./runner";
+import { applyRunner, isTurnActive, stageRunAction, type RunnerStatus, type StageRunAction } from "./runner";
 import { QUIET_AFTER_MS, formatAge } from "./status";
 
 export type TimelineState = "accepted" | "frozen" | "active" | "paused" | "working" | "future";
@@ -49,8 +49,15 @@ export interface ActorCard {
   /** Persisted session/thread id, shortened for display. */
   sessionLabel?: string;
   sessionKind: "session" | "thread";
-  /** Set when a busy claim has gone quiet for a long time. */
+  /** Set when a busy claim has had no meaningful activity for a long time (formatted age). */
   quietFor?: string;
+}
+
+/** Git facts for the footer, supplied by the caller; never inferred here. */
+export interface GitContext {
+  branch?: string;
+  /** Abbreviated HEAD commit. */
+  head?: string;
 }
 
 export interface Banner {
@@ -89,6 +96,8 @@ export interface OverviewArtifacts {
   plan: boolean;
   /** Contents of brief.md when it exists; only the Goal paragraph is displayed. */
   briefText?: string;
+  /** Checked-out branch and HEAD of the repository owning the run, when known. */
+  git?: GitContext;
 }
 
 export interface OverviewActions {
@@ -118,6 +127,12 @@ export interface OverviewModel {
   stageAction?: StageRunAction;
   /** A runner the extension launched for this run. */
   runner?: { alive: boolean; label: string };
+  /**
+   * Non-action state shown instead of Run/Resume while a turn is active.
+   * `detail` (tooltip only) says whether liveness is exact (our terminal)
+   * or inferred from telemetry of a loop started elsewhere.
+   */
+  busyState?: { label: string; detail: string };
   /** For ambiguous: the candidate labels. */
   choices?: string[];
   /** Plan journey: only for plan runs with a readable plan document. */
@@ -180,7 +195,7 @@ export function buildOverviewModel(
       plan: run.kind === "plan" && artifacts.plan,
       diff: diffAction(stage),
     },
-    facts: facts(run, stage),
+    facts: facts(run, stage, artifacts.git),
     goal: artifacts.brief ? parseBriefGoal(artifacts.briefText) : undefined,
     activity: activityLine(live, halted, nowMs),
     history: history(live),
@@ -191,15 +206,21 @@ export function buildOverviewModel(
   if (effective.interrupted) {
     model.activity = { kind: "stopped", text: "Runner stopped · last run interrupted" };
   } else if (effective.stale) {
-    model.activity = { kind: "stale", text: `${model.activity?.text ?? "Working"} · no telemetry for ${formatAge(nowMs - Date.parse(live?.lastEventTs ?? ""))}; the runner may have stopped` };
+    model.activity = { kind: "stale", text: `${model.activity?.text ?? "Working"} · no meaningful activity for ${formatAge(nowMs - Date.parse(live?.lastMeaningful?.ts ?? live?.lastEventTs ?? ""))}` };
   }
   if (ownRunner?.alive) {
     model.runner = { alive: true, label: "Stop (Ctrl-C)" };
-  } else {
-    if (ownRunner && effective.interrupted) {
-      model.runner = { alive: false, label: "Runner stopped" };
-    }
-    model.stageAction = stageRunAction(run, live);
+  } else if (ownRunner && effective.interrupted) {
+    model.runner = { alive: false, label: "Runner stopped" };
+  }
+  const loopEligible = run.kind === "plan" || (stage.state?.status !== "accepted" && stage.state?.status !== "frozen");
+  if (!halted && loopEligible && isTurnActive(live)) {
+    // Never offer a second loop for a stage the UI currently sees as busy.
+    model.busyState = ownRunner?.alive
+      ? { label: "Running", detail: "A runner launched from this window is active (exact: its terminal is open)." }
+      : { label: "Running", detail: "A turn is in progress according to activity.jsonl. The loop was started outside this window, so liveness is inferred from telemetry." };
+  } else if (!ownRunner?.alive) {
+    model.stageAction = run.kind === "stage" ? stageRunAction(run, live) : undefined;
   }
 
   const outcome = run.kind === "plan" ? run.currentOutcome : run.outcome;
@@ -277,7 +298,10 @@ function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveSt
     activity = role === "stage" ? "Working" : "Sparring";
     const active = activeDurationMs(actor, nowMs);
     duration = active === undefined ? undefined : formatDuration(active);
-    const age = actor.lastEventTs ? nowMs - Date.parse(actor.lastEventTs) : NaN;
+    // Measured from the last event the Output Channel would show, so hidden
+    // tool noise does not make a silent turn look lively.
+    const since = live?.lastMeaningful?.ts ?? actor.lastEventTs;
+    const age = since ? nowMs - Date.parse(since) : NaN;
     if (Number.isFinite(age) && age > QUIET_AFTER_MS) {
       quietFor = formatAge(age);
     }
@@ -440,11 +464,15 @@ function diffAction(stage: StageSnapshot): OverviewActions["diff"] {
 }
 
 /** Quiet metadata for the bottom of the page; nothing here is primary content. */
-function facts(run: RunSnapshot, stage: StageSnapshot): { label: string; value: string }[] {
+function facts(run: RunSnapshot, stage: StageSnapshot, git: GitContext | undefined): { label: string; value: string }[] {
   const out: { label: string; value: string }[] = [{ label: "Repository", value: run.location.folderName }];
   if (run.kind === "plan") {
     out.push({ label: "Plan", value: run.state.status });
-    out.push({ label: "Branch", value: run.state.expectedBranch });
+    out.push({ label: "Expected branch", value: run.state.expectedBranch });
+  }
+  if (git?.branch || git?.head) {
+    const head = git.head ? shortenId(git.head, 8)?.replace(/…$/, "") : undefined;
+    out.push({ label: "Checked out", value: [git.branch ?? "(detached)", head ? `@ ${head}` : ""].filter(Boolean).join(" ") });
   }
   if (stage.state?.baseSha) {
     out.push({ label: "Base", value: shortenId(stage.state.baseSha) ?? "" });
@@ -452,7 +480,6 @@ function facts(run: RunSnapshot, stage: StageSnapshot): { label: string; value: 
   if (stage.state?.candidateSha) {
     out.push({ label: "Candidate", value: shortenId(stage.state.candidateSha) ?? "" });
   }
-  out.push({ label: "Stage id", value: stage.stageId });
   if (stage.state?.implementationSessionId) {
     out.push({ label: "Stage session", value: shortenId(stage.state.implementationSessionId, 12) ?? "" });
   }

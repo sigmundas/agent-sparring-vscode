@@ -330,8 +330,12 @@ export class SparringController implements vscode.Disposable {
   }
 
   /** Live state as presented: busy claims a finished runner of ours cannot back are cleared. */
-  private effectiveLive(): LiveState | undefined {
+  get presentedLive(): LiveState | undefined {
     return applyRunner(this.live, this.runnerFor(this.selection.selected?.id), Date.now()).live;
+  }
+
+  private effectiveLive(): LiveState | undefined {
+    return this.presentedLive;
   }
 
   get sparringLocations(): SparringLocation[] {

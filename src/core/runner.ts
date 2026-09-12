@@ -33,7 +33,11 @@ export interface StageRunAction {
 /**
  * The loop action for the selected run, or undefined when none applies:
  * plan runs use Run/Resume Plan; accepted and frozen stages are terminal
- * for the loop; READY only offers an explicit, non-primary rerun.
+ * for the loop; a stage the telemetry shows mid-turn must never get a
+ * second loop; READY only offers an explicit, non-primary rerun.
+ *
+ * `live` must already be the presented state (see applyRunner), so a turn
+ * cut off by our own finished runner no longer counts as active.
  */
 export function stageRunAction(run: RunSnapshot | undefined, live?: LiveState): StageRunAction | undefined {
   if (!run || run.kind !== "stage") {
@@ -43,14 +47,30 @@ export function stageRunAction(run: RunSnapshot | undefined, live?: LiveState): 
   if (status === "accepted" || status === "frozen") {
     return undefined;
   }
+  if (isTurnActive(live)) {
+    return undefined;
+  }
   if (presentStage(status, run.outcome, live).kind === "ready") {
     return { kind: "rerun", label: "Run loop again", primary: false };
   }
-  return hasSessions(run) ? { kind: "resume", label: "Resume stage", primary: true } : { kind: "run", label: "Run stage", primary: true };
+  return hasSessions(run, live) ? { kind: "resume", label: "Resume stage", primary: true } : { kind: "run", label: "Run stage", primary: true };
 }
 
-export function hasSessions(run: StandaloneStageSnapshot): boolean {
-  return Boolean(run.stage.state?.implementationSessionId || run.stage.state?.sparringSessionId);
+/** A stage or sparring turn is in progress as far as the (presented) telemetry says. */
+export function isTurnActive(live: LiveState | undefined): boolean {
+  return Boolean(live && (live.stage.busy || live.sparrer.busy));
+}
+
+/**
+ * Whether a loop already ran for this stage: persisted session ids in
+ * state.json, or session ids / turns observed in telemetry (the engine
+ * persists ids after the first turn, so an interrupted first run counts).
+ */
+export function hasSessions(run: StandaloneStageSnapshot, live?: LiveState): boolean {
+  if (run.stage.state?.implementationSessionId || run.stage.state?.sparringSessionId) {
+    return true;
+  }
+  return Boolean(live && (live.stage.sessionId || live.sparrer.sessionId || live.recentMeaningful.some((entry) => entry.event === "turn.started")));
 }
 
 // ---------------------------------------------------------------- branch

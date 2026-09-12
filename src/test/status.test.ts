@@ -50,7 +50,8 @@ describe("status bar derivation", () => {
     const selection = await planSelection("running", 0);
     const live = foldEvents([event("stage", "turn.started", { provider: "claude-cli" })]);
     const view = deriveStatus(selection, live, Date.parse(live.lastEventTs!) + QUIET_AFTER_MS + 60_000);
-    assert.match(view.text, /Claude working · quiet 11m/);
+    assert.match(view.text, /Claude working · no activity 11m/);
+    assert.match(view.tooltip, /No meaningful activity for 11m/);
   });
 
   it("telemetry never overrides authoritative pause/complete", async () => {

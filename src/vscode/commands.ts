@@ -7,7 +7,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, readGitBranch, resolveExecutable } from "../core/cli";
+import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, resolveExecutable } from "../core/cli";
 import {
   BRIEF_FILENAME,
   HANDOFF_FILENAME,
@@ -23,8 +23,9 @@ import {
 import { parsePlanStages } from "../core/engineFormats";
 import type { OverviewAction } from "../core/overviewHtml";
 import { buildRunPickItems, describeRun } from "../core/runPick";
-import { pickBranch, stageRunAction, type GitRepositoryInfo } from "../core/runner";
+import { stageRunAction } from "../core/runner";
 import type { SparringController } from "./controller";
+import { currentBranch } from "./git";
 import { openCandidateDiff } from "./overview/gitDiff";
 import { OverviewPanelManager } from "./overview/overviewPanel";
 
@@ -85,36 +86,42 @@ async function openOverviewCommand(controller: SparringController, overview: Ove
   await overview.show();
 }
 
-async function openStageFile(controller: SparringController, filename: string): Promise<void> {
+async function openStageFile(controller: SparringController, overview: OverviewPanelManager, filename: string): Promise<void> {
   const run = controller.currentSelection.selected;
   if (!run) {
     return;
   }
-  await openDocument(path.join(currentStageOf(run).dir, filename), `${filename} does not exist yet for this stage.`);
+  await openDocument(path.join(currentStageOf(run).dir, filename), `${filename} does not exist yet for this stage.`, overview.documentColumn);
 }
 
-async function openDocument(file: string, missingMessage: string): Promise<void> {
+/**
+ * Open a document as a normal preview tab in the Overview's own editor
+ * group. showTextDocument reveals an already-open tab for the same URI
+ * instead of duplicating it, and preview tabs are reused by the next
+ * action unless the user pinned one; the Overview tab itself stays open.
+ */
+async function openDocument(file: string, missingMessage: string, viewColumn: vscode.ViewColumn): Promise<void> {
   try {
     await fs.access(file);
   } catch {
     void vscode.window.showWarningMessage(`Agent Sparring: ${missingMessage}`);
     return;
   }
-  await vscode.window.showTextDocument(vscode.Uri.file(file), { preview: true, viewColumn: vscode.ViewColumn.Beside });
+  await vscode.window.showTextDocument(vscode.Uri.file(file), { preview: true, viewColumn, preserveFocus: false });
 }
 
 async function handleOverviewAction(controller: SparringController, overview: OverviewPanelManager, action: OverviewAction): Promise<void> {
   const run = controller.currentSelection.selected;
   switch (action) {
     case "openHandoff":
-      return openStageFile(controller, HANDOFF_FILENAME);
+      return openStageFile(controller, overview, HANDOFF_FILENAME);
     case "openSparring":
-      return openStageFile(controller, SPARRING_FILENAME);
+      return openStageFile(controller, overview, SPARRING_FILENAME);
     case "openBrief":
-      return openStageFile(controller, BRIEF_FILENAME);
+      return openStageFile(controller, overview, BRIEF_FILENAME);
     case "openPlan":
       if (run?.kind === "plan") {
-        await openDocument(run.planPath, `the plan document ${run.state.plan} is missing.`);
+        await openDocument(run.planPath, `the plan document ${run.state.plan} is missing.`, overview.documentColumn);
       }
       return;
     case "openDiff": {
@@ -153,42 +160,6 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
 
 // ---------------------------------------------------------------- run / resume stage
 
-/** Minimal surface of the built-in Git extension's API (vscode.git, API version 1). */
-interface GitApi {
-  repositories: { rootUri: vscode.Uri; state: { HEAD?: { name?: string } } }[];
-}
-
-function gitRepositories(): GitRepositoryInfo[] | undefined {
-  const extension = vscode.extensions.getExtension<{ getAPI(version: 1): GitApi }>("vscode.git");
-  if (!extension?.isActive) {
-    return undefined;
-  }
-  try {
-    return extension.exports.getAPI(1).repositories.map((repo) => ({ rootPath: repo.rootUri.fsPath, branch: repo.state.HEAD?.name }));
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * The current branch of the repository owning `repoRoot`: the Git
- * extension's view first, `.git/HEAD` (worktree-aware) when the extension
- * is unavailable or has not opened that repository. Detached HEAD → undefined.
- */
-export async function currentBranch(repoRoot: string): Promise<string | undefined> {
-  const repos = gitRepositories();
-  if (repos) {
-    const fromApi = pickBranch(repoRoot, repos);
-    if (fromApi) {
-      return fromApi;
-    }
-    if (repos.some((repo) => isInsidePath(repoRoot, repo.rootPath) || path.resolve(repo.rootPath) === path.resolve(repoRoot))) {
-      return undefined; // the extension knows the repository and says it is detached
-    }
-  }
-  return readGitBranch(repoRoot);
-}
-
 async function runStageCommand(controller: SparringController): Promise<void> {
   let run = controller.currentSelection.selected;
   if (!run || run.kind !== "stage") {
@@ -206,10 +177,12 @@ async function runStageCommand(controller: SparringController): Promise<void> {
     void vscode.window.showInformationMessage(`Agent Sparring: a runner launched from this window is still active for ${run.stage.stageId}.`);
     return;
   }
-  const action = stageRunAction(run, controller.currentLive);
+  const live = controller.presentedLive;
+  const action = stageRunAction(run, live);
   if (!action) {
     const status = run.stage.state?.status ?? "working";
-    void vscode.window.showInformationMessage(`Agent Sparring: ${run.stage.stageId} is ${status}; the loop does not run for ${status} stages.`);
+    const why = live && (live.stage.busy || live.sparrer.busy) ? "a turn is already in progress according to its telemetry" : `the loop does not run for ${status} stages`;
+    void vscode.window.showInformationMessage(`Agent Sparring: ${run.stage.stageId} is ${status}; ${why}.`);
     return;
   }
   await launchStageLoop(controller, run, action.label);
@@ -315,7 +288,7 @@ async function looksLikePlan(file: string): Promise<boolean> {
 }
 
 async function askBranch(location: SparringLocation, recorded?: string): Promise<string | undefined> {
-  const detected = recorded ?? (await readGitBranch(location.repoRoot));
+  const detected = recorded ?? (await currentBranch(location.repoRoot));
   const value = await vscode.window.showInputBox({
     title: "Agent Sparring: expected branch",
     prompt: recorded

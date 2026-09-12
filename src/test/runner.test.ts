@@ -171,7 +171,46 @@ describe("runner lifecycle presentation", () => {
     const model = buildOverviewModel(selection, live, ALL, T0 + 60_000, runner);
     assert.equal(model.activity?.kind, "last");
     assert.equal(model.runner, undefined);
-    assert.equal(model.stageAction?.kind, "run");
+    assert.equal(model.stageAction?.kind, "resume", "a turn was observed, so the next launch is a resume");
+  });
+
+  it("an active turn hides Run/Resume even for an externally launched loop, and says so only in the tooltip", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("s", { status: "working" });
+    const selection = selectRun((await discoverRuns([ws.location])).runs);
+    const live = busyLive();
+    const external = buildOverviewModel(selection, live, ALL, T0 + 60_000);
+    assert.equal(external.stageAction, undefined, "never a second run-loop for a busy stage");
+    assert.equal(external.busyState?.label, "Running");
+    assert.match(external.busyState?.detail ?? "", /started outside this window.*inferred from telemetry/);
+    assert.equal(stageRunAction(selection.selected, live), undefined);
+    let html = renderOverviewHtml(external, "n", "c");
+    assert.ok(!html.includes('data-action="runStage"'));
+    assert.match(html, /<span class="busy" title="[^"]*inferred from telemetry[^"]*"><svg[^>]*>.*?<\/svg>Running<\/span>/);
+    assert.ok(!/inferred from telemetry<\/span>/.test(html), "the distinction lives in the tooltip, not the visible text");
+
+    const own: RunnerStatus = { runId: selection.selected!.id, alive: true, startedAtMs: T0 };
+    const owned = buildOverviewModel(selection, live, ALL, T0 + 60_000, own);
+    assert.equal(owned.busyState?.label, "Running");
+    assert.match(owned.busyState?.detail ?? "", /exact: its terminal is open/);
+    html = renderOverviewHtml(owned, "n", "c");
+    assert.match(html, /class="danger" data-action="stopRunner"/);
+
+    // The turn ends (finished or interrupted), the stage stays non-terminal: Resume stage.
+    applyEvent(live, { v: 1, ts: at(90), actor: "stage", event: "turn.finished" });
+    const after = buildOverviewModel(selection, live, ALL, T0 + 120_000);
+    assert.equal(after.busyState, undefined);
+    assert.deepEqual(after.stageAction, { kind: "resume", label: "Resume stage", primary: true });
+  });
+
+  it("a stage never run at all still gets Run stage; frozen/accepted get nothing even when busy telemetry lingers", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("fresh", { status: "working" });
+    assert.equal(stageRunAction(await standalone(ws), foldEvents([event("loop", "loop.started")]))?.kind, "run");
+    await ws.writeStage("fresh", { status: "frozen", base_sha: "b", candidate_sha: "c" });
+    const model = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), busyLive(), ALL, T0 + 60_000);
+    assert.equal(model.stageAction, undefined);
+    assert.equal(model.busyState, undefined, "frozen is halted for the loop; no Running claim");
   });
 
   it("a turn that started after the runner ended (another launcher) is still trusted", () => {
@@ -202,10 +241,12 @@ describe("runner lifecycle presentation", () => {
     assert.equal(soon.stageAgent?.activity, "Working");
     const later = buildOverviewModel(selection, live, ALL, T0 + STALE_ACTIVE_MS + 60_000);
     assert.equal(later.activity?.kind, "stale");
-    assert.equal(later.activity?.text, "Working for 30m 59s · Claude · no telemetry for 30m; the runner may have stopped");
+    assert.equal(later.activity?.text, "Working for 30m 59s · Claude · no meaningful activity for 30m", "no hang implied");
+    assert.equal(later.busyState?.label, "Running", "still busy as far as telemetry says, so still no Run button");
+    assert.match(renderOverviewHtml(later, "n", "c"), /no meaningful activity for 30m<\/span>/);
     assert.equal(later.stageAgent?.activity, "Working", "the claim is kept, only qualified");
     assert.ok(later.stageAgent?.quietFor);
-    assert.equal(later.stageAction?.label, "Run stage", "resuming is still offered");
+    assert.equal(later.stageAction, undefined, "a stale busy claim is still a busy claim: no second loop");
     assert.equal(applyRunner(undefined, undefined, T0).live, undefined);
     assert.equal(applyRunner(foldEvents([event("stage", "turn.finished")]), undefined, T0 + STALE_ACTIVE_MS * 2).stale, false, "idle claims never go stale");
   });

@@ -304,8 +304,12 @@ describe("standalone-stage degradation", () => {
     assert.deepEqual(model.lastSparring, { action: "READY", summary: "Looks done", reason: undefined });
     assert.deepEqual(
       model.facts?.map((fact) => fact.label),
-      ["Repository", "Stage id", "Stage session", "Sparring thread"],
+      ["Repository", "Stage session", "Sparring thread"],
     );
+    const withGit = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, { ...ALL, git: { branch: "feature/reported-statistics-contract", head: "82ab1234deadbeef" } }, T0);
+    assert.deepEqual(withGit.facts?.[1], { label: "Checked out", value: "feature/reported-statistics-contract @ 82ab1234" });
+    const detached = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, { ...ALL, git: { head: "82ab1234deadbeef" } }, T0);
+    assert.deepEqual(detached.facts?.[1], { label: "Checked out", value: "(detached) @ 82ab1234" });
     const html = renderOverviewHtml(model, "n", "c");
     assert.ok(!html.includes('class="journey"'));
     assert.ok(!/Stage \d+ (of|\/) \d+/.test(html), "no position pill without a plan");

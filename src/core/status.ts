@@ -123,11 +123,14 @@ function liveSuffix(live: LiveState | undefined, nowMs: number, tooltipLines: st
   } else if (live.stage.busy) {
     suffix = `${providerDisplayName(live.stage.provider, "stage")} working`;
   }
-  if (live.lastEventTs) {
-    const age = nowMs - Date.parse(live.lastEventTs);
-    tooltipLines.push(`Last activity ${formatAge(age)} ago`);
+  const since = live.lastMeaningful?.ts ?? live.lastEventTs;
+  if (since) {
+    const age = nowMs - Date.parse(since);
     if (suffix && age > QUIET_AFTER_MS) {
-      suffix += ` · quiet ${formatAge(age)}`;
+      suffix += ` · no activity ${formatAge(age)}`;
+      tooltipLines.push(`No meaningful activity for ${formatAge(age)}`);
+    } else if (live.lastMeaningful) {
+      tooltipLines.push(`Last event: ${live.lastMeaningful.description}`);
     }
   }
   if (live.lastVerdict?.summary) {

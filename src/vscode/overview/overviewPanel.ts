@@ -12,7 +12,9 @@ import * as vscode from "vscode";
 import { BRIEF_FILENAME, HANDOFF_FILENAME, SPARRING_FILENAME, currentStageOf } from "../../core/discovery";
 import { renderOverviewHtml, type OverviewAction } from "../../core/overviewHtml";
 import { buildOverviewModel, type OverviewArtifacts, type OverviewModel } from "../../core/overviewModel";
+import { documentViewColumn } from "../../core/viewColumn";
 import type { SparringController } from "../controller";
+import { gitContext } from "../git";
 
 const VIEW_TYPE = "agentSparring.overview";
 
@@ -56,11 +58,28 @@ export class OverviewPanelManager implements vscode.Disposable {
       }
     });
     this.panel.onDidChangeViewState((event) => {
+      if (event.webviewPanel.viewColumn !== undefined) {
+        this.lastColumn = event.webviewPanel.viewColumn;
+      }
       if (event.webviewPanel.visible) {
         this.scheduleUpdate();
       }
     });
+    if (this.panel.viewColumn !== undefined) {
+      this.lastColumn = this.panel.viewColumn;
+    }
     await this.update();
+  }
+
+  private lastColumn: vscode.ViewColumn | undefined;
+
+  /**
+   * The editor group the Overview lives in (current when visible, else the
+   * last one it was seen in), so document actions open beside its tab and
+   * follow it when it is moved.
+   */
+  get documentColumn(): vscode.ViewColumn {
+    return documentViewColumn(this.panel?.viewColumn, this.lastColumn, vscode.window.activeTextEditor?.viewColumn) as vscode.ViewColumn;
   }
 
   private scheduleUpdate(): void {
@@ -99,7 +118,7 @@ export class OverviewPanelManager implements vscode.Disposable {
         readHead(path.join(stage.dir, BRIEF_FILENAME)),
         selection.selected.kind === "plan" ? exists(selection.selected.planPath) : Promise.resolve(false),
       ]);
-      artifacts = { handoff, sparring, brief: briefText !== undefined, briefText, plan };
+      artifacts = { handoff, sparring, brief: briefText !== undefined, briefText, plan, git: await gitContext(selection.selected.location.repoRoot) };
     }
     return buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.runnerFor(selection.selected?.id));
   }

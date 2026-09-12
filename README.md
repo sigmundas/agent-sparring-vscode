@@ -69,6 +69,19 @@ recomputed from the authoritative files; an exit without a matching
 While the runner is alive the Overview offers **Stop (Ctrl-C)**, which sends
 Ctrl-C to that exact terminal. Engine state is never modified.
 
+Whenever the telemetry shows a stage or sparring turn in progress, whoever
+started it, the Overview shows a non-clickable **Running** state instead of
+Run/Resume, so a second loop can never be launched for a busy stage. The
+tooltip says whether that liveness is exact (our terminal) or inferred from
+telemetry. Once the turn has ended and the stage is still non-terminal,
+**Resume stage** returns. A busy claim with no meaningful activity for a
+while reads "no meaningful activity for Xm" rather than implying a hang.
+
+Overview document actions (Brief, Handoff, Sparring report, Plan) open as
+preview tabs in the editor group the Overview panel is in and follow it if
+it is moved; Diff keeps its dedicated diff view and Log focuses the Output
+panel.
+
 For loops started elsewhere, process liveness is unknown: telemetry is
 trusted as before, but a busy claim with no events for 30 minutes is shown as
 stale ("the runner may have stopped") rather than as certain work.

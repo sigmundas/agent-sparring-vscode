@@ -155,6 +155,9 @@ function renderStageCard(model: OverviewModel): string {
     const title = `sparring run-loop ${model.stageId ?? ""} --repo-root <project> --expected-branch <current branch>`;
     buttons.push(button("runStage", model.stageAction.label, true, title, model.stageAction.primary ? "primary" : ""));
   }
+  if (model.busyState) {
+    buttons.push(`<span class="busy" title="${escapeHtml(model.busyState.detail)}">${icon("dot", "dot")}${escapeHtml(model.busyState.label)}</span>`);
+  }
   if (model.runner?.alive) {
     buttons.push(button("stopRunner", model.runner.label, true, "Send Ctrl-C to the terminal running this stage", "danger"));
   }
@@ -222,7 +225,7 @@ function renderStageCard(model: OverviewModel): string {
 function renderActor(card: ActorCard): string {
   const busy = card.activity === "Working" || card.activity === "Sparring";
   const duration = card.duration ? ` for ${escapeHtml(card.duration)}` : "";
-  const quiet = card.quietFor ? ` <span class="muted">· quiet ${escapeHtml(card.quietFor)}</span>` : "";
+  const quiet = card.quietFor ? ` <span class="muted">· no meaningful activity for ${escapeHtml(card.quietFor)}</span>` : "";
   const session = card.sessionLabel ? `${capitalize(card.sessionKind)}: ${escapeHtml(card.sessionLabel)}` : `No ${card.sessionKind} yet`;
   const who = whoClass(card.provider);
   return `<div class="card actor">
@@ -380,6 +383,7 @@ button:disabled { opacity: 0.45; cursor: default; }
 button.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: transparent; font-weight: 600; }
 button.primary:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
 button.danger { color: var(--warn); border-color: var(--warn); }
+.busy { display: inline-flex; align-items: center; padding: 4px 11px; border: 1px solid var(--good); border-radius: 6px; font-size: 0.92em; color: var(--good); font-weight: 600; cursor: help; }
 .stopped, .stale { display: flex; align-items: center; color: var(--warn); }
 
 .facts { display: grid; grid-template-columns: max-content 1fr; gap: 1px 12px; margin: 0; padding-top: 8px; border-top: 1px solid var(--line); font-size: 0.82em; color: var(--vscode-descriptionForeground); }
