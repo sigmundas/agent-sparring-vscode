@@ -200,8 +200,9 @@ describe("overview view model", () => {
     assert.equal(model.stageStatusKind, "ready");
     assert.equal(model.stageLine, "Sparrer said READY; acceptance pending.");
     const html = renderOverviewHtml(model, "n", "c");
-    assert.match(html, /<span class="pill ready" [^>]*>READY · awaiting acceptance<\/span>/);
-    assert.ok(!/<span class="pill[^>]*>working</.test(html));
+    assert.match(html, /<span class="status ready">READY · awaiting acceptance<\/span>/);
+    assert.match(html, /<span class="verdict ready">READY<\/span>/);
+    assert.ok(!/<span class="status[^>]*>working</.test(html));
   });
 
   it("shortens ids", () => {
@@ -260,14 +261,14 @@ describe("overview HTML", () => {
   it("renders the compact journey, the primary stage block and the small actor cards", async () => {
     const ws = await planWorkspace("paused", 1, { sparring: sparringMarkdown("NEEDS_YOU", "Check") });
     const html = renderOverviewHtml(buildOverviewModel(await selection(ws), undefined, ALL, NOW), "n", "c");
-    assert.match(html, /<ol class="journey"><li class="step accepted" title="Stage 1 — Contract \(Accepted\)"><span class="glyph">✓<\/span><span class="num">1<\/span><span class="name">Contract<\/span><\/li>/);
-    assert.match(html, /<li class="step paused current" [^>]*>.*<span class="name">Schema &amp; API<\/span><span class="state">Paused<\/span><\/li>/);
-    assert.equal((html.match(/<span class="state">/g) ?? []).length, 1, "only the current stage carries a state word");
-    assert.match(html, /<li class="step future"/);
-    assert.match(html, /<div class="position muted">Stage 2 of 3<\/div>/);
-    assert.match(html, /<h2 [^>]*>Stage 2 — Schema &amp; API <span class="pill needs_you"/);
-    assert.equal((html.match(/<div class="actor">/g) ?? []).length, 2);
-    assert.ok(html.indexOf('<section class="stage">') < html.indexOf('<section class="actors">'), "stage before actors");
+    assert.match(html, /<ol class="journey"><li class="step accepted" title="Stage 1 — Contract \(Accepted\)"><span class="node"><svg class="icon " [^>]*>.*?<\/svg><\/span><span class="num">1<\/span><span class="name">Contract<\/span><span class="state"><svg[^>]*>.*?<\/svg>Accepted<\/span><\/li>/);
+    assert.match(html, /<li class="step paused current" [^>]*>.*?<span class="name">Schema &amp; API<\/span><span class="state">Paused<\/span><\/li>/);
+    assert.match(html, /<li class="step future" [^>]*><span class="node">3<\/span>.*?<span class="state">Pending<\/span><\/li>/);
+    assert.match(html, /<span class="hpill" title="docs\/plans\/foo.md">Plan run<\/span><span class="hpill">Stage 2 \/ 3<\/span><span class="hpill warn"><svg[^>]*>.*?<\/svg>NEEDS_YOU<\/span>/);
+    assert.match(html, /<h2 [^>]*><svg class="icon accent needs_you"[^>]*>.*?<\/svg>Stage 2 — Schema &amp; API<\/h2>/);
+    assert.match(html, /<span class="status needs_you">NEEDS_YOU<\/span>/);
+    assert.equal((html.match(/<div class="card actor">/g) ?? []).length, 2);
+    assert.ok(html.indexOf('<section class="card stage">') < html.indexOf('<section class="actors">'), "stage before actors");
     assert.ok(html.indexOf('<section class="actors">') < html.indexOf('<dl class="facts">'), "metadata last");
     assert.match(html, /<div class="banner stop">NEEDS_YOU — Check<\/div>/);
     assert.ok(!html.includes("Last activity"));

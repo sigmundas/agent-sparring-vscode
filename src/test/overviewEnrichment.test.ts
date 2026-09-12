@@ -51,7 +51,8 @@ describe("goal extraction from brief.md", () => {
     assert.equal(without.goal, undefined);
     assert.deepEqual({ ...withGoal, goal: undefined }, { ...without, goal: undefined });
     assert.equal(buildOverviewModel(selection, undefined, { ...ALL, brief: false, briefText: "## Goal\nstale\n" }, T0).goal, undefined, "no brief → no goal");
-    assert.match(renderOverviewHtml(withGoal, "n", "c"), /<p class="goal"><span class="label">Goal<\/span> Fix it.<\/p>/);
+    assert.match(renderOverviewHtml(withGoal, "n", "c"), /Goal<\/h3><p class="goal">Fix it.<\/p>/);
+    assert.match(renderOverviewHtml(without, "n", "c"), /Goal<\/h3><p class="muted">brief.md has no ## Goal paragraph.<\/p>/);
   });
 });
 
@@ -154,7 +155,8 @@ describe("recent events résumé", () => {
     const selection = selectRun((await discoverRuns([ws.location])).runs);
     const live = foldEvents([event("stage", "turn.started", { provider: "claude-cli" }), event("stage", "file.changed", { path: "src/a.py", kind: "modify" })]);
     const html = renderOverviewHtml(buildOverviewModel(selection, live, ALL, Date.parse(live.lastEventTs!) + 1000), "n", "c");
-    assert.match(html, /<section class="history"><h3>Recent events<\/h3><ol><li><span class="time">\d\d:\d\d:\d\d<\/span><span class="who">Claude<\/span><span>turn started<\/span><\/li><li>.*changed src\/a.py<\/span><\/li><\/ol><\/section>/);
+    assert.match(html, /<section class="history"><h3><svg[^>]*>.*?<\/svg>Recent events<\/h3><ol><li><span class="time">\d\d:\d\d:\d\d<\/span><span class="who claude">Claude<\/span><span>turn started<\/span><\/li><li>.*changed src\/a.py<\/span><\/li><\/ol><\/section>/);
+    assert.match(html, /Last meaningful event<\/h3><p><span class="time">\d\d:\d\d:\d\d<\/span><span class="sep">·<\/span><span class="who claude">Claude<\/span> changed src\/a.py<\/p>/);
     assert.ok(html.indexOf('<section class="actors">') < html.indexOf('<section class="history">'));
     const quiet = renderOverviewHtml(buildOverviewModel(selection, undefined, ALL, T0), "n", "c");
     assert.ok(!quiet.includes('class="history"'));
@@ -197,8 +199,10 @@ describe("active duration", () => {
     assert.deepEqual(model.activity, { kind: "active", text: "Sparring for 12s · Codex" });
     assert.equal(model.sparrer?.duration, "12s");
     const html = renderOverviewHtml(model, "n", "c");
-    assert.match(html, /<p class="activity active"><span class="label">Now<\/span> Sparring for 12s · Codex<\/p>/);
-    assert.match(html, /<span class="activity sparring"><span class="dot">●<\/span> Sparring <span class="muted">12s<\/span><\/span>/);
+    assert.match(html, /Current activity<\/h3><p class="now"><span class="who codex">Codex<\/span> sparring for <span class="dur">12s<\/span><\/p>/);
+    assert.match(html, /<div class="activity sparring"><svg[^>]*>.*?<\/svg>Sparring for 12s<\/div>/);
+    assert.match(html, /<span class="avatar codex">C<\/span>/);
+    assert.match(html, /<span class="hpill good"><svg[^>]*>.*?<\/svg>Working<\/span>/, "standalone working stage status pill");
   });
 
   it("a halted run shows no active duration even if telemetry claims busy", async () => {
@@ -225,7 +229,7 @@ describe("loop cycle", () => {
     const model = buildOverviewModel(selection, live, ALL, Date.parse(live.lastEventTs!) + 1000);
     assert.equal(model.cycle, 2);
     assert.equal(model.stageStatus, "SEND_BACK · correcting");
-    assert.match(renderOverviewHtml(model, "n", "c"), /<span class="pill quiet" title="loop cycle from telemetry">cycle 2<\/span>/);
+    assert.match(renderOverviewHtml(model, "n", "c"), /<span class="muted" title="loop cycle from telemetry">cycle 2<\/span>/);
     assert.equal(buildOverviewModel(selection, foldEvents([event("loop", "loop.started")]), ALL, T0).cycle, undefined, "no cycle reported yet");
   });
 });
@@ -304,8 +308,9 @@ describe("standalone-stage degradation", () => {
     );
     const html = renderOverviewHtml(model, "n", "c");
     assert.ok(!html.includes('class="journey"'));
-    assert.ok(!html.includes('class="position'));
-    assert.ok(!/Stage \d+ of/.test(html));
-    assert.match(html, /<span class="pill ready">READY<\/span>/);
+    assert.ok(!/Stage \d+ (of|\/) \d+/.test(html), "no position pill without a plan");
+    assert.match(html, /<span class="hpill" [^>]*>Standalone stage<\/span>/);
+    assert.match(html, /<span class="verdict ready">READY<\/span>/);
+    assert.equal(model.status?.label, "Working");
   });
 });

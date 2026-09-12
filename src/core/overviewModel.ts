@@ -98,9 +98,20 @@ export interface OverviewActions {
   diff?: { label: string; detail: string; baseSha: string; targetSha?: string };
 }
 
+/** Header pill: the authoritative lifecycle word for the run, with a colour tone. */
+export interface RunStatus {
+  label: string;
+  tone: "good" | "info" | "warn" | "muted";
+}
+
 export interface OverviewModel {
   kind: "empty" | "ambiguous" | "run";
   title: string;
+  /** `Plan run` or `Standalone stage`. */
+  runKind?: string;
+  status?: RunStatus;
+  /** The last meaningful event, also while a turn is active. */
+  lastEvent?: HistoryEntry;
   /** For ambiguous: the candidate labels. */
   choices?: string[];
   /** Plan journey: only for plan runs with a readable plan document. */
@@ -163,7 +174,10 @@ export function buildOverviewModel(
     goal: artifacts.brief ? parseBriefGoal(artifacts.briefText) : undefined,
     activity: activityLine(live, halted, nowMs),
     history: history(live),
+    runKind: run.kind === "plan" ? "Plan run" : "Standalone stage",
+    status: runStatus(run),
   };
+  model.lastEvent = model.history?.[model.history.length - 1];
 
   const outcome = run.kind === "plan" ? run.currentOutcome : run.outcome;
   if (run.kind === "plan") {
@@ -196,6 +210,31 @@ export function buildOverviewModel(
 }
 
 // ---------------------------------------------------------------- pieces
+
+function runStatus(run: RunSnapshot): RunStatus {
+  if (run.kind === "plan") {
+    switch (run.state.status) {
+      case "running":
+        return { label: "Running", tone: "good" };
+      case "paused": {
+        const action = run.currentOutcome?.action;
+        return { label: action === "NEEDS_YOU" || action === "ESCALATE" ? action : "Paused", tone: "warn" };
+      }
+      case "complete":
+        return { label: "Complete", tone: "good" };
+    }
+  }
+  switch (run.stage.state?.status) {
+    case "accepted":
+      return { label: "Accepted", tone: "good" };
+    case "frozen":
+      return { label: "Frozen", tone: "info" };
+    default: {
+      const action = run.outcome?.action;
+      return action === "NEEDS_YOU" || action === "ESCALATE" ? { label: action, tone: "warn" } : { label: "Working", tone: "good" };
+    }
+  }
+}
 
 function isHalted(run: RunSnapshot): boolean {
   if (run.kind === "plan") {
