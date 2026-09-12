@@ -21,9 +21,11 @@ import {
   type StandaloneStageSnapshot,
 } from "../core/discovery";
 import { parsePlanStages } from "../core/engineFormats";
+import { blocksLaunch } from "../core/liveness";
 import type { OverviewAction } from "../core/overviewHtml";
 import { buildRunPickItems, describeRun } from "../core/runPick";
 import { stageRunAction } from "../core/runner";
+import { planRunId, type SparringSubcommand } from "../core/sparringCommand";
 import type { SparringController } from "./controller";
 import { currentBranch } from "./git";
 import { openCandidateDiff } from "./overview/gitDiff";
@@ -41,6 +43,17 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.runPlan", () => runPlanCommand(controller)),
     vscode.commands.registerCommand("agentSparring.resumePlan", () => resumePlanCommand(controller)),
     vscode.commands.registerCommand("agentSparring.runStage", () => runStageCommand(controller)),
+    // Not contributed in package.json (never in the palette): hooks for the
+    // extension-host integration tests, which cannot drive QuickPicks.
+    vscode.commands.registerCommand("agentSparring._test.chooseRun", async (runId: string) => {
+      await controller.chooseRun(controller.currentDiscovery.runs.find((run) => run.id === runId));
+      return controller.currentSelection.selected?.id;
+    }),
+    vscode.commands.registerCommand("agentSparring._test.liveness", (runId: string) => {
+      const liveness = controller.livenessFor(runId);
+      return { state: liveness.state, source: liveness.source, turnActive: liveness.turnActive, interrupted: liveness.interrupted, detail: liveness.detail, execution: liveness.execution };
+    }),
+    vscode.commands.registerCommand("agentSparring._test.stop", (runId: string) => controller.stopRunner(runId)),
   );
 }
 
@@ -152,7 +165,7 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       return;
     case "stopRunner":
       if (run && !controller.stopRunner(run.id)) {
-        void vscode.window.showInformationMessage("Agent Sparring: no runner launched from this window is alive for the selected stage.");
+        void vscode.window.showInformationMessage("Agent Sparring: no runner observed from this window is alive for the selected stage.");
       }
       return;
   }
@@ -172,17 +185,30 @@ async function runStageCommand(controller: SparringController): Promise<void> {
     }
     return;
   }
-  const runner = controller.runnerFor(run.id);
-  if (runner?.alive) {
-    void vscode.window.showInformationMessage(`Agent Sparring: a runner launched from this window is still active for ${run.stage.stageId}.`);
+  let liveness = controller.livenessFor(run.id);
+  const block = blocksLaunch(liveness);
+  if (block === "running") {
+    void vscode.window.showInformationMessage(`Agent Sparring: a runner is alive for ${run.stage.stageId}. ${liveness.detail}`);
     return;
   }
-  const live = controller.presentedLive;
-  const action = stageRunAction(run, live);
+  if (block === "unknown") {
+    // Telemetry claims a turn but nothing has observed the process: the
+    // override is explicit, and the engine's worktree lock refuses a second
+    // live runner anyway.
+    const proceed = await vscode.window.showWarningMessage(
+      `Agent Sparring: run status unknown for ${run.stage.stageId}. ${liveness.detail} Launch only if you know that runner is no longer alive.`,
+      { modal: true },
+      "Run anyway",
+    );
+    if (proceed !== "Run anyway") {
+      return;
+    }
+    liveness = { ...liveness, turnActive: false };
+  }
+  const action = stageRunAction(run, liveness);
   if (!action) {
     const status = run.stage.state?.status ?? "working";
-    const why = live && (live.stage.busy || live.sparrer.busy) ? "a turn is already in progress according to its telemetry" : `the loop does not run for ${status} stages`;
-    void vscode.window.showInformationMessage(`Agent Sparring: ${run.stage.stageId} is ${status}; ${why}.`);
+    void vscode.window.showInformationMessage(`Agent Sparring: ${run.stage.stageId} is ${status}; the loop does not run for ${status} stages.`);
     return;
   }
   await launchStageLoop(controller, run, action.label);
@@ -202,7 +228,7 @@ async function launchStageLoop(controller: SparringController, run: StandaloneSt
     return;
   }
   const args = buildRunLoopArgs({ stageId: run.stage.stageId, repoRoot, expectedBranch, sparringDir: run.location.sparringDir });
-  controller.launchRunner({ executable, args, cwd: repoRoot, name: `${label}: ${run.stage.stageId}`, runId: run.id, reveal: false });
+  await controller.launch({ executable, args, cwd: repoRoot, name: `${label}: ${run.stage.stageId}`, runId: run.id, kind: "run-loop", stageId: run.stage.stageId, reveal: false });
 }
 
 // ---------------------------------------------------------------- launching
@@ -319,11 +345,12 @@ async function resolveOrExplain(location: SparringLocation): Promise<string | un
   return undefined;
 }
 
-function launch(controller: SparringController, location: SparringLocation, executable: string, args: string[], name: string): void {
-  // A terminal owns the process, so the run survives an extension-host
-  // reload and the user sees the engine's own output. shellPath/shellArgs
-  // execute the binary directly: no shell, no quoting, argument array only.
-  controller.launchRunner({ executable, args, cwd: location.repoRoot, name, reveal: true });
+async function launch(controller: SparringController, location: SparringLocation, executable: string, args: string[], kind: SparringSubcommand, planPath: string): Promise<void> {
+  // The command runs inside the user's normal integrated terminal through
+  // shell integration (executable + argument array, no quoting), so the user
+  // sees the engine's own output and the terminal follows VS Code's normal
+  // persistence; the run id is the one the engine will write state under.
+  await controller.launch({ executable, args, cwd: location.repoRoot, name: kind, runId: planRunId(location, planPath), kind, planPath, reveal: true });
 }
 
 async function runPlanCommand(controller: SparringController): Promise<void> {
@@ -344,7 +371,12 @@ async function runPlanCommand(controller: SparringController): Promise<void> {
     return;
   }
   const args = buildRunPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir });
-  launch(controller, location, executable, args, "run-plan");
+  const runId = planRunId(location, planPath);
+  if (controller.livenessFor(runId).state === "running") {
+    void vscode.window.showInformationMessage("Agent Sparring: a runner for this plan is alive in a terminal of this window.");
+    return;
+  }
+  await launch(controller, location, executable, args, "run-plan", planPath);
 }
 
 async function resumePlanCommand(controller: SparringController): Promise<void> {
@@ -372,9 +404,14 @@ async function resumePlanCommand(controller: SparringController): Promise<void> 
   if (!run) {
     return;
   }
-  if (run.state.status === "running") {
+  const liveness = controller.livenessFor(run.id);
+  if (liveness.state === "running") {
+    void vscode.window.showInformationMessage(`Agent Sparring: a runner is alive for ${run.state.plan}. ${liveness.detail}`);
+    return;
+  }
+  if (run.state.status === "running" && liveness.state !== "stopped") {
     const proceed = await vscode.window.showWarningMessage(
-      `Agent Sparring: ${run.state.plan} is recorded as running. Resume only if that process is no longer alive.`,
+      `Agent Sparring: ${run.state.plan} is recorded as running and no runner process has been observed ending. Resume only if that process is no longer alive.`,
       { modal: true },
       "Resume anyway",
     );
@@ -405,5 +442,5 @@ async function resumePlanCommand(controller: SparringController): Promise<void> 
     sparringDir: run.location.sparringDir,
     evidence,
   });
-  launch(controller, run.location, executable, args, "resume-plan");
+  await launch(controller, run.location, executable, args, "resume-plan", run.planPath);
 }

@@ -14,6 +14,7 @@
  */
 
 import { currentStageOf, runLabel, totalStagesOf, type RunSelection, type RunSnapshot } from "./discovery";
+import type { RunnerLiveness } from "./liveness";
 import { providerDisplayName, type LiveState } from "./liveState";
 import { presentRunStage, stageDisplayName, truncateLabel } from "./presentation";
 
@@ -30,7 +31,12 @@ const PREFIX = "Agent Sparring";
 export const QUIET_AFTER_MS = 10 * 60 * 1000;
 const STANDALONE_NAME_MAX = 28;
 
-export function deriveStatus(selection: RunSelection, live: LiveState | undefined, nowMs: number): StatusView {
+/**
+ * `live` must be the presented fold (see liveness.deriveLiveness) and
+ * `liveness` the runner liveness it came from: a turn the telemetry shows is
+ * worded as certain work only when a process observation backs it.
+ */
+export function deriveStatus(selection: RunSelection, live: LiveState | undefined, nowMs: number, liveness?: RunnerLiveness): StatusView {
   if (!selection.selected) {
     if (selection.ambiguous.length > 0) {
       const lines = selection.ambiguous.map((run) => `• ${run.location.folderName}: ${runLabel(run)} (${authoritativeWord(run)})`);
@@ -70,7 +76,7 @@ export function deriveStatus(selection: RunSelection, live: LiveState | undefine
       }
       return finish(`$(debug-pause) ${PREFIX}: Stage ${position} · ${word}`, tooltipLines, "warning");
     }
-    const suffix = liveSuffix(live, nowMs, tooltipLines) ?? presentation.short;
+    const suffix = liveSuffix(live, nowMs, tooltipLines, liveness) ?? presentation.short;
     return finish(`$(circle-filled) ${PREFIX}: Stage ${position}${suffix ? ` · ${suffix}` : ""}`, tooltipLines, "info");
   }
 
@@ -88,7 +94,7 @@ export function deriveStatus(selection: RunSelection, live: LiveState | undefine
     }
     return finish(`$(debug-pause) ${PREFIX}: ${shortName} · ${presentation.short}`, tooltipLines, "warning");
   }
-  const suffix = liveSuffix(live, nowMs, tooltipLines) ?? presentation.short ?? "working";
+  const suffix = liveSuffix(live, nowMs, tooltipLines, liveness) ?? presentation.short ?? "working";
   return finish(`$(circle-filled) ${PREFIX}: ${shortName} · ${suffix}`, tooltipLines, "info");
 }
 
@@ -112,7 +118,11 @@ function authoritativeWord(run: RunSnapshot): string {
 }
 
 /** The live actor word when an actor is mid-turn; detail lines go to the tooltip. */
-function liveSuffix(live: LiveState | undefined, nowMs: number, tooltipLines: string[]): string | undefined {
+function liveSuffix(live: LiveState | undefined, nowMs: number, tooltipLines: string[], liveness?: RunnerLiveness): string | undefined {
+  if (liveness?.interrupted) {
+    tooltipLines.push("Last run interrupted: the runner exited while a provider turn was in progress according to activity.jsonl.");
+    return "stopped";
+  }
   if (!live || live.eventCount === 0) {
     tooltipLines.push("No activity telemetry for this stage.");
     return undefined;
@@ -122,6 +132,11 @@ function liveSuffix(live: LiveState | undefined, nowMs: number, tooltipLines: st
     suffix = `${providerDisplayName(live.sparrer.provider, "sparrer")} sparring`;
   } else if (live.stage.busy) {
     suffix = `${providerDisplayName(live.stage.provider, "stage")} working`;
+  }
+  if (suffix && liveness?.source === "telemetry") {
+    // Telemetry saw the turn start; no process observation backs it.
+    suffix += " (unconfirmed)";
+    tooltipLines.push("Runner status unknown: " + liveness.detail);
   }
   const since = live.lastMeaningful?.ts ?? live.lastEventTs;
   if (since) {

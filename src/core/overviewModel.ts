@@ -15,8 +15,9 @@ import { parseBriefGoal } from "./brief";
 import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
 import { formatTime } from "./logFormat";
+import { deriveLiveness, type ExecutionRecord, type LivenessState, type RunnerLiveness } from "./liveness";
 import { presentStage, stageDisplayName } from "./presentation";
-import { applyRunner, isTurnActive, stageRunAction, type RunnerStatus, type StageRunAction } from "./runner";
+import { stageRunAction, type StageRunAction } from "./runner";
 import { QUIET_AFTER_MS, formatAge } from "./status";
 
 export type TimelineState = "accepted" | "frozen" | "active" | "paused" | "working" | "future";
@@ -51,6 +52,8 @@ export interface ActorCard {
   sessionKind: "session" | "thread";
   /** Set when a busy claim has had no meaningful activity for a long time (formatted age). */
   quietFor?: string;
+  /** True when the Working/Sparring claim rests on telemetry alone: no runner process has been observed alive. */
+  uncertain?: boolean;
 }
 
 /** Git facts for the footer, supplied by the caller; never inferred here. */
@@ -71,8 +74,13 @@ export interface Banner {
  * Channel would have shown (same filter), never suppressed noise.
  */
 export interface ActivityLine {
-  /** `stopped`: our runner exited mid-turn; `stale`: an external busy claim with no telemetry for a long time. */
-  kind: "active" | "last" | "none" | "stopped" | "stale";
+  /**
+   * `active`: a turn is in progress and the runner is observed alive;
+   * `inferred`: telemetry says a turn started but no process backs it;
+   * `stopped`: the runner ended mid-turn; `stale`: an inferred turn with no
+   * telemetry for a long time.
+   */
+  kind: "active" | "inferred" | "last" | "none" | "stopped" | "stale";
   text: string;
   /** Time of day of the last visible event (kind `last`). */
   time?: string;
@@ -123,16 +131,18 @@ export interface OverviewModel {
   status?: RunStatus;
   /** The last meaningful event, also while a turn is active. */
   lastEvent?: HistoryEntry;
-  /** Run stage / Resume stage / Run loop again for a standalone stage; hidden while our runner is alive. */
+  /** Run stage / Resume stage / Run loop again for a standalone stage; hidden while the runner is alive or its liveness unknown mid-turn. */
   stageAction?: StageRunAction;
-  /** A runner the extension launched for this run. */
+  /** A runner observed for this run: alive (Stop offered) or stopped. */
   runner?: { alive: boolean; label: string };
   /**
-   * Non-action state shown instead of Run/Resume while a turn is active.
-   * `detail` (tooltip only) says whether liveness is exact (our terminal)
-   * or inferred from telemetry of a loop started elsewhere.
+   * Non-action state shown instead of Run/Resume: `Running` only when a
+   * process observation backs it; `Run status unknown` when telemetry alone
+   * claims an active turn. `detail` (tooltip) names the observation.
    */
-  busyState?: { label: string; detail: string };
+  busyState?: { label: string; detail: string; state: LivenessState };
+  /** Runner liveness as derived; the status bar and tests read it too. */
+  liveness?: { state: LivenessState; source: RunnerLiveness["source"]; detail: string };
   /** For ambiguous: the candidate labels. */
   choices?: string[];
   /** Plan journey: only for plan runs with a readable plan document. */
@@ -168,7 +178,7 @@ export function buildOverviewModel(
   rawLive: LiveState | undefined,
   artifacts: OverviewArtifacts = NO_ARTIFACTS,
   nowMs: number = Date.now(),
-  runner?: RunnerStatus,
+  execution?: ExecutionRecord,
 ): OverviewModel {
   if (!selection.selected) {
     if (selection.ambiguous.length > 0) {
@@ -179,15 +189,16 @@ export function buildOverviewModel(
   const run = selection.selected;
   const stage = currentStageOf(run);
   const halted = isHalted(run);
-  const ownRunner = runner && runner.runId === run.id ? runner : undefined;
-  const effective = applyRunner(rawLive, ownRunner, nowMs);
-  const live = effective.live;
+  const ownExecution = execution && execution.runId === run.id ? execution : undefined;
+  const liveness = deriveLiveness(rawLive, ownExecution, nowMs);
+  const live = liveness.live;
+  const uncertain = liveness.source === "telemetry";
 
   const model: OverviewModel = {
     kind: "run",
     title: run.kind === "plan" ? runLabel(run) : stageDisplayName(stage),
-    stageAgent: actorCard("stage", stage, live, halted, nowMs),
-    sparrer: actorCard("sparrer", stage, live, halted, nowMs),
+    stageAgent: actorCard("stage", stage, live, halted, nowMs, uncertain),
+    sparrer: actorCard("sparrer", stage, live, halted, nowMs, uncertain),
     actions: {
       handoff: artifacts.handoff,
       sparring: artifacts.sparring,
@@ -197,30 +208,31 @@ export function buildOverviewModel(
     },
     facts: facts(run, stage, artifacts.git),
     goal: artifacts.brief ? parseBriefGoal(artifacts.briefText) : undefined,
-    activity: activityLine(live, halted, nowMs),
+    activity: activityLine(live, halted, nowMs, uncertain),
     history: history(live),
     runKind: run.kind === "plan" ? "Plan run" : "Standalone stage",
     status: runStatus(run),
+    liveness: { state: liveness.state, source: liveness.source, detail: liveness.detail },
   };
   model.lastEvent = model.history?.[model.history.length - 1];
-  if (effective.interrupted) {
-    model.activity = { kind: "stopped", text: "Runner stopped · last run interrupted" };
-  } else if (effective.stale) {
+  if (liveness.interrupted) {
+    model.activity = { kind: "stopped", text: "Stopped · last turn interrupted" };
+  } else if (liveness.stale) {
     model.activity = { kind: "stale", text: `${model.activity?.text ?? "Working"} · no meaningful activity for ${formatAge(nowMs - Date.parse(live?.lastMeaningful?.ts ?? live?.lastEventTs ?? ""))}` };
   }
-  if (ownRunner?.alive) {
+  if (liveness.state === "running") {
     model.runner = { alive: true, label: "Stop (Ctrl-C)" };
-  } else if (ownRunner && effective.interrupted) {
+  } else if (liveness.interrupted) {
     model.runner = { alive: false, label: "Runner stopped" };
   }
   const loopEligible = run.kind === "plan" || (stage.state?.status !== "accepted" && stage.state?.status !== "frozen");
-  if (!halted && loopEligible && isTurnActive(live)) {
-    // Never offer a second loop for a stage the UI currently sees as busy.
-    model.busyState = ownRunner?.alive
-      ? { label: "Running", detail: "A runner launched from this window is active (exact: its terminal is open)." }
-      : { label: "Running", detail: "A turn is in progress according to activity.jsonl. The loop was started outside this window, so liveness is inferred from telemetry." };
-  } else if (!ownRunner?.alive) {
-    model.stageAction = run.kind === "stage" ? stageRunAction(run, live) : undefined;
+  if (!halted && loopEligible && liveness.state === "running") {
+    model.busyState = { label: "Running", detail: liveness.detail, state: "running" };
+  } else if (!halted && loopEligible && liveness.turnActive) {
+    // Telemetry alone: no second loop from the button, and no certain claim either.
+    model.busyState = { label: "Run status unknown", detail: liveness.detail, state: "unknown" };
+  } else if (liveness.state !== "running") {
+    model.stageAction = run.kind === "stage" ? stageRunAction(run, liveness) : undefined;
   }
 
   const outcome = run.kind === "plan" ? run.currentOutcome : run.outcome;
@@ -287,7 +299,7 @@ function isHalted(run: RunSnapshot): boolean {
   return run.stage.state?.status === "accepted";
 }
 
-function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveState | undefined, halted: boolean, nowMs: number): ActorCard {
+function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveState | undefined, halted: boolean, nowMs: number, uncertain: boolean): ActorCard {
   const actor = live?.[role];
   const persisted = role === "stage" ? stage.state?.implementationSessionId : stage.state?.sparringSessionId;
   const sessionId = persisted ?? actor?.sessionId ?? undefined;
@@ -314,6 +326,7 @@ function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveSt
     sessionLabel: shortenId(sessionId),
     sessionKind: role === "stage" ? "session" : "thread",
     quietFor,
+    uncertain: activity === "Working" || activity === "Sparring" ? uncertain : undefined,
   };
 }
 
@@ -322,13 +335,17 @@ function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveSt
  * takes precedence over the stage agent's when both look busy (a SEND_BACK
  * cycle resumes both; sparring is the later phase).
  */
-export function activityLine(live: LiveState | undefined, halted: boolean, nowMs: number): ActivityLine {
+export function activityLine(live: LiveState | undefined, halted: boolean, nowMs: number, uncertain = false): ActivityLine {
   if (!halted && live) {
     for (const role of ["sparrer", "stage"] as const) {
       const actor = live[role];
       const active = activeDurationMs(actor, nowMs);
       if (actor.busy && active !== undefined) {
         const verb = role === "stage" ? "Working" : "Sparring";
+        if (uncertain) {
+          // Telemetry saw the turn start; nothing has seen the runner alive.
+          return { kind: "inferred", text: `${role === "stage" ? "Turn" : "Sparring turn"} started ${formatDuration(active)} ago · ${providerDisplayName(actor.provider, role)} · runner status unknown` };
+        }
         return { kind: "active", text: `${verb} for ${formatDuration(active)} · ${providerDisplayName(actor.provider, role)}` };
       }
     }

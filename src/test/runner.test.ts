@@ -6,7 +6,8 @@ import { discoverRuns, locateSparringDirs, selectRun, type StandaloneStageSnapsh
 import { applyEvent, emptyLiveState, foldEvents } from "../core/liveState";
 import { buildOverviewModel, type OverviewArtifacts } from "../core/overviewModel";
 import { renderOverviewHtml } from "../core/overviewHtml";
-import { STALE_ACTIVE_MS, applyRunner, pickBranch, stageRunAction, type RunnerStatus } from "../core/runner";
+import { STALE_ACTIVE_MS, deriveLiveness, type ExecutionRecord } from "../core/liveness";
+import { pickBranch, stageRunAction } from "../core/runner";
 import { deriveStatus } from "../core/status";
 import { Workspace, event, sparringMarkdown } from "./fixtures";
 
@@ -123,42 +124,59 @@ describe("runner lifecycle presentation", () => {
     applyEvent(live, { v: 1, ts: at(5), actor: "stage", event: "file.changed", path: "src/a.py", kind: "modify" });
     return live;
   }
+  const running = (runId: string, startedAtMs: number): ExecutionRecord => ({ id: "e1", runId, kind: "run-loop", source: "launched", state: "running", startedAtMs });
+  const ended = (runId: string, startedAtMs: number, endedAtMs: number, exitCode?: number): ExecutionRecord => ({ id: "e1", runId, kind: "run-loop", source: "launched", state: "ended", startedAtMs, endedAtMs, exitCode });
 
-  it("an alive runner leaves telemetry untouched and offers Stop instead of Run", async () => {
+  it("an observed-alive runner: Working for Xs, exact Running, Stop instead of Run", async () => {
     const ws = await Workspace.create();
     await ws.writeStage("s", { status: "working" });
     const selection = selectRun((await discoverRuns([ws.location])).runs);
-    const runner: RunnerStatus = { runId: selection.selected!.id, alive: true, startedAtMs: T0 - 1000 };
-    const model = buildOverviewModel(selection, busyLive(), ALL, T0 + 60_000, runner);
+    const model = buildOverviewModel(selection, busyLive(), ALL, T0 + 60_000, running(selection.selected!.id, T0 - 1000));
     assert.equal(model.stageAgent?.activity, "Working");
+    assert.equal(model.stageAgent?.uncertain, false);
     assert.equal(model.activity?.kind, "active");
+    assert.equal(model.activity?.text, "Working for 59s · Claude");
     assert.equal(model.stageAction, undefined);
     assert.deepEqual(model.runner, { alive: true, label: "Stop (Ctrl-C)" });
+    assert.equal(model.busyState?.label, "Running");
+    assert.equal(model.busyState?.state, "running");
+    assert.match(model.busyState?.detail ?? "", /exact/);
     const html = renderOverviewHtml(model, "n", "c");
     assert.match(html, /class="danger" data-action="stopRunner"/);
+    assert.match(html, /<span class="busy" title="[^"]*"><svg[^>]*>.*?<\/svg>Running<\/span>/);
     assert.ok(!html.includes('data-action="runStage"'));
+    assert.match(html, /Claude<\/span> working for <span class="dur">59s<\/span>/);
   });
 
-  it("runner exit clears the stale busy presentation without a turn.finished / verdict", async () => {
+  it("runner ended mid-turn (Ctrl-C, crash, reload): Stopped · last turn interrupted, duration frozen, Resume stage", async () => {
     const ws = await Workspace.create();
     await ws.writeStage("s", { status: "working", implementation_session_id: "82ab" });
     const selection = selectRun((await discoverRuns([ws.location])).runs);
     const live = busyLive();
-    const runner: RunnerStatus = { runId: selection.selected!.id, alive: false, startedAtMs: T0 - 1000, endedAtMs: T0 + 30_000, exitCode: undefined };
-    const model = buildOverviewModel(selection, live, ALL, T0 + 60_000, runner);
+    const execution = ended(selection.selected!.id, T0 - 1000, T0 + 30_000);
+    const model = buildOverviewModel(selection, live, ALL, T0 + 60_000, execution);
     assert.equal(model.stageAgent?.activity, "Waiting", "no more 'Claude working'");
     assert.equal(model.stageAgent?.duration, undefined);
     assert.equal(model.sparrer?.activity, "Waiting");
-    assert.deepEqual(model.activity, { kind: "stopped", text: "Runner stopped · last run interrupted" });
+    assert.deepEqual(model.activity, { kind: "stopped", text: "Stopped · last turn interrupted" });
     assert.deepEqual(model.runner, { alive: false, label: "Runner stopped" });
+    assert.equal(model.busyState, undefined);
     assert.equal(model.stageAction?.label, "Resume stage", "the loop can be resumed right away");
     assert.equal(model.stageLine, "Working.", "no 'Implementing.' claim either");
     assert.equal(live.stage.busy, true, "the fold itself is not mutated; this is presentation only");
+    assert.match(model.liveness?.detail ?? "", /runner has exited/);
 
-    const status = deriveStatus(selection, applyRunner(live, runner, T0 + 60_000).live, T0 + 60_000);
-    assert.equal(status.text, "$(circle-filled) Agent Sparring: S · working", "authoritative state.json word only, no 'Claude working'");
+    // Much later the card must not have grown: the same model, no duration.
+    const later = buildOverviewModel(selection, live, ALL, T0 + 3 * 60 * 60_000, execution);
+    assert.equal(later.stageAgent?.duration, undefined);
+    assert.equal(later.activity?.kind, "stopped");
+
+    const liveness = deriveLiveness(live, execution, T0 + 60_000);
+    const status = deriveStatus(selection, liveness.live, T0 + 60_000, liveness);
+    assert.equal(status.text, "$(circle-filled) Agent Sparring: S · stopped");
+    assert.match(status.tooltip, /Last run interrupted/);
     assert.ok(!status.tooltip.includes("Claude working"));
-    assert.match(renderOverviewHtml(model, "n", "c"), /Runner stopped · last run interrupted/);
+    assert.match(renderOverviewHtml(model, "n", "c"), /Stopped · last turn interrupted/);
   });
 
   it("a clean exit after turn.finished is not an interruption", async () => {
@@ -167,34 +185,41 @@ describe("runner lifecycle presentation", () => {
     const selection = selectRun((await discoverRuns([ws.location])).runs);
     const live = busyLive();
     applyEvent(live, { v: 1, ts: at(20), actor: "stage", event: "turn.finished" });
-    const runner: RunnerStatus = { runId: selection.selected!.id, alive: false, startedAtMs: T0, endedAtMs: T0 + 25_000, exitCode: 0 };
-    const model = buildOverviewModel(selection, live, ALL, T0 + 60_000, runner);
+    const model = buildOverviewModel(selection, live, ALL, T0 + 60_000, ended(selection.selected!.id, T0, T0 + 25_000, 0));
     assert.equal(model.activity?.kind, "last");
     assert.equal(model.runner, undefined);
+    assert.equal(model.liveness?.state, "stopped");
     assert.equal(model.stageAction?.kind, "resume", "a turn was observed, so the next launch is a resume");
   });
 
-  it("an active turn hides Run/Resume even for an externally launched loop, and says so only in the tooltip", async () => {
+  it("telemetry alone never becomes Running: Run status unknown, inferred activity, no Run button", async () => {
     const ws = await Workspace.create();
     await ws.writeStage("s", { status: "working" });
     const selection = selectRun((await discoverRuns([ws.location])).runs);
     const live = busyLive();
-    const external = buildOverviewModel(selection, live, ALL, T0 + 60_000);
-    assert.equal(external.stageAction, undefined, "never a second run-loop for a busy stage");
-    assert.equal(external.busyState?.label, "Running");
-    assert.match(external.busyState?.detail ?? "", /started outside this window.*inferred from telemetry/);
-    assert.equal(stageRunAction(selection.selected, live), undefined);
-    let html = renderOverviewHtml(external, "n", "c");
+    const model = buildOverviewModel(selection, live, ALL, T0 + 60_000);
+    assert.equal(model.stageAction, undefined, "never a second run-loop from the button for a stage telemetry says is busy");
+    assert.equal(model.busyState?.label, "Run status unknown");
+    assert.equal(model.busyState?.state, "unknown");
+    assert.match(model.busyState?.detail ?? "", /cannot prove the process is alive/);
+    assert.equal(model.liveness?.state, "unknown");
+    assert.equal(model.liveness?.source, "telemetry");
+    assert.equal(model.activity?.kind, "inferred");
+    assert.equal(model.activity?.text, "Turn started 59s ago · Claude · runner status unknown");
+    assert.equal(model.stageAgent?.activity, "Working");
+    assert.equal(model.stageAgent?.uncertain, true);
+    assert.equal(model.runner, undefined, "no Stop: there is no terminal to signal");
+    const html = renderOverviewHtml(model, "n", "c");
     assert.ok(!html.includes('data-action="runStage"'));
-    assert.match(html, /<span class="busy" title="[^"]*inferred from telemetry[^"]*"><svg[^>]*>.*?<\/svg>Running<\/span>/);
-    assert.ok(!/inferred from telemetry<\/span>/.test(html), "the distinction lives in the tooltip, not the visible text");
+    assert.ok(!html.includes('data-action="stopRunner"'));
+    assert.match(html, /<span class="busy unknown" title="[^"]*"><svg[^>]*>.*?<\/svg>Run status unknown<\/span>/);
+    assert.ok(!/>Running</.test(html), "the word Running never appears for telemetry-only liveness");
+    assert.match(html, /Working\? <span class="muted">\(turn observed 59s ago\)<\/span> <span class="muted">· runner status unknown<\/span>/);
 
-    const own: RunnerStatus = { runId: selection.selected!.id, alive: true, startedAtMs: T0 };
-    const owned = buildOverviewModel(selection, live, ALL, T0 + 60_000, own);
-    assert.equal(owned.busyState?.label, "Running");
-    assert.match(owned.busyState?.detail ?? "", /exact: its terminal is open/);
-    html = renderOverviewHtml(owned, "n", "c");
-    assert.match(html, /class="danger" data-action="stopRunner"/);
+    const liveness = deriveLiveness(live, undefined, T0 + 60_000);
+    const status = deriveStatus(selection, liveness.live, T0 + 60_000, liveness);
+    assert.equal(status.text, "$(circle-filled) Agent Sparring: S · Claude working (unconfirmed)");
+    assert.match(status.tooltip, /Runner status unknown/);
 
     // The turn ends (finished or interrupted), the stage stays non-terminal: Resume stage.
     applyEvent(live, { v: 1, ts: at(90), actor: "stage", event: "turn.finished" });
@@ -206,48 +231,35 @@ describe("runner lifecycle presentation", () => {
   it("a stage never run at all still gets Run stage; frozen/accepted get nothing even when busy telemetry lingers", async () => {
     const ws = await Workspace.create();
     await ws.writeStage("fresh", { status: "working" });
-    assert.equal(stageRunAction(await standalone(ws), foldEvents([event("loop", "loop.started")]))?.kind, "run");
+    assert.equal(stageRunAction(await standalone(ws), deriveLiveness(foldEvents([event("loop", "loop.started")]), undefined, T0))?.kind, "run");
     await ws.writeStage("fresh", { status: "frozen", base_sha: "b", candidate_sha: "c" });
     const model = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), busyLive(), ALL, T0 + 60_000);
     assert.equal(model.stageAction, undefined);
     assert.equal(model.busyState, undefined, "frozen is halted for the loop; no Running claim");
   });
 
-  it("a turn that started after the runner ended (another launcher) is still trusted", () => {
-    const live = busyLive();
-    const runner: RunnerStatus = { runId: "r", alive: false, startedAtMs: T0 - 60_000, endedAtMs: T0 - 30_000 };
-    const effective = applyRunner(live, runner, T0 + 10_000);
-    assert.equal(effective.interrupted, false);
-    assert.equal(effective.live?.stage.busy, true);
-  });
-
-  it("a runner for a different run never affects the selected one", async () => {
+  it("an execution for a different run never affects the selected one", async () => {
     const ws = await Workspace.create();
     await ws.writeStage("s", { status: "working" });
     const selection = selectRun((await discoverRuns([ws.location])).runs);
-    const other: RunnerStatus = { runId: "someone-else", alive: false, startedAtMs: T0, endedAtMs: T0 + 1000 };
-    const model = buildOverviewModel(selection, busyLive(), ALL, T0 + 60_000, other);
+    const model = buildOverviewModel(selection, busyLive(), ALL, T0 + 60_000, ended("someone-else", T0, T0 + 1000));
     assert.equal(model.stageAgent?.activity, "Working");
+    assert.equal(model.stageAgent?.uncertain, true);
     assert.equal(model.runner, undefined);
   });
 
-  it("externally launched telemetry keeps working and goes stale only after a long silence", async () => {
+  it("telemetry-only busy claims go stale after a long silence, and stay blocked", async () => {
     const ws = await Workspace.create();
     await ws.writeStage("s", { status: "working" });
     const selection = selectRun((await discoverRuns([ws.location])).runs);
     const live = busyLive();
     const soon = buildOverviewModel(selection, live, ALL, T0 + 5 * 60_000);
-    assert.equal(soon.activity?.kind, "active");
-    assert.equal(soon.stageAgent?.activity, "Working");
+    assert.equal(soon.activity?.kind, "inferred");
     const later = buildOverviewModel(selection, live, ALL, T0 + STALE_ACTIVE_MS + 60_000);
     assert.equal(later.activity?.kind, "stale");
-    assert.equal(later.activity?.text, "Working for 30m 59s · Claude · no meaningful activity for 30m", "no hang implied");
-    assert.equal(later.busyState?.label, "Running", "still busy as far as telemetry says, so still no Run button");
-    assert.match(renderOverviewHtml(later, "n", "c"), /no meaningful activity for 30m<\/span>/);
-    assert.equal(later.stageAgent?.activity, "Working", "the claim is kept, only qualified");
+    assert.equal(later.activity?.text, "Turn started 30m 59s ago · Claude · runner status unknown · no meaningful activity for 30m", "no hang implied");
+    assert.equal(later.busyState?.label, "Run status unknown");
     assert.ok(later.stageAgent?.quietFor);
-    assert.equal(later.stageAction, undefined, "a stale busy claim is still a busy claim: no second loop");
-    assert.equal(applyRunner(undefined, undefined, T0).live, undefined);
-    assert.equal(applyRunner(foldEvents([event("stage", "turn.finished")]), undefined, T0 + STALE_ACTIVE_MS * 2).stale, false, "idle claims never go stale");
+    assert.equal(later.stageAction, undefined, "a stale busy claim is still a busy claim: no second loop from the button");
   });
 });

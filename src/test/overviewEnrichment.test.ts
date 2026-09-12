@@ -4,6 +4,7 @@ import { isMeaningfulActivity } from "../core/activityFilter";
 import { parseBriefGoal } from "../core/brief";
 import { discoverRuns, selectRun, type PlanRunSnapshot } from "../core/discovery";
 import { RECENT_MEANINGFUL_MAX, activeDurationMs, applyEvent, emptyLiveState, foldEvents, formatDuration } from "../core/liveState";
+import type { ExecutionRecord } from "../core/liveness";
 import { LogRenderer } from "../core/logFormat";
 import { HISTORY_MAX, activityLine, buildOverviewModel, history, timelineState, type OverviewArtifacts } from "../core/overviewModel";
 import { renderOverviewHtml } from "../core/overviewHtml";
@@ -189,13 +190,15 @@ describe("active duration", () => {
     const selection = selectRun((await discoverRuns([ws.location])).runs);
     const live = emptyLiveState();
     applyEvent(live, { v: 1, ts: at(0), actor: "stage", event: "turn.started", provider: "claude-cli" });
-    let model = buildOverviewModel(selection, live, ALL, T0 + 192_000);
+    // Certain "Working for" wording needs an observed-alive runner; telemetry alone reads as inferred.
+    const running: ExecutionRecord = { id: "e", runId: selection.selected!.id, kind: "run-loop", source: "launched", state: "running", startedAtMs: T0 - 1000 };
+    let model = buildOverviewModel(selection, live, ALL, T0 + 192_000, running);
     assert.deepEqual(model.activity, { kind: "active", text: "Working for 3m 12s · Claude" });
     assert.equal(model.stageAgent?.duration, "3m 12s");
     assert.equal(model.sparrer?.duration, undefined);
 
     applyEvent(live, { v: 1, ts: at(180), actor: "sparrer", event: "sparring.started", provider: "codex-cli" });
-    model = buildOverviewModel(selection, live, ALL, T0 + 192_000);
+    model = buildOverviewModel(selection, live, ALL, T0 + 192_000, running);
     assert.deepEqual(model.activity, { kind: "active", text: "Sparring for 12s · Codex" });
     assert.equal(model.sparrer?.duration, "12s");
     const html = renderOverviewHtml(model, "n", "c");

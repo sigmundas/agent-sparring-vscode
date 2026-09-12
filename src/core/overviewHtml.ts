@@ -156,7 +156,8 @@ function renderStageCard(model: OverviewModel): string {
     buttons.push(button("runStage", model.stageAction.label, true, title, model.stageAction.primary ? "primary" : ""));
   }
   if (model.busyState) {
-    buttons.push(`<span class="busy" title="${escapeHtml(model.busyState.detail)}">${icon("dot", "dot")}${escapeHtml(model.busyState.label)}</span>`);
+    const cls = model.busyState.state === "running" ? "busy" : "busy unknown";
+    buttons.push(`<span class="${cls}" title="${escapeHtml(model.busyState.detail)}">${icon(model.busyState.state === "running" ? "dot" : "warn", "dot")}${escapeHtml(model.busyState.label)}</span>`);
   }
   if (model.runner?.alive) {
     buttons.push(button("stopRunner", model.runner.label, true, "Send Ctrl-C to the terminal running this stage", "danger"));
@@ -193,6 +194,8 @@ function renderStageCard(model: OverviewModel): string {
     current = `<p class="stopped">${icon("warn", "send_back")}${escapeHtml(model.activity.text)}</p>`;
   } else if (model.activity?.kind === "stale") {
     current = `<p class="stale">${icon("warn", "send_back")}${escapeHtml(model.activity.text)}</p>`;
+  } else if (model.activity?.kind === "inferred") {
+    current = `<p class="inferred" title="${escapeHtml(model.liveness?.detail ?? "")}">${icon("warn", "send_back")}${escapeHtml(model.activity.text)}</p>`;
   } else if (model.runner?.alive && model.activity?.kind !== "active") {
     current = `<p class="muted">Runner started; waiting for the first turn.</p>`;
   } else if (model.activity?.kind === "active") {
@@ -226,13 +229,18 @@ function renderActor(card: ActorCard): string {
   const busy = card.activity === "Working" || card.activity === "Sparring";
   const duration = card.duration ? ` for ${escapeHtml(card.duration)}` : "";
   const quiet = card.quietFor ? ` <span class="muted">· no meaningful activity for ${escapeHtml(card.quietFor)}</span>` : "";
+  const uncertain = busy && card.uncertain ? ` <span class="muted">· runner status unknown</span>` : "";
   const session = card.sessionLabel ? `${capitalize(card.sessionKind)}: ${escapeHtml(card.sessionLabel)}` : `No ${card.sessionKind} yet`;
   const who = whoClass(card.provider);
+  // A telemetry-only turn reads "Working? (turn observed 3m ago)": the duration is
+  // time since the observed start, not a claim that work is happening now.
+  const word = busy && card.uncertain ? `${card.activity}?` : card.activity;
+  const span = busy && card.uncertain ? (card.duration ? ` <span class="muted">(turn observed ${escapeHtml(card.duration)} ago)</span>` : "") : duration;
   return `<div class="card actor">
 <span class="avatar ${who}">${escapeHtml(card.provider.charAt(0).toUpperCase())}</span>
 <div>
 <div><span class="provider ${who}">${escapeHtml(card.provider)}</span> <span class="muted">(${escapeHtml(card.role)})</span></div>
-<div class="activity ${card.activity.toLowerCase()}">${icon("dot", "dot")}${escapeHtml(card.activity)}${busy ? duration : ""}${quiet}</div>
+<div class="activity ${card.activity.toLowerCase()}${busy && card.uncertain ? " uncertain" : ""}">${icon("dot", "dot")}${escapeHtml(word)}${busy ? span : ""}${uncertain}${quiet}</div>
 <div class="session muted">${session}</div>
 </div>
 </div>`;
@@ -384,7 +392,10 @@ button.primary { background: var(--vscode-button-background); color: var(--vscod
 button.primary:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
 button.danger { color: var(--warn); border-color: var(--warn); }
 .busy { display: inline-flex; align-items: center; padding: 4px 11px; border: 1px solid var(--good); border-radius: 6px; font-size: 0.92em; color: var(--good); font-weight: 600; cursor: help; }
-.stopped, .stale { display: flex; align-items: center; color: var(--warn); }
+.busy.unknown { border-color: var(--warn); color: var(--warn); }
+.stopped, .stale, .inferred { display: flex; align-items: center; color: var(--warn); }
+.activity.uncertain { color: var(--warn); }
+.activity.uncertain .icon.dot { color: var(--warn); }
 
 .facts { display: grid; grid-template-columns: max-content 1fr; gap: 1px 12px; margin: 0; padding-top: 8px; border-top: 1px solid var(--line); font-size: 0.82em; color: var(--vscode-descriptionForeground); }
 .facts dt { color: var(--vscode-descriptionForeground); }

@@ -24,17 +24,11 @@ import {
   type RunSnapshot,
   type SparringLocation,
 } from "../core/discovery";
+import { deriveLiveness, type ExecutionRecord, type RunnerLiveness } from "../core/liveness";
 import { applyEvent, emptyLiveState, type LiveState } from "../core/liveState";
 import { LogRenderer } from "../core/logFormat";
-import { applyRunner, type RunnerStatus } from "../core/runner";
 import { deriveStatus } from "../core/status";
-
-/** A `sparring` process the extension launched in its own terminal. */
-interface RunnerRecord {
-  status: RunnerStatus;
-  terminal: vscode.Terminal;
-  name: string;
-}
+import { ExecutionTracker, type LaunchOptions } from "./executionTracker";
 
 const SELECTED_RUN_KEY = "agentSparring.selectedRunId";
 /** The run last shown, whether chosen explicitly or automatically; restores across reloads. */
@@ -53,8 +47,9 @@ export class SparringController implements vscode.Disposable {
   private tailer: ActivityTailer | undefined;
   private readonly logRenderer = new LogRenderer();
   private attachedRunId: string | undefined;
-  /** Runners launched by this extension instance, by run id (or launch name for plan launches). */
-  private readonly runners = new Map<string, RunnerRecord>();
+  /** Runner process observations (launched, typed in a terminal, or re-found after a reload). */
+  private readonly tracker: ExecutionTracker;
+  private reattached = false;
 
   private readonly changeEmitter = new vscode.EventEmitter<void>();
   /** Fires after every re-render: selection, authoritative state or live activity changed. */
@@ -72,6 +67,17 @@ export class SparringController implements vscode.Disposable {
     this.statusBar.name = "Agent Sparring";
     this.statusBar.command = "agentSparring.openOverview";
     this.disposables.push(this.output, this.statusBar, this.changeEmitter);
+    this.tracker = new ExecutionTracker(
+      context,
+      (message) => this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} ${message}`),
+      () => this.locations,
+    );
+    this.disposables.push(
+      this.tracker,
+      // A runner ending may have left new authoritative files behind; a
+      // start or liveness change only needs re-rendering.
+      this.tracker.onDidChange((change) => (change === "ended" ? void this.refresh() : this.render())),
+    );
 
     this.disposables.push(
       vscode.workspace.onDidChangeWorkspaceFolders(() => void this.start()),
@@ -83,10 +89,6 @@ export class SparringController implements vscode.Disposable {
           this.scheduleRefresh();
         }
       }),
-      // The terminal closes when its process exits for any reason (normal
-      // completion, Ctrl-C, error, the user killing the terminal): that is
-      // the runner-exit signal.
-      vscode.window.onDidCloseTerminal((terminal) => this.onTerminalClosed(terminal)),
     );
     this.renderInterval = setInterval(() => this.render(), 60_000);
   }
@@ -104,6 +106,12 @@ export class SparringController implements vscode.Disposable {
     this.statusBar.show();
     await this.refresh();
     this.armPolling();
+    if (!this.reattached) {
+      // Launches recorded before a reload: liveness is re-established from
+      // terminals and processes, never from the telemetry just replayed.
+      this.reattached = true;
+      void this.tracker.reattach();
+    }
   }
 
   private fileFolders(): vscode.WorkspaceFolder[] {
@@ -259,83 +267,41 @@ export class SparringController implements vscode.Disposable {
   // ---------------------------------------------------------------- runners
 
   /**
-   * Launch `executable args` directly (no shell) in a dedicated terminal and
-   * track its lifetime. `runId` ties the runner to a discovered run so the
-   * Overview can offer Stop and, after exit, clear stale busy claims.
+   * Launch a sparring command in an integrated terminal and observe its
+   * lifetime (see ExecutionTracker). `runId` ties the process to a
+   * discovered run so the Overview can offer Stop and, after it ends, say
+   * "interrupted" instead of "running".
    */
-  launchRunner(options: { executable: string; args: string[]; cwd: string; name: string; runId?: string; reveal: boolean }): void {
-    const terminal = vscode.window.createTerminal({
-      name: `Agent Sparring: ${options.name}`,
-      shellPath: options.executable,
-      shellArgs: options.args,
-      cwd: options.cwd,
-      iconPath: new vscode.ThemeIcon("debug-alt"),
-    });
-    if (options.reveal) {
-      terminal.show(true);
-    }
-    const key = options.runId ?? `launch:${options.name}:${Date.now()}`;
-    this.runners.set(key, { terminal, name: options.name, status: { runId: key, alive: true, startedAtMs: Date.now() } });
-    this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} launched ${options.name} in terminal (${options.args.length} args, cwd ${options.cwd})`);
+  async launch(options: LaunchOptions): Promise<void> {
+    await this.tracker.launch(options);
     // The engine writes its state before the first provider turn; pick it up promptly.
     setTimeout(() => void this.refresh(), 1500);
     setTimeout(() => void this.refresh(), 6000);
     this.render();
   }
 
-  /** The runner launched for a run, alive or finished, if this instance launched one. */
-  runnerFor(runId: string | undefined): RunnerStatus | undefined {
-    return runId ? this.runners.get(runId)?.status : undefined;
+  /** The latest runner execution observed for a run (running, unknown after a reload, or ended). */
+  executionFor(runId: string | undefined): ExecutionRecord | undefined {
+    return this.tracker.executionFor(runId);
   }
 
   /** Send Ctrl-C to the exact terminal running this run; nothing else is signalled. */
   stopRunner(runId: string): boolean {
-    const record = this.runners.get(runId);
-    if (!record || !record.status.alive) {
-      return false;
-    }
-    record.terminal.sendText("", false);
-    record.terminal.show(true);
-    this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} sent Ctrl-C to ${record.name}`);
-    return true;
+    return this.tracker.stop(runId);
   }
 
-  private onTerminalClosed(terminal: vscode.Terminal): void {
-    for (const [key, record] of this.runners) {
-      if (record.terminal !== terminal) {
-        continue;
-      }
-      const code = terminal.exitStatus?.code;
-      record.status = { ...record.status, alive: false, endedAtMs: Date.now(), exitCode: code };
-      const how = code === undefined ? "exited (signal or cancelled)" : `exited with code ${code}`;
-      this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} ${record.name} ${how}`);
-      if (code !== undefined && code !== 0) {
-        void vscode.window.showWarningMessage(`Agent Sparring: ${record.name} exited with code ${code}.`, "Show Log").then((choice) => {
-          if (choice === "Show Log") {
-            this.showLog();
-          }
-        });
-      }
-      if (!key.startsWith("launch:")) {
-        // Keep the finished record so the Overview can say "Runner stopped"
-        // until the next launch for this run replaces it.
-        this.runners.set(key, record);
-      } else {
-        this.runners.delete(key);
-      }
-      // Recompute everything from authoritative files + telemetry right away.
-      void this.refresh();
-      return;
-    }
+  /** Runner liveness for the selected run, combining process observation with the activity fold. */
+  get currentLiveness(): RunnerLiveness {
+    return this.livenessFor(this.selection.selected?.id);
   }
 
-  /** Live state as presented: busy claims a finished runner of ours cannot back are cleared. */
+  livenessFor(runId: string | undefined): RunnerLiveness {
+    return deriveLiveness(this.live, this.tracker.executionFor(runId), Date.now());
+  }
+
+  /** Live state as presented: turns a runner known to have ended cannot be executing are cleared. */
   get presentedLive(): LiveState | undefined {
-    return applyRunner(this.live, this.runnerFor(this.selection.selected?.id), Date.now()).live;
-  }
-
-  private effectiveLive(): LiveState | undefined {
-    return this.presentedLive;
+    return this.currentLiveness.live;
   }
 
   get sparringLocations(): SparringLocation[] {
@@ -425,7 +391,8 @@ export class SparringController implements vscode.Disposable {
   // ---------------------------------------------------------------- rendering
 
   render(): void {
-    const view = deriveStatus(this.selection, this.effectiveLive(), Date.now());
+    const liveness = this.currentLiveness;
+    const view = deriveStatus(this.selection, liveness.live, Date.now(), liveness);
     this.statusBar.text = view.text;
     const tooltip = new vscode.MarkdownString(view.tooltip.replace(/\n/g, "  \n"));
     tooltip.appendMarkdown("\n\nClick to open the run overview.");

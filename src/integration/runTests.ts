@@ -53,9 +53,56 @@ async function buildFixture(): Promise<{ root: string; workspaceFile: string }> 
   await fs.writeFile(path.join(barrier, "handoff.md"), "# Handoff\n");
   await fs.writeFile(path.join(barrier, "sparring.md"), "# Sparring\n");
   await writeStage(reported, "stage-reported-statistics-typed-parser", "working");
+  // A stage whose telemetry ends in an unmatched turn.started, as Ctrl-C or a
+  // reload leaves it: the reloaded extension must not call this Running.
+  const stale = await writeStage(reported, "stage-stale-turn", "working");
+  await fs.writeFile(
+    path.join(stale, "activity.jsonl"),
+    '{"v":1,"ts":"2026-09-11T19:00:00.000Z","actor":"loop","event":"loop.started"}\n{"v":1,"ts":"2026-09-11T19:00:01.000Z","actor":"stage","event":"turn.started","provider":"claude-cli"}\n',
+  );
+  // readGitBranch only needs .git/HEAD; no git binary is required for the branch the launch passes.
+  await fs.mkdir(path.join(reported, ".git"), { recursive: true });
+  await fs.writeFile(path.join(reported, ".git", "HEAD"), "ref: refs/heads/feature/reported-statistics\n");
+
+  // A fake `sparring`: writes loop.started + turn.started for the stage (and
+  // deliberately never turn.finished), then sleeps and exits as instructed by
+  // <repo>/.sparring/fake-runner.conf; SIGINT ends it with 130.
+  const fake = path.join(root, "bin", "sparring");
+  await fs.mkdir(path.dirname(fake), { recursive: true });
+  await fs.writeFile(
+    fake,
+    [
+      "#!/bin/sh",
+      'stage="$2"',
+      'root="$4"',
+      'conf="$root/.sparring/fake-runner.conf"',
+      "sleep_for=3; exit_with=0",
+      '[ -f "$conf" ] && . "$conf"',
+      'dir="$root/.sparring/stages/$stage"',
+      'now=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)',
+      "printf '{\"v\":1,\"ts\":\"%s\",\"actor\":\"loop\",\"event\":\"loop.started\"}\\n' \"$now\" >> \"$dir/activity.jsonl\"",
+      "printf '{\"v\":1,\"ts\":\"%s\",\"actor\":\"stage\",\"event\":\"turn.started\",\"provider\":\"claude-cli\",\"session_id\":\"fake\"}\\n' \"$now\" >> \"$dir/activity.jsonl\"",
+      "trap 'exit 130' INT TERM",
+      'echo "fake sparring: $*"',
+      'i=0; while [ "$i" -lt "$sleep_for" ]; do sleep 1; i=$((i+1)); done',
+      'exit "$exit_with"',
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
 
   const workspaceFile = path.join(root, "window.code-workspace");
-  await fs.writeFile(workspaceFile, JSON.stringify({ folders: [{ path: "sporely" }, { path: "sporely-py-reported-statistics" }], settings: {} }, null, 2));
+  await fs.writeFile(
+    workspaceFile,
+    JSON.stringify(
+      {
+        folders: [{ path: "sporely" }, { path: "sporely-py-reported-statistics" }],
+        settings: { "agentSparring.executable": fake, "terminal.integrated.shellIntegration.enabled": true, "terminal.integrated.enablePersistentSessions": true },
+      },
+      null,
+      2,
+    ),
+  );
   return { root, workspaceFile };
 }
 

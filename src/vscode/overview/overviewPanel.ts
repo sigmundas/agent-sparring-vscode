@@ -120,7 +120,7 @@ export class OverviewPanelManager implements vscode.Disposable {
       ]);
       artifacts = { handoff, sparring, brief: briefText !== undefined, briefText, plan, git: await gitContext(selection.selected.location.repoRoot) };
     }
-    return buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.runnerFor(selection.selected?.id));
+    return buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.executionFor(selection.selected?.id));
   }
 
   dispose(): void {
