@@ -93,13 +93,13 @@ export class OverviewPanelManager implements vscode.Disposable {
     let artifacts: OverviewArtifacts = { handoff: false, sparring: false, brief: false, plan: false };
     if (selection.selected) {
       const stage = currentStageOf(selection.selected);
-      const [handoff, sparring, brief, plan] = await Promise.all([
+      const [handoff, sparring, briefText, plan] = await Promise.all([
         exists(path.join(stage.dir, HANDOFF_FILENAME)),
         exists(path.join(stage.dir, SPARRING_FILENAME)),
-        exists(path.join(stage.dir, BRIEF_FILENAME)),
+        readHead(path.join(stage.dir, BRIEF_FILENAME)),
         selection.selected.kind === "plan" ? exists(selection.selected.planPath) : Promise.resolve(false),
       ]);
-      artifacts = { handoff, sparring, brief, plan };
+      artifacts = { handoff, sparring, brief: briefText !== undefined, briefText, plan };
     }
     return buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now());
   }
@@ -124,6 +124,24 @@ function isActionMessage(message: unknown): message is { type: "action"; action:
     (message as Record<string, unknown>)["type"] === "action" &&
     ACTIONS.has(String((message as Record<string, unknown>)["action"]))
   );
+}
+
+/** Only the Goal paragraph is ever displayed; a brief is never read past this many bytes. */
+const BRIEF_READ_LIMIT = 64 * 1024;
+
+/** The beginning of a text file, or undefined when it does not exist / cannot be read. */
+async function readHead(file: string): Promise<string | undefined> {
+  let handle: fs.FileHandle | undefined;
+  try {
+    handle = await fs.open(file, "r");
+    const buffer = Buffer.alloc(BRIEF_READ_LIMIT);
+    const { bytesRead } = await handle.read(buffer, 0, BRIEF_READ_LIMIT, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } catch {
+    return undefined;
+  } finally {
+    await handle?.close();
+  }
 }
 
 async function exists(file: string): Promise<boolean> {

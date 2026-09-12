@@ -173,8 +173,12 @@ describe("overview view model", () => {
     assert.equal(model.actions?.handoff, true);
     assert.equal(model.actions?.sparring, true);
     assert.equal(model.actions?.brief, true);
-    assert.ok(!model.facts?.some((fact) => fact.label === "Stage"), "no low-level Stage row");
-    assert.deepEqual(model.facts?.[1], { label: "Candidate", value: "cccccccc…" });
+    assert.ok(!model.facts?.some((fact) => fact.label === "Last activity"), "the Ns-ago row is gone");
+    assert.deepEqual(model.facts?.slice(1, 3), [
+      { label: "Base", value: "bbbbbbbb…" },
+      { label: "Candidate", value: "cccccccc…" },
+    ]);
+    assert.deepEqual(model.activity, { kind: "none", text: "No activity telemetry for this stage." });
   });
 
   it("empty and ambiguous selections", async () => {
@@ -253,14 +257,19 @@ describe("overview HTML", () => {
     assert.ok(!noDiff.includes('data-action="openDiff"'));
   });
 
-  it("renders the timeline glyphs and the actors side by side", async () => {
+  it("renders the compact journey, the primary stage block and the small actor cards", async () => {
     const ws = await planWorkspace("paused", 1, { sparring: sparringMarkdown("NEEDS_YOU", "Check") });
     const html = renderOverviewHtml(buildOverviewModel(await selection(ws), undefined, ALL, NOW), "n", "c");
-    assert.match(html, /<li class="step accepted" [^>]*><span class="glyph">✓<\/span><span class="name">Contract<\/span>/);
+    assert.match(html, /<ol class="journey"><li class="step accepted" title="Stage 1 — Contract \(accepted\)"><span class="glyph">✓<\/span><span class="num">1<\/span><\/li>/);
     assert.match(html, /<li class="step paused current"/);
     assert.match(html, /<li class="step future"/);
+    assert.match(html, /<div class="position muted">Stage 2 of 3<\/div>/);
+    assert.match(html, /<h2 [^>]*>Stage 2 — Schema &amp; API <span class="pill needs_you"/);
     assert.equal((html.match(/<div class="actor">/g) ?? []).length, 2);
+    assert.ok(html.indexOf('<section class="stage">') < html.indexOf('<section class="actors">'), "stage before actors");
+    assert.ok(html.indexOf('<section class="actors">') < html.indexOf('<dl class="facts">'), "metadata last");
     assert.match(html, /<div class="banner stop">NEEDS_YOU — Check<\/div>/);
+    assert.ok(!html.includes("Last activity"));
   });
 
   it("ambiguous model lists the choices and offers selection", () => {

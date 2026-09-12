@@ -29,7 +29,7 @@ navigates.
 | --- | --- |
 | `Agent Sparring: Run Plan` | Pick a plan Markdown file (`## Stage <n> — <title>` headings), confirm the branch, launch `run-plan`. |
 | `Agent Sparring: Resume Plan` | Pick a paused/running plan run, optionally record human evidence, launch `resume-plan`. |
-| `Agent Sparring: Open Overview` | One editor-area Run Overview panel: stage timeline, Stage Agent / Sparrer cards, current stage line, last sparring outcome, and Open diff / handoff / sparring report / brief / plan buttons. Never auto-opens; updates in place. |
+| `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / frozen / future stages), the current stage as primary content (`Stage N — title`, presentation status, routing state, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), last sparring outcome, small Stage Agent / Sparrer cards, Open diff / handoff / sparring report / brief / plan buttons, and quiet metadata. Never auto-opens; updates in place. |
 | `Agent Sparring: Show Log` | Focus the Output Channel. |
 | `Agent Sparring: Select Run` | Choose explicitly when several runs look active; the choice is remembered per workspace. |
 | `Agent Sparring: Rediscover State` | Re-scan `.sparring` from disk. |
@@ -52,7 +52,8 @@ navigates.
 | working / frozen / accepted per stage | `.sparring/stages/<id>/state.json` |
 | stage count and titles | the plan Markdown named in the run state |
 | NEEDS_YOU / ESCALATE wording on a paused run | `## Routing outcome` in the current stage's `sparring.md` |
-| "Claude working", "Codex sparring", changed files, verdict chronology | `activity.jsonl` (observational only) |
+| "Claude working", "Codex sparring", active-turn duration, loop cycle, last visible event, changed files, verdict chronology | `activity.jsonl` (observational only; the Overview and the Output Channel share one filter for what counts as visible activity) |
+| Goal paragraph in the Overview | `## Goal` in the current stage's `brief.md` (display only) |
 
 Deleting `activity.jsonl` removes the live decoration and nothing else.
 

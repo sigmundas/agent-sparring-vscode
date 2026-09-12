@@ -3,6 +3,10 @@
  * escaped; no filesystem paths, session ids beyond their shortened form, or
  * secrets are placed in the document. The only script is a nonce'd
  * click-to-postMessage shim for the action buttons.
+ *
+ * Layout, top to bottom: where we have been and are going (plan journey),
+ * where we are (current stage: heading, status, goal, activity, last
+ * sparring), the actors as small secondary cards, actions, quiet metadata.
  */
 
 import type { ActorCard, OverviewModel, TimelineItem } from "./overviewModel";
@@ -57,26 +61,20 @@ function renderBody(model: OverviewModel): string {
     parts.push(`<div class="banner ${model.banner.kind}">${escapeHtml(model.banner.text)}</div>`);
   }
   if (model.timeline && model.timeline.length > 0) {
-    parts.push(renderTimeline(model.timeline));
+    parts.push(renderJourney(model.timeline));
   } else if (model.timelineNote) {
     parts.push(`<p class="muted note">${escapeHtml(model.timelineNote)}</p>`);
   }
-  if (model.stageAgent && model.sparrer) {
-    parts.push(`<section class="actors">${renderActor(model.stageAgent)}${renderActor(model.sparrer)}</section>`);
-  }
-  const pill = model.stageStatus
-    ? ` <span class="pill ${escapeHtml(model.stageStatusKind ?? "")}" title="${escapeHtml(model.stageId ? `stage id: ${model.stageId}` : "")}">${escapeHtml(model.stageStatus)}</span>`
-    : "";
-  parts.push(`<section class="stage">
-<h2 title="${escapeHtml(model.stageId ?? "")}">${escapeHtml(model.stageHeading ?? "")}${pill}</h2>
-<p>${escapeHtml(model.stageLine ?? "")}</p>
-</section>`);
+  parts.push(renderStage(model));
   if (model.lastSparring) {
     const reason = model.lastSparring.reason ? ` <span class="muted">(${escapeHtml(model.lastSparring.reason)})</span>` : "";
     parts.push(`<section class="sparring">
-<h3>Last sparring <span class="pill">${escapeHtml(model.lastSparring.action)}</span>${reason}</h3>
+<h3>Last sparring <span class="pill ${escapeHtml(model.lastSparring.action.toLowerCase())}">${escapeHtml(model.lastSparring.action)}</span>${reason}</h3>
 <p>${escapeHtml(model.lastSparring.summary || "(no summary recorded)")}</p>
 </section>`);
+  }
+  if (model.stageAgent && model.sparrer) {
+    parts.push(`<section class="actors">${renderActor(model.stageAgent)}${renderActor(model.sparrer)}</section>`);
   }
   const actions = model.actions;
   if (actions) {
@@ -99,6 +97,28 @@ function renderBody(model: OverviewModel): string {
   return parts.join("\n");
 }
 
+function renderStage(model: OverviewModel): string {
+  const pill = model.stageStatus
+    ? ` <span class="pill ${escapeHtml(model.stageStatusKind ?? "")}" title="${escapeHtml(model.stageId ? `stage id: ${model.stageId}` : "")}">${escapeHtml(model.stageStatus)}</span>`
+    : "";
+  const cycle = model.cycle !== undefined ? ` <span class="pill quiet" title="loop cycle from telemetry">cycle ${model.cycle}</span>` : "";
+  const position = model.position ? `<div class="position muted">${escapeHtml(model.position)}</div>` : "";
+  const goal = model.goal ? `<p class="goal"><span class="label">Goal</span> ${escapeHtml(model.goal)}</p>` : "";
+  let activity = "";
+  if (model.activity) {
+    const time = model.activity.time ? `<span class="time">${escapeHtml(model.activity.time)}</span> ` : "";
+    const label = model.activity.kind === "last" ? "Last" : model.activity.kind === "active" ? "Now" : "";
+    activity = `<p class="activity ${model.activity.kind}">${label ? `<span class="label">${label}</span> ` : ""}${time}${escapeHtml(model.activity.text)}</p>`;
+  }
+  return `<section class="stage">
+${position}
+<h2 title="${escapeHtml(model.stageId ?? "")}">${escapeHtml(model.stageHeading ?? "")}${pill}${cycle}</h2>
+<p class="line">${escapeHtml(model.stageLine ?? "")}</p>
+${goal}
+${activity}
+</section>`;
+}
+
 const GLYPH: Record<TimelineItem["state"], string> = {
   accepted: "✓",
   frozen: "◆",
@@ -108,23 +128,27 @@ const GLYPH: Record<TimelineItem["state"], string> = {
   future: "○",
 };
 
-function renderTimeline(items: TimelineItem[]): string {
+/** One compact row: a glyph per stage, the current stage's title spelled out. */
+function renderJourney(items: TimelineItem[]): string {
   const cells = items.map((item) => {
     const cls = `step ${item.state}${item.current ? " current" : ""}`;
     const label = `Stage ${item.number} — ${item.title} (${item.state})`;
-    return `<li class="${cls}" title="${escapeHtml(label)}"><span class="glyph">${GLYPH[item.state]}</span><span class="name">${escapeHtml(item.title)}</span></li>`;
+    return `<li class="${cls}" title="${escapeHtml(label)}"><span class="glyph">${GLYPH[item.state]}</span><span class="num">${item.number}</span></li>`;
   });
-  return `<ol class="timeline">${cells.join("")}</ol>`;
+  return `<ol class="journey">${cells.join("")}</ol>`;
 }
 
 function renderActor(card: ActorCard): string {
-  const dot = card.activity === "Working" || card.activity === "Sparring" ? "●" : "○";
+  const busy = card.activity === "Working" || card.activity === "Sparring";
+  const dot = busy ? "●" : "○";
+  const duration = card.duration ? ` <span class="muted">${escapeHtml(card.duration)}</span>` : "";
   const quiet = card.quietFor ? ` <span class="muted">· quiet ${escapeHtml(card.quietFor)}</span>` : "";
   const session = card.sessionLabel ? `${card.sessionKind} ${escapeHtml(card.sessionLabel)}` : `no ${card.sessionKind} yet`;
   return `<div class="actor">
-<div class="role">${escapeHtml(card.role)}</div>
-<div><span class="provider">${escapeHtml(card.provider)}</span><span class="activity ${card.activity.toLowerCase()}"><span class="dot">${dot}</span> ${escapeHtml(card.activity)}${quiet}</span></div>
-<div class="session muted">${session}</div>
+<span class="role">${escapeHtml(card.role)}</span>
+<span class="provider">${escapeHtml(card.provider)}</span>
+<span class="activity ${card.activity.toLowerCase()}"><span class="dot">${dot}</span> ${escapeHtml(card.activity)}${duration}${quiet}</span>
+<span class="session muted">${session}</span>
 </div>`;
 }
 
@@ -139,8 +163,8 @@ body { margin: 0; font-family: var(--vscode-font-family); font-size: var(--vscod
 main { max-width: 760px; margin: 0 auto; padding: 12px 18px 20px; }
 header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
 h1 { font-size: 1.05em; font-weight: 600; margin: 0 0 8px; }
-h2 { font-size: 1em; font-weight: 600; margin: 0 0 4px; }
-h3 { font-size: 0.9em; font-weight: 600; margin: 0 0 4px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--vscode-descriptionForeground); }
+h2 { font-size: 1.25em; font-weight: 600; margin: 0 0 4px; line-height: 1.3; }
+h3 { font-size: 0.8em; font-weight: 600; margin: 0 0 3px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--vscode-descriptionForeground); }
 p { margin: 0 0 4px; }
 .muted { color: var(--vscode-descriptionForeground); }
 .run { font-family: var(--vscode-editor-font-family); font-size: 0.9em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
@@ -149,39 +173,47 @@ p { margin: 0 0 4px; }
 .banner.warn { border-left-color: var(--vscode-editorWarning-foreground); }
 .banner.done { border-left-color: var(--vscode-testing-iconPassed, var(--vscode-charts-green)); }
 .note { margin: 6px 0 10px; }
-.timeline { list-style: none; display: flex; align-items: flex-start; gap: 0; margin: 8px 0 14px; padding: 0; height: 60px; overflow-x: auto; }
-.step { position: relative; flex: 1 1 0; min-width: 72px; text-align: center; padding-top: 4px; }
-.step:not(:last-child)::after { content: ""; position: absolute; top: 15px; left: 50%; width: 100%; border-top: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); z-index: 0; }
-.glyph { position: relative; z-index: 1; display: inline-block; width: 22px; height: 22px; line-height: 22px; border-radius: 50%; background: var(--vscode-editor-background); border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); font-size: 12px; }
+.journey { list-style: none; display: flex; align-items: center; gap: 0; margin: 6px 0 12px; padding: 0; }
+.step { position: relative; display: flex; flex-direction: column; align-items: center; width: 36px; }
+.step:not(:last-child)::after { content: ""; position: absolute; top: 9px; left: 50%; width: 100%; border-top: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); z-index: 0; }
+.glyph { position: relative; z-index: 1; display: inline-block; width: 18px; height: 18px; line-height: 18px; text-align: center; border-radius: 50%; background: var(--vscode-editor-background); border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); font-size: 10px; }
+.num { font-size: 0.7em; color: var(--vscode-descriptionForeground); margin-top: 1px; }
 .step.accepted .glyph { color: var(--vscode-testing-iconPassed, var(--vscode-charts-green)); border-color: currentColor; }
 .step.frozen .glyph { color: var(--vscode-charts-blue); border-color: currentColor; }
 .step.active .glyph { color: var(--vscode-focusBorder); border-color: currentColor; }
-.step.paused .glyph { color: var(--vscode-editorWarning-foreground); border-color: currentColor; font-size: 9px; }
-.step.working .glyph { color: var(--vscode-descriptionForeground); }
-.step.future .glyph { color: var(--vscode-descriptionForeground); }
-.name { display: block; margin-top: 4px; font-size: 0.85em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding: 0 4px; color: var(--vscode-descriptionForeground); }
-.step.current .name { color: var(--vscode-foreground); font-weight: 600; }
-.actors { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 0 0 14px; }
-.actor { border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); border-radius: 4px; padding: 5px 9px 6px; line-height: 1.35; }
+.step.paused .glyph { color: var(--vscode-editorWarning-foreground); border-color: currentColor; font-size: 7px; }
+.step.working .glyph, .step.future .glyph { color: var(--vscode-descriptionForeground); }
+.step.current .glyph { box-shadow: 0 0 0 2px var(--vscode-editor-background), 0 0 0 3px currentColor; }
+.step.current .num { color: var(--vscode-foreground); font-weight: 600; }
+.stage { margin: 0 0 12px; }
+.position { font-size: 0.8em; text-transform: uppercase; letter-spacing: 0.04em; }
+.line { font-size: 1em; }
+.goal { margin-top: 6px; line-height: 1.4; }
+.label { font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.04em; color: var(--vscode-descriptionForeground); margin-right: 4px; }
+.activity.active, .activity.last, .activity.none { margin-top: 4px; color: var(--vscode-descriptionForeground); }
+.activity.active { color: var(--vscode-foreground); }
+.time { font-family: var(--vscode-editor-font-family); font-size: 0.9em; }
+.sparring { margin: 0 0 12px; }
+.actors { display: flex; flex-wrap: wrap; gap: 6px 10px; margin: 0 0 10px; }
+.actor { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 8px; border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); border-radius: 4px; padding: 3px 8px; font-size: 0.9em; line-height: 1.35; flex: 1 1 240px; }
 .role { font-size: 0.75em; text-transform: uppercase; letter-spacing: 0.04em; color: var(--vscode-descriptionForeground); }
-.provider { font-weight: 600; display: inline; }
-.activity { display: inline; margin-left: 8px; }
-.activity .dot { color: var(--vscode-descriptionForeground); }
-.activity.working .dot, .activity.sparring .dot { color: var(--vscode-focusBorder); }
-.session { font-family: var(--vscode-editor-font-family); font-size: 0.78em; opacity: 0.8; margin-top: 1px; }
-.stage, .sparring { margin: 0 0 12px; }
+.provider { font-weight: 600; }
+.actor .activity { margin: 0; color: inherit; }
+.actor .dot { color: var(--vscode-descriptionForeground); }
+.actor .activity.working .dot, .actor .activity.sparring .dot { color: var(--vscode-focusBorder); }
+.session { font-family: var(--vscode-editor-font-family); font-size: 0.8em; opacity: 0.8; }
+.pill { display: inline-block; font-size: 0.7em; font-weight: 500; padding: 1px 6px; border-radius: 8px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); vertical-align: middle; text-transform: none; letter-spacing: 0; }
 .pill.ready, .pill.accepted { background: var(--vscode-testing-iconPassed, var(--vscode-charts-green)); color: var(--vscode-editor-background); }
 .pill.needs_you, .pill.escalate { background: var(--vscode-editorWarning-foreground); color: var(--vscode-editor-background); }
-.pill { display: inline-block; font-size: 0.75em; font-weight: 500; padding: 1px 6px; border-radius: 8px; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); vertical-align: middle; text-transform: none; letter-spacing: 0; }
-.actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 12px; }
+.pill.quiet { background: transparent; color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); }
+.actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 12px; }
 button { font-family: inherit; font-size: inherit; padding: 3px 10px; border: 1px solid var(--vscode-button-border, transparent); border-radius: 2px; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); cursor: pointer; }
 button:hover:not(:disabled) { background: var(--vscode-button-secondaryHoverBackground); }
 button:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
 button:disabled { opacity: 0.5; cursor: default; }
-.facts { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 0; font-size: 0.9em; }
+.facts { display: grid; grid-template-columns: max-content 1fr; gap: 1px 12px; margin: 0; padding-top: 8px; border-top: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); font-size: 0.82em; color: var(--vscode-descriptionForeground); }
 .facts dt { color: var(--vscode-descriptionForeground); }
-.facts dd { margin: 0; font-family: var(--vscode-editor-font-family); }
-@media (max-width: 480px) { .actors { grid-template-columns: 1fr; } }
+.facts dd { margin: 0; font-family: var(--vscode-editor-font-family); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 `;
 
 const SCRIPT = `

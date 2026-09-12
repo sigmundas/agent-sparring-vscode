@@ -9,7 +9,10 @@
  * No dependency on the vscode API.
  */
 
+import { describeActivity, isMeaningfulActivity, shortId } from "./activityFilter";
 import type { ActivityEvent } from "./engineFormats";
+
+export { shortId };
 
 export interface ActorLive {
   provider?: string;
@@ -17,7 +20,17 @@ export interface ActorLive {
   model?: string;
   /** A turn started and has not yet finished/failed (as far as telemetry says). */
   busy: boolean;
+  /** Timestamp of the latest turn start/resume while busy; cleared when the turn ends. */
+  busySince?: string;
   lastEventTs?: string;
+}
+
+/** The last event that would earn a line in the Output Channel. */
+export interface MeaningfulEvent {
+  ts: string;
+  actor: string;
+  event: string;
+  description: string;
 }
 
 export interface LiveVerdict {
@@ -34,6 +47,10 @@ export interface LiveState {
   lastPlanEvent?: { event: string; action?: string; summary?: string; ts: string };
   lastGateEvent?: { event: string; sha?: string; summary?: string; ts: string };
   lastLoopEvent?: { event: string; action?: string; summary?: string; cycle?: number; ts: string };
+  /** Latest loop cycle number any loop event carried. */
+  currentCycle?: number;
+  /** Last event that passes the shared Output filter; suppressed noise never lands here. */
+  lastMeaningful?: MeaningfulEvent;
   lastEventTs?: string;
   eventCount: number;
   sendBackCount: number;
@@ -69,23 +86,29 @@ export function applyEvent(state: LiveState, event: ActivityEvent): LiveState {
     }
   }
 
+  if (isMeaningfulActivity(event)) {
+    state.lastMeaningful = { ts: event.ts, actor: event.actor, event: event.event, description: describeActivity(event) ?? event.event };
+  }
+
   switch (event.event) {
     case "turn.started":
       state.stage.busy = true;
+      state.stage.busySince = event.ts;
       break;
     case "turn.finished":
     case "turn.failed":
     case "handoff.ready":
-      state.stage.busy = false;
+      idle(state.stage);
       break;
     case "sparring.started":
       state.sparrer.busy = true;
+      state.sparrer.busySince = event.ts;
       break;
     case "sparring.failed":
-      state.sparrer.busy = false;
+      idle(state.sparrer);
       break;
     case "verdict":
-      state.sparrer.busy = false;
+      idle(state.sparrer);
       if (event.action) {
         state.lastVerdict = { action: event.action, summary: event.summary, ts: event.ts };
         if (event.action === "SEND_BACK") {
@@ -103,19 +126,50 @@ export function applyEvent(state: LiveState, event: ActivityEvent): LiveState {
   if (event.actor === "plan") {
     state.lastPlanEvent = { event: event.event, action: event.action, summary: event.summary, ts: event.ts };
     if (event.event === "plan.paused" || event.event === "plan.failed" || event.event === "plan.completed") {
-      state.stage.busy = false;
-      state.sparrer.busy = false;
+      idle(state.stage);
+      idle(state.sparrer);
     }
   } else if (event.actor === "gate") {
     state.lastGateEvent = { event: event.event, sha: event.sha, summary: event.summary, ts: event.ts };
   } else if (event.actor === "loop") {
     state.lastLoopEvent = { event: event.event, action: event.action, summary: event.summary, cycle: event.cycle, ts: event.ts };
+    if (typeof event.cycle === "number") {
+      state.currentCycle = event.cycle;
+    }
     if (event.event === "loop.stopped" || event.event === "loop.runaway") {
-      state.stage.busy = false;
-      state.sparrer.busy = false;
+      idle(state.stage);
+      idle(state.sparrer);
     }
   }
   return state;
+}
+
+function idle(actor: ActorLive): void {
+  actor.busy = false;
+  actor.busySince = undefined;
+}
+
+/** Milliseconds an actor has been in its current turn, or undefined when not busy / unparseable. */
+export function activeDurationMs(actor: ActorLive, nowMs: number): number | undefined {
+  if (!actor.busy || !actor.busySince) {
+    return undefined;
+  }
+  const since = Date.parse(actor.busySince);
+  return Number.isFinite(since) ? Math.max(0, nowMs - since) : undefined;
+}
+
+/** `Xm Ys` / `Xh Ym` style duration for an active turn. */
+export function formatDuration(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+  }
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
 }
 
 /** Display name for a provider id, falling back to the role. */
@@ -130,11 +184,4 @@ export function providerDisplayName(provider: string | undefined, role: "stage" 
     default:
       return provider;
   }
-}
-
-export function shortId(id: string | undefined, length = 4): string | undefined {
-  if (!id) {
-    return undefined;
-  }
-  return id.length > length ? `${id.slice(0, length)}…` : id;
 }
