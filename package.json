@@ -1,0 +1,94 @@
+{
+  "name": "agent-sparring-vscode",
+  "displayName": "Agent Sparring",
+  "description": "Observe, launch and navigate agent-sparring plan runs from VS Code.",
+  "version": "0.1.0",
+  "publisher": "sintef",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.90.0",
+    "node": ">=20"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "workspaceContains:.sparring",
+    "workspaceContains:.sparring/project.toml",
+    "workspaceContains:.sparring/plans/*.json"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "agentSparring.runPlan",
+        "title": "Run Plan",
+        "category": "Agent Sparring"
+      },
+      {
+        "command": "agentSparring.resumePlan",
+        "title": "Resume Plan",
+        "category": "Agent Sparring"
+      },
+      {
+        "command": "agentSparring.openOverview",
+        "title": "Open Overview",
+        "category": "Agent Sparring"
+      },
+      {
+        "command": "agentSparring.showLog",
+        "title": "Show Log",
+        "category": "Agent Sparring"
+      },
+      {
+        "command": "agentSparring.selectRun",
+        "title": "Select Run",
+        "category": "Agent Sparring"
+      },
+      {
+        "command": "agentSparring.refresh",
+        "title": "Rediscover State",
+        "category": "Agent Sparring"
+      }
+    ],
+    "configuration": {
+      "title": "Agent Sparring",
+      "properties": {
+        "agentSparring.executable": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Path to the `sparring` executable. Leave empty to resolve `sparring` from `PATH`."
+        },
+        "agentSparring.pollIntervalMs": {
+          "type": "number",
+          "default": 1500,
+          "minimum": 250,
+          "description": "Fallback polling interval for activity.jsonl when filesystem events are missed."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "npm run typecheck && npm run bundle",
+    "bundle": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --target=node20 --sourcemap",
+    "watch": "npm run bundle -- --watch",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "compile-tests": "tsc -p tsconfig.test.json",
+    "test": "npm run compile-tests && node --test \"out/test/**/*.test.js\"",
+    "lint": "eslint src",
+    "vscode:prepublish": "npm run build"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.9.0",
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "esbuild": "^0.23.0",
+    "eslint": "^9.9.0",
+    "typescript": "^5.5.4",
+    "typescript-eslint": "^8.0.0"
+  }
+}
