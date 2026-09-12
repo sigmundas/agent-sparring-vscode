@@ -7,6 +7,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { SparringLocation } from "../core/discovery";
 import type { ActivityEvent } from "../core/engineFormats";
 
 /** Real values produced by the engine for `docs/plans/foo.md` (see plan.py: plan_key). */
@@ -43,13 +44,13 @@ export class Workspace {
     this.sparringDir = path.join(root, ".sparring");
   }
 
-  get location() {
-    return { sparringDir: this.sparringDir, repoRoot: this.root };
+  get location(): SparringLocation {
+    return { sparringDir: this.sparringDir, repoRoot: this.root, workspaceFolder: this.root, folderName: path.basename(this.root) };
   }
 
-  static async create(options: { withSpaces?: boolean; sparring?: boolean } = {}): Promise<Workspace> {
+  static async create(options: { withSpaces?: boolean; sparring?: boolean; name?: string } = {}): Promise<Workspace> {
     const base = await fs.mkdtemp(path.join(os.tmpdir(), "agent-sparring-vscode-"));
-    const root = options.withSpaces ? path.join(base, "my repo with spaces") : path.join(base, "repo");
+    const root = path.join(base, options.name ?? (options.withSpaces ? "my repo with spaces" : "repo"));
     await fs.mkdir(root, { recursive: true });
     const ws = new Workspace(root);
     if (options.sparring !== false) {
@@ -57,6 +58,11 @@ export class Workspace {
       await fs.writeFile(path.join(ws.sparringDir, "project.toml"), 'project = "fixture"\n\n[repo]\nroot = "."\n');
     }
     return ws;
+  }
+
+  /** Create the .sparring directory later, as a run started from a terminal would. */
+  async createSparring(): Promise<void> {
+    await fs.mkdir(this.sparringDir, { recursive: true });
   }
 
   async writePlan(label = FOO_PLAN_LABEL, markdown = FOO_PLAN_MARKDOWN): Promise<string> {

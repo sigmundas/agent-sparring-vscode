@@ -33,7 +33,7 @@ const STANDALONE_NAME_MAX = 28;
 export function deriveStatus(selection: RunSelection, live: LiveState | undefined, nowMs: number): StatusView {
   if (!selection.selected) {
     if (selection.ambiguous.length > 0) {
-      const lines = selection.ambiguous.map((run) => `• ${runLabel(run)} (${authoritativeWord(run)})`);
+      const lines = selection.ambiguous.map((run) => `• ${run.location.folderName}: ${runLabel(run)} (${authoritativeWord(run)})`);
       return {
         text: `$(question) ${PREFIX}: ${selection.ambiguous.length} runs · select`,
         tooltip: `Several runs look active; pick one:\n${lines.join("\n")}`,
@@ -48,6 +48,7 @@ export function deriveStatus(selection: RunSelection, live: LiveState | undefine
   const name = stageDisplayName(stage);
   const presentation = presentRunStage(run, live);
   const tooltipLines: string[] = [runLabel(run)];
+  tooltipLines.push(`Repository: ${run.location.folderName}`);
   tooltipLines.push(run.kind === "plan" ? `Stage ${stagePosition(run)} — ${name}` : name);
   tooltipLines.push(`Stage id: ${stage.stageId}`);
   tooltipLines.push(`Stage state: ${presentation.label}`);

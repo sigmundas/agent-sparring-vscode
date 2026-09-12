@@ -11,7 +11,7 @@ import {
   activityPathFor,
   currentStageOf,
   discoverRuns,
-  locateSparringDir,
+  locateAll,
   runLabel,
   selectRun,
   totalStagesOf,
@@ -74,20 +74,24 @@ export class SparringController implements vscode.Disposable {
 
   async start(): Promise<void> {
     this.disposeWatchers();
-    this.locations = [];
-    for (const folder of vscode.workspace.workspaceFolders ?? []) {
-      if (folder.uri.scheme !== "file") {
-        continue;
-      }
-      const location = await locateSparringDir(folder.uri.fsPath);
-      if (location) {
-        this.locations.push(location);
-        this.watch(folder);
-      }
+    // Every workspace folder is watched independently, whether or not it has
+    // a .sparring yet, so one created later (e.g. by `sparring new-stage`
+    // in a terminal) is discovered without a reload.
+    for (const folder of this.fileFolders()) {
+      this.watch(folder);
     }
     this.statusBar.show();
     await this.refresh();
     this.armPolling();
+  }
+
+  private fileFolders(): vscode.WorkspaceFolder[] {
+    return (vscode.workspace.workspaceFolders ?? []).filter((folder) => folder.uri.scheme === "file");
+  }
+
+  /** Probe each workspace folder on its own; never merge folders into one root. */
+  private async relocate(): Promise<void> {
+    this.locations = await locateAll(this.fileFolders().map((folder) => ({ path: folder.uri.fsPath, name: folder.name })));
   }
 
   dispose(): void {
@@ -164,6 +168,7 @@ export class SparringController implements vscode.Disposable {
 
   async refresh(): Promise<void> {
     this.refreshTimer = undefined;
+    await this.relocate();
     this.discovery = await discoverRuns(this.locations);
     const preferred = this.context.workspaceState.get<string>(SELECTED_RUN_KEY);
     const sticky = this.attachedRunId ?? this.context.workspaceState.get<string>(STICKY_RUN_KEY);
@@ -220,7 +225,7 @@ export class SparringController implements vscode.Disposable {
     const stage = currentStageOf(run);
     const position = run.kind === "plan" ? `stage ${run.state.currentStageIndex + 1}/${totalStagesOf(run) ?? "?"}` : "stage";
     this.output.appendLine("");
-    this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} attached to ${runLabel(run)} · ${position} ${stage.stageId}`);
+    this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} attached to ${run.location.folderName} · ${runLabel(run)} · ${position} ${stage.stageId}`);
     await this.pollActivity();
   }
 

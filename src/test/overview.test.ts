@@ -55,7 +55,8 @@ describe("overview view model", () => {
     assert.equal(model.sparrer?.sessionLabel, "019d");
     assert.equal(model.actions?.handoff, true);
     assert.equal(model.actions?.diff, undefined, "no base_sha recorded → no diff action");
-    assert.deepEqual(model.facts?.slice(0, 2), [
+    assert.deepEqual(model.facts?.slice(0, 3), [
+      { label: "Repository", value: "repo" },
       { label: "Plan", value: "running" },
       { label: "Branch", value: "feature/x" },
     ]);
@@ -173,7 +174,7 @@ describe("overview view model", () => {
     assert.equal(model.actions?.sparring, true);
     assert.equal(model.actions?.brief, true);
     assert.ok(!model.facts?.some((fact) => fact.label === "Stage"), "no low-level Stage row");
-    assert.deepEqual(model.facts?.[0], { label: "Candidate", value: "cccccccc…" });
+    assert.deepEqual(model.facts?.[1], { label: "Candidate", value: "cccccccc…" });
   });
 
   it("empty and ambiguous selections", async () => {
@@ -185,7 +186,7 @@ describe("overview view model", () => {
     await ws.writePlanRun("bar-00000000", { plan: "docs/plans/bar.md", status: "paused", current_stage_index: 0, current_stage: "bar-00000000-stage-1-only" });
     const model = buildOverviewModel(await selection(ws), undefined, NONE, NOW);
     assert.equal(model.kind, "ambiguous");
-    assert.deepEqual(model.choices, ["docs/plans/bar.md", "docs/plans/foo.md"]);
+    assert.deepEqual(model.choices, ["repo: docs/plans/bar.md", "repo: docs/plans/foo.md"]);
   });
 
   it("READY on a working stage presents as awaiting acceptance", async () => {

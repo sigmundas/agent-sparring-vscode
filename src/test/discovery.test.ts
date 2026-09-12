@@ -197,7 +197,7 @@ describe("terminal selections are kept", () => {
   it("an accepted selection survives a simulated reload (only the persisted id remains)", async () => {
     const ws = await Workspace.create();
     await ws.writeStage("hotfix-1", { status: "accepted", candidate_sha: "c" });
-    const persistedId = `stage:${ws.stageDir("hotfix-1")}`;
+    const persistedId = `${ws.root}|stage:hotfix-1`;
     const restored = selectRun((await discover(ws)).runs, undefined, persistedId);
     assert.equal(restored.selected?.id, persistedId);
     // An explicit persisted selection is honoured as well.
@@ -217,7 +217,7 @@ describe("terminal selections are kept", () => {
   it("a remembered terminal run yields to a newly started open run", async () => {
     const ws = await Workspace.create();
     await ws.writeStage("done", { status: "accepted" });
-    const doneId = `stage:${ws.stageDir("done")}`;
+    const doneId = `${ws.root}|stage:done`;
     await ws.writeStage("fresh", { status: "working" });
     const selection = selectRun((await discover(ws)).runs, undefined, doneId);
     assert.equal(selection.selected?.kind === "stage" && selection.selected.stage.stageId, "fresh");
@@ -228,7 +228,7 @@ describe("terminal selections are kept", () => {
     await ws.writeStage("a", { status: "working" });
     await ws.writeStage("b", { status: "working" });
     assert.equal(selectRun((await discover(ws)).runs).selected, undefined);
-    const bId = `stage:${ws.stageDir("b")}`;
+    const bId = `${ws.root}|stage:b`;
     assert.equal(selectRun((await discover(ws)).runs, undefined, bId).selected?.id, bId);
   });
 

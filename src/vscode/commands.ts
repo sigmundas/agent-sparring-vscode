@@ -12,7 +12,9 @@ import {
   BRIEF_FILENAME,
   HANDOFF_FILENAME,
   SPARRING_FILENAME,
+  chooseLaunchLocation,
   currentStageOf,
+  isInsidePath,
   isOpenRun,
   runLabel,
   totalStagesOf,
@@ -53,6 +55,11 @@ function describeRun(run: RunSnapshot): string {
   return `standalone stage · ${run.stage.state?.status ?? "working"}`;
 }
 
+/** `repo: run` when several repositories are present, else just the run. */
+function runPickLabel(run: RunSnapshot, multiRepo: boolean): string {
+  return multiRepo ? `${run.location.folderName}: ${runLabel(run)}` : runLabel(run);
+}
+
 async function selectRunCommand(controller: SparringController): Promise<void> {
   const runs = controller.currentDiscovery.runs;
   if (runs.length === 0) {
@@ -60,17 +67,21 @@ async function selectRunCommand(controller: SparringController): Promise<void> {
     return;
   }
   const selectedId = controller.currentSelection.selected?.id;
+  const multiRepo = new Set(runs.map((run) => run.location.workspaceFolder)).size > 1;
   const items: RunItem[] = runs
     .slice()
-    .sort((a, b) => Number(isOpenRun(b)) - Number(isOpenRun(a)) || b.stateMtimeMs - a.stateMtimeMs)
+    .sort(
+      (a, b) =>
+        a.location.folderName.localeCompare(b.location.folderName) || Number(isOpenRun(b)) - Number(isOpenRun(a)) || b.stateMtimeMs - a.stateMtimeMs,
+    )
     .map((run) => ({
-      label: `${run.id === selectedId ? "$(check) " : ""}${runLabel(run)}`,
+      label: `${run.id === selectedId ? "$(check) " : ""}${runPickLabel(run, multiRepo)}`,
       description: describeRun(run),
-      detail: currentStageOf(run).stageId,
+      detail: `${run.location.folderName} · ${currentStageOf(run).stageId}`,
       run,
     }));
   items.push({ label: "$(sync) Automatic selection", description: "clear the explicit choice", run: undefined });
-  const picked = await vscode.window.showQuickPick(items, { placeHolder: "Which run should Agent Sparring follow?" });
+  const picked = await vscode.window.showQuickPick(items, { placeHolder: "Which repository / run should Agent Sparring follow?" });
   if (!picked) {
     return;
   }
@@ -157,25 +168,20 @@ async function pickLocation(controller: SparringController): Promise<SparringLoc
     void vscode.window.showErrorMessage("Agent Sparring: no `.sparring` directory in any workspace folder.");
     return undefined;
   }
-  if (locations.length === 1) {
-    return locations[0];
-  }
-  const active = vscode.window.activeTextEditor?.document.uri.fsPath;
-  const containing = active ? locations.find((location) => isInside(active, location.repoRoot)) : undefined;
-  if (containing) {
-    return containing;
+  const active = vscode.window.activeTextEditor?.document;
+  const activeFile = active?.uri.scheme === "file" ? active.uri.fsPath : undefined;
+  const chosen = chooseLaunchLocation(locations, controller.currentSelection.selected, activeFile);
+  if (chosen) {
+    return chosen;
   }
   const picked = await vscode.window.showQuickPick(
-    locations.map((location) => ({ label: path.basename(location.repoRoot), description: location.repoRoot, location })),
+    locations.map((location) => ({ label: location.folderName, description: location.repoRoot, location })),
     { placeHolder: "Which repository?" },
   );
   return picked?.location;
 }
 
-function isInside(file: string, root: string): boolean {
-  const relative = path.relative(root, file);
-  return !!relative && !relative.startsWith("..") && !path.isAbsolute(relative);
-}
+const isInside = isInsidePath;
 
 async function pickPlanDocument(location: SparringLocation): Promise<string | undefined> {
   const active = vscode.window.activeTextEditor?.document;

@@ -90,7 +90,7 @@ export function buildOverviewModel(
 ): OverviewModel {
   if (!selection.selected) {
     if (selection.ambiguous.length > 0) {
-      return { kind: "ambiguous", title: "Several runs look active", choices: selection.ambiguous.map(runLabel) };
+      return { kind: "ambiguous", title: "Several runs look active", choices: selection.ambiguous.map((run) => `${run.location.folderName}: ${runLabel(run)}`) };
     }
     return { kind: "empty", title: "No active run" };
   }
@@ -276,7 +276,7 @@ function diffAction(stage: StageSnapshot): OverviewActions["diff"] {
 }
 
 function facts(run: RunSnapshot, stage: StageSnapshot, live: LiveState | undefined, nowMs: number): { label: string; value: string }[] {
-  const out: { label: string; value: string }[] = [];
+  const out: { label: string; value: string }[] = [{ label: "Repository", value: run.location.folderName }];
   if (run.kind === "plan") {
     out.push({ label: "Plan", value: run.state.status });
     out.push({ label: "Branch", value: run.state.expectedBranch });

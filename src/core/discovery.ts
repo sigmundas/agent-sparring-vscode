@@ -39,6 +39,18 @@ export interface SparringLocation {
   sparringDir: string;
   /** Absolute repository root the engine would use (see resolveRepoRoot). */
   repoRoot: string;
+  /**
+   * Identity of the owning VS Code workspace folder (its fsPath). Every run
+   * id is prefixed with it, so two repositories with identical stage ids
+   * never collide and a persisted selection names the repository too.
+   */
+  workspaceFolder: string;
+  /** Short display name of the owning workspace folder. */
+  folderName: string;
+}
+
+export function runIdFor(location: SparringLocation, kind: "plan" | "stage", key: string): string {
+  return `${location.workspaceFolder}|${kind}:${key}`;
 }
 
 export interface StageSnapshot {
@@ -139,7 +151,11 @@ export function readTomlRepoRoot(toml: string): string | undefined {
   return undefined;
 }
 
-export async function locateSparringDir(folder: string): Promise<SparringLocation | undefined> {
+/**
+ * Look for `.sparring` directly under one workspace folder. Each folder of a
+ * multi-root workspace is probed on its own; folders are never merged.
+ */
+export async function locateSparringDir(folder: string, folderName?: string): Promise<SparringLocation | undefined> {
   const sparringDir = path.join(folder, SPARRING_DIRNAME);
   try {
     const stat = await fs.stat(sparringDir);
@@ -149,7 +165,18 @@ export async function locateSparringDir(folder: string): Promise<SparringLocatio
   } catch {
     return undefined;
   }
-  return { sparringDir, repoRoot: await resolveRepoRoot(sparringDir) };
+  return {
+    sparringDir,
+    repoRoot: await resolveRepoRoot(sparringDir),
+    workspaceFolder: folder,
+    folderName: folderName ?? path.basename(folder),
+  };
+}
+
+/** Probe every workspace folder independently and keep those with `.sparring`. */
+export async function locateAll(folders: { path: string; name?: string }[]): Promise<SparringLocation[]> {
+  const found = await Promise.all(folders.map((folder) => locateSparringDir(folder.path, folder.name)));
+  return found.filter((location): location is SparringLocation => location !== undefined);
 }
 
 /** Resolve a recorded plan label (plan.py: plan_label) back to an absolute path. */
@@ -228,7 +255,7 @@ async function snapshotPlanRun(location: SparringLocation, statePath: string): P
 
   return {
     kind: "plan",
-    id: `plan:${statePath}`,
+    id: runIdFor(location, "plan", planKey),
     location,
     planKey,
     statePath,
@@ -297,7 +324,7 @@ async function discoverStandaloneStages(location: SparringLocation, planRuns: Pl
       continue; // not a stage the engine created (no state.json)
     }
     const stage = await snapshotStage(dir, name, undefined);
-    out.push({ kind: "stage", id: `stage:${dir}`, location, stage, stateMtimeMs: mtimeMs, outcome: await readOutcome(dir) });
+    out.push({ kind: "stage", id: runIdFor(location, "stage", name), location, stage, stateMtimeMs: mtimeMs, outcome: await readOutcome(dir) });
   }
   return out;
 }
@@ -370,6 +397,32 @@ export function selectRun(runs: RunSnapshot[], preferredId?: string, stickyId?: 
   }
   const terminal = runs.slice().sort((a, b) => b.stateMtimeMs - a.stateMtimeMs);
   return { selected: terminal[0], ambiguous: [] };
+}
+
+/**
+ * Which repository a launch (Run Plan) should target: the selected run's
+ * repository first, then the only repository, then the one containing the
+ * active document; undefined means the caller must ask.
+ */
+export function chooseLaunchLocation(locations: SparringLocation[], selected: RunSnapshot | undefined, activeFile?: string): SparringLocation | undefined {
+  if (selected) {
+    const owner = locations.find((location) => location.workspaceFolder === selected.location.workspaceFolder);
+    if (owner) {
+      return owner;
+    }
+  }
+  if (locations.length === 1) {
+    return locations[0];
+  }
+  if (activeFile) {
+    return locations.find((location) => isInsidePath(activeFile, location.repoRoot) || isInsidePath(activeFile, location.workspaceFolder));
+  }
+  return undefined;
+}
+
+export function isInsidePath(file: string, root: string): boolean {
+  const relative = path.relative(root, file);
+  return !!relative && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
 /** The stage whose activity.jsonl should be tailed for a run. */
