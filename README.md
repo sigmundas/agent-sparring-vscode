@@ -31,8 +31,11 @@ navigates.
 | --- | --- |
 | `Agent Sparring: Run Plan` | Pick a plan Markdown file (`## Stage <n> — <title>` headings), confirm the branch, launch `run-plan`. |
 | `Agent Sparring: Resume Plan` | Pick a paused/running plan run, optionally record human evidence, launch `resume-plan`. |
-| `Agent Sparring: Run / Resume Stage` | For the selected standalone stage (or after picking one), launch `sparring run-loop <stage> --repo-root <project> --expected-branch <current branch>` in a terminal. The branch comes from the Git repository owning the project (built-in Git API, then `.git/HEAD`); a detached HEAD is refused, never guessed. Also offered as **Run stage** / **Resume stage** in the Overview; accepted and frozen stages have no run action, READY offers only an explicit **Run loop again**. |
-| `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / frozen / future stages), the current stage as primary content (`Stage N — title`, presentation status, routing state, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), last sparring outcome, small Stage Agent / Sparrer cards, Open diff / handoff / sparring report / brief / plan buttons, and quiet metadata. Never auto-opens; updates in place. |
+| `Agent Sparring: Run / Resume Stage` | For the selected standalone stage (or after picking one), launch `sparring run-loop <stage> --repo-root <project> --expected-branch <current branch>` in a terminal. The branch comes from the Git repository owning the project (built-in Git API, then `.git/HEAD`); a detached HEAD is refused, never guessed. Also offered as **Run stage** / **Resume stage** in the Overview. |
+| `Agent Sparring: Accept Stage` | For a stage whose independent review passed (**Review complete**): one action that runs the engine's `freeze-candidate` and, only if that succeeds, `accept-candidate` for the selected stage, project and current branch. Refusals are translated (uncommitted changes, not pushed, wrong branch, code changed after the review); the engine's own output goes to the Output Channel. Also offered as **Accept stage** in the Overview. |
+| `Agent Sparring: Choose Plan for Stage…` | Associate a Markdown plan file (any location, ordinary file picker) with the selected standalone stage. Stored in VS Code workspace state per repository + stage id, never in engine state; gives the Overview a **Plan** button, this stage's heading and an informational **Up next**. Change or remove it the same way. |
+| `Agent Sparring: Choose sparring Executable…` | Pick the `sparring` CLI with a file dialog and store it as `agentSparring.executable`. |
+| `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / finalizing / future stages), the current stage as primary content (`Stage N — title`, a human state word with one explaining sentence, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), latest sparring result, small Stage Agent / Sparrer cards, Brief / Handoff / Sparring report / Diff / Plan / Log buttons, and quiet metadata (where the engine's own words live). Never auto-opens; updates in place. |
 | `Agent Sparring: Show Log` | Focus the Output Channel. |
 | `Agent Sparring: Select Run` | Choose explicitly when several runs look active; the choice is remembered per workspace. |
 | `Agent Sparring: Rediscover State` | Re-scan `.sparring` from disk. |
@@ -40,12 +43,61 @@ navigates.
 
 ## Settings
 
-- `agentSparring.executable` — path to `sparring`; empty resolves it from `PATH`.
+- `agentSparring.executable` — full path to `sparring`. Empty (the default)
+  hands the bare word `sparring` to your integrated shell, which resolves it
+  with its own `PATH` exactly as when you type it; the extension host's
+  `PATH` is never consulted for that, so "works in the terminal" means
+  "works from the button". See "Executable resolution" below.
 - `agentSparring.pollIntervalMs` — fallback poll interval for the activity log.
 - `agentSparring.nestedSearchDepth` — how many levels below each workspace
   folder are searched for nested projects with their own `.sparring`
   (default 2; 0 probes only the folders themselves). Hidden and
   dependency/build directories are never entered.
+
+## Executable resolution
+
+| Situation | What runs | On failure |
+| --- | --- | --- |
+| Nothing configured, terminal shell integration available (the normal case) | Your integrated shell receives `sparring` plus the argument array through the shell-integration API; the shell's own `PATH`, venv activation and profile apply. Nothing is pre-checked from the extension host. | If the shell itself reports the command as not found (exit 127, or 9009 on cmd.exe), the extension says so and offers **Open Settings** / **Choose executable…**. |
+| `agentSparring.executable` set | Exactly that path (relative paths resolve against the project). It is validated before anything is launched. | `agentSparring.executable points at …, which does not exist or is not executable.` |
+| Nothing configured, no shell integration within 5 s | A best-effort `PATH` search in the extension host, then a dedicated terminal whose process is `sparring`. | `Agent Sparring could not resolve the CLI from this VS Code environment. Set agentSparring.executable to the full path.` (never a suggestion to reinstall the engine). |
+
+Short commands (Accept stage) use the same rule: your shell through shell
+integration when available (the output is read back for translation and
+the log), otherwise a direct process with a host-resolved path.
+
+## What the words mean
+
+The Overview and status bar use one plain vocabulary; the engine's own
+words stay in tooltips, the metadata footer and the Output Channel.
+
+| Shown | Meaning | Engine state behind it |
+| --- | --- | --- |
+| **Working** | Implementation or independent review is happening (or a correction turn is running after a finding). | stage `working`; a live turn in `activity.jsonl` |
+| **Changes requested** — *The independent reviewer found something to fix. Work will continue automatically.* | The sparrer sent the stage back; the loop continues on its own. | routing action `SEND_BACK` |
+| **Needs you** — *the reviewer's request* | Only you can do the next thing; **Resume stage** afterwards is deliberately not the primary button. | routing action `NEEDS_YOU` |
+| **Escalated** | The reviewer could not settle it; read the sparring report and decide. | routing action `ESCALATE` |
+| **Review complete** — *Independent review passed. No unresolved findings remain.* | Primary action **Accept stage**; **Run loop again** stays available as a quiet secondary action. | routing action `READY` |
+| **Finalizing stage…** | The moment between the two acceptance steps. If it persists, *Finalizing did not complete. Use Accept stage to finish it.* (re-freezing is allowed by the engine). | stage `frozen` |
+| **Accepted** — *Stage complete.* | Nothing further runs for this stage. | stage `accepted` |
+| **Stopped** — *The last run was interrupted.* | The runner ended mid-turn (Ctrl-C, crash, reload); **Resume stage** returns. | runner liveness, see below |
+
+## Plans: managed runs and associated files
+
+- A **managed plan run** is the engine's `.sparring/plans/<key>.json`. It is
+  authoritative: the Overview shows the journey, **Plan** opens the recorded
+  document, and after the current stage is accepted **Continue plan** calls
+  `sparring resume-plan`, which advances past the accepted stage and starts
+  the next one (paused runs get **Resume plan**).
+- A **standalone stage** has no machine-readable plan. **Choose plan…** lets
+  you pick any Markdown file (no directory convention is assumed). The
+  association is VS Code workspace state keyed by repository + stage id;
+  the engine never sees it. The Overview then shows **Plan**, this stage's
+  heading when exactly one `## Stage … — …` heading matches its id, and,
+  once accepted, **Up next** with the following heading and **Open in plan**.
+  Because the engine has no operation that starts a standalone stage from a
+  plan, nothing here offers to; "Up next" is information, not a button that
+  runs something.
 
 ## Source-of-truth rule
 
@@ -54,7 +106,8 @@ navigates.
 | running / paused / complete, current stage index and id | `.sparring/plans/<key>.json` |
 | working / frozen / accepted per stage | `.sparring/stages/<id>/state.json` |
 | stage count and titles | the plan Markdown named in the run state |
-| NEEDS_YOU / ESCALATE wording on a paused run | `## Routing outcome` in the current stage's `sparring.md` |
+| Changes requested / Needs you / Escalated / Review complete | `## Routing outcome` in the current stage's `sparring.md` |
+| Plan button and "Up next" for a standalone stage | the Markdown file you associated (VS Code workspace state; display only) |
 | "Claude working", "Codex sparring", active-turn duration, loop cycle, last visible event, changed files, verdict chronology | `activity.jsonl` (observational only; the Overview and the Output Channel share one filter for what counts as visible activity) |
 | Goal paragraph in the Overview | `## Goal` in the current stage's `brief.md` (display only) |
 
@@ -102,7 +155,8 @@ What the UI shows:
   confirmation; the engine's worktree lock refuses a second live runner anyway.
   A busy claim with no telemetry for 30 minutes is additionally flagged
   stale; silence is information, never a death detector.
-- Accepted / frozen stages have no run action, whatever the telemetry says.
+- Accepted stages have no action; a stage stuck in the engine's frozen
+  state offers **Accept stage** again, whatever the telemetry says.
 
 Engine state (`state.json`, `activity.jsonl`) is never modified; all of this is
 presentation and liveness state inside the extension.
@@ -153,7 +207,7 @@ npm install
 npm run build      # typecheck + esbuild bundle to dist/
 npm test           # node:test unit tests against fake .sparring fixtures
 npm run lint
-npm run test:integration   # downloads VS Code once, opens a generated multi-root workspace, asserts discovery and runner lifecycle with a fake `sparring`
+npm run test:integration   # downloads VS Code once, opens a generated multi-root workspace, asserts discovery, runner lifecycle, bare-`sparring` resolution by the shell, command-not-found, Accept stage and plan association with a fake `sparring`
 ```
 
 Press F5 in VS Code to launch an Extension Development Host.

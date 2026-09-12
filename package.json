@@ -65,6 +65,21 @@
         "command": "agentSparring.runStage",
         "title": "Run / Resume Stage",
         "category": "Agent Sparring"
+      },
+      {
+        "command": "agentSparring.acceptStage",
+        "title": "Accept Stage",
+        "category": "Agent Sparring"
+      },
+      {
+        "command": "agentSparring.choosePlan",
+        "title": "Choose Plan for Stage…",
+        "category": "Agent Sparring"
+      },
+      {
+        "command": "agentSparring.chooseExecutable",
+        "title": "Choose sparring Executable…",
+        "category": "Agent Sparring"
       }
     ],
     "configuration": {
@@ -73,7 +88,7 @@
         "agentSparring.executable": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Path to the `sparring` executable. Leave empty to resolve `sparring` from `PATH`."
+          "markdownDescription": "Full path to the `sparring` executable. Leave empty to let your integrated shell resolve `sparring` from its own `PATH` (the same way it does when you type the command). Set it when the shell reports the command as not found, or when terminal shell integration is unavailable."
         },
         "agentSparring.pollIntervalMs": {
           "type": "number",

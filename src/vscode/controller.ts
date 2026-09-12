@@ -27,8 +27,10 @@ import {
 import { deriveLiveness, type ExecutionRecord, type RunnerLiveness } from "../core/liveness";
 import { applyEvent, emptyLiveState, type LiveState } from "../core/liveState";
 import { LogRenderer } from "../core/logFormat";
+import { PLAN_ASSOCIATIONS_KEY, associatedPlanFor, withAssociation, type PlanAssociations } from "../core/planAssociation";
 import { deriveStatus } from "../core/status";
-import { ExecutionTracker, type LaunchOptions } from "./executionTracker";
+import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
+import { ExecutionTracker, type CommandNotFound, type LaunchOptions, type LaunchResult } from "./executionTracker";
 
 const SELECTED_RUN_KEY = "agentSparring.selectedRunId";
 /** The run last shown, whether chosen explicitly or automatically; restores across reloads. */
@@ -49,11 +51,17 @@ export class SparringController implements vscode.Disposable {
   private attachedRunId: string | undefined;
   /** Runner process observations (launched, typed in a terminal, or re-found after a reload). */
   private readonly tracker: ExecutionTracker;
+  /** Short commands (freeze / accept) run to completion; never tracked as runners. */
+  private readonly commands: SparringCommandRunner;
   private reattached = false;
+  /** Run ids whose Accept stage operation from this window is still in flight. */
+  private readonly accepting = new Set<string>();
 
   private readonly changeEmitter = new vscode.EventEmitter<void>();
   /** Fires after every re-render: selection, authoritative state or live activity changed. */
   readonly onDidChange = this.changeEmitter.event;
+  /** A launch from this window ended because the shell could not find the command. */
+  readonly onCommandNotFound: vscode.Event<CommandNotFound>;
 
   private refreshTimer: ReturnType<typeof setTimeout> | undefined;
   private pollTimer: ReturnType<typeof setTimeout> | undefined;
@@ -72,8 +80,11 @@ export class SparringController implements vscode.Disposable {
       (message) => this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} ${message}`),
       () => this.locations,
     );
+    this.onCommandNotFound = this.tracker.onCommandNotFound;
+    this.commands = new SparringCommandRunner((message) => this.log(message));
     this.disposables.push(
       this.tracker,
+      this.commands,
       // A runner ending may have left new authoritative files behind; a
       // start or liveness change only needs re-rendering.
       this.tracker.onDidChange((change) => (change === "ended" ? void this.refresh() : this.render())),
@@ -272,11 +283,53 @@ export class SparringController implements vscode.Disposable {
    * discovered run so the Overview can offer Stop and, after it ends, say
    * "interrupted" instead of "running".
    */
-  async launch(options: LaunchOptions): Promise<void> {
-    await this.tracker.launch(options);
-    // The engine writes its state before the first provider turn; pick it up promptly.
-    setTimeout(() => void this.refresh(), 1500);
-    setTimeout(() => void this.refresh(), 6000);
+  async launch(options: LaunchOptions): Promise<LaunchResult> {
+    const result = await this.tracker.launch(options);
+    if (result.ok) {
+      // The engine writes its state before the first provider turn; pick it up promptly.
+      setTimeout(() => void this.refresh(), 1500);
+      setTimeout(() => void this.refresh(), 6000);
+    }
+    this.render();
+    return result;
+  }
+
+  /** Run one short sparring command to completion (see SparringCommandRunner). */
+  runCommand(options: RunCommandOptions): Promise<RunCommandResult> {
+    return this.commands.run(options);
+  }
+
+  /** Append a line to the Output Channel under the Extension actor. */
+  log(message: string): void {
+    this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} ${message}`);
+  }
+
+  // ---------------------------------------------------------------- acceptance in flight
+
+  isAccepting(runId: string | undefined): boolean {
+    return runId !== undefined && this.accepting.has(runId);
+  }
+
+  setAccepting(runId: string, accepting: boolean): void {
+    if (accepting) {
+      this.accepting.add(runId);
+    } else {
+      this.accepting.delete(runId);
+    }
+    this.render();
+  }
+
+  // ---------------------------------------------------------------- plan associations (UI metadata only)
+
+  /** The Markdown plan the user associated with a run in this workspace, if any. Never read by or written into the engine. */
+  associatedPlan(runId: string | undefined): string | undefined {
+    return runId === undefined ? undefined : associatedPlanFor(this.context.workspaceState.get<PlanAssociations>(PLAN_ASSOCIATIONS_KEY), runId);
+  }
+
+  async setAssociatedPlan(runId: string, planPath: string | undefined): Promise<void> {
+    const next = withAssociation(this.context.workspaceState.get<PlanAssociations>(PLAN_ASSOCIATIONS_KEY), runId, planPath);
+    await this.context.workspaceState.update(PLAN_ASSOCIATIONS_KEY, next);
+    this.log(planPath ? `associated plan ${path.basename(planPath)} with ${runId.split("|").pop()} (VS Code workspace state only)` : `removed the plan association of ${runId.split("|").pop()}`);
     this.render();
   }
 

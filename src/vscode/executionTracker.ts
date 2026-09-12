@@ -22,21 +22,24 @@
  */
 
 import * as vscode from "vscode";
+import { executableWord, isCommandNotFoundExit, planExecutable, type ExecutableProblem } from "../core/cli";
 import type { SparringLocation } from "../core/discovery";
 import type { ExecutionRecord, ExecutionSource } from "../core/liveness";
 import { findDescendant } from "../core/processTree";
 import { commandLineRuns, matchSparringCommand, parseSparringCommand, type SparringSubcommand } from "../core/sparringCommand";
 import { listProcesses, processProbeSupported } from "./processProbe";
+import { awaitShellIntegration, hostEnv, SHELL_INTEGRATION_TIMEOUT_MS } from "./shellIntegration";
+
+export { SHELL_INTEGRATION_TIMEOUT_MS };
 
 const LAUNCHES_KEY = "agentSparring.launches";
-/** How long a fresh terminal gets to report shell integration before the dedicated-terminal fallback is used. */
-export const SHELL_INTEGRATION_TIMEOUT_MS = 5000;
 /** After a reload, how long reconnected terminals get to appear before a recorded launch is declared gone. */
 export const RECONNECT_GRACE_MS = 6000;
 const PROBE_INTERVAL_MS = 4000;
 
 export interface LaunchOptions {
-  executable: string;
+  /** The configured `agentSparring.executable` (possibly empty); resolution happens at launch, once the shell is known. */
+  configured: string | undefined;
   args: string[];
   cwd: string;
   /** Terminal title suffix and log label. */
@@ -48,6 +51,15 @@ export interface LaunchOptions {
   reveal: boolean;
 }
 
+export type LaunchResult = { ok: true; record: ExecutionRecord; via: "shell" | "terminal" } | { ok: false; error: string; problem: ExecutableProblem };
+
+/** The shell reported that the launched command word does not exist. */
+export interface CommandNotFound {
+  runId: string;
+  word: string;
+  exitCode: number;
+}
+
 interface Tracked {
   record: ExecutionRecord;
   kind: SparringSubcommand;
@@ -57,6 +69,8 @@ interface Tracked {
   terminalPid?: number;
   execution?: vscode.TerminalShellExecution;
   probeTimer?: ReturnType<typeof setInterval>;
+  /** The command word or path this window launched (undefined for observed / reattached runs). */
+  word?: string;
 }
 
 interface PersistedLaunch {
@@ -78,6 +92,9 @@ export class ExecutionTracker implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
   private readonly changeEmitter = new vscode.EventEmitter<TrackerChange>();
   readonly onDidChange = this.changeEmitter.event;
+  private readonly notFoundEmitter = new vscode.EventEmitter<CommandNotFound>();
+  /** A launch from this window ended with the shell's command-not-found code. */
+  readonly onCommandNotFound = this.notFoundEmitter.event;
   private counter = 0;
 
   constructor(
@@ -87,6 +104,7 @@ export class ExecutionTracker implements vscode.Disposable {
   ) {
     this.disposables.push(
       this.changeEmitter,
+      this.notFoundEmitter,
       vscode.window.onDidStartTerminalShellExecution((event) => this.onExecutionStarted(event)),
       vscode.window.onDidEndTerminalShellExecution((event) => this.onExecutionEnded(event)),
       vscode.window.onDidCloseTerminal((terminal) => this.onTerminalClosed(terminal)),
@@ -137,31 +155,50 @@ export class ExecutionTracker implements vscode.Disposable {
   // ---------------------------------------------------------------- launching
 
   /**
-   * Run `executable args` in a fresh integrated terminal (the user's normal
-   * shell, cwd = project) through shell integration. Falls back to a
+   * Run the sparring CLI with `args` in a fresh integrated terminal (the
+   * user's normal shell, cwd = project) through shell integration, handing
+   * the shell a bare `sparring` (or the configured path) as executable plus
+   * an argument array, so the shell's own PATH and environment resolve it;
+   * the extension host's PATH is never consulted for that. Falls back to a
    * dedicated terminal whose process is the runner when shell integration
-   * does not appear in time. Never builds a quoted command line.
+   * does not appear in time; then a bare name must be resolvable from this
+   * process, or the launch fails with a configuration message. Never builds
+   * a quoted command line.
    */
-  async launch(options: LaunchOptions): Promise<ExecutionRecord> {
-    this.dropEnded(options.runId);
+  async launch(options: LaunchOptions): Promise<LaunchResult> {
+    const configured = await planExecutable(options.configured, hostEnv(options.cwd), true);
+    if (!configured.ok) {
+      this.log(`refused to launch ${options.name}: ${configured.error}`);
+      return { ok: false, error: configured.error, problem: configured.problem };
+    }
     const title = `Agent Sparring: ${options.name}`;
     const shellTerminal = vscode.window.createTerminal({ name: title, cwd: options.cwd, iconPath: new vscode.ThemeIcon("debug-alt") });
     if (options.reveal) {
       shellTerminal.show(true);
     }
-    const integration = await this.awaitShellIntegration(shellTerminal);
+    const integration = await awaitShellIntegration(shellTerminal);
     if (integration) {
-      const execution = integration.executeCommand(options.executable, options.args);
+      this.dropEnded(options.runId);
+      const word = executableWord(configured.plan);
+      const execution = integration.executeCommand(word, options.args);
       const item = this.track(options, "launched", shellTerminal, execution);
-      this.log(`launched ${options.name} via shell integration (${options.args.length} args, cwd ${options.cwd})`);
+      item.word = word;
+      this.log(`launched ${options.name} via shell integration (${configured.plan.kind === "shell" ? `'${word}' resolved by the shell` : word}, ${options.args.length} args, cwd ${options.cwd})`);
       void this.persistWithPid(item, shellTerminal);
       this.changeEmitter.fire("started");
-      return item.record;
+      return { ok: true, record: item.record, via: "shell" };
     }
     shellTerminal.dispose();
+    const direct = await planExecutable(options.configured, hostEnv(options.cwd), false);
+    if (!direct.ok) {
+      this.log(`could not launch ${options.name}: shell integration unavailable and ${direct.error}`);
+      return { ok: false, error: direct.error, problem: direct.problem };
+    }
+    this.dropEnded(options.runId);
+    const path = executableWord(direct.plan);
     const dedicated = vscode.window.createTerminal({
       name: title,
-      shellPath: options.executable,
+      shellPath: path,
       shellArgs: options.args,
       cwd: options.cwd,
       iconPath: new vscode.ThemeIcon("debug-alt"),
@@ -170,35 +207,11 @@ export class ExecutionTracker implements vscode.Disposable {
       dedicated.show(true);
     }
     const item = this.track(options, "terminal", dedicated, undefined);
-    this.log(`launched ${options.name} in a dedicated terminal (shell integration unavailable; ${options.args.length} args, cwd ${options.cwd})`);
+    item.word = path;
+    this.log(`launched ${options.name} in a dedicated terminal (shell integration unavailable; ${path}, ${options.args.length} args, cwd ${options.cwd})`);
     void this.persistWithPid(item, dedicated);
     this.changeEmitter.fire("started");
-    return item.record;
-  }
-
-  private awaitShellIntegration(terminal: vscode.Terminal): Promise<vscode.TerminalShellIntegration | undefined> {
-    if (terminal.shellIntegration) {
-      return Promise.resolve(terminal.shellIntegration);
-    }
-    return new Promise((resolve) => {
-      const done = (value: vscode.TerminalShellIntegration | undefined) => {
-        clearTimeout(timer);
-        listener.dispose();
-        closed.dispose();
-        resolve(value);
-      };
-      const timer = setTimeout(() => done(undefined), SHELL_INTEGRATION_TIMEOUT_MS);
-      const listener = vscode.window.onDidChangeTerminalShellIntegration((event) => {
-        if (event.terminal === terminal) {
-          done(event.shellIntegration);
-        }
-      });
-      const closed = vscode.window.onDidCloseTerminal((closedTerminal) => {
-        if (closedTerminal === terminal) {
-          done(undefined);
-        }
-      });
-    });
+    return { ok: true, record: item.record, via: "terminal" };
   }
 
   private track(options: Pick<LaunchOptions, "runId" | "kind" | "stageId" | "planPath">, source: ExecutionSource, terminal: vscode.Terminal | undefined, execution: vscode.TerminalShellExecution | undefined, startedAtMs = Date.now()): Tracked {
@@ -295,6 +308,10 @@ export class ExecutionTracker implements vscode.Disposable {
     this.log(`${describe(item)} ${how}${detail ? ` — ${detail}` : ""}`);
     void this.persist();
     this.changeEmitter.fire("ended");
+    if (item.record.source === "launched" && item.word && isCommandNotFoundExit(exitCode, process.platform)) {
+      this.log(`the shell reported '${item.word}' as not found (exit ${exitCode})`);
+      this.notFoundEmitter.fire({ runId: item.record.runId, word: item.word, exitCode: exitCode as number });
+    }
   }
 
   // ---------------------------------------------------------------- persistence + reload

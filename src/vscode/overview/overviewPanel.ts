@@ -10,7 +10,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { BRIEF_FILENAME, HANDOFF_FILENAME, SPARRING_FILENAME, currentStageOf } from "../../core/discovery";
-import { renderOverviewHtml, type OverviewAction } from "../../core/overviewHtml";
+import { OVERVIEW_ACTIONS, renderOverviewHtml, type OverviewAction } from "../../core/overviewHtml";
 import { buildOverviewModel, type OverviewArtifacts, type OverviewModel } from "../../core/overviewModel";
 import { documentViewColumn } from "../../core/viewColumn";
 import type { SparringController } from "../controller";
@@ -111,14 +111,26 @@ export class OverviewPanelManager implements vscode.Disposable {
     const selection = this.controller.currentSelection;
     let artifacts: OverviewArtifacts = { handoff: false, sparring: false, brief: false, plan: false };
     if (selection.selected) {
-      const stage = currentStageOf(selection.selected);
-      const [handoff, sparring, briefText, plan] = await Promise.all([
+      const run = selection.selected;
+      const stage = currentStageOf(run);
+      const associatedPath = run.kind === "stage" ? this.controller.associatedPlan(run.id) : undefined;
+      const [handoff, sparring, briefText, plan, associatedText] = await Promise.all([
         exists(path.join(stage.dir, HANDOFF_FILENAME)),
         exists(path.join(stage.dir, SPARRING_FILENAME)),
         readHead(path.join(stage.dir, BRIEF_FILENAME)),
-        selection.selected.kind === "plan" ? exists(selection.selected.planPath) : Promise.resolve(false),
+        run.kind === "plan" ? exists(run.planPath) : Promise.resolve(false),
+        associatedPath ? readHead(associatedPath, PLAN_READ_LIMIT) : Promise.resolve(undefined),
       ]);
-      artifacts = { handoff, sparring, brief: briefText !== undefined, briefText, plan, git: await gitContext(selection.selected.location.repoRoot) };
+      artifacts = {
+        handoff,
+        sparring,
+        brief: briefText !== undefined,
+        briefText,
+        plan,
+        git: await gitContext(run.location.repoRoot),
+        associatedPlan: associatedPath ? { path: associatedPath, exists: associatedText !== undefined, text: associatedText } : undefined,
+        accepting: this.controller.isAccepting(run.id),
+      };
     }
     return buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.executionFor(selection.selected?.id));
   }
@@ -134,18 +146,7 @@ export class OverviewPanelManager implements vscode.Disposable {
   }
 }
 
-const ACTIONS: ReadonlySet<string> = new Set<OverviewAction>([
-  "openHandoff",
-  "openSparring",
-  "openBrief",
-  "openPlan",
-  "openDiff",
-  "showLog",
-  "selectRun",
-  "runPlan",
-  "runStage",
-  "stopRunner",
-]);
+const ACTIONS: ReadonlySet<string> = new Set<OverviewAction>(OVERVIEW_ACTIONS);
 
 function isActionMessage(message: unknown): message is { type: "action"; action: OverviewAction } {
   return (
@@ -158,14 +159,16 @@ function isActionMessage(message: unknown): message is { type: "action"; action:
 
 /** Only the Goal paragraph is ever displayed; a brief is never read past this many bytes. */
 const BRIEF_READ_LIMIT = 64 * 1024;
+/** An associated plan is read for its headings only; never past this many bytes. */
+const PLAN_READ_LIMIT = 512 * 1024;
 
 /** The beginning of a text file, or undefined when it does not exist / cannot be read. */
-async function readHead(file: string): Promise<string | undefined> {
+async function readHead(file: string, limit = BRIEF_READ_LIMIT): Promise<string | undefined> {
   let handle: fs.FileHandle | undefined;
   try {
     handle = await fs.open(file, "r");
-    const buffer = Buffer.alloc(BRIEF_READ_LIMIT);
-    const { bytesRead } = await handle.read(buffer, 0, BRIEF_READ_LIMIT, 0);
+    const buffer = Buffer.alloc(limit);
+    const { bytesRead } = await handle.read(buffer, 0, limit, 0);
     return buffer.subarray(0, bytesRead).toString("utf8");
   } catch {
     return undefined;

@@ -127,7 +127,7 @@ describe("recent events résumé", () => {
         ["Claude", "added src/b.py"],
         ["Claude", "turn finished"],
         ["Codex", "started"],
-        ["Codex", "SEND_BACK — range handling"],
+        ["Codex", "Changes requested — range handling"],
       ],
     );
     assert.ok(entries.every((entry) => /^\d\d:\d\d:\d\d$/.test(entry.time)));
@@ -231,7 +231,8 @@ describe("loop cycle", () => {
     const live = foldEvents([event("loop", "loop.started"), event("sparrer", "verdict", { action: "SEND_BACK" }), event("loop", "loop.send_back", { cycle: 2 }), event("stage", "turn.started", { resumed: true })]);
     const model = buildOverviewModel(selection, live, ALL, Date.parse(live.lastEventTs!) + 1000);
     assert.equal(model.cycle, 2);
-    assert.equal(model.stageStatus, "SEND_BACK · correcting");
+    assert.equal(model.stageStatus, "Working", "a live correction turn is plainly Working");
+    assert.equal(model.lastSparring?.word, "Changes requested", "the finding stays visible as the latest sparring result");
     assert.match(renderOverviewHtml(model, "n", "c"), /<span class="muted" title="loop cycle from telemetry">cycle 2<\/span>/);
     assert.equal(buildOverviewModel(selection, foldEvents([event("loop", "loop.started")]), ALL, T0).cycle, undefined, "no cycle reported yet");
   });
@@ -267,7 +268,7 @@ describe("plan journey states", () => {
     const frozen = await plan("running", 2, ["accepted", "accepted", "frozen"]);
     assert.deepEqual(
       frozen.stages.map((stage, i) => timelineState(stage, i, 2, frozen)),
-      ["accepted", "accepted", "frozen"],
+      ["accepted", "accepted", "finalizing"],
     );
   });
 
@@ -304,10 +305,10 @@ describe("standalone-stage degradation", () => {
     assert.equal(model.position, undefined);
     assert.equal(model.stageHeading, "Reported statistics typed parser");
     assert.equal(model.goal, "Parse it.");
-    assert.deepEqual(model.lastSparring, { action: "READY", summary: "Looks done", reason: undefined });
+    assert.deepEqual(model.lastSparring, { action: "READY", word: "Review passed", summary: "Looks done", reason: undefined });
     assert.deepEqual(
       model.facts?.map((fact) => fact.label),
-      ["Repository", "Stage session", "Sparring thread"],
+      ["Repository", "Engine state", "Stage session", "Sparring thread"],
     );
     const withGit = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, { ...ALL, git: { branch: "feature/reported-statistics-contract", head: "82ab1234deadbeef" } }, T0);
     assert.deepEqual(withGit.facts?.[1], { label: "Checked out", value: "feature/reported-statistics-contract @ 82ab1234" });
@@ -317,7 +318,7 @@ describe("standalone-stage degradation", () => {
     assert.ok(!html.includes('class="journey"'));
     assert.ok(!/Stage \d+ (of|\/) \d+/.test(html), "no position pill without a plan");
     assert.match(html, /<span class="hpill" [^>]*>Standalone stage<\/span>/);
-    assert.match(html, /<span class="verdict ready">READY<\/span>/);
-    assert.equal(model.status?.label, "Working");
+    assert.match(html, /<span class="verdict ready" title="Routing action: READY">Review passed<\/span>/);
+    assert.equal(model.status?.label, "Review complete");
   });
 });

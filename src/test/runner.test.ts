@@ -7,9 +7,9 @@ import { applyEvent, emptyLiveState, foldEvents } from "../core/liveState";
 import { buildOverviewModel, type OverviewArtifacts } from "../core/overviewModel";
 import { renderOverviewHtml } from "../core/overviewHtml";
 import { STALE_ACTIVE_MS, deriveLiveness, type ExecutionRecord } from "../core/liveness";
-import { pickBranch, stageRunAction } from "../core/runner";
+import { pickBranch, stageActions, stageRunAction } from "../core/runner";
 import { deriveStatus } from "../core/status";
-import { Workspace, event, sparringMarkdown } from "./fixtures";
+import { Workspace, event, normalUi, sparringMarkdown } from "./fixtures";
 
 const ALL: OverviewArtifacts = { handoff: true, sparring: true, brief: true, plan: true };
 const T0 = Date.parse("2026-09-12T19:00:00.000Z");
@@ -79,33 +79,70 @@ describe("stage run action", () => {
     assert.equal(stageRunAction(await standalone(ws))?.kind, "resume", "either session counts");
   });
 
-  it("NEEDS_YOU and SEND_BACK offer Resume stage", async () => {
+  it("Needs you / Escalated offer Resume stage without making it primary; SEND_BACK offers a primary Resume", async () => {
     const ws = await Workspace.create();
     await ws.writeStage("s", { status: "working", implementation_session_id: "x" }, { "sparring.md": sparringMarkdown("NEEDS_YOU", "Pick a colour") });
-    assert.equal(stageRunAction(await standalone(ws))?.label, "Resume stage");
+    assert.deepEqual(stageRunAction(await standalone(ws)), { kind: "resume", label: "Resume stage", primary: false });
+    const model = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, ALL, T0);
+    assert.equal(model.stageStatus, "Needs you");
+    assert.deepEqual(model.banner, { kind: "stop", text: "Needs you — Pick a colour" });
+    const html = renderOverviewHtml(model, "n", "c");
+    assert.match(html, /<div class="banner stop">Needs you — Pick a colour<\/div>/);
+    assert.ok(!/class="primary" data-action="runStage"/.test(html), "Resume does not answer the human gate, so it is not the primary button");
+    assert.ok(!/NEEDS_YOU/.test(normalUi(html)), "the engine word appears in tooltips and the footer only");
     await ws.writeStage("s", { status: "working", implementation_session_id: "x" }, { "sparring.md": sparringMarkdown("SEND_BACK", "fix") });
-    assert.equal(stageRunAction(await standalone(ws))?.label, "Resume stage");
+    assert.deepEqual(stageRunAction(await standalone(ws)), { kind: "resume", label: "Resume stage", primary: true });
   });
 
-  it("accepted and frozen stages have no run action; plan runs have none either", async () => {
+  it("accepted stages have no action at all; plan runs have no stage action", async () => {
     const ws = await Workspace.create();
     await ws.writeStage("done", { status: "accepted", candidate_sha: "c" });
     assert.equal(stageRunAction(await standalone(ws)), undefined);
-    await ws.writeStage("done", { status: "frozen", base_sha: "b", candidate_sha: "c", implementation_session_id: "x" });
-    assert.equal(stageRunAction(await standalone(ws)), undefined);
+    assert.deepEqual(stageActions(await standalone(ws)), {});
     assert.equal(stageRunAction(undefined), undefined);
     const model = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, ALL, T0);
     assert.equal(model.stageAction, undefined);
-    assert.ok(!renderOverviewHtml(model, "n", "c").includes('data-action="runStage"'));
+    assert.equal(model.stageLine, "Stage complete.");
+    const html = renderOverviewHtml(model, "n", "c");
+    assert.ok(!html.includes('data-action="runStage"'));
+    assert.ok(!html.includes('data-action="acceptStage"'));
+    assert.match(html, /Stage complete/);
   });
 
-  it("READY only offers a non-primary, explicitly labelled rerun", async () => {
+  it("Review complete: Accept stage is primary, Run loop again is a quiet secondary action, never Freeze candidate", async () => {
     const ws = await Workspace.create();
     await ws.writeStage("s", { status: "working", implementation_session_id: "x" }, { "sparring.md": sparringMarkdown("READY", "Looks done") });
-    assert.deepEqual(stageRunAction(await standalone(ws)), { kind: "rerun", label: "Run loop again", primary: false });
-    const html = renderOverviewHtml(buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, ALL, T0), "n", "c");
-    assert.match(html, /<button type="button" data-action="runStage" [^>]*>Run loop again<\/button>/);
+    const run = await standalone(ws);
+    assert.deepEqual(stageActions(run), { primary: { kind: "accept", label: "Accept stage", primary: true }, secondary: { kind: "rerun", label: "Run loop again", primary: false } });
+    assert.deepEqual(stageRunAction(run), { kind: "rerun", label: "Run loop again", primary: false }, "the loop launch for READY is only the explicit rerun");
+    const model = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, ALL, T0);
+    assert.equal(model.stageAction?.label, "Accept stage");
+    assert.equal(model.secondaryAction?.label, "Run loop again");
+    const html = renderOverviewHtml(model, "n", "c");
+    assert.match(html, /<div class="actions"><button type="button" class="primary" data-action="acceptStage" title="sparring freeze-candidate s …, then sparring accept-candidate s …[^"]*">Accept stage<\/button>/);
+    assert.match(html, /<button type="button" class="quiet" data-action="runStage" [^>]*>Run loop again<\/button><\/div>/, "the rerun sits last in the row");
     assert.ok(!/class="primary" data-action="runStage"/.test(html));
+    assert.ok(!/Freeze candidate|FROZEN|frozen/.test(normalUi(html)));
+  });
+
+  it("Finalizing (engine FROZEN) offers Accept stage again and explains the recoverable step", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("s", { status: "frozen", base_sha: "b", candidate_sha: "c", implementation_session_id: "x" }, { "sparring.md": sparringMarkdown("READY", "Looks done") });
+    assert.deepEqual(stageActions(await standalone(ws)), { primary: { kind: "accept", label: "Accept stage", primary: true } });
+    assert.equal(stageRunAction(await standalone(ws)), undefined, "no loop launch for a finalizing stage");
+    const selection = selectRun((await discoverRuns([ws.location])).runs);
+    const model = buildOverviewModel(selection, undefined, ALL, T0);
+    assert.equal(model.stageStatus, "Finalizing stage…");
+    assert.equal(model.stageLine, "Finalizing did not complete. Use Accept stage to finish it.");
+    assert.equal(model.stageAction?.label, "Accept stage");
+    // While this window's own acceptance runs, the state reads as transient and no button is offered.
+    const accepting = buildOverviewModel(selection, undefined, { ...ALL, accepting: true }, T0);
+    assert.equal(accepting.stageLine, "Finalizing stage…");
+    assert.equal(accepting.stageAction, undefined);
+    assert.equal(accepting.accepting?.label, "Accepting stage…");
+    const html = renderOverviewHtml(accepting, "n", "c");
+    assert.match(html, /Accepting stage…/);
+    assert.ok(!/frozen|FROZEN/.test(normalUi(html)));
   });
 
   it("the primary button sits in the stage card's action row", async () => {
@@ -162,7 +199,9 @@ describe("runner lifecycle presentation", () => {
     assert.deepEqual(model.runner, { alive: false, label: "Runner stopped" });
     assert.equal(model.busyState, undefined);
     assert.equal(model.stageAction?.label, "Resume stage", "the loop can be resumed right away");
-    assert.equal(model.stageLine, "Working.", "no 'Implementing.' claim either");
+    assert.equal(model.stageStatus, "Stopped");
+    assert.equal(model.stageLine, "The last run was interrupted.");
+    assert.equal(model.status?.label, "Stopped");
     assert.equal(live.stage.busy, true, "the fold itself is not mutated; this is presentation only");
     assert.match(model.liveness?.detail ?? "", /runner has exited/);
 

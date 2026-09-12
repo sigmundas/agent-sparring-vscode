@@ -16,7 +16,7 @@
 import { currentStageOf, runLabel, totalStagesOf, type RunSelection, type RunSnapshot } from "./discovery";
 import type { RunnerLiveness } from "./liveness";
 import { providerDisplayName, type LiveState } from "./liveState";
-import { presentRunStage, stageDisplayName, truncateLabel } from "./presentation";
+import { actionWord, presentRunStage, stageDisplayName, truncateLabel } from "./presentation";
 
 export type StatusSeverity = "none" | "info" | "warning" | "error";
 
@@ -58,6 +58,7 @@ export function deriveStatus(selection: RunSelection, live: LiveState | undefine
   tooltipLines.push(run.kind === "plan" ? `Stage ${stagePosition(run)} — ${name}` : name);
   tooltipLines.push(`Stage id: ${stage.stageId}`);
   tooltipLines.push(`Stage state: ${presentation.label}`);
+  tooltipLines.push(`Engine state: ${presentation.raw}`);
 
   if (run.kind === "plan") {
     const { status } = run.state;
@@ -67,9 +68,9 @@ export function deriveStatus(selection: RunSelection, live: LiveState | undefine
     }
     if (status === "paused") {
       const outcome = run.currentOutcome;
-      const word = outcome?.action === "NEEDS_YOU" || outcome?.action === "ESCALATE" ? outcome.action : "Paused";
+      const word = outcome?.action === "NEEDS_YOU" || outcome?.action === "ESCALATE" ? actionWord(outcome.action) : "Paused";
       if (outcome?.summary) {
-        tooltipLines.push(`${outcome.action}: ${outcome.summary}`);
+        tooltipLines.push(`${actionWord(outcome.action)}: ${outcome.summary}`);
       }
       if (live?.lastPlanEvent?.event === "plan.failed" && live.lastPlanEvent.summary) {
         tooltipLines.push(`Stopped: ${live.lastPlanEvent.summary}`);
@@ -85,12 +86,12 @@ export function deriveStatus(selection: RunSelection, live: LiveState | undefine
   if (presentation.kind === "accepted") {
     return finish(`$(check) ${PREFIX}: ${shortName} · accepted`, tooltipLines, "none");
   }
-  if (presentation.kind === "frozen") {
-    return finish(`$(lock) ${PREFIX}: ${shortName} · frozen`, tooltipLines, "none");
+  if (presentation.kind === "finalizing") {
+    return finish(`$(lock) ${PREFIX}: ${shortName} · finalizing`, tooltipLines, "none");
   }
   if (presentation.kind === "needs_you" || presentation.kind === "escalate") {
     if (run.outcome?.summary) {
-      tooltipLines.push(`${run.outcome.action}: ${run.outcome.summary}`);
+      tooltipLines.push(`${actionWord(run.outcome.action)}: ${run.outcome.summary}`);
     }
     return finish(`$(debug-pause) ${PREFIX}: ${shortName} · ${presentation.short}`, tooltipLines, "warning");
   }
@@ -149,7 +150,7 @@ function liveSuffix(live: LiveState | undefined, nowMs: number, tooltipLines: st
     }
   }
   if (live.lastVerdict?.summary) {
-    tooltipLines.push(`Last verdict ${live.lastVerdict.action}: ${live.lastVerdict.summary}`);
+    tooltipLines.push(`Last verdict ${actionWord(live.lastVerdict.action)}: ${live.lastVerdict.summary}`);
   }
   return suffix;
 }

@@ -185,3 +185,12 @@ export function sparringMarkdown(action: string, summary: string, reason?: strin
   lines.push("", "## SEND BACK TO STAGE", "", "(not applicable)", "");
   return lines.join("\n");
 }
+
+/**
+ * The Overview as a non-expert reads it: tooltips (`title="…"`) and the
+ * metadata footer are the advanced surfaces where the engine's own words
+ * are allowed; everything else must use the human vocabulary.
+ */
+export function normalUi(html: string): string {
+  return html.replace(/title="[^"]*"/g, "").replace(/<dl class="facts">[\s\S]*?<\/dl>/g, "");
+}

@@ -17,7 +17,7 @@ import * as vscode from "vscode";
 import type { DiscoveryDiagnostic } from "../core/diagnose";
 import type { ExecutionRecord, LivenessState, RunnerLiveness } from "../core/liveness";
 
-const STAGES = ["stage-reported-statistics-contract", "stage-reported-statistics-local-schema-barrier", "stage-reported-statistics-typed-parser", "stage-stale-turn"];
+const STAGES = ["stage-reported-statistics-contract", "stage-reported-statistics-local-schema-barrier", "stage-reported-statistics-typed-parser", "stage-review-complete", "stage-review-complete-dirty", "stage-stale-turn"];
 
 interface LivenessReport {
   state: LivenessState;
@@ -53,7 +53,11 @@ export async function run(): Promise<void> {
   await staleTelemetryAssertions(report, reportedRepo);
   await launchedRunnerAssertions(report, reportedRepo);
   await observedTerminalAssertions(report, reportedRepo);
-  console.log("integration: discovery, stale telemetry, launched runner exit, Ctrl-C and observed terminal command all verified");
+  await bareExecutableAssertions(report, reportedRepo, fixtureRoot);
+  await commandNotFoundAssertions(report, reportedRepo);
+  await acceptStageAssertions(report, reportedRepo);
+  await planAssociationAssertions(report, reportedRepo, fixtureRoot);
+  console.log("integration: discovery, stale telemetry, launched runner exit, Ctrl-C, observed terminal command, bare executable via the shell, command-not-found, Accept stage and plan association all verified");
 }
 
 // ---------------------------------------------------------------- discovery (unchanged shape)
@@ -75,9 +79,11 @@ async function discoveryAssertions(report: DiscoveryDiagnostic, fixtureRoot: str
       [STAGES[1], true, true, "accepted"],
       [STAGES[2], true, true, "working"],
       [STAGES[3], true, true, "working"],
+      [STAGES[4], true, true, "working"],
+      [STAGES[5], true, true, "working"],
     ],
   );
-  assert.equal(location.runIds.length, 4, "the second workspace folder produces recorded runs");
+  assert.equal(location.runIds.length, 6, "the second workspace folder produces recorded runs");
 
   const sporely = report.folders[0];
   assert.equal(sporely.sparringExists, true);
@@ -88,7 +94,7 @@ async function discoveryAssertions(report: DiscoveryDiagnostic, fixtureRoot: str
   assert.equal(sporely.locations[1].projectDir, path.join(sporely.fsPath, "nested-repo"));
   assert.equal(sporely.locations[1].runIds.length, 1);
 
-  assert.equal(report.runs.length, 5);
+  assert.equal(report.runs.length, 7);
   for (const stage of STAGES) {
     assert.ok(
       report.pickLabels.some((label) => label.includes(`sporely-py-reported-statistics: ${stage}`)),
@@ -96,10 +102,10 @@ async function discoveryAssertions(report: DiscoveryDiagnostic, fixtureRoot: str
     );
   }
   assert.ok(report.pickLabels.some((label) => label.includes("nested-repo: stage-nested-only")));
-  // Three open stages in two repositories: ambiguous, never guessed, and the report says so.
-  assert.equal(report.ambiguousIds.length, 3);
+  // Five open stages in two repositories: ambiguous, never guessed, and the report says so.
+  assert.equal(report.ambiguousIds.length, 5);
   assert.equal(report.selectedId, undefined);
-  assert.match(report.noSelectionReason ?? "", /3 runs look active/);
+  assert.match(report.noSelectionReason ?? "", /5 runs look active/);
 }
 
 // ---------------------------------------------------------------- stale telemetry at activation
@@ -177,6 +183,171 @@ async function observedTerminalAssertions(report: DiscoveryDiagnostic, reportedR
   const stopped = await waitFor(runId, (liveness) => liveness.state === "stopped", 20_000, "its end is observed too");
   assert.equal(stopped.interrupted, true, "again no turn.finished was ever written");
   terminal.dispose();
+}
+
+// ---------------------------------------------------------------- bare `sparring` resolved by the shell, not the extension host
+
+interface ModelReport {
+  stageStatus?: string;
+  stageLine?: string;
+  runKind?: string;
+  stageAction?: { kind: string; label: string; primary: boolean };
+  secondaryAction?: { kind: string; label: string };
+  banner?: { kind: string; text: string };
+  actions?: { plan: boolean; choosePlan: boolean; changePlan: boolean };
+  plan?: { source: string; name: string; current?: string; next?: { display: string; line: number } };
+}
+
+async function shellIntegrationAvailable(cwd: string): Promise<boolean> {
+  const terminal = vscode.window.createTerminal({ name: "probe", cwd });
+  const integration = await shellIntegrationFor(terminal, 8000);
+  terminal.dispose();
+  return integration !== undefined;
+}
+
+async function bareExecutableAssertions(report: DiscoveryDiagnostic, reportedRepo: string, fixtureRoot: string): Promise<void> {
+  const fakeBin = path.join(fixtureRoot, "bin");
+  assert.ok(!(process.env.PATH ?? "").split(path.delimiter).includes(fakeBin), "the extension host's PATH must not contain the fake: only the integrated shell's does");
+  if (!(await shellIntegrationAvailable(reportedRepo))) {
+    console.log("integration: shell integration unavailable in this host; bare-executable scenario skipped");
+    return;
+  }
+  const configuration = vscode.workspace.getConfiguration("agentSparring");
+  const original = configuration.inspect<string>("executable")?.workspaceValue;
+  await configuration.update("executable", "", vscode.ConfigurationTarget.Workspace);
+  try {
+    const runId = runIdOf(report, reportedRepo, "stage-reported-statistics-typed-parser");
+    assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+    await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=3\nexit_with=0\n");
+    await vscode.commands.executeCommand("agentSparring.runStage");
+    const running = await waitFor(runId, (liveness) => liveness.state === "running", 15_000, "bare `sparring` launched through the shell is observed alive (no extension-host PATH precheck)");
+    assert.equal(running.execution?.source, "launched", "handed to the shell through shell integration");
+    const stopped = await waitFor(runId, (liveness) => liveness.state === "stopped", 20_000, "and it ends normally");
+    assert.equal(stopped.execution?.exitCode, 0);
+    console.log("integration: bare `sparring` resolved by the integrated shell although the extension host cannot see it");
+  } finally {
+    await configuration.update("executable", original, vscode.ConfigurationTarget.Workspace);
+  }
+}
+
+// ---------------------------------------------------------------- the shell itself reports command-not-found
+
+async function commandNotFoundAssertions(report: DiscoveryDiagnostic, reportedRepo: string): Promise<void> {
+  if (!(await shellIntegrationAvailable(reportedRepo))) {
+    console.log("integration: shell integration unavailable in this host; command-not-found scenario skipped");
+    return;
+  }
+  const configuration = vscode.workspace.getConfiguration("agentSparring");
+  const original = configuration.inspect<string>("executable")?.workspaceValue;
+  const missingWord = "sparring-missing-for-agent-sparring-test";
+  await configuration.update("executable", missingWord, vscode.ConfigurationTarget.Workspace);
+  try {
+    const runId = runIdOf(report, reportedRepo, "stage-reported-statistics-typed-parser");
+    assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+    await vscode.commands.executeCommand("agentSparring.runStage");
+    const deadline = Date.now() + 15_000;
+    let seen: { runId: string; word: string; exitCode: number } | undefined;
+    while (Date.now() < deadline && !seen) {
+      seen = (await vscode.commands.executeCommand("agentSparring._test.lastCommandNotFound")) as typeof seen;
+      if (!seen) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+    }
+    assert.ok(seen, "the shell's command-not-found exit is recognised and reported as a configuration problem");
+    assert.equal(seen.word, missingWord);
+    assert.equal(seen.runId, runId);
+    assert.equal(seen.exitCode, 127);
+    const liveness = await livenessOf(runId);
+    assert.equal(liveness.state, "stopped", "a not-found launch is never left Running");
+    console.log(`integration: command-not-found reported for '${missingWord}' with exit ${seen.exitCode}`);
+  } finally {
+    await configuration.update("executable", original, vscode.ConfigurationTarget.Workspace);
+  }
+}
+
+// ---------------------------------------------------------------- Accept stage: freeze, then accept
+
+async function acceptStageAssertions(report: DiscoveryDiagnostic, reportedRepo: string): Promise<void> {
+  const callsLog = path.join(reportedRepo, ".sparring", "fake-calls.log");
+  const stateOf = async (stage: string) => JSON.parse(await fs.readFile(path.join(reportedRepo, ".sparring", "stages", stage, "state.json"), "utf8")) as { status: string; candidate_sha: string | null };
+  const model = async () => (await vscode.commands.executeCommand("agentSparring._test.overviewModel")) as ModelReport;
+
+  // Success: freeze then accept, in order, as one action.
+  const okId = runIdOf(report, reportedRepo, "stage-review-complete");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", okId), okId);
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  let before = await model();
+  assert.equal(before.stageStatus, "Review complete");
+  assert.equal(before.stageAction?.label, "Accept stage");
+  assert.equal(before.secondaryAction?.label, "Run loop again");
+  await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=1\nexit_with=0\n");
+  await fs.rm(callsLog, { force: true });
+  const result = (await vscode.commands.executeCommand("agentSparring._test.acceptStage")) as { ok: boolean; step?: string; message?: string; candidateSha?: string } | undefined;
+  assert.ok(result, "Accept stage ran");
+  assert.equal(result.ok, true, `Accept stage succeeded: ${JSON.stringify(result)}`);
+  assert.equal(result.candidateSha, "c0ffee0000000000000000000000000000000000", "the accepted SHA is read back from the engine's output");
+  const calls = (await fs.readFile(callsLog, "utf8")).trim().split("\n");
+  assert.deepEqual(calls, ["freeze-candidate stage-review-complete", "accept-candidate stage-review-complete"], "freeze first, accept second, nothing else");
+  assert.equal((await stateOf("stage-review-complete")).status, "accepted");
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  const after = await model();
+  assert.equal(after.stageStatus, "Accepted", "the existing Overview refreshed to the accepted state");
+  assert.equal(after.stageLine, "Stage complete.");
+  assert.equal(after.stageAction, undefined);
+  assert.deepEqual(after.banner, { kind: "done", text: "Stage complete" });
+
+  // Refusal at the first step: the second command is never issued, wording is the user's.
+  const dirtyId = runIdOf(report, reportedRepo, "stage-review-complete-dirty");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", dirtyId), dirtyId);
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  before = await model();
+  assert.equal(before.stageAction?.label, "Accept stage");
+  await fs.writeFile(
+    path.join(reportedRepo, ".sparring", "fake-runner.conf"),
+    "sleep_for=1\nexit_with=0\nfreeze_refusal='refusing to freeze c0ffee as the candidate for stage x: the working tree holds changes that commit does not represent (src/a.py). Commit or discard them first.'\n",
+  );
+  await fs.rm(callsLog, { force: true });
+  const refused = (await vscode.commands.executeCommand("agentSparring._test.acceptStage")) as { ok: boolean; step?: string; message?: string; detail?: string } | undefined;
+  assert.ok(refused);
+  assert.equal(refused.ok, false);
+  assert.equal(refused.step, "freeze");
+  assert.match(refused.message ?? "", /uncommitted changes/, `engine stderr was read and translated (detail: ${JSON.stringify(refused.detail)})`);
+  assert.deepEqual((await fs.readFile(callsLog, "utf8")).trim().split("\n"), ["freeze-candidate stage-review-complete-dirty"], "accept-candidate is never called after a refused freeze");
+  assert.equal((await stateOf("stage-review-complete-dirty")).status, "working");
+  await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=1\nexit_with=0\n");
+  console.log("integration: Accept stage ran freeze then accept; a refused freeze stopped before accept with translated wording");
+}
+
+// ---------------------------------------------------------------- plan association (VS Code state only)
+
+async function planAssociationAssertions(report: DiscoveryDiagnostic, reportedRepo: string, fixtureRoot: string): Promise<void> {
+  const model = async () => (await vscode.commands.executeCommand("agentSparring._test.overviewModel")) as ModelReport;
+  const runId = runIdOf(report, reportedRepo, "stage-review-complete");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  const none = await model();
+  assert.equal(none.actions?.choosePlan, true);
+  assert.equal(none.actions?.plan, false);
+
+  // The plan may live anywhere: here outside the repository entirely.
+  const planFile = path.join(fixtureRoot, "notes", "roadmap.md");
+  await fs.mkdir(path.dirname(planFile), { recursive: true });
+  await fs.writeFile(planFile, "# Roadmap\n\n## Stage 1 — Review complete\n\n## Stage 2 — Cloud schema and synchronization\n");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.associatePlan", planFile), planFile);
+  const associated = await model();
+  assert.equal(associated.runKind, "Standalone stage", "still standalone: no managed plan run was invented");
+  assert.equal(associated.actions?.plan, true);
+  assert.equal(associated.actions?.changePlan, true);
+  assert.equal(associated.plan?.source, "associated");
+  assert.equal(associated.plan?.current, "Stage 1 — Review complete");
+  assert.equal(associated.plan?.next?.display, "Stage 2 — Cloud schema and synchronization");
+  const stageDir = path.join(reportedRepo, ".sparring", "stages", "stage-review-complete");
+  assert.deepEqual((await fs.readdir(stageDir)).sort(), ["sparring.md", "state.json"], "the association never touches engine state");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.associatePlan", undefined), undefined);
+  const removed = await model();
+  assert.equal(removed.actions?.choosePlan, true);
+  assert.equal(removed.plan, undefined);
+  console.log("integration: plan association stored, displayed and removed without touching engine state");
 }
 
 // ---------------------------------------------------------------- helpers

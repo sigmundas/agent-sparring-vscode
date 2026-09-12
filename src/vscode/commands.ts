@@ -1,13 +1,16 @@
 /**
- * Command implementations: run/resume a plan in a VS Code terminal (the
- * executable is spawned directly with an argument array, no shell), select
- * a run, and open the Run Overview panel and its actions.
+ * Command implementations: run/resume a plan or a stage in a VS Code
+ * terminal (the CLI is handed to the user's shell as executable + argument
+ * array, never a quoted command line), accept a stage (freeze then accept
+ * as one action), associate a plan document with a standalone stage, select
+ * a run, and the Run Overview panel and its actions.
  */
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, resolveExecutable } from "../core/cli";
+import { acceptStage, type AcceptStageResult } from "../core/acceptance";
+import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, commandNotFoundMessage, type ExecutableProblem } from "../core/cli";
 import {
   BRIEF_FILENAME,
   HANDOFF_FILENAME,
@@ -23,10 +26,12 @@ import {
 import { parsePlanStages } from "../core/engineFormats";
 import { blocksLaunch } from "../core/liveness";
 import type { OverviewAction } from "../core/overviewHtml";
+import { locateStage, parsePlanHeadings } from "../core/planAssociation";
 import { buildRunPickItems, describeRun } from "../core/runPick";
-import { stageRunAction } from "../core/runner";
+import { stageActions, stageRunAction } from "../core/runner";
 import { planRunId, type SparringSubcommand } from "../core/sparringCommand";
 import type { SparringController } from "./controller";
+import type { LaunchResult } from "./executionTracker";
 import { currentBranch } from "./git";
 import { openCandidateDiff } from "./overview/gitDiff";
 import { OverviewPanelManager } from "./overview/overviewPanel";
@@ -43,6 +48,10 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.runPlan", () => runPlanCommand(controller)),
     vscode.commands.registerCommand("agentSparring.resumePlan", () => resumePlanCommand(controller)),
     vscode.commands.registerCommand("agentSparring.runStage", () => runStageCommand(controller)),
+    vscode.commands.registerCommand("agentSparring.acceptStage", () => acceptStageCommand(controller, overview)),
+    vscode.commands.registerCommand("agentSparring.choosePlan", () => associatePlanCommand(controller, overview)),
+    vscode.commands.registerCommand("agentSparring.chooseExecutable", () => chooseExecutableCommand()),
+    controller.onCommandNotFound((event) => void explainCommandNotFound(event.word)),
     // Not contributed in package.json (never in the palette): hooks for the
     // extension-host integration tests, which cannot drive QuickPicks.
     vscode.commands.registerCommand("agentSparring._test.chooseRun", async (runId: string) => {
@@ -54,8 +63,26 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
       return { state: liveness.state, source: liveness.source, turnActive: liveness.turnActive, interrupted: liveness.interrupted, detail: liveness.detail, execution: liveness.execution };
     }),
     vscode.commands.registerCommand("agentSparring._test.stop", (runId: string) => controller.stopRunner(runId)),
+    vscode.commands.registerCommand("agentSparring._test.acceptStage", async () => {
+      const run = controller.currentSelection.selected;
+      return run?.kind === "stage" ? performAcceptStage(controller, run) : undefined;
+    }),
+    vscode.commands.registerCommand("agentSparring._test.associatePlan", async (planPath: string | undefined) => {
+      const run = controller.currentSelection.selected;
+      if (run) {
+        await controller.setAssociatedPlan(run.id, planPath);
+      }
+      return controller.associatedPlan(run?.id);
+    }),
+    vscode.commands.registerCommand("agentSparring._test.overviewModel", () => overview.buildModel()),
+    vscode.commands.registerCommand("agentSparring._test.lastCommandNotFound", () => lastCommandNotFound),
+    controller.onCommandNotFound((event) => {
+      lastCommandNotFound = event;
+    }),
   );
 }
+
+let lastCommandNotFound: { runId: string; word: string; exitCode: number } | undefined;
 
 // ---------------------------------------------------------------- select run
 
@@ -112,15 +139,22 @@ async function openStageFile(controller: SparringController, overview: OverviewP
  * group. showTextDocument reveals an already-open tab for the same URI
  * instead of duplicating it, and preview tabs are reused by the next
  * action unless the user pinned one; the Overview tab itself stays open.
+ * `line` (1-based) reveals that line, e.g. the next stage's heading.
  */
-async function openDocument(file: string, missingMessage: string, viewColumn: vscode.ViewColumn): Promise<void> {
+async function openDocument(file: string, missingMessage: string, viewColumn: vscode.ViewColumn, line?: number): Promise<void> {
   try {
     await fs.access(file);
   } catch {
     void vscode.window.showWarningMessage(`Agent Sparring: ${missingMessage}`);
     return;
   }
-  await vscode.window.showTextDocument(vscode.Uri.file(file), { preview: true, viewColumn, preserveFocus: false });
+  const selection = line && line > 0 ? new vscode.Range(line - 1, 0, line - 1, 0) : undefined;
+  await vscode.window.showTextDocument(vscode.Uri.file(file), { preview: true, viewColumn, preserveFocus: false, selection });
+}
+
+/** The plan document for the selected run: the engine's for a plan run, the associated file for a standalone stage. */
+function planDocumentFor(controller: SparringController, run: RunSnapshot): string | undefined {
+  return run.kind === "plan" ? run.planPath : controller.associatedPlan(run.id);
 }
 
 async function handleOverviewAction(controller: SparringController, overview: OverviewPanelManager, action: OverviewAction): Promise<void> {
@@ -132,11 +166,34 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       return openStageFile(controller, overview, SPARRING_FILENAME);
     case "openBrief":
       return openStageFile(controller, overview, BRIEF_FILENAME);
-    case "openPlan":
-      if (run?.kind === "plan") {
-        await openDocument(run.planPath, `the plan document ${run.state.plan} is missing.`, overview.documentColumn);
+    case "openPlan": {
+      if (!run) {
+        return;
+      }
+      const file = planDocumentFor(controller, run);
+      if (file) {
+        await openDocument(file, `the plan document ${path.basename(file)} is missing.`, overview.documentColumn);
       }
       return;
+    }
+    case "openNextStage": {
+      if (!run) {
+        return;
+      }
+      const file = planDocumentFor(controller, run);
+      if (!file) {
+        return;
+      }
+      let line: number | undefined;
+      try {
+        const position = locateStage(parsePlanHeadings(await fs.readFile(file, "utf8")), currentStageOf(run).stageId);
+        line = position?.next?.line;
+      } catch {
+        line = undefined;
+      }
+      await openDocument(file, `the plan document ${path.basename(file)} is missing.`, overview.documentColumn, line);
+      return;
+    }
     case "openDiff": {
       if (!run) {
         return;
@@ -159,9 +216,19 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       return;
     case "runPlan":
       return runPlanCommand(controller);
+    case "resumePlan":
+      await resumePlanCommand(controller, run?.kind === "plan" ? run : undefined);
+      await overview.update();
+      return;
     case "runStage":
       await runStageCommand(controller);
       await overview.update();
+      return;
+    case "acceptStage":
+      await acceptStageCommand(controller, overview);
+      return;
+    case "associatePlan":
+      await associatePlanCommand(controller, overview);
       return;
     case "stopRunner":
       if (run && !controller.stopRunner(run.id)) {
@@ -173,7 +240,7 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
 
 // ---------------------------------------------------------------- run / resume stage
 
-async function runStageCommand(controller: SparringController): Promise<void> {
+async function selectedStage(controller: SparringController): Promise<StandaloneStageSnapshot | undefined> {
   let run = controller.currentSelection.selected;
   if (!run || run.kind !== "stage") {
     await selectRunCommand(controller);
@@ -183,6 +250,14 @@ async function runStageCommand(controller: SparringController): Promise<void> {
     if (run) {
       void vscode.window.showInformationMessage("Agent Sparring: the selected run is a plan run; use Run Plan / Resume Plan for it.");
     }
+    return undefined;
+  }
+  return run;
+}
+
+async function runStageCommand(controller: SparringController): Promise<void> {
+  const run = await selectedStage(controller);
+  if (!run) {
     return;
   }
   let liveness = controller.livenessFor(run.id);
@@ -207,8 +282,12 @@ async function runStageCommand(controller: SparringController): Promise<void> {
   }
   const action = stageRunAction(run, liveness);
   if (!action) {
-    const status = run.stage.state?.status ?? "working";
-    void vscode.window.showInformationMessage(`Agent Sparring: ${run.stage.stageId} is ${status}; the loop does not run for ${status} stages.`);
+    const primary = stageActions(run, liveness).primary;
+    if (primary?.kind === "accept") {
+      void vscode.window.showInformationMessage(`Agent Sparring: the review of ${run.stage.stageId} is complete; use Accept stage to finish it.`);
+    } else {
+      void vscode.window.showInformationMessage(`Agent Sparring: ${run.stage.stageId} is complete; nothing further runs for an accepted stage.`);
+    }
     return;
   }
   await launchStageLoop(controller, run, action.label);
@@ -223,12 +302,146 @@ async function launchStageLoop(controller: SparringController, run: StandaloneSt
     );
     return;
   }
-  const executable = await resolveOrExplain(run.location);
-  if (!executable) {
+  const args = buildRunLoopArgs({ stageId: run.stage.stageId, repoRoot, expectedBranch, sparringDir: run.location.sparringDir });
+  const result = await controller.launch({ configured: configuredExecutable(), args, cwd: repoRoot, name: `${label}: ${run.stage.stageId}`, runId: run.id, kind: "run-loop", stageId: run.stage.stageId, reveal: false });
+  await explainLaunch(result);
+}
+
+// ---------------------------------------------------------------- accept stage (freeze, then accept)
+
+async function acceptStageCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
+  const run = await selectedStage(controller);
+  if (!run) {
     return;
   }
-  const args = buildRunLoopArgs({ stageId: run.stage.stageId, repoRoot, expectedBranch, sparringDir: run.location.sparringDir });
-  await controller.launch({ executable, args, cwd: repoRoot, name: `${label}: ${run.stage.stageId}`, runId: run.id, kind: "run-loop", stageId: run.stage.stageId, reveal: false });
+  if (run.stage.state?.status === "accepted") {
+    void vscode.window.showInformationMessage(`Agent Sparring: ${run.stage.stageId} is already accepted.`);
+    return;
+  }
+  const liveness = controller.livenessFor(run.id);
+  if (blocksLaunch(liveness) === "running") {
+    void vscode.window.showInformationMessage(`Agent Sparring: a runner is still alive for ${run.stage.stageId}; wait for it to finish before accepting.`);
+    return;
+  }
+  if (controller.isAccepting(run.id)) {
+    return;
+  }
+  const result = await performAcceptStage(controller, run);
+  await overview.update();
+  if (!result) {
+    return;
+  }
+  if (result.ok) {
+    void vscode.window.showInformationMessage(`Agent Sparring: stage accepted${result.candidateSha ? ` at ${result.candidateSha.slice(0, 8)}` : ""}. Stage complete.`);
+    return;
+  }
+  if (result.commandNotFound) {
+    await explainCommandNotFound(configuredExecutable() || "sparring");
+    return;
+  }
+  const buttons = result.retryable && result.step === "accept" ? ["Try Accept stage again", "Show log"] : ["Show log"];
+  const choice = await vscode.window.showErrorMessage(`Agent Sparring: ${result.message}`, ...buttons);
+  if (choice === "Show log") {
+    controller.showLog();
+  } else if (choice === "Try Accept stage again") {
+    await acceptStageCommand(controller, overview);
+  }
+}
+
+/**
+ * Run the engine's two acceptance steps in order for `run`, marking the
+ * run as accepting meanwhile so the Overview shows Accepting stage… and
+ * offers no second action. Returns undefined when the branch or executable
+ * could not be established (already explained to the user).
+ */
+async function performAcceptStage(controller: SparringController, run: StandaloneStageSnapshot): Promise<AcceptStageResult | undefined> {
+  const repoRoot = run.location.repoRoot;
+  const expectedBranch = await currentBranch(repoRoot);
+  if (!expectedBranch) {
+    void vscode.window.showErrorMessage(
+      `Agent Sparring: no Git branch is checked out in ${run.location.folderName} (detached HEAD or not a repository). Check out the stage's branch, then accept again.`,
+    );
+    return undefined;
+  }
+  const invocation = { stageId: run.stage.stageId, repoRoot, expectedBranch, sparringDir: run.location.sparringDir };
+  controller.setAccepting(run.id, true);
+  controller.log(`Accept stage ${run.stage.stageId}: freeze-candidate, then accept-candidate (branch ${expectedBranch})`);
+  let problem: { error: string; problem: ExecutableProblem } | undefined;
+  try {
+    const result = await acceptStage(async (args) => {
+      const outcome = await controller.runCommand({ configured: configuredExecutable(), args, cwd: repoRoot, name: `Accept stage: ${run.stage.stageId}` });
+      if (!outcome.ok) {
+        problem = { error: outcome.error, problem: outcome.problem };
+        return { exitCode: undefined, output: outcome.error };
+      }
+      return outcome.outcome;
+    }, invocation);
+    if (problem) {
+      await explainExecutableProblem(problem.error);
+      return undefined;
+    }
+    if (result.ok) {
+      controller.log(`Accept stage ${run.stage.stageId}: accepted${result.candidateSha ? ` ${result.candidateSha}` : ""}`);
+    } else {
+      controller.log(`Accept stage ${run.stage.stageId}: ${result.step === "freeze" ? "freeze-candidate" : "accept-candidate"} failed — ${result.message}`);
+      if (result.detail) {
+        for (const line of result.detail.split(/\r?\n/)) {
+          controller.log(`  ${line}`);
+        }
+      }
+    }
+    return result;
+  } finally {
+    controller.setAccepting(run.id, false);
+    await controller.refresh();
+  }
+}
+
+// ---------------------------------------------------------------- plan association (UI metadata only)
+
+async function associatePlanCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
+  const run = controller.currentSelection.selected;
+  if (!run) {
+    return;
+  }
+  if (run.kind === "plan") {
+    void vscode.window.showInformationMessage("Agent Sparring: this is an engine-managed plan run; its plan document is already known.");
+    return;
+  }
+  const current = controller.associatedPlan(run.id);
+  let choice: "choose" | "remove" | undefined = "choose";
+  if (current) {
+    const picked = await vscode.window.showQuickPick(
+      [
+        { label: "$(file) Choose another plan file…", description: path.basename(current), action: "choose" as const },
+        { label: "$(close) Remove the association", description: "the stage keeps running; only the Plan button goes away", action: "remove" as const },
+      ],
+      { placeHolder: `Plan for ${run.stage.stageId} (kept in VS Code only; the engine is not told)` },
+    );
+    choice = picked?.action;
+  }
+  if (!choice) {
+    return;
+  }
+  if (choice === "remove") {
+    await controller.setAssociatedPlan(run.id, undefined);
+    await overview.update();
+    return;
+  }
+  const chosen = await vscode.window.showOpenDialog({
+    canSelectMany: false,
+    canSelectFolders: false,
+    defaultUri: vscode.Uri.file(current ? path.dirname(current) : run.location.repoRoot),
+    filters: { Markdown: ["md", "markdown"], "All files": ["*"] },
+    openLabel: "Associate plan",
+    title: `Plan document for ${run.stage.stageId}`,
+  });
+  const file = chosen?.[0]?.fsPath;
+  if (!file) {
+    return;
+  }
+  await controller.setAssociatedPlan(run.id, file);
+  await overview.update();
 }
 
 // ---------------------------------------------------------------- launching
@@ -327,30 +540,58 @@ async function askBranch(location: SparringLocation, recorded?: string): Promise
   return value?.trim() || undefined;
 }
 
-async function resolveOrExplain(location: SparringLocation): Promise<string | undefined> {
-  const configured = vscode.workspace.getConfiguration("agentSparring").get<string>("executable", "");
-  const resolved = await resolveExecutable(configured, {
-    platform: process.platform,
-    PATH: process.env.PATH,
-    PATHEXT: process.env.PATHEXT,
-    cwd: location.repoRoot,
-  });
-  if (resolved.ok) {
-    return resolved.path;
-  }
-  const choice = await vscode.window.showErrorMessage(`Agent Sparring: ${resolved.error}`, "Open Settings");
-  if (choice === "Open Settings") {
-    await vscode.commands.executeCommand("workbench.action.openSettings", "agentSparring.executable");
-  }
-  return undefined;
+// ---------------------------------------------------------------- executable configuration
+
+function configuredExecutable(): string {
+  return vscode.workspace.getConfiguration("agentSparring").get<string>("executable", "");
 }
 
-async function launch(controller: SparringController, location: SparringLocation, executable: string, args: string[], kind: SparringSubcommand, planPath: string): Promise<void> {
+async function explainLaunch(result: LaunchResult): Promise<void> {
+  if (!result.ok) {
+    await explainExecutableProblem(result.error);
+  }
+}
+
+/** Configuration errors: the honest message plus the two ways to fix it. */
+async function explainExecutableProblem(error: string): Promise<void> {
+  const choice = await vscode.window.showErrorMessage(`Agent Sparring: ${error}`, "Open Settings", "Choose executable…");
+  if (choice === "Open Settings") {
+    await vscode.commands.executeCommand("workbench.action.openSettings", "agentSparring.executable");
+  } else if (choice === "Choose executable…") {
+    await chooseExecutableCommand();
+  }
+}
+
+async function explainCommandNotFound(word: string): Promise<void> {
+  await explainExecutableProblem(commandNotFoundMessage(word));
+}
+
+/** Pick the sparring CLI with a file dialog and store it as `agentSparring.executable`. */
+async function chooseExecutableCommand(): Promise<void> {
+  const chosen = await vscode.window.showOpenDialog({
+    canSelectMany: false,
+    canSelectFolders: false,
+    openLabel: "Use as sparring executable",
+    title: "Agent Sparring: choose the sparring executable",
+  });
+  const file = chosen?.[0]?.fsPath;
+  if (!file) {
+    return;
+  }
+  const configuration = vscode.workspace.getConfiguration("agentSparring");
+  const inspected = configuration.inspect<string>("executable");
+  const target = inspected?.workspaceValue !== undefined || inspected?.workspaceFolderValue !== undefined ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+  await configuration.update("executable", file, target);
+  void vscode.window.showInformationMessage(`Agent Sparring: agentSparring.executable set to ${file} (${target === vscode.ConfigurationTarget.Workspace ? "workspace" : "user"} settings).`);
+}
+
+async function launch(controller: SparringController, location: SparringLocation, args: string[], kind: SparringSubcommand, planPath: string): Promise<void> {
   // The command runs inside the user's normal integrated terminal through
   // shell integration (executable + argument array, no quoting), so the user
   // sees the engine's own output and the terminal follows VS Code's normal
   // persistence; the run id is the one the engine will write state under.
-  await controller.launch({ executable, args, cwd: location.repoRoot, name: kind, runId: planRunId(location, planPath), kind, planPath, reveal: true });
+  const result = await controller.launch({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: kind, runId: planRunId(location, planPath), kind, planPath, reveal: true });
+  await explainLaunch(result);
 }
 
 async function runPlanCommand(controller: SparringController): Promise<void> {
@@ -366,28 +607,30 @@ async function runPlanCommand(controller: SparringController): Promise<void> {
   if (!expectedBranch) {
     return;
   }
-  const executable = await resolveOrExplain(location);
-  if (!executable) {
-    return;
-  }
   const args = buildRunPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir });
   const runId = planRunId(location, planPath);
   if (controller.livenessFor(runId).state === "running") {
     void vscode.window.showInformationMessage("Agent Sparring: a runner for this plan is alive in a terminal of this window.");
     return;
   }
-  await launch(controller, location, executable, args, "run-plan", planPath);
+  await launch(controller, location, args, "run-plan", planPath);
 }
 
-async function resumePlanCommand(controller: SparringController): Promise<void> {
+/**
+ * Resume (or continue) a managed plan run with `sparring resume-plan`.
+ * `preselected` is the Overview's selected plan run; without it the paused
+ * / running runs are offered. A current stage that is already accepted is
+ * advanced past by the engine, so the same command is "Continue plan".
+ */
+async function resumePlanCommand(controller: SparringController, preselected?: PlanRunSnapshot): Promise<void> {
   const plans = controller.currentDiscovery.runs.filter((run): run is PlanRunSnapshot => run.kind === "plan" && run.state.status !== "complete");
   if (plans.length === 0) {
     void vscode.window.showInformationMessage("Agent Sparring: no paused or running plan run to resume.");
     return;
   }
-  let run: PlanRunSnapshot | undefined = plans[0];
+  let run: PlanRunSnapshot | undefined = preselected && plans.some((candidate) => candidate.id === preselected.id) ? preselected : plans[0];
   const selected = controller.currentSelection.selected;
-  if (plans.length > 1) {
+  if (!preselected && plans.length > 1) {
     const picked = await vscode.window.showQuickPick(
       plans
         .slice()
@@ -409,7 +652,7 @@ async function resumePlanCommand(controller: SparringController): Promise<void> 
     void vscode.window.showInformationMessage(`Agent Sparring: a runner is alive for ${run.state.plan}. ${liveness.detail}`);
     return;
   }
-  if (run.state.status === "running" && liveness.state !== "stopped") {
+  if (run.state.status === "running" && liveness.state !== "stopped" && run.currentStage.state?.status !== "accepted") {
     const proceed = await vscode.window.showWarningMessage(
       `Agent Sparring: ${run.state.plan} is recorded as running and no runner process has been observed ending. Resume only if that process is no longer alive.`,
       { modal: true },
@@ -423,17 +666,17 @@ async function resumePlanCommand(controller: SparringController): Promise<void> 
   if (!expectedBranch) {
     return;
   }
-  const evidence = await vscode.window.showInputBox({
-    title: "Agent Sparring: human evidence (optional)",
-    prompt: "Answer, check result or decision to record under '## Human evidence' before the same stage resumes. Leave empty to resume without evidence.",
-    ignoreFocusOut: true,
-  });
-  if (evidence === undefined) {
-    return;
-  }
-  const executable = await resolveOrExplain(run.location);
-  if (!executable) {
-    return;
+  const continuing = run.currentStage.state?.status === "accepted";
+  let evidence: string | undefined = "";
+  if (!continuing) {
+    evidence = await vscode.window.showInputBox({
+      title: "Agent Sparring: human evidence (optional)",
+      prompt: "Answer, check result or decision to record under '## Human evidence' before the same stage resumes. Leave empty to resume without evidence.",
+      ignoreFocusOut: true,
+    });
+    if (evidence === undefined) {
+      return;
+    }
   }
   const args = buildResumePlanArgs({
     planPath: run.planPath,
@@ -442,5 +685,5 @@ async function resumePlanCommand(controller: SparringController): Promise<void> 
     sparringDir: run.location.sparringDir,
     evidence,
   });
-  await launch(controller, run.location, executable, args, "resume-plan", run.planPath);
+  await launch(controller, run.location, args, "resume-plan", run.planPath);
 }

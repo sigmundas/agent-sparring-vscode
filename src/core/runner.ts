@@ -21,38 +21,113 @@ import { presentStage } from "./presentation";
 
 // ---------------------------------------------------------------- action
 
-export type StageRunActionKind = "run" | "resume" | "rerun";
+export type StageRunActionKind = "run" | "resume" | "rerun" | "accept";
 
 export interface StageRunAction {
   kind: StageRunActionKind;
   label: string;
-  /** Primary actions are the obvious next step; a rerun after READY is not. */
+  /** Primary actions are the obvious next step; a rerun after READY, or Resume while the stage needs the human, are not. */
   primary: boolean;
 }
 
 /**
- * The loop action for the selected run, or undefined when none applies:
- * plan runs use Run/Resume Plan; accepted and frozen stages are terminal
- * for the loop; a run whose runner is alive or whose telemetry shows an
- * active turn with unknown liveness offers nothing (the UI shows a state
- * instead); READY only offers an explicit, non-primary rerun.
+ * The stage actions for the selected run: `primary` is the obvious next
+ * step, `secondary` an advanced alternative. Nothing when: the run is a
+ * plan run (plan actions apply), the stage is accepted, or a runner is
+ * alive / telemetry claims an active turn with unknown liveness (the UI
+ * shows a state instead).
+ *
+ * - fresh stage → Run stage; a stage that ran before → Resume stage;
+ * - Needs you / Escalated → Resume stage, not primary: the human request
+ *   is what matters and pressing Resume does not answer it;
+ * - Review complete (READY) → Accept stage, with Run loop again as the
+ *   secondary advanced action;
+ * - Finalizing (engine FROZEN, i.e. the acceptance did not complete) →
+ *   Accept stage again; the engine allows re-freezing.
  */
-export function stageRunAction(run: RunSnapshot | undefined, liveness?: RunnerLiveness): StageRunAction | undefined {
+export function stageActions(run: RunSnapshot | undefined, liveness?: RunnerLiveness): { primary?: StageRunAction; secondary?: StageRunAction } {
   if (!run || run.kind !== "stage") {
-    return undefined;
+    return {};
   }
   const status = run.stage.state?.status;
-  if (status === "accepted" || status === "frozen") {
-    return undefined;
+  if (status === "accepted") {
+    return {};
   }
   if (liveness && blocksLaunch(liveness)) {
-    return undefined;
+    return {};
   }
   const live = liveness?.live;
-  if (presentStage(status, run.outcome, live).kind === "ready") {
-    return { kind: "rerun", label: "Run loop again", primary: false };
+  const presentation = presentStage(status, run.outcome, live);
+  if (presentation.kind === "finalizing") {
+    return { primary: { kind: "accept", label: "Accept stage", primary: true } };
   }
-  return hasSessions(run, live) ? { kind: "resume", label: "Resume stage", primary: true } : { kind: "run", label: "Run stage", primary: true };
+  if (presentation.kind === "ready") {
+    return { primary: { kind: "accept", label: "Accept stage", primary: true }, secondary: { kind: "rerun", label: "Run loop again", primary: false } };
+  }
+  const resume = hasSessions(run, live);
+  if (presentation.kind === "needs_you" || presentation.kind === "escalate") {
+    return { primary: { kind: resume ? "resume" : "run", label: resume ? "Resume stage" : "Run stage", primary: false } };
+  }
+  return { primary: resume ? { kind: "resume", label: "Resume stage", primary: true } : { kind: "run", label: "Run stage", primary: true } };
+}
+
+/** The loop action (Run / Resume / Run loop again) for a stage, or undefined; Accept stage is not a loop launch. */
+export function stageRunAction(run: RunSnapshot | undefined, liveness?: RunnerLiveness): StageRunAction | undefined {
+  const { primary, secondary } = stageActions(run, liveness);
+  if (primary && primary.kind !== "accept") {
+    return primary;
+  }
+  return secondary;
+}
+
+// ---------------------------------------------------------------- plan runs
+
+export interface PlanAction {
+  kind: "resume" | "continue";
+  label: string;
+  primary: boolean;
+  /** What the button does, for its tooltip. */
+  detail: string;
+}
+
+/**
+ * The engine operation that moves a managed plan run forward, when one
+ * applies. Everything is `sparring resume-plan`: it records optional human
+ * evidence and continues at the current stage, and it advances past a
+ * current stage that is already ACCEPTED without running anything
+ * (plan.py: resume_plan). Wording follows the situation:
+ *
+ * - paused (Needs you / Escalated / a failure) → Resume plan;
+ * - recorded as running with no live runner and no active turn → Resume
+ *   plan (the run stopped without pausing itself);
+ * - current stage ACCEPTED while the plan is not complete → Continue plan;
+ * - complete, or a runner alive / liveness unknown mid-turn → nothing.
+ */
+export function planAction(run: RunSnapshot | undefined, liveness?: RunnerLiveness): PlanAction | undefined {
+  if (!run || run.kind !== "plan" || run.state.status === "complete") {
+    return undefined;
+  }
+  if (liveness?.state === "running") {
+    return undefined;
+  }
+  if (run.state.status === "paused") {
+    // Paused is authoritative: the engine wrote it as it stopped, so a
+    // lingering turn.started in telemetry cannot be a live runner.
+  } else if (liveness && blocksLaunch(liveness)) {
+    return undefined;
+  }
+  if (run.currentStage.state?.status === "accepted") {
+    return { kind: "continue", label: "Continue plan", primary: true, detail: "sparring resume-plan: the accepted stage is advanced past and the next stage starts." };
+  }
+  if (run.state.status === "paused") {
+    const action = run.currentOutcome?.action;
+    const needsHuman = action === "NEEDS_YOU" || action === "ESCALATE";
+    return { kind: "resume", label: "Resume plan", primary: !needsHuman, detail: needsHuman ? "sparring resume-plan: record your answer or check result, then the same stage continues." : "sparring resume-plan: continue the plan at its current stage." };
+  }
+  if (!liveness || liveness.state === "stopped" || (liveness.state === "unknown" && !liveness.turnActive)) {
+    return { kind: "resume", label: "Resume plan", primary: true, detail: "sparring resume-plan: the run is recorded as running but no runner is alive; continue it at its current stage." };
+  }
+  return undefined;
 }
 
 /**

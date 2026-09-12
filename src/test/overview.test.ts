@@ -4,7 +4,7 @@ import { discoverRuns, selectRun, type RunSelection } from "../core/discovery";
 import { foldEvents } from "../core/liveState";
 import { renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel, shortenId, type OverviewArtifacts } from "../core/overviewModel";
-import { FOO_PLAN_KEY, FOO_PLAN_LABEL, FOO_STAGE_IDS, Workspace, event, sparringMarkdown } from "./fixtures";
+import { FOO_PLAN_KEY, FOO_PLAN_LABEL, FOO_STAGE_IDS, Workspace, event, normalUi, sparringMarkdown } from "./fixtures";
 
 const NOW = Date.parse("2026-09-12T20:00:00.000Z");
 const ALL: OverviewArtifacts = { handoff: true, sparring: true, brief: true, plan: true };
@@ -45,7 +45,7 @@ describe("overview view model", () => {
     );
     assert.equal(model.timeline?.[1].title, "Schema & API");
     assert.equal(model.stageHeading, "Stage 2 — Schema & API");
-    assert.equal(model.stageStatus, "working");
+    assert.equal(model.stageStatus, "Working");
     assert.equal(model.stageLine, "Implementing.");
     assert.equal(model.stageAgent?.provider, "Claude");
     assert.equal(model.stageAgent?.activity, "Working");
@@ -65,12 +65,13 @@ describe("overview view model", () => {
   it("SEND_BACK outcome on a running stage reads as correcting", async () => {
     const ws = await planWorkspace("running", 2, { sparring: sparringMarkdown("SEND_BACK", "Empty vs missing statistics state conflated."), stageState: { base_sha: "a".repeat(40) } });
     const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
-    assert.equal(model.stageLine, "Correcting SEND_BACK finding");
-    assert.deepEqual(model.lastSparring, { action: "SEND_BACK", summary: "Empty vs missing statistics state conflated.", reason: undefined });
+    assert.equal(model.stageLine, "The independent reviewer found something to fix. Work will continue automatically.");
+    assert.deepEqual(model.lastSparring, { action: "SEND_BACK", word: "Changes requested", summary: "Empty vs missing statistics state conflated.", reason: undefined });
     assert.equal(model.actions?.diff?.label, "Diff");
     assert.equal(model.actions?.diff?.detail, "base aaaaaaaa… … current HEAD");
     assert.equal(model.actions?.diff?.targetSha, undefined);
-    assert.equal(model.stageStatus, "SEND_BACK · correcting");
+    assert.equal(model.stageStatus, "Changes requested");
+    assert.equal(model.stageRaw, "working · SEND_BACK");
     assert.equal(model.sparrer?.activity, "Waiting");
   });
 
@@ -78,7 +79,7 @@ describe("overview view model", () => {
     const ws = await planWorkspace("running", 0, { sparring: sparringMarkdown("SEND_BACK", "x") });
     const live = foldEvents([event("sparrer", "sparring.started", { provider: "codex-cli" })]);
     const model = buildOverviewModel(await selection(ws), live, ALL, NOW);
-    assert.equal(model.stageLine, "Under sparring.");
+    assert.equal(model.stageLine, "Under independent review.");
     assert.equal(model.sparrer?.activity, "Sparring");
   });
 
@@ -86,7 +87,10 @@ describe("overview view model", () => {
     const ws = await planWorkspace("paused", 1, { sparring: sparringMarkdown("NEEDS_YOU", "Check on a Pixel 7", "device_manual_check") });
     const live = foldEvents([event("stage", "turn.started", { provider: "claude-cli" })]);
     const model = buildOverviewModel(await selection(ws), live, ALL, NOW);
-    assert.deepEqual(model.banner, { kind: "stop", text: "NEEDS_YOU — Check on a Pixel 7" });
+    assert.deepEqual(model.banner, { kind: "stop", text: "Needs you — Check on a Pixel 7" });
+    assert.equal(model.status?.label, "Needs you");
+    assert.equal(model.planAction?.label, "Resume plan");
+    assert.equal(model.planAction?.primary, false, "the human request is primary, not the button");
     assert.equal(model.timeline?.[1].state, "paused");
     assert.equal(model.stageAgent?.activity, "Idle");
     assert.equal(model.lastSparring?.reason, "device_manual_check");
@@ -97,7 +101,7 @@ describe("overview view model", () => {
     const ws = await planWorkspace("paused", 0, { sparring: sparringMarkdown("ESCALATE", "Needs a stronger sparrer") });
     const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
     assert.equal(model.banner?.kind, "stop");
-    assert.match(model.banner?.text ?? "", /^ESCALATE — Needs a stronger sparrer/);
+    assert.match(model.banner?.text ?? "", /^Escalated — Needs a stronger sparrer/);
   });
 
   it("failure pause without a stop verdict shows Paused with the recorded reason", async () => {
@@ -121,11 +125,15 @@ describe("overview view model", () => {
     assert.equal(model.actions?.diff?.targetSha, "c".repeat(40));
   });
 
-  it("frozen current stage is distinguished from accepted", async () => {
+  it("frozen current stage is distinguished from accepted and never named frozen", async () => {
     const ws = await planWorkspace("running", 1, { stageState: { status: "frozen", base_sha: "b".repeat(40), candidate_sha: "c".repeat(40) } });
     const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
-    assert.equal(model.timeline?.[1].state, "frozen");
-    assert.equal(model.stageLine, "Candidate frozen; awaiting acceptance.");
+    assert.equal(model.timeline?.[1].state, "finalizing");
+    assert.equal(model.stageStatus, "Finalizing stage…");
+    assert.equal(model.stageLine, "Finalizing did not complete. Use Accept stage to finish it.");
+    const html = renderOverviewHtml(model, "n", "c");
+    assert.ok(!/frozen|FROZEN|Freeze candidate/.test(normalUi(html)), "no normal UI text says frozen");
+    assert.match(html, /Engine state: FROZEN/, "the engine word survives only in a tooltip");
   });
 
   it("missing plan document degrades to a note without inventing stages", async () => {
@@ -166,15 +174,19 @@ describe("overview view model", () => {
     const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
     assert.equal(model.kind, "run");
     assert.equal(model.title, "Local schema barrier");
-    assert.equal(model.stageStatus, "ACCEPTED · stage complete");
-    assert.deepEqual(model.banner, { kind: "done", text: "Stage complete — candidate accepted" });
+    assert.equal(model.stageStatus, "Accepted");
+    assert.equal(model.stageLine, "Stage complete.");
+    assert.deepEqual(model.banner, { kind: "done", text: "Stage complete" });
+    assert.equal(model.stageAction, undefined, "no Run / Resume / Accept for an accepted stage");
+    assert.equal(model.secondaryAction, undefined);
     assert.equal(model.stageAgent?.activity, "Idle");
     assert.equal(model.actions?.diff?.label, "Diff");
     assert.equal(model.actions?.handoff, true);
     assert.equal(model.actions?.sparring, true);
     assert.equal(model.actions?.brief, true);
     assert.ok(!model.facts?.some((fact) => fact.label === "Last activity"), "the Ns-ago row is gone");
-    assert.deepEqual(model.facts?.slice(1, 3), [
+    assert.deepEqual(model.facts?.slice(1, 4), [
+      { label: "Engine state", value: "ACCEPTED" },
       { label: "Base", value: "bbbbbbbb…" },
       { label: "Candidate", value: "cccccccc…" },
     ]);
@@ -193,16 +205,17 @@ describe("overview view model", () => {
     assert.deepEqual(model.choices, ["repo: docs/plans/bar.md", "repo: docs/plans/foo.md"]);
   });
 
-  it("READY on a working stage presents as awaiting acceptance", async () => {
+  it("READY on a working stage presents as Review complete", async () => {
     const ws = await planWorkspace("running", 1, { sparring: sparringMarkdown("READY", "Looks complete") });
     const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
-    assert.equal(model.stageStatus, "READY · awaiting acceptance");
+    assert.equal(model.stageStatus, "Review complete");
     assert.equal(model.stageStatusKind, "ready");
-    assert.equal(model.stageLine, "Sparrer said READY; acceptance pending.");
+    assert.equal(model.stageLine, "Independent review passed. No unresolved findings remain.");
     const html = renderOverviewHtml(model, "n", "c");
-    assert.match(html, /<span class="status ready">READY · awaiting acceptance<\/span>/);
-    assert.match(html, /<span class="verdict ready">READY<\/span>/);
+    assert.match(html, /<span class="status ready" title="Engine state: working · READY">Review complete<\/span>/);
+    assert.match(html, /<span class="verdict ready" title="Routing action: READY">Review passed<\/span>/);
     assert.ok(!/<span class="status[^>]*>working</.test(html));
+    assert.ok(!/awaiting acceptance/.test(html));
   });
 
   it("shortens ids", () => {
@@ -264,13 +277,13 @@ describe("overview HTML", () => {
     assert.match(html, /<ol class="journey"><li class="step accepted" title="Stage 1 — Contract \(Accepted\)"><span class="node"><svg class="icon " [^>]*>.*?<\/svg><\/span><span class="num">1<\/span><span class="name">Contract<\/span><span class="state"><svg[^>]*>.*?<\/svg>Accepted<\/span><\/li>/);
     assert.match(html, /<li class="step paused current" [^>]*>.*?<span class="name">Schema &amp; API<\/span><span class="state">Paused<\/span><\/li>/);
     assert.match(html, /<li class="step future" [^>]*><span class="node">3<\/span>.*?<span class="state">Pending<\/span><\/li>/);
-    assert.match(html, /<span class="hpill" title="docs\/plans\/foo.md">Plan run<\/span><span class="hpill">Stage 2 \/ 3<\/span><span class="hpill warn"><svg[^>]*>.*?<\/svg>NEEDS_YOU<\/span>/);
+    assert.match(html, /<span class="hpill" title="docs\/plans\/foo.md">Plan run<\/span><span class="hpill">Stage 2 \/ 3<\/span><span class="hpill warn"><svg[^>]*>.*?<\/svg>Needs you<\/span>/);
     assert.match(html, /<h2 [^>]*><svg class="icon accent needs_you"[^>]*>.*?<\/svg>Stage 2 — Schema &amp; API<\/h2>/);
-    assert.match(html, /<span class="status needs_you">NEEDS_YOU<\/span>/);
+    assert.match(html, /<span class="status needs_you" title="[^"]*">Needs you<\/span>/);
     assert.equal((html.match(/<div class="card actor">/g) ?? []).length, 2);
     assert.ok(html.indexOf('<section class="card stage">') < html.indexOf('<section class="actors">'), "stage before actors");
     assert.ok(html.indexOf('<section class="actors">') < html.indexOf('<dl class="facts">'), "metadata last");
-    assert.match(html, /<div class="banner stop">NEEDS_YOU — Check<\/div>/);
+    assert.match(html, /<div class="banner stop">Needs you — Check<\/div>/);
     assert.ok(!html.includes("Last activity"));
   });
 

@@ -14,8 +14,40 @@
  */
 
 import { TIMELINE_STATE_WORD, type ActorCard, type HistoryEntry, type OverviewModel, type TimelineItem } from "./overviewModel";
+import type { StageRunAction } from "./runner";
 
-export type OverviewAction = "openHandoff" | "openSparring" | "openBrief" | "openPlan" | "openDiff" | "showLog" | "selectRun" | "runPlan" | "runStage" | "stopRunner";
+export type OverviewAction =
+  | "openHandoff"
+  | "openSparring"
+  | "openBrief"
+  | "openPlan"
+  | "openNextStage"
+  | "openDiff"
+  | "showLog"
+  | "selectRun"
+  | "runPlan"
+  | "resumePlan"
+  | "runStage"
+  | "acceptStage"
+  | "associatePlan"
+  | "stopRunner";
+
+export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
+  "openHandoff",
+  "openSparring",
+  "openBrief",
+  "openPlan",
+  "openNextStage",
+  "openDiff",
+  "showLog",
+  "selectRun",
+  "runPlan",
+  "resumePlan",
+  "runStage",
+  "acceptStage",
+  "associatePlan",
+  "stopRunner",
+];
 
 export function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch] as string);
@@ -126,7 +158,7 @@ function renderHeader(model: OverviewModel): string {
 
 const JOURNEY_ICON: Record<TimelineItem["state"], keyof typeof ICON | undefined> = {
   accepted: "check",
-  frozen: "lock",
+  finalizing: "lock",
   active: undefined,
   paused: "pause",
   working: undefined,
@@ -147,13 +179,30 @@ function renderJourney(items: TimelineItem[]): string {
   return `<ol class="journey">${cells.join("")}</ol>`;
 }
 
+/** The stage action a button triggers: Accept stage is the two-step acceptance, everything else launches the loop. */
+function stageActionButton(action: StageRunAction, stageId: string | undefined, cls = action.primary ? "primary" : ""): string {
+  if (action.kind === "accept") {
+    const title = `sparring freeze-candidate ${stageId ?? ""} …, then sparring accept-candidate ${stageId ?? ""} … (--repo-root <project> --expected-branch <current branch>)`;
+    return button("acceptStage", action.label, true, title, cls);
+  }
+  const title = `sparring run-loop ${stageId ?? ""} --repo-root <project> --expected-branch <current branch>`;
+  return button("runStage", action.label, true, title, cls);
+}
+
 function renderStageCard(model: OverviewModel): string {
-  const statusWord = model.stageStatus ? `<span class="status ${escapeHtml(model.stageStatusKind ?? "")}">${escapeHtml(model.stageStatus)}</span>` : "";
+  const statusWord = model.stageStatus
+    ? `<span class="status ${escapeHtml(model.stageStatusKind ?? "")}" title="${escapeHtml(model.stageRaw ? `Engine state: ${model.stageRaw}` : "")}">${escapeHtml(model.stageStatus)}</span>`
+    : "";
   const cycle = model.cycle !== undefined ? `<span class="sep">·</span><span class="muted" title="loop cycle from telemetry">cycle ${model.cycle}</span>` : "";
   const buttons: string[] = [];
   if (model.stageAction) {
-    const title = `sparring run-loop ${model.stageId ?? ""} --repo-root <project> --expected-branch <current branch>`;
-    buttons.push(button("runStage", model.stageAction.label, true, title, model.stageAction.primary ? "primary" : ""));
+    buttons.push(stageActionButton(model.stageAction, model.stageId));
+  }
+  if (model.planAction) {
+    buttons.push(button("resumePlan", model.planAction.label, true, model.planAction.detail, model.planAction.primary ? "primary" : ""));
+  }
+  if (model.accepting) {
+    buttons.push(`<span class="busy accepting" title="${escapeHtml(model.accepting.detail)}">${icon("dot", "dot")}${escapeHtml(model.accepting.label)}</span>`);
   }
   if (model.busyState) {
     const cls = model.busyState.state === "running" ? "busy" : "busy unknown";
@@ -171,9 +220,17 @@ function renderStageCard(model: OverviewModel): string {
       buttons.push(button("openDiff", actions.diff.label, true, actions.diff.detail));
     }
     if (actions.plan) {
-      buttons.push(button("openPlan", "Plan", true, "Open the plan document"));
+      buttons.push(button("openPlan", "Plan", true, model.plan ? `${model.plan.name} — ${model.plan.note}` : "Open the plan document"));
+    } else if (actions.choosePlan) {
+      buttons.push(button("associatePlan", "Choose plan…", true, "Pick the Markdown plan this stage belongs to (kept in VS Code only; the engine is not told)"));
+    }
+    if (actions.changePlan) {
+      buttons.push(button("associatePlan", "Change plan…", true, actions.plan ? "Choose another plan file or remove the association" : "The associated plan file is missing: choose another or remove the association", "quiet"));
     }
     buttons.push(button("showLog", "Log", true, "Show the Agent Sparring output channel"));
+  }
+  if (model.secondaryAction) {
+    buttons.push(stageActionButton(model.secondaryAction, model.stageId, "quiet"));
   }
 
   const goal = model.goal
@@ -185,9 +242,10 @@ function renderStageCard(model: OverviewModel): string {
     const reason = model.lastSparring.reason ? ` <span class="muted">(${escapeHtml(model.lastSparring.reason)})</span>` : "";
     const iconName = action === "READY" ? "check" : "warn";
     sparring = `<div class="block"><h3>${icon(iconName, action.toLowerCase())}Latest sparring result</h3>
-<p><span class="verdict ${escapeHtml(action.toLowerCase())}">${escapeHtml(action)}</span>${reason}</p>
+<p><span class="verdict ${escapeHtml(action.toLowerCase())}" title="${escapeHtml(`Routing action: ${action}`)}">${escapeHtml(model.lastSparring.word)}</span>${reason}</p>
 <p>${escapeHtml(model.lastSparring.summary || "(no summary recorded)")}</p></div>`;
   }
+  const upNext = renderUpNext(model);
 
   let current = `<p class="muted">No provider turn in progress.</p>`;
   if (model.activity?.kind === "stopped") {
@@ -216,13 +274,35 @@ function renderStageCard(model: OverviewModel): string {
 <div class="actions">${buttons.join("")}</div>
 </div>
 <div class="columns">
-<div class="col">${goal}${sparring}</div>
+<div class="col">${goal}${sparring}${upNext}</div>
 <div class="col right">
 <div class="block"><h3>${icon("pulse", "accent")}Current activity</h3>${current}</div>
 <div class="block"><h3>${icon("doc")}Last meaningful event</h3>${last}</div>
 </div>
 </div>
 </section>`;
+}
+
+/**
+ * "Up next" for an accepted stage, from the plan document: authoritative
+ * for a managed plan run (the engine's next stage), informational for an
+ * associated file (a heading, nothing more). The next heading of an
+ * associated plan can be opened at its line.
+ */
+function renderUpNext(model: OverviewModel): string {
+  const plan = model.plan;
+  if (!plan || model.stageStatusKind !== "accepted") {
+    return "";
+  }
+  if (!plan.next) {
+    if (plan.source === "associated" && !plan.current) {
+      return `<div class="block"><h3>${icon("doc")}Plan</h3><p class="muted">${escapeHtml(plan.name)} · this stage was not matched to a heading in it.</p></div>`;
+    }
+    return "";
+  }
+  const link = plan.source === "associated" ? ` ${button("openNextStage", "Open in plan", true, `Open ${plan.name} at this heading`, "quiet")}` : "";
+  const note = plan.source === "associated" ? `<p class="muted">From the plan you associated in VS Code; the engine has no next-stage operation for a standalone stage.</p>` : "";
+  return `<div class="block upnext"><h3>${icon("doc")}Up next</h3><p><span class="next">${escapeHtml(plan.next.display)}</span>${link}</p>${note}</div>`;
 }
 
 function renderActor(card: ActorCard): string {
@@ -317,7 +397,7 @@ h1 { font-size: 1.35em; font-weight: 600; margin: 0; }
 .step.accepted .node { background: var(--good); color: var(--vscode-editor-background); }
 .step.active .node { background: var(--info); color: var(--vscode-editor-background); }
 .step.paused .node { background: var(--warn); color: var(--vscode-editor-background); }
-.step.frozen .node { background: var(--info); color: var(--vscode-editor-background); }
+.step.finalizing .node { background: var(--info); color: var(--vscode-editor-background); }
 .step.current .node { box-shadow: 0 0 0 3px var(--vscode-editor-background), 0 0 0 4px currentColor; }
 .step.active.current .node { box-shadow: 0 0 0 3px var(--vscode-editor-background), 0 0 0 4px var(--info); }
 .step.paused.current .node { box-shadow: 0 0 0 3px var(--vscode-editor-background), 0 0 0 4px var(--warn); }
@@ -328,7 +408,7 @@ h1 { font-size: 1.35em; font-weight: 600; margin: 0; }
 .step.accepted .state { color: var(--good); }
 .step.active .state { color: var(--info); }
 .step.paused .state { color: var(--warn); }
-.step.frozen .state { color: var(--info); }
+.step.finalizing .state { color: var(--info); }
 
 .card { border: 1px solid var(--line); border-radius: 8px; background: var(--card); }
 .stage { padding: 12px 14px 10px; margin: 0 0 10px; }
@@ -343,7 +423,9 @@ h2 .icon.escalate { color: var(--bad); }
 .status.ready, .status.accepted { color: var(--good); }
 .status.send_back, .status.needs_you { color: var(--warn); }
 .status.escalate { color: var(--bad); }
-.status.frozen { color: var(--info); }
+.status.finalizing { color: var(--info); }
+.status.stopped { color: var(--warn); }
+.next { font-weight: 600; }
 .columns { display: grid; grid-template-columns: 3fr 2fr; gap: 0 18px; margin-top: 12px; }
 .col.right { border-left: 1px solid var(--line); padding-left: 18px; }
 .block { padding: 6px 0 10px; }
@@ -391,8 +473,10 @@ button:disabled { opacity: 0.45; cursor: default; }
 button.primary { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border-color: transparent; font-weight: 600; }
 button.primary:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
 button.danger { color: var(--warn); border-color: var(--warn); }
+button.quiet { background: transparent; color: var(--vscode-descriptionForeground); }
 .busy { display: inline-flex; align-items: center; padding: 4px 11px; border: 1px solid var(--good); border-radius: 6px; font-size: 0.92em; color: var(--good); font-weight: 600; cursor: help; }
 .busy.unknown { border-color: var(--warn); color: var(--warn); }
+.busy.accepting { border-color: var(--info); color: var(--info); }
 .stopped, .stale, .inferred { display: flex; align-items: center; color: var(--warn); }
 .activity.uncertain { color: var(--warn); }
 .activity.uncertain .icon.dot { color: var(--warn); }

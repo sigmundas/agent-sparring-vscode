@@ -53,6 +53,12 @@ async function buildFixture(): Promise<{ root: string; workspaceFile: string }> 
   await fs.writeFile(path.join(barrier, "handoff.md"), "# Handoff\n");
   await fs.writeFile(path.join(barrier, "sparring.md"), "# Sparring\n");
   await writeStage(reported, "stage-reported-statistics-typed-parser", "working");
+  // Two stages whose independent review passed (READY recorded in
+  // sparring.md): Accept stage runs freeze then accept against the fake.
+  for (const name of ["stage-review-complete", "stage-review-complete-dirty"]) {
+    const dir = await writeStage(reported, name, "working");
+    await fs.writeFile(path.join(dir, "sparring.md"), "# Sparring\n\n## Routing outcome\n\n- Action: `READY`\n- Summary: Looks complete\n");
+  }
   // A stage whose telemetry ends in an unmatched turn.started, as Ctrl-C or a
   // reload leaves it: the reloaded extension must not call this Running.
   const stale = await writeStage(reported, "stage-stale-turn", "working");
@@ -64,21 +70,38 @@ async function buildFixture(): Promise<{ root: string; workspaceFile: string }> 
   await fs.mkdir(path.join(reported, ".git"), { recursive: true });
   await fs.writeFile(path.join(reported, ".git", "HEAD"), "ref: refs/heads/feature/reported-statistics\n");
 
-  // A fake `sparring`: writes loop.started + turn.started for the stage (and
-  // deliberately never turn.finished), then sleeps and exits as instructed by
-  // <repo>/.sparring/fake-runner.conf; SIGINT ends it with 130.
+  // A fake `sparring`. run-loop: writes loop.started + turn.started for the
+  // stage (and deliberately never turn.finished), then sleeps and exits as
+  // instructed by <repo>/.sparring/fake-runner.conf; SIGINT ends it with 130.
+  // freeze-candidate / accept-candidate: rewrite state.json like the engine
+  // (FROZEN with a candidate, then ACCEPTED), or refuse with the engine's own
+  // stderr wording when the conf sets freeze_refusal / accept_refusal. Every
+  // subcommand is appended to .sparring/fake-calls.log.
   const fake = path.join(root, "bin", "sparring");
   await fs.mkdir(path.dirname(fake), { recursive: true });
   await fs.writeFile(
     fake,
     [
       "#!/bin/sh",
+      'sub="$1"',
       'stage="$2"',
       'root="$4"',
       'conf="$root/.sparring/fake-runner.conf"',
-      "sleep_for=3; exit_with=0",
+      "sleep_for=3; exit_with=0; freeze_refusal=; accept_refusal=",
       '[ -f "$conf" ] && . "$conf"',
       'dir="$root/.sparring/stages/$stage"',
+      'echo "$sub $stage" >> "$root/.sparring/fake-calls.log"',
+      'sha="c0ffee0000000000000000000000000000000000"',
+      'if [ "$sub" = "freeze-candidate" ]; then',
+      '  if [ -n "$freeze_refusal" ]; then echo "could not freeze candidate: $freeze_refusal" >&2; exit 1; fi',
+      '  printf \'{"base_sha": null, "candidate_sha": "%s", "implementation_session_id": null, "sparring_session_id": null, "status": "frozen"}\\n\' "$sha" > "$dir/state.json"',
+      '  echo "frozen candidate: $sha"; exit 0',
+      "fi",
+      'if [ "$sub" = "accept-candidate" ]; then',
+      '  if [ -n "$accept_refusal" ]; then echo "could not accept candidate: $accept_refusal" >&2; exit 1; fi',
+      '  printf \'{"base_sha": null, "candidate_sha": "%s", "implementation_session_id": null, "sparring_session_id": null, "status": "accepted"}\\n\' "$sha" > "$dir/state.json"',
+      '  echo "accepted candidate: $sha"; exit 0',
+      "fi",
       'now=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)',
       "printf '{\"v\":1,\"ts\":\"%s\",\"actor\":\"loop\",\"event\":\"loop.started\"}\\n' \"$now\" >> \"$dir/activity.jsonl\"",
       "printf '{\"v\":1,\"ts\":\"%s\",\"actor\":\"stage\",\"event\":\"turn.started\",\"provider\":\"claude-cli\",\"session_id\":\"fake\"}\\n' \"$now\" >> \"$dir/activity.jsonl\"",
@@ -91,13 +114,23 @@ async function buildFixture(): Promise<{ root: string; workspaceFile: string }> 
     { mode: 0o755 },
   );
 
+  // The fake's directory is put on the *integrated shell's* PATH only (never
+  // on the extension host's), so the bare-`sparring` scenario exercises the
+  // real situation: the shell finds it, the extension process cannot.
+  const shellPath = `${path.dirname(fake)}:\${env:PATH}`;
   const workspaceFile = path.join(root, "window.code-workspace");
   await fs.writeFile(
     workspaceFile,
     JSON.stringify(
       {
         folders: [{ path: "sporely" }, { path: "sporely-py-reported-statistics" }],
-        settings: { "agentSparring.executable": fake, "terminal.integrated.shellIntegration.enabled": true, "terminal.integrated.enablePersistentSessions": true },
+        settings: {
+          "agentSparring.executable": fake,
+          "terminal.integrated.shellIntegration.enabled": true,
+          "terminal.integrated.enablePersistentSessions": true,
+          "terminal.integrated.env.osx": { PATH: shellPath },
+          "terminal.integrated.env.linux": { PATH: shellPath },
+        },
       },
       null,
       2,

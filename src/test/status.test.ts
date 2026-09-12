@@ -43,7 +43,7 @@ describe("status bar derivation", () => {
     live = foldEvents([event("sparrer", "verdict", { provider: "codex-cli", action: "SEND_BACK", summary: "fix it" })], live);
     view = deriveStatus(selection, live, Date.parse(live.lastEventTs!) + 1000);
     assert.equal(view.text, "$(circle-filled) Agent Sparring: Stage 3/3", "telemetry verdicts decorate the tooltip only");
-    assert.match(view.tooltip, /Last verdict SEND_BACK: fix it/);
+    assert.match(view.tooltip, /Last verdict Changes requested: fix it/);
   });
 
   it("flags a long-silent 'working' claim as quiet", async () => {
@@ -58,13 +58,13 @@ describe("status bar derivation", () => {
     const paused = await planSelection("paused", 1, sparringMarkdown("NEEDS_YOU", "Check on device", "device_manual_check"));
     const busyLive = foldEvents([event("stage", "turn.started", { provider: "claude-cli" })]);
     let view = deriveStatus(paused, busyLive, NOW);
-    assert.equal(view.text, "$(debug-pause) Agent Sparring: Stage 2/3 · NEEDS_YOU");
-    assert.match(view.tooltip, /NEEDS_YOU: Check on device/);
+    assert.equal(view.text, "$(debug-pause) Agent Sparring: Stage 2/3 · Needs you");
+    assert.match(view.tooltip, /Needs you: Check on device/);
     assert.ok(!view.tooltip.includes("Long findings"));
 
     const escalated = await planSelection("paused", 1, sparringMarkdown("ESCALATE", "Needs a stronger sparrer"));
     view = deriveStatus(escalated, busyLive, NOW);
-    assert.equal(view.text, "$(debug-pause) Agent Sparring: Stage 2/3 · ESCALATE");
+    assert.equal(view.text, "$(debug-pause) Agent Sparring: Stage 2/3 · Escalated");
 
     const failed = await planSelection("paused", 1, sparringMarkdown("READY", "Looks good"));
     view = deriveStatus(failed, foldEvents([event("plan", "plan.failed", { summary: "acceptance gate refused" })]), NOW);
@@ -91,11 +91,13 @@ describe("status bar derivation", () => {
     const ws = await Workspace.create();
     await ws.writeStage("hotfix-1", { status: "frozen", candidate_sha: "abc" });
     let view = deriveStatus(selectRun((await discoverRuns([ws.location])).runs), undefined, NOW);
-    assert.equal(view.text, "$(lock) Agent Sparring: Hotfix 1 · frozen");
+    assert.equal(view.text, "$(lock) Agent Sparring: Hotfix 1 · finalizing");
+    assert.ok(!/frozen/i.test(view.text));
+    assert.match(view.tooltip, /Engine state: FROZEN/);
 
     await ws.writeStage("hotfix-1", { status: "working" }, { "sparring.md": sparringMarkdown("NEEDS_YOU", "Pick a colour") });
     view = deriveStatus(selectRun((await discoverRuns([ws.location])).runs), undefined, NOW);
-    assert.equal(view.text, "$(debug-pause) Agent Sparring: Hotfix 1 · NEEDS_YOU");
+    assert.equal(view.text, "$(debug-pause) Agent Sparring: Hotfix 1 · Needs you");
   });
 
   it("accepted standalone stage stays on the bar", async () => {
@@ -105,9 +107,9 @@ describe("status bar derivation", () => {
     assert.equal(view.text, "$(check) Agent Sparring: Local schema barrier · accepted");
   });
 
-  it("running plan with a READY outcome shows READY after the position", async () => {
+  it("running plan with a READY outcome shows Review complete after the position", async () => {
     const view = deriveStatus(await planSelection("running", 1, sparringMarkdown("READY", "Good")), undefined, NOW);
-    assert.equal(view.text, "$(circle-filled) Agent Sparring: Stage 2/3 · READY");
+    assert.equal(view.text, "$(circle-filled) Agent Sparring: Stage 2/3 · Review complete");
   });
 
   it("formats ages", () => {

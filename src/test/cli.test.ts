@@ -3,7 +3,18 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { buildResumePlanArgs, buildRunPlanArgs, readGitBranch, resolveExecutable } from "../core/cli";
+import {
+  UNRESOLVABLE_MESSAGE,
+  buildAcceptCandidateArgs,
+  buildFreezeCandidateArgs,
+  buildResumePlanArgs,
+  buildRunPlanArgs,
+  commandNotFoundMessage,
+  executableWord,
+  isCommandNotFoundExit,
+  planExecutable,
+  readGitBranch,
+} from "../core/cli";
 import { Workspace } from "./fixtures";
 
 describe("CLI argument building", () => {
@@ -29,7 +40,16 @@ describe("CLI argument building", () => {
   });
 });
 
-describe("executable resolution", () => {
+describe("acceptance command construction", () => {
+  it("freeze-candidate and accept-candidate mirror cli.py: positional stage, --repo-root, --expected-branch", () => {
+    const invocation = { stageId: "stage-x", repoRoot: "/my repo", expectedBranch: "feature/x", sparringDir: "/my repo/.sparring" };
+    assert.deepEqual(buildFreezeCandidateArgs(invocation), ["freeze-candidate", "stage-x", "--repo-root", "/my repo", "--expected-branch", "feature/x"]);
+    assert.deepEqual(buildAcceptCandidateArgs(invocation), ["accept-candidate", "stage-x", "--repo-root", "/my repo", "--expected-branch", "feature/x"]);
+    assert.deepEqual(buildFreezeCandidateArgs({ ...invocation, sparringDir: "/elsewhere/.sparring" }).slice(0, 3), ["--sparring-dir", "/elsewhere/.sparring", "freeze-candidate"]);
+  });
+});
+
+describe("executable planning", () => {
   async function fakeBin(dirName: string): Promise<{ dir: string; file: string }> {
     const base = await fs.mkdtemp(path.join(os.tmpdir(), "agent-sparring-bin-"));
     const dir = path.join(base, dirName);
@@ -39,39 +59,58 @@ describe("executable resolution", () => {
     return { dir, file };
   }
 
-  it("reports a missing executable with guidance instead of throwing", async () => {
+  it("with a shell available, bare `sparring` is handed to the shell and never pre-rejected from the extension host's PATH", async () => {
     const empty = await fs.mkdtemp(path.join(os.tmpdir(), "agent-sparring-empty-"));
-    const result = await resolveExecutable("", { platform: "linux", PATH: empty });
-    assert.equal(result.ok, false);
-    assert.match(!result.ok ? result.error : "", /not found on PATH/);
-    assert.match(!result.ok ? result.error : "", /agentSparring.executable/);
+    assert.deepEqual(await planExecutable("", { platform: "darwin", PATH: empty }, true), { ok: true, plan: { kind: "shell", command: "sparring" } });
+    assert.deepEqual(await planExecutable(undefined, { platform: "linux", PATH: "" }, true), { ok: true, plan: { kind: "shell", command: "sparring" } });
+    assert.equal(executableWord({ kind: "shell", command: "sparring" }), "sparring");
   });
 
-  it("finds a fake sparring on a PATH entry containing spaces", async () => {
-    const { dir, file } = await fakeBin("bin with spaces");
-    const result = await resolveExecutable(undefined, { platform: "darwin", PATH: `/nonexistent:${dir}` });
-    assert.deepEqual(result, { ok: true, path: file });
-  });
-
-  it("honours an explicit configured path and rejects a missing one", async () => {
+  it("a configured absolute path wins over the shell and is validated", async () => {
     const { file } = await fakeBin("bin");
-    assert.deepEqual(await resolveExecutable(file, { platform: "darwin", PATH: "" }), { ok: true, path: file });
-    const missing = await resolveExecutable(path.join(path.dirname(file), "nope"), { platform: "darwin", PATH: "" });
+    assert.deepEqual(await planExecutable(file, { platform: "darwin", PATH: "" }, true), { ok: true, plan: { kind: "configured", path: file } });
+    assert.deepEqual(await planExecutable(file, { platform: "darwin", PATH: "" }, false), { ok: true, plan: { kind: "configured", path: file } });
+    const missing = await planExecutable(path.join(path.dirname(file), "nope"), { platform: "darwin", PATH: "" }, true);
     assert.equal(missing.ok, false);
+    assert.equal(!missing.ok && missing.problem, "configured-invalid");
+    assert.match(!missing.ok ? missing.error : "", /agentSparring.executable points at .*nope, which does not exist/);
+    assert.ok(!(!missing.ok && /pip install/.test(missing.error)), "never a reinstall suggestion");
   });
 
   it("resolves a relative configured path against the workspace", async () => {
     const { dir, file } = await fakeBin("bin");
-    const result = await resolveExecutable("./bin/sparring", { platform: "darwin", PATH: "", cwd: path.dirname(dir) });
-    assert.deepEqual(result, { ok: true, path: file });
+    assert.deepEqual(await planExecutable("./bin/sparring", { platform: "darwin", PATH: "", cwd: path.dirname(dir) }, true), { ok: true, plan: { kind: "configured", path: file } });
+  });
+
+  it("without a shell, bare `sparring` falls back to this process's PATH, else an honest configuration message", async () => {
+    const { dir, file } = await fakeBin("bin with spaces");
+    assert.deepEqual(await planExecutable("", { platform: "darwin", PATH: `/nonexistent:${dir}` }, false), { ok: true, plan: { kind: "resolved", path: file } });
+    const empty = await fs.mkdtemp(path.join(os.tmpdir(), "agent-sparring-empty-"));
+    const result = await planExecutable("", { platform: "linux", PATH: empty }, false);
+    assert.equal(result.ok, false);
+    assert.equal(!result.ok && result.problem, "unresolvable");
+    assert.equal(!result.ok && result.error, UNRESOLVABLE_MESSAGE);
+    assert.match(UNRESOLVABLE_MESSAGE, /could not resolve the CLI from this VS Code environment/);
+    assert.ok(!/pip install|reinstall/i.test(UNRESOLVABLE_MESSAGE), "lacking shell PATH visibility is not an installation problem");
   });
 
   it("applies PATHEXT and ';' separators when told it is Windows", async () => {
     const base = await fs.mkdtemp(path.join(os.tmpdir(), "agent-sparring-win-"));
     const file = path.join(base, "sparring.EXE");
     await fs.writeFile(file, "");
-    const result = await resolveExecutable("", { platform: "win32", PATH: `C:\\nope;${base}`, PATHEXT: ".COM;.EXE;.BAT" });
-    assert.deepEqual(result, { ok: true, path: file });
+    assert.deepEqual(await planExecutable("", { platform: "win32", PATH: `C:\\nope;${base}`, PATHEXT: ".COM;.EXE;.BAT" }, false), { ok: true, plan: { kind: "resolved", path: file } });
+  });
+
+  it("recognises the shell's command-not-found exit code, and words the error as a configuration problem", () => {
+    assert.equal(isCommandNotFoundExit(127, "darwin"), true);
+    assert.equal(isCommandNotFoundExit(127, "linux"), true);
+    assert.equal(isCommandNotFoundExit(9009, "win32"), true);
+    assert.equal(isCommandNotFoundExit(9009, "darwin"), false);
+    assert.equal(isCommandNotFoundExit(1, "darwin"), false);
+    assert.equal(isCommandNotFoundExit(undefined, "darwin"), false);
+    assert.match(commandNotFoundMessage("sparring"), /Your shell could not find 'sparring'/);
+    assert.match(commandNotFoundMessage("sparring"), /agentSparring.executable/);
+    assert.ok(!/pip install/.test(commandNotFoundMessage("sparring")));
   });
 });
 

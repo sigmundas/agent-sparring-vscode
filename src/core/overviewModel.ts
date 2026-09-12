@@ -2,13 +2,20 @@
  * Shared view model for the Run Overview. Built from the same inputs the
  * status bar uses (discovery selection + activity fold), so the two surfaces
  * cannot drift semantically. Pure: no vscode API, no filesystem access; the
- * caller supplies which stage artifacts exist and the brief text.
+ * caller supplies which stage artifacts exist, the brief text, the plan
+ * association and whether an acceptance is in flight.
  *
  * Authoritative facts (plan status, stage status, journey, routing outcome,
  * session ids, SHAs) come from plan-run state, state.json and sparring.md.
  * Only the actor "Working / Sparring / Waiting" words, active durations, the
  * loop cycle and the last visible event come from the observational
- * activity fold. The Goal is display-only text from brief.md.
+ * activity fold. The Goal is display-only text from brief.md. An associated
+ * plan (chosen in VS Code) is display-only too and is never confused with
+ * the engine's own plan run.
+ *
+ * Wording is the human vocabulary of presentation.ts; the engine's own
+ * words are carried separately (`stageRaw`, the Engine state fact) for
+ * tooltips and the footer.
  */
 
 import { parseBriefGoal } from "./brief";
@@ -16,16 +23,17 @@ import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
 import { formatTime } from "./logFormat";
 import { deriveLiveness, type ExecutionRecord, type LivenessState, type RunnerLiveness } from "./liveness";
-import { presentStage, stageDisplayName } from "./presentation";
-import { stageRunAction, type StageRunAction } from "./runner";
+import { locateStage, parsePlanHeadings, planTitle, type PlanHeading } from "./planAssociation";
+import { actionWord, presentStage, stageDisplayName, type StagePresentation } from "./presentation";
+import { planAction, stageActions, type PlanAction, type StageRunAction } from "./runner";
 import { QUIET_AFTER_MS, formatAge } from "./status";
 
-export type TimelineState = "accepted" | "frozen" | "active" | "paused" | "working" | "future";
+export type TimelineState = "accepted" | "finalizing" | "active" | "paused" | "working" | "future";
 
 /** The word shown under a journey node; only the current stage gets one. */
 export const TIMELINE_STATE_WORD: Record<TimelineState, string> = {
   accepted: "Accepted",
-  frozen: "Frozen",
+  finalizing: "Finalizing",
   active: "In progress",
   paused: "Paused",
   working: "Not accepted",
@@ -97,6 +105,14 @@ export interface HistoryEntry {
 /** How many recent meaningful events the Overview shows. */
 export const HISTORY_MAX = 4;
 
+/** A Markdown plan the user associated with a standalone stage in VS Code (workspace state only). */
+export interface AssociatedPlan {
+  path: string;
+  exists: boolean;
+  /** Document text when readable; headings are parsed for display. */
+  text?: string;
+}
+
 export interface OverviewArtifacts {
   handoff: boolean;
   sparring: boolean;
@@ -106,21 +122,47 @@ export interface OverviewArtifacts {
   briefText?: string;
   /** Checked-out branch and HEAD of the repository owning the run, when known. */
   git?: GitContext;
+  /** Extension-side plan association for a standalone stage (UI metadata, never engine state). */
+  associatedPlan?: AssociatedPlan;
+  /** An Accept stage operation started from this window is still running. */
+  accepting?: boolean;
 }
 
 export interface OverviewActions {
   handoff: boolean;
   sparring: boolean;
   brief: boolean;
+  /** A plan document can be opened: the managed plan run's, or the associated file. */
   plan: boolean;
+  /** Standalone stage with no association: offer Choose plan…. */
+  choosePlan: boolean;
+  /** An associated plan exists and can be changed or removed. */
+  changePlan: boolean;
   /** Present when base_sha is recorded; `detail` (for a tooltip) says what the diff spans. */
   diff?: { label: string; detail: string; baseSha: string; targetSha?: string };
 }
 
-/** Header pill: the authoritative lifecycle word for the run, with a colour tone. */
+/** Header pill: the lifecycle word for the run, with a colour tone. */
 export interface RunStatus {
   label: string;
   tone: "good" | "info" | "warn" | "muted";
+}
+
+/**
+ * Where this stage sits in a plan document. `managed` is authoritative
+ * (the engine's plan run); `associated` is a file the user chose here and
+ * carries no engine meaning.
+ */
+export interface PlanContext {
+  source: "managed" | "associated";
+  /** Display name: the document's first heading, else its file name. */
+  name: string;
+  /** The heading describing this stage, when known (managed: always; associated: only on an unambiguous match). */
+  current?: string;
+  /** The heading after this stage; informational unless a `planAction` continues a managed run. */
+  next?: { display: string; line: number };
+  /** One sentence for the tooltip / note about what this context is. */
+  note: string;
 }
 
 export interface OverviewModel {
@@ -131,8 +173,14 @@ export interface OverviewModel {
   status?: RunStatus;
   /** The last meaningful event, also while a turn is active. */
   lastEvent?: HistoryEntry;
-  /** Run stage / Resume stage / Run loop again for a standalone stage; hidden while the runner is alive or its liveness unknown mid-turn. */
+  /** Primary stage action (Run stage / Resume stage / Accept stage); hidden while the runner is alive or its liveness unknown mid-turn. */
   stageAction?: StageRunAction;
+  /** Advanced alternative (Run loop again after Review complete). */
+  secondaryAction?: StageRunAction;
+  /** Resume plan / Continue plan for a managed plan run. */
+  planAction?: PlanAction;
+  /** An Accept stage operation from this window is in flight. */
+  accepting?: { label: string; detail: string };
   /** A runner observed for this run: alive (Stop offered) or stopped. */
   runner?: { alive: boolean; label: string };
   /**
@@ -145,7 +193,7 @@ export interface OverviewModel {
   liveness?: { state: LivenessState; source: RunnerLiveness["source"]; detail: string };
   /** For ambiguous: the candidate labels. */
   choices?: string[];
-  /** Plan journey: only for plan runs with a readable plan document. */
+  /** Plan journey: only for managed plan runs with a readable plan document. */
   timeline?: TimelineItem[];
   timelineNote?: string;
   /** `Stage 2 of 5` for plan runs. */
@@ -155,9 +203,12 @@ export interface OverviewModel {
   stageHeading?: string;
   /** Raw engine stage id, for secondary metadata / tooltips only. */
   stageId?: string;
-  /** Derived presentation label, e.g. `READY · awaiting acceptance`. */
+  /** Human state word, e.g. `Review complete`. */
   stageStatus?: string;
   stageStatusKind?: string;
+  /** The engine's vocabulary for the state (tooltip only). */
+  stageRaw?: string;
+  /** One sentence under the state word. */
   stageLine?: string;
   /** Current loop cycle when telemetry has reported one. */
   cycle?: number;
@@ -166,7 +217,8 @@ export interface OverviewModel {
   /** The last few meaningful events, oldest first; omitted without telemetry. */
   history?: HistoryEntry[];
   banner?: Banner;
-  lastSparring?: { action: string; summary: string; reason?: string };
+  lastSparring?: { action: string; word: string; summary: string; reason?: string };
+  plan?: PlanContext;
   actions?: OverviewActions;
   facts?: { label: string; value: string }[];
 }
@@ -193,6 +245,9 @@ export function buildOverviewModel(
   const liveness = deriveLiveness(rawLive, ownExecution, nowMs);
   const live = liveness.live;
   const uncertain = liveness.source === "telemetry";
+  const outcome = run.kind === "plan" ? run.currentOutcome : run.outcome;
+  const presentation = presentStage(stage.state?.status, outcome, live);
+  const plan = planContext(run, stage, artifacts.associatedPlan);
 
   const model: OverviewModel = {
     kind: "run",
@@ -203,16 +258,19 @@ export function buildOverviewModel(
       handoff: artifacts.handoff,
       sparring: artifacts.sparring,
       brief: artifacts.brief,
-      plan: run.kind === "plan" && artifacts.plan,
+      plan: run.kind === "plan" ? artifacts.plan : Boolean(artifacts.associatedPlan?.exists),
+      choosePlan: run.kind === "stage" && !artifacts.associatedPlan,
+      changePlan: run.kind === "stage" && Boolean(artifacts.associatedPlan),
       diff: diffAction(stage),
     },
-    facts: facts(run, stage, artifacts.git),
+    facts: facts(run, stage, artifacts.git, presentation, artifacts.associatedPlan),
     goal: artifacts.brief ? parseBriefGoal(artifacts.briefText) : undefined,
     activity: activityLine(live, halted, nowMs, uncertain),
     history: history(live),
     runKind: run.kind === "plan" ? "Plan run" : "Standalone stage",
-    status: runStatus(run),
+    status: runStatus(run, presentation, liveness),
     liveness: { state: liveness.state, source: liveness.source, detail: liveness.detail },
+    plan,
   };
   model.lastEvent = model.history?.[model.history.length - 1];
   if (liveness.interrupted) {
@@ -226,16 +284,23 @@ export function buildOverviewModel(
     model.runner = { alive: false, label: "Runner stopped" };
   }
   const loopEligible = run.kind === "plan" || (stage.state?.status !== "accepted" && stage.state?.status !== "frozen");
-  if (!halted && loopEligible && liveness.state === "running") {
+  if (artifacts.accepting) {
+    model.accepting = { label: "Accepting stage…", detail: "sparring freeze-candidate, then sparring accept-candidate, are running in a terminal of this window." };
+  } else if (!halted && loopEligible && liveness.state === "running") {
     model.busyState = { label: "Running", detail: liveness.detail, state: "running" };
   } else if (!halted && loopEligible && liveness.turnActive) {
     // Telemetry alone: no second loop from the button, and no certain claim either.
     model.busyState = { label: "Run status unknown", detail: liveness.detail, state: "unknown" };
   } else if (liveness.state !== "running") {
-    model.stageAction = run.kind === "stage" ? stageRunAction(run, liveness) : undefined;
+    if (run.kind === "stage") {
+      const actions = stageActions(run, liveness);
+      model.stageAction = actions.primary;
+      model.secondaryAction = actions.secondary;
+    } else {
+      model.planAction = planAction(run, liveness);
+    }
   }
 
-  const outcome = run.kind === "plan" ? run.currentOutcome : run.outcome;
   if (run.kind === "plan") {
     Object.assign(model, timeline(run));
     const number = stage.number ?? run.state.currentStageIndex + 1;
@@ -247,48 +312,60 @@ export function buildOverviewModel(
   }
   model.stageId = stage.stageId;
   if (!stage.exists) {
-    model.stageStatus = "not created";
+    model.stageStatus = "Not created";
     model.stageStatusKind = "future";
+    model.stageRaw = "no stage directory";
+  } else if (liveness.interrupted && (presentation.kind === "working" || presentation.kind === "send_back")) {
+    model.stageStatus = "Stopped";
+    model.stageStatusKind = "stopped";
+    model.stageRaw = presentation.raw;
   } else {
-    const presentation = presentStage(stage.state?.status, outcome, live);
     model.stageStatus = presentation.label;
     model.stageStatusKind = presentation.kind;
+    model.stageRaw = presentation.raw;
   }
   if (!halted && live?.currentCycle !== undefined) {
     model.cycle = live.currentCycle;
   }
 
   if (outcome) {
-    model.lastSparring = { action: outcome.action, summary: outcome.summary, reason: outcome.needsYouReason };
+    model.lastSparring = { action: outcome.action, word: actionWord(outcome.action), summary: outcome.summary, reason: outcome.needsYouReason };
   }
-  Object.assign(model, currentLine(run, stage, live));
+  Object.assign(model, currentLine(run, stage, live, presentation, liveness, Boolean(artifacts.accepting), model.planAction));
   return model;
 }
 
 // ---------------------------------------------------------------- pieces
 
-function runStatus(run: RunSnapshot): RunStatus {
+function runStatus(run: RunSnapshot, presentation: StagePresentation, liveness: RunnerLiveness): RunStatus {
   if (run.kind === "plan") {
     switch (run.state.status) {
       case "running":
-        return { label: "Running", tone: "good" };
+        return liveness.interrupted ? { label: "Stopped", tone: "warn" } : { label: "Running", tone: "good" };
       case "paused": {
         const action = run.currentOutcome?.action;
-        return { label: action === "NEEDS_YOU" || action === "ESCALATE" ? action : "Paused", tone: "warn" };
+        return { label: action === "NEEDS_YOU" || action === "ESCALATE" ? actionWord(action) : "Paused", tone: "warn" };
       }
       case "complete":
         return { label: "Complete", tone: "good" };
     }
   }
-  switch (run.stage.state?.status) {
+  if (liveness.interrupted && (presentation.kind === "working" || presentation.kind === "send_back")) {
+    return { label: "Stopped", tone: "warn" };
+  }
+  switch (presentation.kind) {
     case "accepted":
       return { label: "Accepted", tone: "good" };
-    case "frozen":
-      return { label: "Frozen", tone: "info" };
-    default: {
-      const action = run.outcome?.action;
-      return action === "NEEDS_YOU" || action === "ESCALATE" ? { label: action, tone: "warn" } : { label: "Working", tone: "good" };
-    }
+    case "finalizing":
+      return { label: "Finalizing", tone: "info" };
+    case "ready":
+      return { label: "Review complete", tone: "good" };
+    case "needs_you":
+    case "escalate":
+    case "send_back":
+      return { label: presentation.label, tone: "warn" };
+    default:
+      return { label: "Working", tone: "good" };
   }
 }
 
@@ -354,7 +431,7 @@ export function activityLine(live: LiveState | undefined, halted: boolean, nowMs
     // Phrased as a past fact ("last event: Claude · changed x.py"), never as
     // what an actor is doing right now; telemetry cannot support the latter.
     const last = live.lastMeaningful;
-    return { kind: "last", time: formatTime(last.ts), text: `${whoFor(last, live)} · ${last.description}` };
+    return { kind: "last", time: formatTime(last.ts), text: `${whoFor(last, live)} · ${describeForOverview(last)}` };
   }
   return { kind: "none", text: "No activity telemetry for this stage." };
 }
@@ -364,7 +441,18 @@ export function history(live: LiveState | undefined): HistoryEntry[] | undefined
   if (!live || live.recentMeaningful.length === 0) {
     return undefined;
   }
-  return live.recentMeaningful.slice(-HISTORY_MAX).map((entry) => ({ time: formatTime(entry.ts), who: whoFor(entry, live), description: entry.description }));
+  return live.recentMeaningful.slice(-HISTORY_MAX).map((entry) => ({ time: formatTime(entry.ts), who: whoFor(entry, live), description: describeForOverview(entry) }));
+}
+
+/**
+ * The Output Channel keeps the engine's words (`SEND_BACK — range handling`);
+ * the Overview shows the same event with the human word in front.
+ */
+function describeForOverview(entry: MeaningfulEvent): string {
+  if (entry.event !== "verdict") {
+    return entry.description;
+  }
+  return entry.description.replace(/^[A-Z_]+/, (action) => actionWord(action));
 }
 
 function whoFor(entry: MeaningfulEvent, live: LiveState): string {
@@ -405,7 +493,7 @@ export function timelineState(stage: StageSnapshot, index: number, current: numb
     return "accepted";
   }
   if (status === "frozen") {
-    return "frozen";
+    return "finalizing";
   }
   if (index === current) {
     return run.state.status === "paused" ? "paused" : "active";
@@ -413,7 +501,60 @@ export function timelineState(stage: StageSnapshot, index: number, current: numb
   return index < current ? "working" : "future";
 }
 
-function currentLine(run: RunSnapshot, stage: StageSnapshot, live: LiveState | undefined): Pick<OverviewModel, "stageLine" | "banner"> {
+// ---------------------------------------------------------------- plan context
+
+/**
+ * Managed plan run: the next heading from the engine-parsed plan. Standalone
+ * stage with an associated file: the document's headings, and this stage's
+ * place in them only when one heading unambiguously matches.
+ */
+function planContext(run: RunSnapshot, stage: StageSnapshot, associated: AssociatedPlan | undefined): PlanContext | undefined {
+  if (run.kind === "plan") {
+    const stages = run.planStages;
+    const index = run.state.currentStageIndex;
+    const nextHeading = stages?.[index + 1];
+    return {
+      source: "managed",
+      name: run.state.plan,
+      current: `Stage ${stage.number ?? index + 1} — ${stageDisplayName(stage)}`,
+      next: nextHeading ? { display: `Stage ${nextHeading.number} — ${nextHeading.title}`, line: 0 } : undefined,
+      note: "The engine's plan run: it records which stage is current and resume-plan continues it.",
+    };
+  }
+  if (!associated) {
+    return undefined;
+  }
+  const name = (associated.text ? planTitle(associated.text) : undefined) ?? basename(associated.path);
+  const note = "Associated with this stage in VS Code for display only; the engine does not know about it and nothing here starts a stage from it.";
+  if (!associated.exists || associated.text === undefined) {
+    return { source: "associated", name, note: associated.exists ? note : `${note} The file is currently missing.` };
+  }
+  const headings: PlanHeading[] = parsePlanHeadings(associated.text);
+  const position = locateStage(headings, stage.stageId);
+  return {
+    source: "associated",
+    name,
+    current: position?.current.display,
+    next: position?.next ? { display: position.next.display, line: position.next.line } : undefined,
+    note,
+  };
+}
+
+function basename(file: string): string {
+  return file.split(/[\\/]/).pop() ?? file;
+}
+
+// ---------------------------------------------------------------- state line + banner
+
+function currentLine(
+  run: RunSnapshot,
+  stage: StageSnapshot,
+  live: LiveState | undefined,
+  presentation: StagePresentation,
+  liveness: RunnerLiveness,
+  accepting: boolean,
+  plan: PlanAction | undefined,
+): Pick<OverviewModel, "stageLine" | "banner"> {
   const outcome = run.kind === "plan" ? run.currentOutcome : run.outcome;
   const stageStatus = stage.state?.status;
 
@@ -426,8 +567,8 @@ function currentLine(run: RunSnapshot, stage: StageSnapshot, live: LiveState | u
       if (outcome?.action === "NEEDS_YOU" || outcome?.action === "ESCALATE") {
         const detail = outcome.summary ? ` — ${outcome.summary}` : "";
         return {
-          stageLine: outcome.action === "NEEDS_YOU" ? "Waiting for you. Resume the plan with your answer or check result." : "Sparring escalated. Spar this stage elsewhere, then resume.",
-          banner: { kind: "stop", text: `${outcome.action}${detail}` },
+          stageLine: outcome.action === "NEEDS_YOU" ? "Waiting for you. Resume the plan with your answer or check result." : "The independent reviewer could not settle this. Read the sparring report, then resume the plan.",
+          banner: { kind: "stop", text: `${actionWord(outcome.action)}${detail}` },
         };
       }
       const failure = live?.lastPlanEvent?.event === "plan.failed" ? live.lastPlanEvent.summary : undefined;
@@ -436,29 +577,43 @@ function currentLine(run: RunSnapshot, stage: StageSnapshot, live: LiveState | u
         banner: { kind: "warn", text: `Paused${failure ? ` — ${failure}` : ""}` },
       };
     }
-  } else if (stageStatus === "accepted") {
-    return { stageLine: "Candidate accepted; nothing further runs for this stage.", banner: { kind: "done", text: "Stage complete — candidate accepted" } };
-  } else if (outcome?.action === "NEEDS_YOU" || outcome?.action === "ESCALATE") {
-    if (!(live?.stage.busy || live?.sparrer.busy)) {
-      return { stageLine: outcome.action === "NEEDS_YOU" ? "Waiting for you." : "Sparring escalated.", banner: { kind: "stop", text: `${outcome.action}${outcome.summary ? ` — ${outcome.summary}` : ""}` } };
+    if (stageStatus === "accepted") {
+      return { stageLine: plan?.kind === "continue" ? "Stage complete. Continue plan starts the next stage." : "Stage complete." };
     }
+  } else if (stageStatus === "accepted") {
+    return { stageLine: "Stage complete.", banner: { kind: "done", text: "Stage complete" } };
+  } else if (presentation.kind === "needs_you") {
+    return {
+      stageLine: "Waiting for you. When it is done, resume the stage; the reviewer checks again.",
+      banner: { kind: "stop", text: `Needs you${outcome?.summary ? ` — ${outcome.summary}` : ""}` },
+    };
+  } else if (presentation.kind === "escalate") {
+    return {
+      stageLine: "The independent reviewer could not settle this. Read the sparring report and decide how to continue.",
+      banner: { kind: "stop", text: `Escalated${outcome?.summary ? ` — ${outcome.summary}` : ""}` },
+    };
   }
 
-  // running / working
   if (stageStatus === "frozen") {
-    return { stageLine: "Candidate frozen; awaiting acceptance." };
+    if (accepting) {
+      return { stageLine: "Finalizing stage…" };
+    }
+    if (liveness.state === "running") {
+      return { stageLine: "Finalizing stage…" };
+    }
+    return { stageLine: "Finalizing did not complete. Use Accept stage to finish it." };
   }
-  if (stageStatus === "accepted") {
-    return { stageLine: "Accepted; advancing to the next stage." };
+  if (liveness.interrupted && (presentation.kind === "working" || presentation.kind === "send_back")) {
+    return { stageLine: "The last run was interrupted." };
   }
   if (live?.sparrer.busy) {
-    return { stageLine: "Under sparring." };
+    return { stageLine: "Under independent review." };
   }
-  if (outcome?.action === "SEND_BACK") {
-    return { stageLine: "Correcting SEND_BACK finding" };
+  if (presentation.kind === "send_back") {
+    return { stageLine: presentation.detail };
   }
-  if (outcome?.action === "READY") {
-    return { stageLine: "Sparrer said READY; acceptance pending." };
+  if (presentation.kind === "ready") {
+    return { stageLine: presentation.detail };
   }
   if (live?.stage.busy) {
     return { stageLine: "Implementing." };
@@ -480,16 +635,21 @@ function diffAction(stage: StageSnapshot): OverviewActions["diff"] {
   };
 }
 
-/** Quiet metadata for the bottom of the page; nothing here is primary content. */
-function facts(run: RunSnapshot, stage: StageSnapshot, git: GitContext | undefined): { label: string; value: string }[] {
+/** Quiet metadata for the bottom of the page; nothing here is primary content. The engine's own vocabulary lives here. */
+function facts(run: RunSnapshot, stage: StageSnapshot, git: GitContext | undefined, presentation: StagePresentation, associated: AssociatedPlan | undefined): { label: string; value: string }[] {
   const out: { label: string; value: string }[] = [{ label: "Repository", value: run.location.folderName }];
   if (run.kind === "plan") {
     out.push({ label: "Plan", value: run.state.status });
     out.push({ label: "Expected branch", value: run.state.expectedBranch });
+  } else if (associated) {
+    out.push({ label: "Plan", value: `${basename(associated.path)} (associated in VS Code)` });
   }
   if (git?.branch || git?.head) {
     const head = git.head ? shortenId(git.head, 8)?.replace(/…$/, "") : undefined;
     out.push({ label: "Checked out", value: [git.branch ?? "(detached)", head ? `@ ${head}` : ""].filter(Boolean).join(" ") });
+  }
+  if (stage.exists) {
+    out.push({ label: "Engine state", value: presentation.raw });
   }
   if (stage.state?.baseSha) {
     out.push({ label: "Base", value: shortenId(stage.state.baseSha) ?? "" });
