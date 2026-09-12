@@ -357,7 +357,7 @@ function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
       }
       break;
     case "next-stage":
-      buttons.push(button("startNextStage", "Start next stage", true, `sparring new-stage ${next.start?.stageId ?? ""} — creates the stage; you fill in brief.md from the plan section, then Run stage`, "primary"));
+      buttons.push(button("startNextStage", "Start next stage", true, `sparring new-stage ${next.start?.stageId ?? ""} --brief-file … — creates the stage with this plan section as its brief.md; Run stage then begins implementation`, "primary"));
       buttons.push(openNext("Open in plan"));
       buttons.push(button("matchStage", "Change match…", true, MATCH_TITLE, "quiet"));
       break;

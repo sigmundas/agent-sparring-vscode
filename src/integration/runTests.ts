@@ -26,7 +26,7 @@ async function main(): Promise<void> {
       extensionDevelopmentPath,
       extensionTestsPath,
       launchArgs: [fixture.workspaceFile, "--disable-extensions", "--disable-workspace-trust"],
-      extensionTestsEnv: { AGENT_SPARRING_FIXTURE: fixture.root },
+      extensionTestsEnv: { AGENT_SPARRING_FIXTURE: fixture.root, AGENT_SPARRING_IT_ONLY: process.env.AGENT_SPARRING_IT_ONLY ?? "" },
     });
   } catch (error) {
     console.error("integration test failed", error);
@@ -74,8 +74,10 @@ async function buildFixture(): Promise<{ root: string; workspaceFile: string }> 
   // stage (and deliberately never turn.finished), then sleeps and exits as
   // instructed by <repo>/.sparring/fake-runner.conf; SIGINT ends it with 130.
   // new-stage: creates the stage directory with state.json and a template
-  // brief.md like Stage.create (no --repo-root: it works from cwd), or
-  // refuses an existing directory with the engine's wording.
+  // brief.md like Stage.create (no --repo-root: it works from cwd), or with
+  // --brief-file that file's content verbatim as brief.md (read first: a
+  // missing file refuses before creating anything), or refuses an existing
+  // directory with the engine's wording.
   // freeze-candidate / accept-candidate: rewrite state.json like the engine
   // (FROZEN with a candidate, then ACCEPTED), or refuse with the engine's own
   // stderr wording when the conf sets freeze_refusal / accept_refusal. Every
@@ -88,18 +90,29 @@ async function buildFixture(): Promise<{ root: string; workspaceFile: string }> 
       "#!/bin/sh",
       'sub="$1"',
       'stage="$2"',
-      'root="$4"; [ -n "$root" ] || root="$PWD"',
+      'shift 2; root=; brief_file=; brief_flag=',
+      'while [ $# -gt 0 ]; do',
+      '  case "$1" in',
+      '    --repo-root) root="$2"; shift 2 ;;',
+      '    --brief-file) brief_file="$2"; brief_flag=" --brief-file"; shift 2 ;;',
+      '    *) shift ;;',
+      "  esac",
+      "done",
+      '[ -n "$root" ] || root="$PWD"',
       'conf="$root/.sparring/fake-runner.conf"',
       "sleep_for=3; exit_with=0; freeze_refusal=; accept_refusal=",
       '[ -f "$conf" ] && . "$conf"',
       'dir="$root/.sparring/stages/$stage"',
-      'echo "$sub $stage" >> "$root/.sparring/fake-calls.log"',
+      'echo "$sub $stage$brief_flag" >> "$root/.sparring/fake-calls.log"',
       'sha="c0ffee0000000000000000000000000000000000"',
       'if [ "$sub" = "new-stage" ]; then',
+      '  if [ -n "$brief_file" ] && [ ! -r "$brief_file" ]; then echo "could not create stage: could not read --brief-file \'$brief_file\': No such file" >&2; exit 1; fi',
       '  if [ -d "$dir" ]; then echo "could not create stage: stage \'$stage\' already exists at $dir" >&2; exit 1; fi',
       '  mkdir -p "$dir"',
       '  printf \'{"base_sha": null, "candidate_sha": null, "implementation_session_id": null, "sparring_session_id": null, "status": "working"}\\n\' > "$dir/state.json"',
-      '  printf \'# Stage brief: %s\\n\\n## Goal\\n\\n(Describe the bounded goal for this stage.)\\n\' "$stage" > "$dir/brief.md"',
+      '  if [ -n "$brief_file" ]; then cat "$brief_file" > "$dir/brief.md"; else',
+      '    printf \'# Stage brief: %s\\n\\n## Goal\\n\\n(Describe the bounded goal for this stage.)\\n\' "$stage" > "$dir/brief.md"',
+      "  fi",
       '  echo "created stage \'$stage\' at $dir"; exit 0',
       "fi",
       'if [ "$sub" = "freeze-candidate" ]; then',

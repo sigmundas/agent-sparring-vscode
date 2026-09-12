@@ -26,7 +26,7 @@ import { deriveLiveness, type ExecutionRecord, type LivenessState, type RunnerLi
 import { proposeNextStage, type NextStageProposal } from "./nextStage";
 import { briefMentionedStages, buildStageIndex, locateStage, parsePlanHeadings, planTitle, sectionSummary, type HeadingRef, type MatchSource, type PlanHeading } from "./planAssociation";
 import { actionWord, presentStage, stageDisplayName, type StagePresentation } from "./presentation";
-import { planAction, stageActions, type PlanAction, type StageRunAction } from "./runner";
+import { hasSessions, planAction, stageActions, type PlanAction, type StageRunAction } from "./runner";
 import { QUIET_AFTER_MS, formatAge } from "./status";
 
 export type TimelineState = "accepted" | "finalizing" | "active" | "paused" | "working" | "future";
@@ -304,6 +304,7 @@ export function buildOverviewModel(
   const uncertain = liveness.source === "telemetry";
   const outcome = run.kind === "plan" ? run.currentOutcome : run.outcome;
   const presentation = presentStage(stage.state?.status, outcome, live);
+  const fresh = isFreshStage(run, stage, presentation, liveness);
   const plan = planContext(run, stage, artifacts);
 
   const model: OverviewModel = {
@@ -326,7 +327,7 @@ export function buildOverviewModel(
     activity: activityLine(live, halted, nowMs, uncertain),
     history: history(live),
     runKind: run.kind === "plan" ? "Plan run" : "Standalone stage",
-    status: runStatus(run, presentation, liveness),
+    status: fresh ? { label: "Ready to start", tone: "info" } : runStatus(run, presentation, liveness),
     liveness: { state: liveness.state, source: liveness.source, detail: liveness.detail },
     plan,
   };
@@ -378,7 +379,7 @@ export function buildOverviewModel(
     model.stageStatusKind = "stopped";
     model.stageRaw = presentation.raw;
   } else {
-    model.stageStatus = presentation.label;
+    model.stageStatus = fresh ? "Ready to start" : presentation.label;
     model.stageStatusKind = presentation.kind;
     model.stageRaw = presentation.raw;
   }
@@ -389,7 +390,7 @@ export function buildOverviewModel(
   if (outcome) {
     model.lastSparring = { action: outcome.action, word: actionWord(outcome.action), summary: outcome.summary, reason: outcome.needsYouReason };
   }
-  Object.assign(model, currentLine(run, stage, live, presentation, liveness, Boolean(artifacts.accepting), model.planAction));
+  Object.assign(model, currentLine(run, stage, live, presentation, liveness, Boolean(artifacts.accepting), model.planAction, fresh));
   if (stage.state?.status === "accepted" && !(run.kind === "plan" && run.state.status === "complete")) {
     model.whatsNext = whatsNext(run, plan, artifacts, model.planAction);
   }
@@ -397,6 +398,23 @@ export function buildOverviewModel(
 }
 
 // ---------------------------------------------------------------- pieces
+
+/**
+ * A standalone stage that exists but has never run: state.json is `working`
+ * with no session ids, sparring.md records no outcome, telemetry has seen no
+ * turn and no runner is or was alive. Those recorded absences are what
+ * "Ready to start" claims; nothing about the stage's readiness in any
+ * other sense.
+ */
+function isFreshStage(run: RunSnapshot, stage: StageSnapshot, presentation: StagePresentation, liveness: RunnerLiveness): boolean {
+  if (run.kind !== "stage" || !stage.exists || presentation.kind !== "working" || run.outcome) {
+    return false;
+  }
+  if (liveness.interrupted || liveness.state === "running" || liveness.turnActive) {
+    return false;
+  }
+  return !hasSessions(run, liveness.live);
+}
 
 function runStatus(run: RunSnapshot, presentation: StagePresentation, liveness: RunnerLiveness): RunStatus {
   if (run.kind === "plan") {
@@ -602,7 +620,7 @@ function planContext(run: RunSnapshot, stage: StageSnapshot, artifacts: Overview
     return undefined;
   }
   const name = (associated.text ? planTitle(associated.text) : undefined) ?? basename(associated.path);
-  const note = "Associated with this stage in VS Code for display only; the engine does not know about it. A following stage is created with the engine's own new-stage command.";
+  const note = "Associated with this stage in VS Code for display only; the engine does not know about it. A following stage is created with the engine's own new-stage command, briefed with that stage's plan section.";
   if (!associated.exists || associated.text === undefined) {
     return { source: "associated", name, hasHeadings: false, hasStageLabels: false, note: associated.exists ? note : `${note} The file is currently missing.` };
   }
@@ -676,7 +694,7 @@ function whatsNext(run: RunSnapshot, plan: PlanContext | undefined, artifacts: O
   const entry = index.find((candidate) => candidate.label === next.label);
   const start = entry && next.defined ? proposeNextStage(entry) : undefined;
   if (start) {
-    return { kind: "next-stage", heading: next.display, summary: next.summary, text: "Start next stage creates it with the engine; you then fill in its brief from this plan section and run it.", start };
+    return { kind: "next-stage", heading: next.display, summary: next.summary, text: "Start next stage creates it with the engine, using this plan section as its brief. Run stage then begins implementation.", start };
   }
   return {
     kind: "next-unclear",
@@ -701,6 +719,7 @@ function currentLine(
   liveness: RunnerLiveness,
   accepting: boolean,
   plan: PlanAction | undefined,
+  fresh = false,
 ): Pick<OverviewModel, "stageLine" | "banner"> {
   const outcome = run.kind === "plan" ? run.currentOutcome : run.outcome;
   const stageStatus = stage.state?.status;
@@ -765,6 +784,9 @@ function currentLine(
   }
   if (live?.stage.busy) {
     return { stageLine: "Implementing." };
+  }
+  if (fresh) {
+    return { stageLine: "Ready to start. Run stage begins implementation." };
   }
   return { stageLine: stage.exists ? "Working." : "Not started yet." };
 }

@@ -27,11 +27,12 @@ import {
 import { parsePlanStages } from "../core/engineFormats";
 import { blocksLaunch } from "../core/liveness";
 import type { OverviewAction } from "../core/overviewHtml";
-import { createStage, proposeNextStage, type NewStageResult } from "../core/nextStage";
+import { createStage, proposeNextStage, renderNextStageBrief, type NewStageResult } from "../core/nextStage";
 import { buildStageIndex, locateStage, parsePlanHeadings, sectionSummary, type HeadingRef, type PlanHeading, type StageEntry } from "../core/planAssociation";
 import { buildRunPickItems, describeRun } from "../core/runPick";
 import { stageActions, stageRunAction } from "../core/runner";
 import { planRunId, type SparringSubcommand } from "../core/sparringCommand";
+import { withTemporaryFile } from "../core/tempFile";
 import type { SparringController } from "./controller";
 import type { LaunchResult } from "./executionTracker";
 import { currentBranch } from "./git";
@@ -851,16 +852,18 @@ async function startNextStageCommand(controller: SparringController, overview: O
 }
 
 export type StartNextStageOutcome =
-  | { ok: true; stageId: string; runId: string }
-  | { ok: false; reason: "not-accepted" | "no-plan" | "no-next" | "exists" | "cancelled" | "branch" | "executable" | "engine"; message?: string; stageId?: string };
+  | { ok: true; stageId: string; runId: string; brief: string }
+  | { ok: false; reason: "not-accepted" | "no-plan" | "no-next" | "brief" | "exists" | "cancelled" | "branch" | "executable" | "engine"; message?: string; stageId?: string };
 
 /**
  * Start the stage that follows `run` in its associated plan: propose the
- * id from the plan's next stage label and canonical title, confirm, run
- * the engine's `new-stage`, carry the plan association (matched to that
- * stage) over to the new run, select it, and open its fresh brief.md
- * beside the plan section. Nothing under .sparring is written here: the
- * engine creates the stage, the user writes the brief.
+ * id from the plan's next stage label and canonical title, render that
+ * stage's plan section as the brief, confirm, run the engine's `new-stage
+ * --brief-file` with the brief in a temporary file, carry the plan
+ * association (matched to that stage) over to the new run and select it.
+ * The loop is not launched: Run stage is the user's next, deliberate step.
+ * Nothing under .sparring is written here: the engine creates the stage
+ * and writes brief.md from the file it is given.
  */
 async function performStartNextStage(controller: SparringController, overview: OverviewPanelManager, run: StandaloneStageSnapshot, options: { confirm: boolean }): Promise<StartNextStageOutcome> {
   if (run.stage.state?.status !== "accepted") {
@@ -877,9 +880,23 @@ async function performStartNextStage(controller: SparringController, overview: O
   const briefText = await readOptional(path.join(run.stage.dir, BRIEF_FILENAME));
   const position = locateStage(headings, { stageId: run.stage.stageId, title: run.stage.title, briefText, manual: association.match });
   const proposal = position?.next.state === "found" ? proposeNextStage(position.next.stage) : undefined;
+  const planName = path.basename(association.path);
   if (!proposal) {
-    void vscode.window.showInformationMessage("Agent Sparring: the plan does not define a clear next stage after this one. Match this stage or read the plan.");
+    const nextEntry = position?.next.state === "found" ? position.next.stage : undefined;
+    await explainNextStageProblem(
+      controller,
+      overview,
+      run,
+      association.path,
+      nextEntry?.ambiguous ? `${planName} defines ${nextEntry.display} in more than one section, so Agent Sparring cannot say which one to start.` : "the plan does not define a clear next stage after this one.",
+      nextEntry ? (nextEntry.canonical ?? nextEntry.occurrences[0])?.line : undefined,
+    );
     return { ok: false, reason: "no-next" };
+  }
+  const rendered = renderNextStageBrief(text, proposal, planName);
+  if (!rendered.ok) {
+    await explainNextStageProblem(controller, overview, run, association.path, rendered.message, proposal.line);
+    return { ok: false, reason: "brief", message: rendered.message, stageId: proposal.stageId };
   }
   const location = run.location;
   const existing = controller.currentDiscovery.runs.find((candidate) => candidate.kind === "stage" && candidate.location.projectDir === location.projectDir && candidate.stage.stageId === proposal.stageId);
@@ -892,24 +909,28 @@ async function performStartNextStage(controller: SparringController, overview: O
     return { ok: false, reason: "exists", stageId: proposal.stageId };
   }
   if (options.confirm) {
-    const detail = [`Stage id: ${proposal.stageId}`, `From: ${path.basename(association.path)} › ${proposal.display} (line ${proposal.line})`, "", "The engine's new-stage command creates the stage. You then fill in its brief from the plan section and run it."].join("\n");
+    const detail = ["Agent Sparring will create the stage using this plan section as its brief.", "", `Stage: ${proposal.display}`, `Stage id: ${proposal.stageId}`, `Plan section: ${planName} › ${proposal.display} (line ${proposal.line})`].join("\n");
     const choice = await vscode.window.showInformationMessage(`Start ${proposal.display}?`, { modal: true, detail }, "Start stage");
     if (choice !== "Start stage") {
       return { ok: false, reason: "cancelled" };
     }
   }
-  controller.log(`Start next stage: sparring new-stage ${proposal.stageId} (from ${path.basename(association.path)} › ${proposal.display})`);
+  controller.log(`Start next stage: sparring new-stage ${proposal.stageId} --brief-file <temporary copy of ${planName} › ${proposal.display}>`);
   let problem: string | undefined;
-  const result: NewStageResult = await createStage(
-    async (args) => {
-      const outcome = await controller.runCommand({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: `New stage: ${proposal.stageId}` });
-      if (!outcome.ok) {
-        problem = outcome.error;
-        return { exitCode: undefined, output: outcome.error };
-      }
-      return outcome.outcome;
-    },
-    { stageId: proposal.stageId, repoRoot: location.repoRoot, sparringDir: location.sparringDir },
+  // The brief travels through a temporary file outside the workspace; the
+  // engine reads it and writes brief.md. The file is removed afterwards.
+  const result: NewStageResult = await withTemporaryFile(rendered.brief, `${proposal.stageId}.md`, (briefFile) =>
+    createStage(
+      async (args) => {
+        const outcome = await controller.runCommand({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: `New stage: ${proposal.stageId}` });
+        if (!outcome.ok) {
+          problem = outcome.error;
+          return { exitCode: undefined, output: outcome.error };
+        }
+        return outcome.outcome;
+      },
+      { stageId: proposal.stageId, repoRoot: location.repoRoot, sparringDir: location.sparringDir, briefFile },
+    ),
   );
   if (problem) {
     await explainExecutableProblem(problem);
@@ -920,6 +941,7 @@ async function performStartNextStage(controller: SparringController, overview: O
     for (const line of result.detail.split(/\r?\n/)) {
       controller.log(`  ${line}`);
     }
+    // The accepted stage stays selected; the engine refused before creating anything.
     if (result.commandNotFound) {
       await explainCommandNotFound(configuredExecutable() || "sparring");
     } else {
@@ -930,7 +952,7 @@ async function performStartNextStage(controller: SparringController, overview: O
     }
     return { ok: false, reason: "engine", message: result.message, stageId: proposal.stageId };
   }
-  controller.log(`Start next stage: created ${proposal.stageId}`);
+  controller.log(`Start next stage: created ${proposal.stageId} with ${rendered.brief.split("\n").length} lines of brief from ${planName}`);
   // The new stage belongs to the same plan, at the stage we just started; the
   // association (VS Code state only) follows it so the Overview can place it.
   const newRunId = runIdFor(location, "stage", proposal.stageId);
@@ -943,11 +965,26 @@ async function performStartNextStage(controller: SparringController, overview: O
   }
   await overview.update();
   if (options.confirm) {
-    // The plan section first, the brief last so it has focus: the user's next step is to write it.
-    await openDocument(association.path, `the plan document ${path.basename(association.path)} is missing.`, overview.documentColumn, proposal.line);
-    const brief = path.join(location.sparringDir, "stages", proposal.stageId, BRIEF_FILENAME);
-    await openDocument(brief, "brief.md was not created by the engine.", overview.documentColumn);
-    void vscode.window.showInformationMessage(`Agent Sparring: ${proposal.display} created as ${proposal.stageId}. Fill in its brief from the plan section, then use Run stage.`);
+    // Deliberately no loop launch: the Overview now shows the new stage as
+    // Ready to start, and Run stage is the checkpoint before provider tokens.
+    void vscode.window.showInformationMessage(`Agent Sparring: ${proposal.display} created as ${proposal.stageId}, briefed from ${planName}. Run stage begins implementation.`);
   }
-  return { ok: true, stageId: proposal.stageId, runId: newRunId };
+  return { ok: true, stageId: proposal.stageId, runId: newRunId, brief: rendered.brief };
+}
+
+/**
+ * The next stage cannot be started as things stand (no clear section, an
+ * ambiguous definition, a heading-only section): nothing is created, the
+ * reason is stated, and the two ways forward are offered.
+ */
+async function explainNextStageProblem(controller: SparringController, overview: OverviewPanelManager, run: StandaloneStageSnapshot, planPath: string, message: string, line: number | undefined): Promise<void> {
+  controller.log(`Start next stage: nothing created — ${message}`);
+  const choice = await vscode.window.showWarningMessage(`Agent Sparring: ${message}`, "Open in plan", "Change match…");
+  if (choice === "Open in plan") {
+    await openDocument(planPath, `the plan document ${path.basename(planPath)} is missing.`, overview.documentColumn, line);
+  } else if (choice === "Change match…") {
+    if (controller.currentSelection.selected?.id === run.id) {
+      await matchStageCommand(controller, overview);
+    }
+  }
 }

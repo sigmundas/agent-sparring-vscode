@@ -10,7 +10,7 @@
  *   sparring [--sparring-dir DIR] run-loop    STAGE --repo-root ROOT --expected-branch BRANCH
  *   sparring [--sparring-dir DIR] freeze-candidate STAGE --repo-root ROOT --expected-branch BRANCH
  *   sparring [--sparring-dir DIR] accept-candidate STAGE --repo-root ROOT --expected-branch BRANCH
- *   sparring [--sparring-dir DIR] new-stage   STAGE
+ *   sparring [--sparring-dir DIR] new-stage   STAGE [--brief-file PATH]   (engine 7b6b2d8)
  *
  * No dependency on the vscode API.
  */
@@ -67,16 +67,25 @@ export interface NewStageInvocation {
   stageId: string;
   repoRoot: string;
   sparringDir?: string;
+  /** A UTF-8 Markdown file the engine uses verbatim as the initial brief.md (`--brief-file`). */
+  briefFile?: string;
 }
 
 /**
- * `sparring [--sparring-dir DIR] new-stage STAGE` (cli.py: new_stage → Stage.create):
- * the engine writes the stage skeleton (state.json, brief.md, notes.md,
- * handoff.md, sparring.md templates). No --repo-root: the command takes
- * only the global --sparring-dir, resolved against cwd when omitted.
+ * `sparring [--sparring-dir DIR] new-stage STAGE [--brief-file PATH]` (cli.py:
+ * new_stage → Stage.create): the engine writes the stage skeleton
+ * (state.json, brief.md, notes.md, handoff.md, sparring.md). With
+ * --brief-file it reads that file first and writes it as brief.md in place
+ * of the template; an unreadable file fails before any stage is created.
+ * No --repo-root: the command takes only the global --sparring-dir,
+ * resolved against cwd when omitted.
  */
 export function buildNewStageArgs(invocation: NewStageInvocation): string[] {
-  return [...globalArgs(invocation), "new-stage", invocation.stageId];
+  const args = [...globalArgs(invocation), "new-stage", invocation.stageId];
+  if (invocation.briefFile) {
+    args.push("--brief-file", invocation.briefFile);
+  }
+  return args;
 }
 
 function globalArgs(invocation: { repoRoot: string; sparringDir?: string }): string[] {

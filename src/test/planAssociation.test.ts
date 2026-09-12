@@ -426,7 +426,7 @@ describe("Overview plan actions", () => {
       kind: "next-stage",
       heading: "Stage 3C — Cloud schema and synchronization",
       summary: "text",
-      text: "Start next stage creates it with the engine; you then fill in its brief from this plan section and run it.",
+      text: "Start next stage creates it with the engine, using this plan section as its brief. Run stage then begins implementation.",
       start: { stageId: "stage-3c-cloud-schema-and-synchronization", label: "3C", title: "Cloud schema and synchronization", display: "Stage 3C — Cloud schema and synchronization", line: 12 },
     });
     html = renderOverviewHtml(accepted, "n", "c");

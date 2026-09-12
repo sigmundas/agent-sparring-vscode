@@ -49,15 +49,25 @@ export async function run(): Promise<void> {
   await vscode.commands.executeCommand("agentSparring.refresh");
   const report = (await vscode.commands.executeCommand("agentSparring.diagnoseDiscovery")) as DiscoveryDiagnostic;
 
-  await discoveryAssertions(report, fixtureRoot);
-  await staleTelemetryAssertions(report, reportedRepo);
-  await launchedRunnerAssertions(report, reportedRepo);
-  await observedTerminalAssertions(report, reportedRepo);
-  await bareExecutableAssertions(report, reportedRepo, fixtureRoot);
-  await commandNotFoundAssertions(report, reportedRepo);
-  await acceptStageAssertions(report, reportedRepo);
-  await planAssociationAssertions(report, reportedRepo, fixtureRoot);
-  console.log("integration: discovery, stale telemetry, launched runner exit, Ctrl-C, observed terminal command, bare executable via the shell, command-not-found, Accept stage and plan association all verified");
+  // AGENT_SPARRING_IT_ONLY=accept,plan runs a subset of sections (a development aid
+  // when one section is being worked on); unset, everything runs in order.
+  const sections: [string, () => Promise<void>][] = [
+    ["discovery", () => discoveryAssertions(report, fixtureRoot)],
+    ["stale", () => staleTelemetryAssertions(report, reportedRepo)],
+    ["launched", () => launchedRunnerAssertions(report, reportedRepo)],
+    ["observed", () => observedTerminalAssertions(report, reportedRepo)],
+    ["bare", () => bareExecutableAssertions(report, reportedRepo, fixtureRoot)],
+    ["notfound", () => commandNotFoundAssertions(report, reportedRepo)],
+    ["accept", () => acceptStageAssertions(report, reportedRepo)],
+    ["plan", () => planAssociationAssertions(report, reportedRepo, fixtureRoot)],
+  ];
+  const only = (process.env.AGENT_SPARRING_IT_ONLY ?? "").split(",").map((name) => name.trim()).filter(Boolean);
+  for (const [name, section] of sections) {
+    if (only.length === 0 || only.includes(name)) {
+      await section();
+    }
+  }
+  console.log(only.length > 0 ? `integration: sections ${only.join(", ")} verified` : "integration: discovery, stale telemetry, launched runner exit, Ctrl-C, observed terminal command, bare executable via the shell, command-not-found, Accept stage and plan association all verified");
 }
 
 // ---------------------------------------------------------------- discovery (unchanged shape)
@@ -204,6 +214,7 @@ interface StartOutcome {
   stageId?: string;
   runId?: string;
   reason?: string;
+  brief?: string;
 }
 
 async function shellIntegrationAvailable(cwd: string): Promise<boolean> {
@@ -404,14 +415,17 @@ async function startNextStageAssertions(report: DiscoveryDiagnostic, reportedRep
   const outcome = (await vscode.commands.executeCommand("agentSparring._test.startNextStage")) as StartOutcome | undefined;
   assert.ok(outcome?.ok, `Start next stage succeeded: ${JSON.stringify(outcome)}`);
   assert.equal(outcome.stageId, "stage-3c-cloud-schema");
-  assert.deepEqual((await fs.readFile(callsLog, "utf8")).trim().split("\n"), ["new-stage stage-3c-cloud-schema"], "exactly one engine command, nothing else, via the configured fake executable");
+  assert.deepEqual((await fs.readFile(callsLog, "utf8")).trim().split("\n"), ["new-stage stage-3c-cloud-schema --brief-file"], "exactly one engine command, with the brief handed over by file, via the configured fake executable");
   const created = path.join(reportedRepo, ".sparring", "stages", "stage-3c-cloud-schema");
-  assert.deepEqual((await fs.readdir(created)).sort(), ["brief.md", "state.json"], "the engine wrote the stage; the extension wrote nothing");
-  assert.match(await fs.readFile(path.join(created, "brief.md"), "utf8"), /Describe the bounded goal/, "the brief is the engine's template, left for the user to fill in");
+  assert.deepEqual((await fs.readdir(created)).sort(), ["brief.md", "state.json"], "the engine wrote the stage; the extension wrote nothing under .sparring");
+  const expectedBrief = "# Stage brief: stage-3c-cloud-schema\n\nStage 3C from plan `range.md`. Implement only this section; the other stages are separate.\n\n## Stage 3C — Cloud schema\n\nCloud side.\n";
+  assert.equal(await fs.readFile(path.join(created, "brief.md"), "utf8"), expectedBrief, "the brief is the plan's Stage 3C section verbatim under the engine's brief header");
+  assert.equal(outcome.brief, expectedBrief);
   const after = await model();
   assert.equal(after.runKind, "Standalone stage");
-  assert.equal(after.stageStatus, "Working", "the Overview switched to the new stage");
-  assert.equal(after.stageAction?.label, "Run stage");
+  assert.equal(after.stageStatus, "Ready to start", "the Overview switched to the new, never-run stage");
+  assert.equal(after.stageLine, "Ready to start. Run stage begins implementation.");
+  assert.equal(after.stageAction?.label, "Run stage", "Run stage is the next primary action; no loop was launched");
   assert.equal(after.plan?.current, "Stage 3C — Cloud schema", "the plan association and its match followed the new stage");
   assert.equal(after.plan?.matched, "manual");
   assert.equal(after.whatsNext, undefined, "not accepted yet");
