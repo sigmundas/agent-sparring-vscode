@@ -38,6 +38,20 @@ export const FOO_STAGE_IDS = [
   "foo-1cd13d24-stage-3-device-ui-check",
 ];
 
+const PROJECT_TOML = 'project = "fixture"\n\n[repo]\nroot = "."\n';
+
+export interface WorkspaceOptions {
+  withSpaces?: boolean;
+  /** false: create the folder without any `.sparring`. */
+  sparring?: boolean;
+  name?: string;
+  /**
+   * Where project.toml is written: inside `.sparring` (the engine's place,
+   * default), at the repository root only (`root`), or nowhere (`none`).
+   */
+  config?: "sparring" | "root" | "none";
+}
+
 export class Workspace {
   readonly sparringDir: string;
   constructor(readonly root: string) {
@@ -45,17 +59,34 @@ export class Workspace {
   }
 
   get location(): SparringLocation {
-    return { sparringDir: this.sparringDir, repoRoot: this.root, workspaceFolder: this.root, folderName: path.basename(this.root) };
+    return { sparringDir: this.sparringDir, projectDir: this.root, repoRoot: this.root, workspaceFolder: this.root, folderName: path.basename(this.root) };
   }
 
-  static async create(options: { withSpaces?: boolean; sparring?: boolean; name?: string } = {}): Promise<Workspace> {
+  static async create(options: WorkspaceOptions = {}): Promise<Workspace> {
     const base = await fs.mkdtemp(path.join(os.tmpdir(), "agent-sparring-vscode-"));
-    const root = path.join(base, options.name ?? (options.withSpaces ? "my repo with spaces" : "repo"));
+    return Workspace.createAt(path.join(base, options.name ?? (options.withSpaces ? "my repo with spaces" : "repo")), options);
+  }
+
+  /**
+   * A project checked out inside another directory (a git worktree under a
+   * parent folder, a monorepo package): what the Explorer shows as a child
+   * node of a workspace folder, not a workspace folder itself.
+   */
+  static async createNested(parent: string, relativePath: string, options: Omit<WorkspaceOptions, "name" | "withSpaces"> = {}): Promise<Workspace> {
+    return Workspace.createAt(path.join(parent, ...relativePath.split("/")), options);
+  }
+
+  private static async createAt(root: string, options: WorkspaceOptions): Promise<Workspace> {
     await fs.mkdir(root, { recursive: true });
     const ws = new Workspace(root);
     if (options.sparring !== false) {
       await fs.mkdir(ws.sparringDir, { recursive: true });
-      await fs.writeFile(path.join(ws.sparringDir, "project.toml"), 'project = "fixture"\n\n[repo]\nroot = "."\n');
+      if (options.config !== "none" && options.config !== "root") {
+        await fs.writeFile(path.join(ws.sparringDir, "project.toml"), PROJECT_TOML);
+      }
+    }
+    if (options.config === "root") {
+      await fs.writeFile(path.join(root, "project.toml"), PROJECT_TOML);
     }
     return ws;
   }

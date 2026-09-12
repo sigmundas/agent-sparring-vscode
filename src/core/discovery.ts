@@ -37,20 +37,33 @@ export const CONFIG_FILENAME = "project.toml";
 export interface SparringLocation {
   /** Absolute path of the `.sparring` directory. */
   sparringDir: string;
+  /**
+   * The directory that owns `.sparring` (its parent): the project the engine
+   * manages. Equal to `workspaceFolder` for a `.sparring` directly under a
+   * workspace folder; deeper for a repository nested inside one (e.g. a git
+   * worktree checked out under a parent folder). Every run id is prefixed
+   * with it, so two repositories with identical stage ids never collide and
+   * a persisted selection names the repository too.
+   */
+  projectDir: string;
   /** Absolute repository root the engine would use (see resolveRepoRoot). */
   repoRoot: string;
-  /**
-   * Identity of the owning VS Code workspace folder (its fsPath). Every run
-   * id is prefixed with it, so two repositories with identical stage ids
-   * never collide and a persisted selection names the repository too.
-   */
+  /** fsPath of the VS Code workspace folder the project was found under. */
   workspaceFolder: string;
-  /** Short display name of the owning workspace folder. */
+  /**
+   * Short display name: the workspace folder's name, or for a nested
+   * project the name of its directory (what the Explorer shows as the node).
+   */
   folderName: string;
 }
 
 export function runIdFor(location: SparringLocation, kind: "plan" | "stage", key: string): string {
-  return `${location.workspaceFolder}|${kind}:${key}`;
+  return `${location.projectDir}|${kind}:${key}`;
+}
+
+/** Whether a location's project is nested below (not directly at) its workspace folder. */
+export function isNestedLocation(location: SparringLocation): boolean {
+  return path.resolve(location.projectDir) !== path.resolve(location.workspaceFolder);
 }
 
 export interface StageSnapshot {
@@ -156,7 +169,11 @@ export function readTomlRepoRoot(toml: string): string | undefined {
  * multi-root workspace is probed on its own; folders are never merged.
  */
 export async function locateSparringDir(folder: string, folderName?: string): Promise<SparringLocation | undefined> {
-  const sparringDir = path.join(folder, SPARRING_DIRNAME);
+  return locationAt(folder, folder, folderName ?? path.basename(folder));
+}
+
+async function locationAt(projectDir: string, workspaceFolder: string, folderName: string): Promise<SparringLocation | undefined> {
+  const sparringDir = path.join(projectDir, SPARRING_DIRNAME);
   try {
     const stat = await fs.stat(sparringDir);
     if (!stat.isDirectory()) {
@@ -167,16 +184,100 @@ export async function locateSparringDir(folder: string, folderName?: string): Pr
   }
   return {
     sparringDir,
+    projectDir,
     repoRoot: await resolveRepoRoot(sparringDir),
-    workspaceFolder: folder,
-    folderName: folderName ?? path.basename(folder),
+    workspaceFolder,
+    folderName,
   };
 }
 
-/** Probe every workspace folder independently and keep those with `.sparring`. */
-export async function locateAll(folders: { path: string; name?: string }[]): Promise<SparringLocation[]> {
-  const found = await Promise.all(folders.map((folder) => locateSparringDir(folder.path, folder.name)));
-  return found.filter((location): location is SparringLocation => location !== undefined);
+/** How deep below a workspace folder nested projects are looked for by default. */
+export const DEFAULT_NESTED_SEARCH_DEPTH = 2;
+
+/**
+ * Directory names never descended into while looking for nested projects.
+ * Hidden directories (leading dot) are skipped as well. The engine never
+ * writes `.sparring` inside any of these.
+ */
+export const NESTED_SEARCH_SKIP: ReadonlySet<string> = new Set([
+  "node_modules",
+  "dist",
+  "out",
+  "build",
+  "target",
+  "venv",
+  "__pycache__",
+  "site-packages",
+  "vendor",
+  "bower_components",
+  "coverage",
+]);
+
+export interface LocateOptions {
+  /**
+   * Maximum depth below a workspace folder at which a nested project's
+   * `.sparring` is still discovered; 0 probes only the folder itself.
+   */
+  nestedSearchDepth?: number;
+}
+
+/**
+ * Probe one workspace folder: `.sparring` directly under it, plus every
+ * nested project directory (`<folder>/<a>/.sparring`, `<folder>/<a>/<b>/.sparring`,
+ * ... up to `nestedSearchDepth`). A directory that owns a `.sparring` is a
+ * project root and is not searched further down; hidden and build/dependency
+ * directories are never entered; symbolic links are not followed.
+ *
+ * Nested projects are what the Explorer shows as child nodes of a workspace
+ * folder (a git worktree checked out under a parent folder, a monorepo
+ * package): a `.sparring/stages/<id>/state.json` there is as authoritative
+ * as one directly under the folder.
+ */
+export async function locateSparringDirs(folder: string, folderName?: string, options: LocateOptions = {}): Promise<SparringLocation[]> {
+  const maxDepth = Math.max(0, options.nestedSearchDepth ?? DEFAULT_NESTED_SEARCH_DEPTH);
+  const found: SparringLocation[] = [];
+  const top = await locationAt(folder, folder, folderName ?? path.basename(folder));
+  if (top) {
+    found.push(top);
+  }
+  let frontier = [folder];
+  for (let depth = 1; depth <= maxDepth && frontier.length > 0; depth++) {
+    const next: string[] = [];
+    for (const dir of frontier) {
+      for (const child of await listSearchableSubdirs(dir)) {
+        const location = await locationAt(child, folder, path.basename(child));
+        if (location) {
+          found.push(location); // a project root: do not look inside it
+        } else {
+          next.push(child);
+        }
+      }
+    }
+    frontier = next;
+  }
+  return found;
+}
+
+async function listSearchableSubdirs(dir: string): Promise<string[]> {
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  return entries
+    .filter((entry) => entry.isDirectory() && !entry.name.startsWith(".") && !NESTED_SEARCH_SKIP.has(entry.name))
+    .map((entry) => path.join(dir, entry.name))
+    .sort();
+}
+
+/**
+ * Probe every workspace folder independently (each including its nested
+ * projects) and keep every `.sparring` found. Folders are never merged.
+ */
+export async function locateAll(folders: { path: string; name?: string }[], options: LocateOptions = {}): Promise<SparringLocation[]> {
+  const found = await Promise.all(folders.map((folder) => locateSparringDirs(folder.path, folder.name, options)));
+  return found.flat();
 }
 
 /** Resolve a recorded plan label (plan.py: plan_label) back to an absolute path. */
@@ -406,7 +507,7 @@ export function selectRun(runs: RunSnapshot[], preferredId?: string, stickyId?: 
  */
 export function chooseLaunchLocation(locations: SparringLocation[], selected: RunSnapshot | undefined, activeFile?: string): SparringLocation | undefined {
   if (selected) {
-    const owner = locations.find((location) => location.workspaceFolder === selected.location.workspaceFolder);
+    const owner = locations.find((location) => location.projectDir === selected.location.projectDir);
     if (owner) {
       return owner;
     }
@@ -415,7 +516,11 @@ export function chooseLaunchLocation(locations: SparringLocation[], selected: Ru
     return locations[0];
   }
   if (activeFile) {
-    return locations.find((location) => isInsidePath(activeFile, location.repoRoot) || isInsidePath(activeFile, location.workspaceFolder));
+    // A nested project's directory lies inside its parent's too: the deepest
+    // (most specific) match owns the file.
+    return locations
+      .filter((location) => isInsidePath(activeFile, location.repoRoot) || isInsidePath(activeFile, location.projectDir))
+      .sort((a, b) => b.projectDir.length - a.projectDir.length)[0];
   }
   return undefined;
 }

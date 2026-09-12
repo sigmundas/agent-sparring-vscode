@@ -15,15 +15,13 @@ import {
   chooseLaunchLocation,
   currentStageOf,
   isInsidePath,
-  isOpenRun,
-  runLabel,
-  totalStagesOf,
   type PlanRunSnapshot,
   type RunSnapshot,
   type SparringLocation,
 } from "../core/discovery";
 import { parsePlanStages } from "../core/engineFormats";
 import type { OverviewAction } from "../core/overviewHtml";
+import { buildRunPickItems, describeRun } from "../core/runPick";
 import type { SparringController } from "./controller";
 import { openCandidateDiff } from "./overview/gitDiff";
 import { OverviewPanelManager } from "./overview/overviewPanel";
@@ -35,6 +33,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.showLog", () => controller.showLog()),
     vscode.commands.registerCommand("agentSparring.refresh", () => controller.refresh()),
     vscode.commands.registerCommand("agentSparring.selectRun", () => selectRunCommand(controller)),
+    vscode.commands.registerCommand("agentSparring.diagnoseDiscovery", () => controller.diagnoseDiscovery()),
     vscode.commands.registerCommand("agentSparring.openOverview", () => openOverviewCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.runPlan", () => runPlanCommand(controller)),
     vscode.commands.registerCommand("agentSparring.resumePlan", () => resumePlanCommand(controller)),
@@ -47,39 +46,19 @@ interface RunItem extends vscode.QuickPickItem {
   run?: RunSnapshot;
 }
 
-function describeRun(run: RunSnapshot): string {
-  if (run.kind === "plan") {
-    const total = totalStagesOf(run);
-    return `${run.state.status} · stage ${run.state.currentStageIndex + 1}/${total ?? "?"} · ${run.state.expectedBranch}`;
-  }
-  return `standalone stage · ${run.stage.state?.status ?? "working"}`;
-}
-
-/** `repo: run` when several repositories are present, else just the run. */
-function runPickLabel(run: RunSnapshot, multiRepo: boolean): string {
-  return multiRepo ? `${run.location.folderName}: ${runLabel(run)}` : runLabel(run);
-}
-
 async function selectRunCommand(controller: SparringController): Promise<void> {
   const runs = controller.currentDiscovery.runs;
   if (runs.length === 0) {
-    void vscode.window.showInformationMessage("Agent Sparring: no recorded plan runs or stages in this workspace.");
+    const choice = await vscode.window.showInformationMessage(
+      "Agent Sparring: no recorded plan runs or stages in this workspace.",
+      "Diagnose Discovery",
+    );
+    if (choice === "Diagnose Discovery") {
+      await controller.diagnoseDiscovery();
+    }
     return;
   }
-  const selectedId = controller.currentSelection.selected?.id;
-  const multiRepo = new Set(runs.map((run) => run.location.workspaceFolder)).size > 1;
-  const items: RunItem[] = runs
-    .slice()
-    .sort(
-      (a, b) =>
-        a.location.folderName.localeCompare(b.location.folderName) || Number(isOpenRun(b)) - Number(isOpenRun(a)) || b.stateMtimeMs - a.stateMtimeMs,
-    )
-    .map((run) => ({
-      label: `${run.id === selectedId ? "$(check) " : ""}${runPickLabel(run, multiRepo)}`,
-      description: describeRun(run),
-      detail: `${run.location.folderName} · ${currentStageOf(run).stageId}`,
-      run,
-    }));
+  const items: RunItem[] = buildRunPickItems(runs, controller.currentSelection.selected?.id);
   items.push({ label: "$(sync) Automatic selection", description: "clear the explicit choice", run: undefined });
   const picked = await vscode.window.showQuickPick(items, { placeHolder: "Which repository / run should Agent Sparring follow?" });
   if (!picked) {
@@ -190,8 +169,9 @@ async function pickPlanDocument(location: SparringLocation): Promise<string | un
       return active.uri.fsPath;
     }
   }
-  const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(location.repoRoot));
-  const pattern = folder ? new vscode.RelativePattern(folder, "**/*.md") : "**/*.md";
+  // Relative to the repository itself, so a nested project is not searched
+  // through its whole parent workspace folder.
+  const pattern = new vscode.RelativePattern(vscode.Uri.file(location.repoRoot), "**/*.md");
   const candidates = await vscode.workspace.findFiles(pattern, "**/{node_modules,.git,.sparring,dist,out,.venv}/**", 400);
   const plans: { label: string; description: string; detail?: string; file: string }[] = [];
   for (const uri of candidates) {

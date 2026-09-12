@@ -7,15 +7,19 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { ActivityTailer } from "../core/activityTailer";
+import { diagnoseDiscovery, renderDiagnostic, type DiscoveryDiagnostic } from "../core/diagnose";
 import {
+  DEFAULT_NESTED_SEARCH_DEPTH,
   activityPathFor,
   currentStageOf,
   discoverRuns,
+  isNestedLocation,
   locateAll,
   runLabel,
   selectRun,
   totalStagesOf,
   type Discovery,
+  type LocateOptions,
   type RunSelection,
   type RunSnapshot,
   type SparringLocation,
@@ -65,6 +69,9 @@ export class SparringController implements vscode.Disposable {
         if (event.affectsConfiguration("agentSparring.pollIntervalMs")) {
           this.armPolling();
         }
+        if (event.affectsConfiguration("agentSparring.nestedSearchDepth")) {
+          this.scheduleRefresh();
+        }
       }),
     );
     this.renderInterval = setInterval(() => this.render(), 60_000);
@@ -89,9 +96,50 @@ export class SparringController implements vscode.Disposable {
     return (vscode.workspace.workspaceFolders ?? []).filter((folder) => folder.uri.scheme === "file");
   }
 
-  /** Probe each workspace folder on its own; never merge folders into one root. */
+  /** Probe each workspace folder on its own (including nested projects); never merge folders into one root. */
   private async relocate(): Promise<void> {
-    this.locations = await locateAll(this.fileFolders().map((folder) => ({ path: folder.uri.fsPath, name: folder.name })));
+    const before = this.locations;
+    this.locations = await locateAll(
+      this.fileFolders().map((folder) => ({ path: folder.uri.fsPath, name: folder.name })),
+      this.locateOptions(),
+    );
+    const nestedBefore = before.filter(isNestedLocation).map((location) => location.projectDir);
+    const nestedNow = this.locations.filter(isNestedLocation).map((location) => location.projectDir);
+    if (nestedBefore.join("\0") !== nestedNow.join("\0")) {
+      this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} nested projects with .sparring: ${nestedNow.length === 0 ? "none" : nestedNow.join(", ")}`);
+    }
+  }
+
+  private locateOptions(): LocateOptions {
+    const configured = vscode.workspace.getConfiguration("agentSparring").get<number>("nestedSearchDepth", DEFAULT_NESTED_SEARCH_DEPTH);
+    return { nestedSearchDepth: Number.isFinite(configured) ? Math.max(0, Math.floor(configured)) : DEFAULT_NESTED_SEARCH_DEPTH };
+  }
+
+  /**
+   * Trace the production discovery path for every workspace folder into the
+   * Output Channel (paths, existence, parse success and lifecycle status
+   * only) and return the structured report.
+   */
+  async diagnoseDiscovery(): Promise<DiscoveryDiagnostic> {
+    const folders = (vscode.workspace.workspaceFolders ?? []).map((folder) => ({
+      index: folder.index,
+      name: folder.name,
+      scheme: folder.uri.scheme,
+      fsPath: folder.uri.fsPath,
+    }));
+    const report = await diagnoseDiscovery(folders, {
+      ...this.locateOptions(),
+      preferredId: this.context.workspaceState.get<string>(SELECTED_RUN_KEY),
+      stickyId: this.attachedRunId ?? this.context.workspaceState.get<string>(STICKY_RUN_KEY),
+    });
+    this.output.appendLine("");
+    this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} ---- Diagnose Discovery (extension ${String(this.context.extension.packageJSON.version)}) ----`);
+    for (const line of renderDiagnostic(report)) {
+      this.output.appendLine(`${" ".repeat(26)}${line}`);
+    }
+    this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} ---- end of diagnostic ----`);
+    this.output.show(true);
+    return report;
   }
 
   dispose(): void {
@@ -117,8 +165,10 @@ export class SparringController implements vscode.Disposable {
 
   private watch(folder: vscode.WorkspaceFolder): void {
     // Deliberately narrow globs: only the engine's authoritative files and
-    // the activity stream, never the whole workspace.
-    const authoritative = [".sparring/plans/*.json", ".sparring/stages/*/state.json", ".sparring/stages/*/sparring.md"];
+    // the activity stream, at any depth so nested projects are covered too.
+    // The base is a workspace folder, so this filters the workspace watcher's
+    // existing event stream rather than starting a new recursive watcher.
+    const authoritative = ["**/.sparring/plans/*.json", "**/.sparring/stages/*/state.json", "**/.sparring/stages/*/sparring.md"];
     for (const glob of authoritative) {
       const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, glob));
       const onChange = () => this.scheduleRefresh();
@@ -127,7 +177,7 @@ export class SparringController implements vscode.Disposable {
       watcher.onDidDelete(onChange);
       this.watcherDisposables.push(watcher);
     }
-    const activity = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, ".sparring/stages/*/activity.jsonl"));
+    const activity = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, "**/.sparring/stages/*/activity.jsonl"));
     const onActivity = (uri: vscode.Uri) => {
       if (this.tailer && path.resolve(uri.fsPath) === path.resolve(this.tailer.path)) {
         this.schedulePoll();

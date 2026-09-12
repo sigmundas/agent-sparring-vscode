@@ -6,7 +6,11 @@ navigates.
 
 ## What it does (V1 shell)
 
-- Detects a workspace folder with a `.sparring/` directory.
+- Detects every `.sparring/` directory in the workspace: directly under each
+  workspace folder and in projects nested below one (a git worktree or a
+  monorepo package checked out under a parent folder; see
+  `agentSparring.nestedSearchDepth`). Each project is its own repository in
+  the run list.
 - Discovers recorded plan runs (`.sparring/plans/<key>.json`), their stages
   (`.sparring/stages/<id>/state.json`) and standalone stages.
 - Shows one status-bar item, e.g. `● Agent Sparring: Stage 3/6 · Claude working`,
@@ -29,11 +33,16 @@ navigates.
 | `Agent Sparring: Show Log` | Focus the Output Channel. |
 | `Agent Sparring: Select Run` | Choose explicitly when several runs look active; the choice is remembered per workspace. |
 | `Agent Sparring: Rediscover State` | Re-scan `.sparring` from disk. |
+| `Agent Sparring: Diagnose Discovery` | Trace discovery for every workspace folder into the Output Channel: scheme, path, the `.sparring` probed, nested projects, stage/plan files and whether they parsed (lifecycle status only), runs produced, what Select Repository / Run would list, and why nothing is selected. Never logs file contents. |
 
 ## Settings
 
 - `agentSparring.executable` — path to `sparring`; empty resolves it from `PATH`.
 - `agentSparring.pollIntervalMs` — fallback poll interval for the activity log.
+- `agentSparring.nestedSearchDepth` — how many levels below each workspace
+  folder are searched for nested projects with their own `.sparring`
+  (default 2; 0 probes only the folders themselves). Hidden and
+  dependency/build directories are never entered.
 
 ## Source-of-truth rule
 
@@ -54,6 +63,7 @@ npm install
 npm run build      # typecheck + esbuild bundle to dist/
 npm test           # node:test unit tests against fake .sparring fixtures
 npm run lint
+npm run test:integration   # downloads VS Code once, opens a generated multi-root workspace, asserts real discovery
 ```
 
 Press F5 in VS Code to launch an Extension Development Host.
