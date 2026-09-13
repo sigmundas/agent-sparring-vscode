@@ -26,6 +26,7 @@ import {
 } from "../core/discovery";
 import { deriveLiveness, type ExecutionRecord, type RunnerLiveness } from "../core/liveness";
 import { applyEvent, emptyLiveState, type LiveState } from "../core/liveState";
+import { HUMAN_CHECKS_KEY, humanChecksFor, withHumanCheck, withoutHumanChecks, type CheckRecord, type HumanCheckDrafts } from "../core/humanChecks";
 import { LogRenderer } from "../core/logFormat";
 import { PLAN_ASSOCIATIONS_KEY, planAssociationFor, withAssociation, withManualMatch, type HeadingRef, type PlanAssociation, type PlanAssociations } from "../core/planAssociation";
 import { deriveStatus } from "../core/status";
@@ -344,6 +345,27 @@ export class SparringController implements vscode.Disposable {
     await this.context.workspaceState.update(PLAN_ASSOCIATIONS_KEY, next);
     const stage = runId.split("|").pop();
     this.log(match ? `matched ${stage} to plan heading ${match.label ? `Stage ${match.label} — ` : ""}${match.title} (VS Code workspace state only)` : `cleared the manual plan heading match of ${stage}`);
+    this.render();
+  }
+
+  // ---------------------------------------------------------------- manual check drafts (UI state until submitted)
+
+  /** Outcomes / notes the user recorded for the plan's manual checks of a run; drafts in workspace state until Submit evidence writes them to notes.md. */
+  humanChecks(runId: string | undefined): Record<string, CheckRecord> {
+    return runId === undefined ? {} : humanChecksFor(this.context.workspaceState.get<HumanCheckDrafts>(HUMAN_CHECKS_KEY), runId);
+  }
+
+  /** Merge one check's outcome and/or note. `notify` false keeps the Overview from re-rendering (a note being typed). */
+  async setHumanCheck(runId: string, key: string, change: CheckRecord, notify = true): Promise<void> {
+    const next = withHumanCheck(this.context.workspaceState.get<HumanCheckDrafts>(HUMAN_CHECKS_KEY), runId, key, change);
+    await this.context.workspaceState.update(HUMAN_CHECKS_KEY, next);
+    if (notify) {
+      this.render();
+    }
+  }
+
+  async clearHumanChecks(runId: string): Promise<void> {
+    await this.context.workspaceState.update(HUMAN_CHECKS_KEY, withoutHumanChecks(this.context.workspaceState.get<HumanCheckDrafts>(HUMAN_CHECKS_KEY), runId));
     this.render();
   }
 

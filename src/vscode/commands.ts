@@ -10,10 +10,11 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { acceptStage, type AcceptStageResult } from "../core/acceptance";
-import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, commandNotFoundMessage, type ExecutableProblem } from "../core/cli";
+import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, type ExecutableProblem } from "../core/cli";
 import {
   BRIEF_FILENAME,
   HANDOFF_FILENAME,
+  NOTES_FILENAME,
   SPARRING_FILENAME,
   chooseLaunchLocation,
   currentStageOf,
@@ -25,6 +26,7 @@ import {
   type StandaloneStageSnapshot,
 } from "../core/discovery";
 import { parsePlanStages } from "../core/engineFormats";
+import { appendHumanEvidence, insertHandoffEvidence, renderHumanEvidence, submittableChecks } from "../core/humanChecks";
 import { blocksLaunch } from "../core/liveness";
 import type { OverviewAction } from "../core/overviewHtml";
 import { createStage, proposeNextStage, renderNextStageBrief, type NewStageResult } from "../core/nextStage";
@@ -256,6 +258,21 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
         void vscode.window.showInformationMessage("Agent Sparring: no runner observed from this window is alive for the selected stage.");
       }
       return;
+    case "openPlanSection": {
+      if (!run) {
+        return;
+      }
+      const file = planDocumentFor(controller, run);
+      if (!file) {
+        return;
+      }
+      const model = await overview.buildModel();
+      await openDocument(file, `the plan document ${path.basename(file)} is missing.`, overview.documentColumn, model.plan?.currentLine);
+      return;
+    }
+    case "submitForReview":
+      await submitForReviewCommand(controller, overview);
+      return;
   }
 }
 
@@ -449,6 +466,148 @@ async function performAcceptStage(controller: SparringController, run: Standalon
     controller.setAccepting(run.id, false);
     await controller.refresh();
   }
+}
+
+// ---------------------------------------------------------------- submit manual verification evidence for review
+
+/**
+ * Hand the recorded manual-verification results back to the *reviewer*.
+ *
+ * The outcomes are rendered as one `## Human evidence` entry and written
+ * where the engine keeps them (the stage's notes.md, in the engine's own
+ * append shape) and — for a standalone stage — into the same section of
+ * handoff.md, because the sparring prompt shows the reviewer `handoff.md`
+ * verbatim and only the stage agent would otherwise fold notes.md into it.
+ *
+ * Then the *reviewer* runs, not the stage agent:
+ *
+ *  - standalone stage → `sparring run-sparring <stage>`, which resumes the
+ *    recorded sparring session against the unchanged candidate. Running
+ *    `run-loop` here would start Claude first with nothing to implement;
+ *    Resume stage remains the separate action for real implementation work.
+ *  - managed plan run → the engine's own `resume-plan --evidence`, which
+ *    records the evidence and continues the plan at this same stage. The
+ *    plan loop is the engine's orchestration and is not bypassed here.
+ *
+ * Nothing is frozen or accepted: the reviewer rules on the next turn.
+ */
+async function submitForReviewCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
+  const run = controller.currentSelection.selected;
+  if (!run) {
+    return;
+  }
+  const model = await overview.buildModel();
+  const panel = model.actionRequired;
+  if (!panel) {
+    void vscode.window.showInformationMessage("Agent Sparring: this stage is not waiting for you right now.");
+    return;
+  }
+  if (model.branchGuard) {
+    await explainWrongBranch(model.branchGuard);
+    return;
+  }
+  if (!panel.submit.enabled) {
+    // The same sentence the disabled button carries: incomplete evidence, a
+    // live runner, or nothing to send.
+    void vscode.window.showInformationMessage(`Agent Sparring: ${panel.submit.detail}`);
+    return;
+  }
+  const recorded = submittableChecks(panel);
+  const entry = renderHumanEvidence(recorded, new Date(), model.planName);
+  if (!entry) {
+    void vscode.window.showInformationMessage("Agent Sparring: record Pass, Fail or Blocked for the remaining checks first.");
+    return;
+  }
+  const count = recorded.length;
+  const what = run.kind === "plan" ? "the engine records the evidence and continues the plan at this same stage" : "the independent reviewer reads it and rules again; the stage agent is not started";
+  const detail = [`${count} result${count === 1 ? "" : "s"} will be recorded under '## Human evidence', then ${what}.`, "", entry].join("\n");
+  const choice = await vscode.window.showInformationMessage("Submit for review?", { modal: true, detail }, "Submit for review");
+  if (choice !== "Submit for review") {
+    return;
+  }
+  if (run.kind === "plan") {
+    const expectedBranch = await askBranch(run.location, run.state.expectedBranch);
+    if (!expectedBranch) {
+      return;
+    }
+    const args = buildResumePlanArgs({ planPath: run.planPath, repoRoot: run.location.repoRoot, expectedBranch, sparringDir: run.location.sparringDir, evidence: entry });
+    controller.log(`Submit for review: ${count} manual verification result(s) passed to resume-plan --evidence for ${run.currentStage.stageId}`);
+    await launch(controller, run.location, args, "resume-plan", run.planPath);
+    await controller.clearHumanChecks(run.id);
+    await overview.update();
+    return;
+  }
+  const expectedBranch = await currentBranch(run.location.repoRoot);
+  if (!expectedBranch) {
+    void vscode.window.showErrorMessage(
+      `Agent Sparring: no Git branch is checked out in ${run.location.folderName} (detached HEAD or not a repository). Check out the stage's branch, then submit again.`,
+    );
+    return;
+  }
+  if (!(await recordEvidence(controller, run, entry))) {
+    return;
+  }
+  await controller.clearHumanChecks(run.id);
+  const args = buildRunSparringArgs({ stageId: run.stage.stageId, repoRoot: run.location.repoRoot, expectedBranch, sparringDir: run.location.sparringDir });
+  controller.log(`Submit for review: sparring run-sparring ${run.stage.stageId} (branch ${expectedBranch}); the stage agent is not started`);
+  const result = await controller.launch({
+    configured: configuredExecutable(),
+    args,
+    cwd: run.location.repoRoot,
+    name: `Review: ${run.stage.stageId}`,
+    runId: run.id,
+    kind: "run-sparring",
+    stageId: run.stage.stageId,
+    reveal: false,
+  });
+  await explainLaunch(result);
+  await overview.update();
+}
+
+/**
+ * Write the entry into the stage's notes.md (the engine's own place and
+ * append shape) and, when the file exists, into handoff.md's `## Human
+ * evidence` section, which is what the reviewer's prompt actually shows.
+ * False when nothing could be written; the caller then launches nothing.
+ */
+async function recordEvidence(controller: SparringController, run: StandaloneStageSnapshot, entry: string): Promise<boolean> {
+  const notesPath = path.join(run.stage.dir, NOTES_FILENAME);
+  try {
+    const notes = (await readOptional(notesPath)) ?? `# Notes: ${run.stage.stageId}\n`;
+    await fs.writeFile(notesPath, appendHumanEvidence(notes, entry), "utf8");
+  } catch (error) {
+    void vscode.window.showErrorMessage(`Agent Sparring: could not write ${NOTES_FILENAME} for ${run.stage.stageId}: ${(error as Error).message}. Nothing was submitted.`);
+    return false;
+  }
+  controller.log(`Submit for review: recorded the results under '## Human evidence' in ${run.stage.stageId}/${NOTES_FILENAME}`);
+  const handoffPath = path.join(run.stage.dir, HANDOFF_FILENAME);
+  const handoff = await readOptional(handoffPath);
+  if (handoff === undefined) {
+    // Without a handoff the reviewer's prompt says "(no handoff.md available)";
+    // nothing is invented here, and the evidence stays in notes.md.
+    controller.log(`Submit for review: ${run.stage.stageId} has no ${HANDOFF_FILENAME}; the reviewer will see no handoff at all`);
+    void vscode.window.showWarningMessage(`Agent Sparring: ${run.stage.stageId} has no ${HANDOFF_FILENAME}, so the reviewer's prompt carries no handoff. The evidence was recorded in ${NOTES_FILENAME}.`);
+    return true;
+  }
+  try {
+    await fs.writeFile(handoffPath, insertHandoffEvidence(handoff, entry), "utf8");
+    controller.log(`Submit for review: mirrored the entry into ${run.stage.stageId}/${HANDOFF_FILENAME} (the reviewer's prompt reads handoff.md verbatim)`);
+  } catch (error) {
+    const proceed = await vscode.window.showWarningMessage(
+      `Agent Sparring: the evidence was recorded in ${NOTES_FILENAME}, but ${HANDOFF_FILENAME} could not be updated (${(error as Error).message}). The reviewer reads handoff.md, so it may not see this evidence.`,
+      "Ask for review anyway",
+    );
+    return proceed === "Ask for review anyway";
+  }
+  return true;
+}
+
+/** Nothing is launched from the wrong branch; the recorded branch is named so the fix is obvious. */
+async function explainWrongBranch(guard: { expected: string; actual?: string }): Promise<void> {
+  const where = guard.actual ? `the repository is on ${guard.actual}` : "no branch is checked out";
+  void vscode.window.showWarningMessage(
+    `Agent Sparring: this stage belongs to ${guard.expected}, but ${where}. Switch branches first; the engine refuses a run on another branch.`,
+  );
 }
 
 // ---------------------------------------------------------------- plan association (UI metadata only)

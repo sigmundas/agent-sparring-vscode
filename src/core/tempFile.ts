@@ -1,9 +1,11 @@
 /**
- * The one place the extension writes a file: a short-lived UTF-8 file in
- * the operating system's temporary directory, handed to the engine by path
- * (`sparring new-stage … --brief-file <path>`) and removed afterwards
- * whatever the outcome. Never a path under a workspace or `.sparring`:
- * everything authoritative is written by the engine.
+ * A short-lived UTF-8 file in the operating system's temporary directory,
+ * handed to the engine by path (`sparring new-stage … --brief-file <path>`)
+ * and removed afterwards whatever the outcome. Never a path under a
+ * workspace or `.sparring`: everything authoritative is written by the
+ * engine. (The one file the extension writes under `.sparring` is a stage's
+ * notes.md `## Human evidence` prose, which the engine documents as written
+ * "by hand" and never parses; see humanChecks.ts.)
  *
  * No dependency on the vscode API.
  */

@@ -87,7 +87,12 @@ describe("overview view model", () => {
     const ws = await planWorkspace("paused", 1, { sparring: sparringMarkdown("NEEDS_YOU", "Check on a Pixel 7", "device_manual_check") });
     const live = foldEvents([event("stage", "turn.started", { provider: "claude-cli" })]);
     const model = buildOverviewModel(await selection(ws), live, ALL, NOW);
-    assert.deepEqual(model.banner, { kind: "stop", text: "Needs you — Check on a Pixel 7" });
+    assert.equal(model.banner, undefined, "the Action required panel replaces the banner");
+    assert.equal(model.actionRequired?.kind, "needs_you");
+    assert.equal(model.actionRequired?.summary, "Check on a Pixel 7");
+    assert.equal(model.actionRequired?.reviewerNote, "device_manual_check");
+    assert.deepEqual(model.actionRequired?.resume, { action: "resumePlan", label: "Resume plan", detail: model.planAction?.detail });
+    assert.equal(model.actionRequired?.submit.enabled, false, "nothing recorded yet");
     assert.equal(model.status?.label, "Needs you");
     assert.equal(model.planAction?.label, "Resume plan");
     assert.equal(model.planAction?.primary, false, "the human request is primary, not the button");
@@ -100,8 +105,10 @@ describe("overview view model", () => {
   it("ESCALATE", async () => {
     const ws = await planWorkspace("paused", 0, { sparring: sparringMarkdown("ESCALATE", "Needs a stronger sparrer") });
     const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
-    assert.equal(model.banner?.kind, "stop");
-    assert.match(model.banner?.text ?? "", /^Escalated — Needs a stronger sparrer/);
+    assert.equal(model.banner, undefined);
+    assert.equal(model.actionRequired?.kind, "escalate");
+    assert.equal(model.actionRequired?.word, "Escalated");
+    assert.equal(model.actionRequired?.summary, "Needs a stronger sparrer");
   });
 
   it("failure pause without a stop verdict shows Paused with the recorded reason", async () => {
@@ -163,7 +170,8 @@ describe("overview view model", () => {
     assert.equal(model.stageHeading, "Hotfix 1");
     assert.equal(model.title, "Hotfix 1");
     assert.equal(model.stageId, "hotfix-1");
-    assert.equal(model.banner?.kind, "stop");
+    assert.equal(model.actionRequired?.kind, "needs_you");
+    assert.match(model.actionRequired?.noChecks ?? "", /No plan is linked/);
     assert.equal(model.stageAgent?.sessionLabel, "ssssssss…");
     assert.equal(model.actions?.plan, false);
   });
@@ -280,11 +288,19 @@ describe("overview HTML", () => {
     assert.match(html, /<li class="step future" [^>]*><span class="node">3<\/span>.*?<span class="state">Pending<\/span><\/li>/);
     assert.match(html, /<span class="hpill" title="docs\/plans\/foo.md">Plan run<\/span><span class="hpill">Stage 2 \/ 3<\/span><span class="hpill warn"><svg[^>]*>.*?<\/svg>Needs you<\/span>/);
     assert.match(html, /<h2 [^>]*><svg class="icon accent needs_you"[^>]*>.*?<\/svg>Stage 2 — Schema &amp; API<\/h2>/);
-    assert.match(html, /<span class="status needs_you" title="[^"]*">Needs you<\/span>/);
+    assert.ok(!/<span class="status needs_you"/.test(html), "the card does not repeat the header pill's Needs you");
     assert.equal((html.match(/<div class="card actor">/g) ?? []).length, 2);
+    assert.ok(html.indexOf('<section class="card action needs_you">') < html.indexOf('<section class="card stage">'), "action required before the stage card");
     assert.ok(html.indexOf('<section class="card stage">') < html.indexOf('<section class="actors">'), "stage before actors");
     assert.ok(html.indexOf('<section class="actors">') < html.indexOf('<dl class="facts">'), "metadata last");
-    assert.match(html, /<div class="banner stop">Needs you — Check<\/div>/);
+    assert.ok(!html.includes('class="banner'), "no banner repeats the panel");
+    assert.equal((normalUi(html).match(/Needs you/g) ?? []).length, 1, "one primary status badge; the panel is titled Action required");
+    assert.match(html, /<h2><svg class="icon needs_you"[^>]*>.*?<\/svg>Action required<\/h2><p class="summary">Check<\/p>/);
+    assert.match(html, /<button type="button" class="primary" data-action="submitForReview" title="[^"]*" disabled>Submit for review<\/button>/);
+    assert.match(html, /data-action="openSparring"[^>]*>Open detailed review</);
+    assert.match(html, /class="quiet" data-action="resumePlan"[^>]*>Resume plan \(implementation\)</);
+    assert.ok(!html.includes("Latest sparring result"), "the panel is the latest sparring result");
+    assert.match(html, /<div class="run muted" title="[^"]*"><span class="plan">docs\/plans\/foo.md<\/span><span class="sep">›<\/span><span>Stage 2 — Schema &amp; API<\/span><\/div>/, "the header names the plan (its label when the document is not read), then the stage");
     assert.ok(!html.includes("Last activity"));
   });
 

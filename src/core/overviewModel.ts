@@ -21,6 +21,8 @@
 import { parseBriefGoal } from "./brief";
 import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
+import { parseHandoffBranch, type SparringOutcome } from "./engineFormats";
+import { deriveVerification, parseHumanEvidence, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
 import { formatTime } from "./logFormat";
 import { deriveLiveness, type ExecutionRecord, type LivenessState, type RunnerLiveness } from "./liveness";
 import { proposeNextStage, type NextStageProposal } from "./nextStage";
@@ -131,6 +133,12 @@ export interface OverviewArtifacts {
   associatedPlan?: AssociatedPlan;
   /** An Accept stage operation started from this window is still running. */
   accepting?: boolean;
+  /** Outcomes the user has recorded for the plan's manual checks (VS Code workspace state, drafts until submitted). */
+  humanChecks?: Record<string, CheckRecord>;
+  /** Contents of the stage's notes.md when readable; only its `## Human evidence` section is consulted (what is already recorded). */
+  notesText?: string;
+  /** Contents of the stage's handoff.md when readable; only its `## Git context` branch line is consulted. */
+  handoffText?: string;
 }
 
 export interface OverviewActions {
@@ -174,6 +182,8 @@ export interface PlanContext {
   matched?: MatchSource;
   /** The label of the current logical stage (associated plans; undefined for an unlabelled heading). */
   currentLabel?: string;
+  /** 1-based line of the current stage's heading in the document, when it was located there. */
+  currentLine?: number;
   /**
    * The stage that follows in workflow order: for a managed run the engine's
    * next stage; for an associated plan the next stage *label* found in the
@@ -220,8 +230,85 @@ export interface WhatsNext {
   start?: NextStageProposal;
 }
 
+/**
+ * The checked-out branch is not the one this stage's work belongs to, as
+ * far as the recorded artifacts say. Both sides are facts: `expected` is
+ * the plan run's `expected_branch` (the engine refuses any other) or the
+ * branch written in the stage's last handoff; `actual` is the repository's
+ * checked-out branch, absent on a detached HEAD. While this is set the
+ * extension offers nothing that runs the engine, because every loop command
+ * takes `--expected-branch` and the engine's branch guard would refuse.
+ */
+export interface BranchGuard {
+  expected: string;
+  /** Undefined when HEAD is detached or the branch could not be read. */
+  actual?: string;
+  /** Where `expected` comes from: the engine's plan-run state, or the stage's handoff.md. */
+  source: "plan-run" | "handoff";
+  /** One sentence naming the source, for the warning's second line. */
+  detail: string;
+}
+
+/**
+ * The single "Action required" panel for a stage the reviewer handed to
+ * the human. It replaces the banner, the card's state word and the Latest
+ * sparring result block for NEEDS_YOU / ESCALATE, so the routing action is
+ * named once in the header pill and explained once here. The lists are
+ * derived from the matched plan section, the routing outcome and the
+ * notes.md `## Human evidence` section (see humanChecks.ts).
+ */
+export interface ActionRequired extends VerificationView {
+  kind: "needs_you" | "escalate";
+  /** `Needs you` / `Escalated`. */
+  word: string;
+  /**
+   * The panel's own title: `Action required` while checks are outstanding,
+   * `Evidence ready for review` once every requested check has an outcome.
+   */
+  headline: string;
+  /** One sentence under a headline that replaces the reviewer's summary. */
+  subtitle?: string;
+  /** The reviewer's routing summary (sparring.md), verbatim. */
+  summary: string;
+  /** The reviewer's needs-you reason, verbatim: the one compact reviewer note. */
+  reviewerNote?: string;
+  /** Why there are no checks at all, when there are none. */
+  noChecks?: string;
+  /**
+   * The last observed review run (`run-sparring`) ended without succeeding.
+   * Said as a failed review, never as an interrupted stage: the stage agent
+   * was not involved.
+   */
+  reviewFailure?: string;
+  /**
+   * Submit for review: record the drafted outcomes and ask the independent
+   * reviewer to look again — `sparring run-sparring` for a standalone stage,
+   * the engine's own `resume-plan --evidence` inside a plan run. Enabled only
+   * once every requested check has an outcome: it is not an implementation
+   * turn, so partial evidence has nothing to add for the reviewer.
+   */
+  submit: { label: string; enabled: boolean; detail: string };
+  /**
+   * Resume *implementation* without new evidence: the existing Resume stage
+   * / Resume plan operation, when one is offered. Deliberately separate from
+   * Submit for review — that asks the reviewer to evaluate the unchanged
+   * candidate, this starts the stage agent again.
+   */
+  resume?: { action: "runStage" | "resumePlan"; label: string; detail: string };
+  /** Open plan section is possible (the plan was located). */
+  planSection: boolean;
+  /** The detailed review (sparring.md) exists. */
+  review: boolean;
+}
+
 export interface OverviewModel {
   kind: "empty" | "ambiguous" | "run";
+  /** The plan the stage belongs to (managed run or associated file), for the header. */
+  planName?: string;
+  /** The checked-out branch is not this stage's; nothing that runs the engine is offered while it is set. */
+  branchGuard?: BranchGuard;
+  /** Reviewer hand-back to the human; present only for NEEDS_YOU / ESCALATE with no turn in progress. */
+  actionRequired?: ActionRequired;
   title: string;
   /** `Plan run` or `Standalone stage`. */
   runKind?: string;
@@ -306,6 +393,7 @@ export function buildOverviewModel(
   const presentation = presentStage(stage.state?.status, outcome, live);
   const fresh = isFreshStage(run, stage, presentation, liveness);
   const plan = planContext(run, stage, artifacts);
+  const branchGuard = branchMismatch(run, artifacts);
 
   const model: OverviewModel = {
     kind: "run",
@@ -333,7 +421,7 @@ export function buildOverviewModel(
   };
   model.lastEvent = model.history?.[model.history.length - 1];
   if (liveness.interrupted) {
-    model.activity = { kind: "stopped", text: "Stopped · last turn interrupted" };
+    model.activity = { kind: "stopped", text: liveness.execution?.kind === "run-sparring" ? "Stopped · independent review did not finish" : "Stopped · last turn interrupted" };
   } else if (liveness.stale) {
     model.activity = { kind: "stale", text: `${model.activity?.text ?? "Working"} · no meaningful activity for ${formatAge(nowMs - Date.parse(live?.lastMeaningful?.ts ?? live?.lastEventTs ?? ""))}` };
   }
@@ -350,7 +438,9 @@ export function buildOverviewModel(
   } else if (!halted && loopEligible && liveness.turnActive) {
     // Telemetry alone: no second loop from the button, and no certain claim either.
     model.busyState = { label: "Run status unknown", detail: liveness.detail, state: "unknown" };
-  } else if (liveness.state !== "running") {
+  } else if (liveness.state !== "running" && !branchGuard) {
+    // On the wrong branch nothing is offered: every loop command passes
+    // --expected-branch and the engine's own guard would refuse the run.
     if (run.kind === "stage") {
       const actions = stageActions(run, liveness);
       model.stageAction = actions.primary;
@@ -359,6 +449,7 @@ export function buildOverviewModel(
       model.planAction = planAction(run, liveness);
     }
   }
+  model.branchGuard = branchGuard;
 
   if (run.kind === "plan") {
     Object.assign(model, timeline(run));
@@ -394,7 +485,164 @@ export function buildOverviewModel(
   if (stage.state?.status === "accepted" && !(run.kind === "plan" && run.state.status === "complete")) {
     model.whatsNext = whatsNext(run, plan, artifacts, model.planAction);
   }
+  model.planName = plan?.name;
+  model.actionRequired = actionRequired(run, presentation, outcome, plan, artifacts, model, branchGuard, liveness);
+  if (model.actionRequired) {
+    // The panel names and explains the action; no banner repeats it.
+    delete model.banner;
+    if (model.actionRequired.ready && model.actionRequired.kind === "needs_you") {
+      // The recorded routing action is still NEEDS_YOU; what changed is that
+      // every check it asked for now has an outcome. The pill says that, and
+      // the panel's own headline is the only other place it is said.
+      model.status = { label: "Evidence ready", tone: "info" };
+    }
+  }
   return model;
+}
+
+// ---------------------------------------------------------------- branch guard
+
+/**
+ * The recorded branch for this run against the checked-out one. A managed
+ * plan run records `expected_branch` and the engine refuses every other
+ * branch; a standalone stage records none, so the branch its last handoff
+ * was generated on (handoff.py's `## Git context`) is the only written-down
+ * answer. Undefined when nothing is recorded, when the checked-out branch
+ * is unknown *and* nothing is recorded, or when the two agree.
+ */
+export function branchMismatch(run: RunSnapshot, artifacts: OverviewArtifacts): BranchGuard | undefined {
+  // An accepted stage (or a finished plan) runs nothing, and the branch it
+  // was written on may legitimately have been merged away since: warning
+  // about the checkout there would be noise, not a guard.
+  if (run.kind === "plan" ? run.state.status === "complete" : run.stage.state?.status === "accepted") {
+    return undefined;
+  }
+  const expected =
+    run.kind === "plan"
+      ? { branch: run.state.expectedBranch, source: "plan-run" as const, detail: "The plan run was started for this branch (expected_branch in the engine's plan-run state); the engine refuses any other." }
+      : artifacts.handoffText
+        ? { branch: parseHandoffBranch(artifacts.handoffText), source: "handoff" as const, detail: "This stage's last recorded handoff was generated on that branch (## Git context in handoff.md); state.json records no branch." }
+        : undefined;
+  if (!expected?.branch?.trim()) {
+    return undefined;
+  }
+  const actual = artifacts.git?.branch?.trim();
+  if (actual === expected.branch.trim()) {
+    return undefined;
+  }
+  if (actual === undefined && artifacts.git === undefined) {
+    return undefined; // nothing was read about the repository: no claim either way
+  }
+  return { expected: expected.branch.trim(), actual, source: expected.source, detail: expected.detail };
+}
+
+// ---------------------------------------------------------------- action required (NEEDS_YOU / ESCALATE)
+
+/**
+ * Built when the recorded routing outcome hands the stage to the human and
+ * no turn is acting on it: a standalone stage presenting Needs you /
+ * Escalated, or a paused plan run whose current outcome is one of those.
+ * The manual checks come from the matched plan section (managed: the
+ * engine's current stage located in the document; associated: the same
+ * match the plan context used); the reviewer's sentences are attached to
+ * the check they overlap with, else listed as additional requests.
+ */
+function actionRequired(
+  run: RunSnapshot,
+  presentation: StagePresentation,
+  outcome: SparringOutcome | undefined,
+  plan: PlanContext | undefined,
+  artifacts: OverviewArtifacts,
+  model: OverviewModel,
+  branchGuard: BranchGuard | undefined,
+  liveness: RunnerLiveness,
+): ActionRequired | undefined {
+  if (!outcome || (outcome.action !== "NEEDS_YOU" && outcome.action !== "ESCALATE")) {
+    return undefined;
+  }
+  const handedOver = run.kind === "plan" ? run.state.status === "paused" : presentation.kind === "needs_you" || presentation.kind === "escalate";
+  if (!handedOver || model.accepting) {
+    return undefined;
+  }
+  const kind = outcome.action === "NEEDS_YOU" ? "needs_you" : "escalate";
+  const planText = run.kind === "plan" ? artifacts.planText : artifacts.associatedPlan?.text;
+  const sectionLine = plan?.currentLine;
+  const checks = planText && sectionLine ? planChecks(planText, sectionLine) : { explicit: [], parents: [] };
+  const view = deriveVerification(checks, outcome, parseHumanEvidence(artifacts.notesText), artifacts.humanChecks ?? {});
+  let noChecks: string | undefined;
+  if (view.recorded.length === 0 && view.required.length === 0) {
+    if (!plan) {
+      noChecks = "No plan is linked to this stage, so no plan checks can be listed, and the sparring report requests nothing specific. Choose plan… links one.";
+    } else if (!planText) {
+      noChecks = `The plan ${plan.name} could not be read.`;
+    } else if (!sectionLine) {
+      noChecks = plan.source === "associated" ? `Agent Sparring doesn't yet know which section of ${plan.name} is this stage. Match this stage… to list its manual checks.` : `The current stage could not be located in ${plan.name}.`;
+    } else {
+      noChecks = "The plan section for this stage lists no manual or human-gated checks, and the sparring report requests nothing specific.";
+    }
+  }
+  const resume: ActionRequired["resume"] | undefined =
+    run.kind === "plan"
+      ? model.planAction
+        ? { action: "resumePlan", label: model.planAction.label, detail: model.planAction.detail }
+        : undefined
+      : model.stageAction && model.stageAction.kind !== "accept"
+        ? { action: "runStage", label: model.stageAction.label, detail: `sparring run-loop ${model.stageId ?? ""}: the stage agent implements again first, then the reviewer looks. Use it when there is work to do, not to hand over evidence.` }
+        : undefined;
+  const ready = view.ready;
+  const pending = view.required.filter((item) => !item.record?.outcome).length;
+  const command =
+    run.kind === "plan"
+      ? "sparring resume-plan --evidence …: the engine records the evidence and continues the plan at this same stage"
+      : `sparring run-sparring ${model.stageId ?? ""}: the recorded sparring session reads the evidence and rules again. The stage agent is not started.`;
+  let submitDetail: string;
+  let submitEnabled = false;
+  if (branchGuard) {
+    submitDetail = `Switch to ${branchGuard.expected} first; the engine refuses to review a candidate from another branch.`;
+  } else if (view.recorded.length === 0 && view.required.length === 0) {
+    submitDetail = "No requested check is listed, so there is no recorded evidence to send.";
+  } else if (!ready) {
+    submitDetail = `Record Pass, Fail or Blocked for ${pending === 1 ? "the remaining check" : `all ${pending} remaining checks`} first. Submitting asks the reviewer to rule on the evidence, so it goes when the evidence is complete.`;
+  } else if (blocked(model)) {
+    submitDetail = "Nothing can run right now (a runner is alive or its status is unknown).";
+  } else {
+    submitEnabled = true;
+    submitDetail = `Records the drafted results under '## Human evidence' and asks the reviewer to rule on them (${command}). The reviewer decides; nothing is marked ready or accepted here.`;
+  }
+  return {
+    ...view,
+    kind,
+    word: actionWord(outcome.action),
+    reviewFailure: reviewFailure(liveness),
+    headline: ready && kind === "needs_you" ? "Evidence ready for review" : "Action required",
+    subtitle: ready && kind === "needs_you" ? "All requested checks have evidence. Send it back to the independent reviewer." : undefined,
+    summary: outcome.summary,
+    reviewerNote: outcome.needsYouReason,
+    noChecks,
+    submit: { label: "Submit for review", enabled: submitEnabled, detail: submitDetail },
+    resume,
+    planSection: Boolean(sectionLine && (run.kind === "plan" ? artifacts.plan : artifacts.associatedPlan?.exists)),
+    review: artifacts.sparring,
+  };
+}
+
+/**
+ * The last observed run for this stage was a review (`run-sparring`) that
+ * ended without succeeding. Only the process observation speaks here: which
+ * command it was, and how it ended.
+ */
+function reviewFailure(liveness: RunnerLiveness): string | undefined {
+  const execution = liveness.execution;
+  if (!execution || execution.kind !== "run-sparring" || execution.state !== "ended" || execution.exitCode === 0) {
+    return undefined;
+  }
+  const how = execution.exitCode === undefined ? "was interrupted or its terminal closed" : `exited with code ${execution.exitCode}`;
+  return `The last review run ${how}. The stage and its candidate are unchanged, and the recorded evidence is still there: Submit for review tries the reviewer again.`;
+}
+
+/** Nothing may be launched: a runner is alive, or telemetry claims a turn nothing has observed ending. */
+function blocked(model: OverviewModel): boolean {
+  return model.busyState !== undefined || model.runner?.alive === true;
 }
 
 // ---------------------------------------------------------------- pieces
@@ -606,10 +854,12 @@ function planContext(run: RunSnapshot, stage: StageSnapshot, artifacts: Overview
         defined: true,
       };
     }
+    const currentInDocument = artifacts.planText ? parsePlanHeadings(artifacts.planText).find((heading) => heading.label === String(stage.number ?? index + 1) && heading.title === stage.title) : undefined;
     return {
       source: "managed",
-      name: run.state.plan,
+      name: (artifacts.planText ? planTitle(artifacts.planText) : undefined) ?? run.state.plan,
       current: `Stage ${stage.number ?? index + 1} — ${stageDisplayName(stage)}`,
+      currentLine: currentInDocument?.line,
       next,
       hasHeadings: Boolean(stages && stages.length > 0),
       hasStageLabels: Boolean(stages && stages.length > 0),
@@ -645,6 +895,8 @@ function planContext(run: RunSnapshot, stage: StageSnapshot, artifacts: Overview
     current: position?.display,
     matched: position?.source,
     currentLabel: position?.stage?.label,
+    // The stage's defining section when the plan has one; else the heading that was matched.
+    currentLine: position ? (position.stage?.canonical ?? position.current).line : undefined,
     next,
     nextState: position?.next.state,
     hasHeadings: headings.length > 0,
@@ -750,6 +1002,11 @@ function currentLine(
     // No banner: the header pill already says Accepted and this line says complete.
     return { stageLine: "Stage complete." };
   } else if (presentation.kind === "needs_you") {
+    // A review run that died says so, even while the recorded outcome is
+    // still NEEDS_YOU: the stage agent was never involved in it.
+    if (liveness.interrupted && liveness.execution?.kind === "run-sparring") {
+      return { stageLine: "The independent review did not finish. The stage and its candidate are unchanged." };
+    }
     return {
       stageLine: "Waiting for you. When it is done, resume the stage; the reviewer checks again.",
       banner: { kind: "stop", text: `Needs you${outcome?.summary ? ` — ${outcome.summary}` : ""}` },
@@ -771,7 +1028,7 @@ function currentLine(
     return { stageLine: "Finalizing did not complete. Use Accept stage to finish it." };
   }
   if (liveness.interrupted && (presentation.kind === "working" || presentation.kind === "send_back")) {
-    return { stageLine: "The last run was interrupted." };
+    return { stageLine: liveness.execution?.kind === "run-sparring" ? "The independent review did not finish. The stage and its candidate are unchanged." : "The last run was interrupted." };
   }
   if (live?.sparrer.busy) {
     return { stageLine: "Under independent review." };

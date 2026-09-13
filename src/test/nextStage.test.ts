@@ -231,7 +231,13 @@ describe("new-stage is the engine's own lifecycle", () => {
       }
     }
     await walk(src);
-    assert.deepEqual(offenders, ["core/tempFile.ts"], "state.json, brief.md and the stage directory come from `sparring new-stage`; the extension's one write is the temporary brief it hands the engine");
+    assert.deepEqual(offenders, ["core/tempFile.ts", "vscode/commands.ts"], "state.json, brief.md and the stage directory come from `sparring new-stage`; the extension writes only the temporary brief it hands the engine and, on Submit evidence, a stage's notes.md ## Human evidence prose");
+    const commandWrites = (await fs.readFile(path.join(src, "vscode", "commands.ts"), "utf8")).match(/\bfs\.writeFile\([^\n]*/g) ?? [];
+    assert.deepEqual(
+      commandWrites.map((call) => /\(([^,]+),/.exec(call)?.[1]),
+      ["notesPath", "handoffPath"],
+      "the only workspace files the extension writes are the stage's notes.md (the engine's own '## Human evidence' append) and the same entry in handoff.md, which is what the reviewer's prompt reads",
+    );
     const temp = await fs.readFile(path.join(src, "core", "tempFile.ts"), "utf8");
     assert.match(temp, /mkdtemp\(path\.join\(os\.tmpdir\(\)/, "the temporary file lives under the OS temporary directory");
     assert.ok(!/\.sparring["'/]|sparringDir|repoRoot|workspace/.test(temp.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "")), "and its location is never derived from the workspace or .sparring");

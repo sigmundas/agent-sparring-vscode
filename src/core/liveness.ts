@@ -43,13 +43,13 @@ export type ExecutionState =
   /** The hosting terminal survived a reload but whether the command inside it is still running cannot be established. */
   | "unknown";
 
-/** What the extension knows about one `sparring` run-loop / run-plan / resume-plan process. */
+/** What the extension knows about one `sparring` run-loop / run-sparring / run-plan / resume-plan process. */
 export interface ExecutionRecord {
   /** Unique per observation; a new launch or a newly observed command gets a new id. */
   id: string;
   /** The discovered run this execution belongs to (see discovery.runIdFor). */
   runId: string;
-  kind: "run-loop" | "run-plan" | "resume-plan";
+  kind: "run-loop" | "run-sparring" | "run-plan" | "resume-plan";
   source: ExecutionSource;
   state: ExecutionState;
   startedAtMs: number;

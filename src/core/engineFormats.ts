@@ -230,6 +230,35 @@ export function parsePlanStages(markdown: string, planKey?: string): PlanStageHe
 }
 
 // ---------------------------------------------------------------------------
+// handoff.md git context (handoff.py: render_handoff)
+// ---------------------------------------------------------------------------
+
+/**
+ * The branch recorded in a stage's `handoff.md` (`## Git context` → ``- Branch:
+ * `feature/x` ``, handoff.py). That is the branch the stage's last handoff was
+ * generated on: the only place a standalone stage's branch is written down,
+ * since state.json records none. Undefined when the file has no such line.
+ */
+export function parseHandoffBranch(markdown: string): string | undefined {
+  const lines = markdown.split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === "## Git context");
+  if (start < 0) {
+    return undefined;
+  }
+  for (let index = start + 1; index < lines.length; index++) {
+    if (/^#{1,2}\s/.test(lines[index])) {
+      break;
+    }
+    const match = /^-\s+Branch:\s*`?([^`\s][^`]*?)`?\s*$/.exec(lines[index]);
+    if (match) {
+      const branch = match[1].trim();
+      return branch && branch !== "not recorded" ? branch : undefined;
+    }
+  }
+  return undefined;
+}
+
+// ---------------------------------------------------------------------------
 // sparring.md routing outcome (sparring_exchange.py: render_sparring)
 // ---------------------------------------------------------------------------
 
@@ -241,6 +270,8 @@ export interface SparringOutcome {
   action: RoutingAction;
   summary: string;
   needsYouReason?: string;
+  /** The body of the engine-rendered `## Deferred` section (the sparrer's deferred / human-gated items), when present and non-empty. */
+  deferred?: string;
 }
 
 /**
@@ -281,7 +312,24 @@ export function parseSparringOutcome(markdown: string): SparringOutcome | undefi
   if (!action || !ROUTING_ACTIONS.has(action)) {
     return undefined;
   }
-  return { action: action as RoutingAction, summary, needsYouReason };
+  return { action: action as RoutingAction, summary, needsYouReason, deferred: sectionBody(lines, "## Deferred") };
+}
+
+/** The trimmed prose under a `##` heading of sparring.md, up to the next `#`/`##` heading; undefined when absent, empty or the template's `(none)`. */
+function sectionBody(lines: string[], heading: string): string | undefined {
+  const start = lines.findIndex((line) => line.trim() === heading);
+  if (start < 0) {
+    return undefined;
+  }
+  const body: string[] = [];
+  for (let index = start + 1; index < lines.length; index++) {
+    if (/^#{1,2}\s/.test(lines[index])) {
+      break;
+    }
+    body.push(lines[index]);
+  }
+  const text = body.join("\n").trim();
+  return !text || /^\((?:none|not applicable|none recorded)\)$/i.test(text) ? undefined : text;
 }
 
 // ---------------------------------------------------------------------------

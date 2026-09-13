@@ -13,7 +13,8 @@
  * meaningful event on the right); provider cards; recent events; metadata.
  */
 
-import { TIMELINE_STATE_WORD, type ActorCard, type HistoryEntry, type OverviewModel, type TimelineItem, type WhatsNext } from "./overviewModel";
+import { CHECK_OUTCOMES, OUTCOME_WORDS, type CheckItem, type CheckOutcome } from "./humanChecks";
+import { TIMELINE_STATE_WORD, type ActionRequired, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { MatchSource } from "./planAssociation";
 import type { StageRunAction } from "./runner";
 
@@ -34,7 +35,17 @@ export type OverviewAction =
   | "matchStage"
   | "clearMatch"
   | "startNextStage"
-  | "stopRunner";
+  | "stopRunner"
+  | "openPlanSection"
+  | "submitForReview";
+
+/** A Pass / Fail / Blocked click or a note edit on one manual check, posted by the webview as it happens. */
+export interface HumanCheckMessage {
+  type: "humanCheck";
+  key: string;
+  outcome?: CheckOutcome;
+  note?: string;
+}
 
 export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "openHandoff",
@@ -54,6 +65,8 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "clearMatch",
   "startNextStage",
   "stopRunner",
+  "openPlanSection",
+  "submitForReview",
 ];
 
 export function escapeHtml(text: string): string {
@@ -123,7 +136,12 @@ function renderBody(model: OverviewModel): string {
 
   const parts: string[] = [];
   parts.push(renderHeader(model));
-  if (model.banner) {
+  if (model.branchGuard) {
+    parts.push(renderBranchGuard(model.branchGuard));
+  }
+  if (model.actionRequired) {
+    parts.push(renderActionRequired(model, model.actionRequired));
+  } else if (model.banner) {
     parts.push(`<div class="banner ${model.banner.kind}">${escapeHtml(model.banner.text)}</div>`);
   }
   if (model.timeline && model.timeline.length > 0) {
@@ -158,10 +176,111 @@ function renderHeader(model: OverviewModel): string {
   if (model.status) {
     pills.push(`<span class="hpill ${model.status.tone}">${icon("dot", "dot")}${escapeHtml(model.status.label)}</span>`);
   }
+  if (model.branchGuard) {
+    pills.push(`<span class="hpill bad" title="${escapeHtml(`This stage belongs to ${model.branchGuard.expected}`)}">${icon("warn", "escalate")}Wrong branch</span>`);
+  }
+  // The plan the stage belongs to, then the stage: the run label alone
+  // (a stage id) does not say which piece of work this is part of.
+  const stageName = model.plan?.current ?? model.stageHeading ?? model.title;
+  const crumb = model.planName ? `<span class="plan">${escapeHtml(model.planName)}</span><span class="sep">›</span><span>${escapeHtml(stageName)}</span>` : `<span class="id">${escapeHtml(model.title)}</span>`;
   return `<header class="top">
-<div><h1>Agent Sparring</h1><div class="run muted" title="${escapeHtml(model.stageId ?? "")}">${escapeHtml(model.title)}</div></div>
+<div><h1>Agent Sparring</h1><div class="run muted" title="${escapeHtml(model.stageId ?? "")}">${crumb}</div></div>
 <div class="pills">${pills.join("")}</div>
 </header>`;
+}
+
+// ---------------------------------------------------------------- wrong branch
+
+/**
+ * The checked-out branch is not this stage's. Prominent, above everything,
+ * and paired with the absence of every engine action: each loop command
+ * passes `--expected-branch`, so running one here would be refused by the
+ * engine's own branch guard anyway.
+ */
+function renderBranchGuard(guard: BranchGuard): string {
+  const actual = guard.actual ? `The repository is on <span class="branch">${escapeHtml(guard.actual)}</span>.` : "No branch is checked out (detached HEAD).";
+  return `<section class="card branchguard">
+<h2>${icon("warn", "escalate")}Wrong branch</h2>
+<p>This stage belongs to <span class="branch">${escapeHtml(guard.expected)}</span>. ${actual}</p>
+<p class="muted small">Switch branches before resuming. ${escapeHtml(guard.detail)}</p>
+</section>`;
+}
+
+// ---------------------------------------------------------------- action required
+
+/**
+ * The one place a NEEDS_YOU / ESCALATE outcome is explained: the reviewer's
+ * summary once, one compact reviewer note, then Manual verification in
+ * four parts — the plan requirement (explicit checks or verbatim prose),
+ * the reviewer's requested checks (labelled as reviewer-derived), what
+ * notes.md already records, and what is still required with Pass / Fail /
+ * Blocked and a note each. Every check appears once, in the recorded or
+ * the required list, tagged Plan or Reviewer. Submit evidence & resume
+ * records the outcomes under ## Human evidence and resumes the same stage;
+ * nothing here marks the stage ready or accepted.
+ */
+function renderActionRequired(model: OverviewModel, panel: ActionRequired): string {
+  const summary = panel.subtitle ? `<p class="summary">${escapeHtml(panel.subtitle)}</p>` : panel.summary ? `<p class="summary">${escapeHtml(panel.summary)}</p>` : "";
+  const note = panel.reviewerNote ? `<p class="reason"><span class="tag reviewer">Reviewer note</span> ${escapeHtml(panel.reviewerNote)}</p>` : "";
+  const failure = panel.reviewFailure ? `<p class="failure">${icon("warn", "escalate")}${escapeHtml(panel.reviewFailure)}</p>` : "";
+  const total = panel.recorded.length + panel.required.length;
+  let body = "";
+  if (total === 0) {
+    body = `<p class="muted">${escapeHtml(panel.noChecks ?? "")}</p>`;
+  } else {
+    const parts: string[] = [];
+    // Plan requirement: the plan's words, never rewritten.
+    if (panel.explicitCount > 0) {
+      parts.push(`<div class="part"><h4>Plan requirement</h4><p class="muted small">${panel.explicitCount} explicit check${panel.explicitCount === 1 ? "" : "s"} under the plan's <em>Manual verification</em> list, shown below as written.</p>${panel.parents.map((parent) => `<p class="criterion parent">${escapeHtml(parent.text)}</p>`).join("")}</div>`);
+    } else if (panel.parents.length > 0) {
+      parts.push(`<div class="part"><h4>Plan requirement</h4>${panel.parents.map((parent) => `<p class="criterion parent" title="${escapeHtml(`Plan line ${parent.line}`)}">${escapeHtml(parent.text)}</p>`).join("")}${panel.reviewerCount > 0 ? `<p class="muted small">The plan states this as prose; the checks below are the reviewer's more specific requests, not plan text.</p>` : ""}</div>`);
+    } else {
+      parts.push(`<div class="part"><h4>Plan requirement</h4><p class="muted small">The plan section for this stage lists no manual check; the checks below are the reviewer's.</p></div>`);
+    }
+    if (panel.reviewerCount > 0) {
+      parts.push(`<div class="part"><h4>Reviewer requested checks</h4><p class="muted small">${panel.reviewerCount} check${panel.reviewerCount === 1 ? "" : "s"} taken from the sparring report's own sentences (marked <span class="tag reviewer">Reviewer</span> below); the wording is the reviewer's, not the plan's.</p></div>`);
+    }
+    parts.push(`<div class="part"><h4>Evidence already recorded</h4>${panel.recorded.length > 0 ? `<ol class="checklist recorded">${panel.recorded.map(renderRecorded).join("")}</ol>` : `<p class="muted small">Nothing under ## Human evidence in notes.md names these checks yet.</p>`}</div>`);
+    parts.push(`<div class="part"><h4>Still required</h4>${panel.required.length > 0 ? `<ol class="checklist">${panel.required.map(renderRequired).join("")}</ol>` : `<p class="muted small">Every check has recorded evidence. Submit nothing new, or resume so the reviewer reads it.</p>`}</div>`);
+    body = parts.join("");
+  }
+  const progress = panel.progress ? `<span class="progress" title="Checks with recorded or drafted Pass, out of all checks">${escapeHtml(panel.progress)}</span>` : "";
+  const buttons: string[] = [];
+  buttons.push(button("submitForReview", panel.submit.label, panel.submit.enabled, panel.submit.detail, "primary"));
+  if (panel.planSection) {
+    buttons.push(button("openPlanSection", "Open plan section", true, `Open ${model.planName ?? "the plan"} at this stage's section`));
+  }
+  buttons.push(button("openSparring", "Open detailed review", panel.review, "Open sparring.md"));
+  if (panel.resume) {
+    buttons.push(button(panel.resume.action, `${panel.resume.label} (implementation)`, true, panel.resume.detail, "quiet"));
+  }
+  return `<section class="card action ${panel.kind}${panel.ready ? " ready" : ""}">
+<div class="actionhead"><h2>${icon(panel.ready && panel.kind === "needs_you" ? "check" : "warn", panel.ready && panel.kind === "needs_you" ? "ready" : panel.kind)}${escapeHtml(panel.headline)}</h2>${summary}${note}${failure}</div>
+<div class="checks"><h3>${icon("check", "accent")}Manual verification ${progress}</h3>${body}</div>
+<div class="actions">${buttons.join("")}</div>
+</section>`;
+}
+
+function originTag(item: CheckItem): string {
+  return item.origin === "plan" ? `<span class="tag plan" title="${escapeHtml(item.line ? `Plan line ${item.line}` : "From the plan")}">Plan</span>` : `<span class="tag reviewer" title="From the sparring report, not the plan">Reviewer</span>`;
+}
+
+/** ✓ text — recorded in notes.md; the excerpt says which entry, so a wrong match is visible. */
+function renderRecorded(item: CheckItem): string {
+  const outcome = item.evidence?.outcome;
+  const mark = outcome === "fail" ? "✗" : outcome === "blocked" ? "⊘" : "✓";
+  const word = outcome ? `<span class="outcome ${outcome}">${OUTCOME_WORDS[outcome]}</span> ` : "";
+  return `<li class="check done ${escapeHtml(outcome ?? "pass")}"><div class="checkrow"><span class="mark">${mark}</span><div class="checkbody"><p class="criterion">${word}${escapeHtml(item.text)} ${originTag(item)}</p><p class="muted small evidence" title="${item.evidence?.how === "exact" ? "A result recorded from this panel" : "A ## Human evidence entry naming this check"}">notes.md: ${escapeHtml(item.evidence?.excerpt ?? "")}</p></div></div></li>`;
+}
+
+/** ○ text with Pass / Fail / Blocked and a note. */
+function renderRequired(item: CheckItem): string {
+  const outcome = item.record?.outcome;
+  const choices = CHECK_OUTCOMES.map((candidate) => `<button type="button" class="choice ${candidate}${outcome === candidate ? " on" : ""}" data-check="${escapeHtml(item.key)}" data-outcome="${candidate}" aria-pressed="${outcome === candidate}">${OUTCOME_WORDS[candidate]}</button>`).join("");
+  return `<li class="check${outcome ? ` ${outcome}` : ""}">
+<div class="checkrow"><span class="mark">○</span><div class="checkbody"><p class="criterion">${escapeHtml(item.text)} ${originTag(item)}</p></div></div>
+<div class="record"><span class="choices">${choices}</span><textarea class="note" data-check="${escapeHtml(item.key)}" rows="1" placeholder="Evidence or note (optional)">${escapeHtml(item.record?.note ?? "")}</textarea></div>
+</li>`;
 }
 
 const JOURNEY_ICON: Record<TimelineItem["state"], keyof typeof ICON | undefined> = {
@@ -199,18 +318,21 @@ function stageActionButton(action: StageRunAction, stageId: string | undefined, 
 
 function renderStageCard(model: OverviewModel): string {
   const accepted = model.whatsNext !== undefined;
+  const handedOver = model.actionRequired !== undefined;
   // Once accepted, the header pill already says Accepted: the card line
-  // says "Stage complete." once and nothing repeats it.
+  // says "Stage complete." once and nothing repeats it. Likewise Needs you /
+  // Escalated: the pill names it and the Action required panel explains it.
   const statusWord =
-    model.stageStatus && !accepted
+    model.stageStatus && !accepted && !handedOver
       ? `<span class="status ${escapeHtml(model.stageStatusKind ?? "")}" title="${escapeHtml(model.stageRaw ? `Engine state: ${model.stageRaw}` : "")}">${escapeHtml(model.stageStatus)}</span><span class="sep">·</span>`
       : "";
   const cycle = model.cycle !== undefined ? `<span class="muted" title="loop cycle from telemetry">cycle ${model.cycle}</span><span class="sep">·</span>` : "";
   const buttons: string[] = [];
-  if (model.stageAction) {
+  if (model.stageAction && !handedOver) {
+    // While the human is asked for something, the resume lives in the Action required panel.
     buttons.push(stageActionButton(model.stageAction, model.stageId));
   }
-  if (model.planAction && !accepted) {
+  if (model.planAction && !accepted && !handedOver) {
     // For an accepted stage the plan action is the primary button of What's next instead.
     buttons.push(button("resumePlan", model.planAction.label, true, model.planAction.detail, model.planAction.primary ? "primary" : ""));
   }
@@ -250,7 +372,9 @@ function renderStageCard(model: OverviewModel): string {
     ? `<div class="block"><h3>${icon("target", "accent")}Goal</h3><p class="goal">${escapeHtml(model.goal)}</p></div>`
     : `<div class="block"><h3>${icon("target", "accent")}Goal</h3><p class="muted">${model.actions?.brief ? "brief.md has no ## Goal paragraph." : "No brief.md for this stage yet."}</p></div>`;
   let sparring = `<div class="block"><h3>${icon("chat")}Latest sparring result</h3><p class="muted">No routing outcome recorded yet.</p></div>`;
-  if (model.lastSparring) {
+  if (handedOver) {
+    sparring = ""; // the Action required panel is the latest sparring result
+  } else if (model.lastSparring) {
     const action = model.lastSparring.action;
     const reason = model.lastSparring.reason ? ` <span class="muted">(${escapeHtml(model.lastSparring.reason)})</span>` : "";
     const iconName = action === "READY" ? "check" : "warn";
@@ -468,6 +592,63 @@ h1 { font-size: 1.35em; font-weight: 600; margin: 0; }
 .hpill.info { color: var(--info); border-color: var(--info); }
 .hpill.warn { color: var(--warn); border-color: var(--warn); }
 
+.run .plan { font-family: var(--vscode-font-family); font-weight: 600; color: var(--vscode-foreground); }
+.run .sep { margin: 0 6px; }
+
+.branchguard { padding: 12px 14px; margin: 8px 0 12px; border-left: 3px solid var(--bad); }
+.branchguard h2 { font-size: 1.1em; }
+.branchguard h2 .icon { color: var(--bad); }
+.branch { font-family: var(--vscode-editor-font-family); font-weight: 600; color: var(--vscode-foreground); }
+.hpill.bad { color: var(--bad); border-color: var(--bad); }
+.hpill .icon { width: 11px; height: 11px; margin-right: 5px; }
+
+.action { padding: 12px 14px 12px; margin: 8px 0 12px; border-left: 3px solid var(--warn); }
+.action.ready { border-left-color: var(--good); }
+.action.ready h2 .icon { color: var(--good); }
+.failure { display: flex; align-items: flex-start; margin-top: 6px; color: var(--bad); }
+.action.escalate { border-left-color: var(--bad); }
+.action h2 { font-size: 1.1em; }
+.action h2 .icon { color: var(--warn); }
+.action.escalate h2 .icon { color: var(--bad); }
+.action .summary { margin: 4px 0 0; font-weight: 600; }
+.action .reason { margin: 0 0 4px; }
+.action .checks { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+.action h3 .progress { margin-left: auto; font-weight: 600; color: var(--info); font-family: var(--vscode-editor-font-family); font-size: 0.95em; }
+.small { font-size: 0.88em; }
+.action .part { margin-top: 8px; }
+.action h4 { margin: 0 0 3px; font-size: 0.9em; font-weight: 600; color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 0.04em; }
+.tag { display: inline-block; padding: 0 6px; border-radius: 4px; font-size: 0.78em; font-weight: 600; vertical-align: 1px; border: 1px solid var(--line); color: var(--vscode-descriptionForeground); }
+.tag.plan { border-color: var(--info); color: var(--info); }
+.tag.reviewer { border-color: var(--codex); color: var(--codex); }
+.checklist { list-style: none; margin: 4px 0 0; padding: 0; }
+.check { padding: 6px 0 8px; border-top: 1px dashed var(--line); }
+.check:first-child { border-top: none; }
+.checkrow { display: flex; gap: 10px; align-items: flex-start; }
+.check .mark { flex: none; width: 18px; text-align: center; font-weight: 700; color: var(--vscode-descriptionForeground); }
+.check.pass .mark { color: var(--good); }
+.check.fail .mark { color: var(--bad); }
+.check.blocked .mark { color: var(--warn); }
+.checkbody { flex: 1 1 auto; min-width: 0; }
+.criterion { margin: 0 0 2px; white-space: pre-wrap; }
+.criterion.parent { padding: 4px 10px; border-left: 2px solid var(--info); background: var(--vscode-textBlockQuote-background); }
+.check.done .criterion { color: var(--vscode-descriptionForeground); }
+.outcome { font-weight: 600; }
+.outcome.pass { color: var(--good); }
+.outcome.fail { color: var(--bad); }
+.outcome.blocked { color: var(--warn); }
+.evidence { margin: 0; font-family: var(--vscode-editor-font-family); }
+.record { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0 0 28px; flex-wrap: wrap; }
+.choices { display: inline-flex; gap: 0; flex: none; }
+button.choice { border-radius: 0; margin-left: -1px; }
+button.choice:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
+button.choice:last-child { border-radius: 0 6px 6px 0; }
+button.choice.on.pass { background: var(--good); color: var(--vscode-editor-background); border-color: var(--good); font-weight: 600; }
+button.choice.on.fail { background: var(--bad); color: var(--vscode-editor-background); border-color: var(--bad); font-weight: 600; }
+button.choice.on.blocked { background: var(--warn); color: var(--vscode-editor-background); border-color: var(--warn); font-weight: 600; }
+textarea.note { flex: 1 1 240px; min-height: 26px; padding: 4px 8px; font-family: inherit; font-size: 0.92em; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--line)); border-radius: 6px; resize: vertical; }
+textarea.note:focus { outline: 1px solid var(--vscode-focusBorder); }
+.action > .actions { margin-top: 12px; }
+
 .banner { margin: 8px 0 10px; padding: 6px 10px; border-left: 3px solid var(--info); background: var(--vscode-textBlockQuote-background); font-weight: 600; }
 .banner.stop, .banner.warn { border-left-color: var(--warn); }
 .banner.done { border-left-color: var(--good); }
@@ -586,9 +767,35 @@ const SCRIPT = `
 (function () {
   var vscode = acquireVsCodeApi();
   document.addEventListener('click', function (event) {
-    var target = event.target instanceof Element ? event.target.closest('button[data-action]') : null;
+    var element = event.target instanceof Element ? event.target : null;
+    var choice = element ? element.closest('button[data-check][data-outcome]') : null;
+    if (choice && !choice.disabled) {
+      vscode.postMessage({ type: 'humanCheck', key: choice.getAttribute('data-check'), outcome: choice.getAttribute('data-outcome') });
+      return;
+    }
+    var target = element ? element.closest('button[data-action]') : null;
     if (!target || target.disabled) { return; }
     vscode.postMessage({ type: 'action', action: target.getAttribute('data-action') });
+  });
+  // Notes are saved as they are typed (debounced) and on blur, so a re-render
+  // of the page never loses them; the extension stores them as drafts.
+  var timers = {};
+  function saveNote(area) {
+    var key = area.getAttribute('data-check');
+    vscode.postMessage({ type: 'humanCheck', key: key, note: area.value });
+  }
+  document.addEventListener('input', function (event) {
+    var area = event.target;
+    if (!(area instanceof HTMLTextAreaElement) || !area.hasAttribute('data-check')) { return; }
+    var key = area.getAttribute('data-check');
+    clearTimeout(timers[key]);
+    timers[key] = setTimeout(function () { saveNote(area); }, 400);
+  });
+  document.addEventListener('focusout', function (event) {
+    var area = event.target;
+    if (!(area instanceof HTMLTextAreaElement) || !area.hasAttribute('data-check')) { return; }
+    clearTimeout(timers[area.getAttribute('data-check')]);
+    saveNote(area);
   });
 })();
 `;

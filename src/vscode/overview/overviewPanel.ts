@@ -9,8 +9,9 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { BRIEF_FILENAME, HANDOFF_FILENAME, SPARRING_FILENAME, currentStageOf } from "../../core/discovery";
-import { OVERVIEW_ACTIONS, renderOverviewHtml, type OverviewAction } from "../../core/overviewHtml";
+import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, currentStageOf } from "../../core/discovery";
+import { CHECK_OUTCOMES } from "../../core/humanChecks";
+import { OVERVIEW_ACTIONS, renderOverviewHtml, type HumanCheckMessage, type OverviewAction } from "../../core/overviewHtml";
 import { buildOverviewModel, type OverviewArtifacts, type OverviewModel } from "../../core/overviewModel";
 import { documentViewColumn } from "../../core/viewColumn";
 import type { SparringController } from "../controller";
@@ -55,6 +56,8 @@ export class OverviewPanelManager implements vscode.Disposable {
     this.panel.webview.onDidReceiveMessage((message: unknown) => {
       if (isActionMessage(message)) {
         void this.onAction(message.action);
+      } else if (isHumanCheckMessage(message)) {
+        void this.recordHumanCheck(message);
       }
     });
     this.panel.onDidChangeViewState((event) => {
@@ -72,6 +75,24 @@ export class OverviewPanelManager implements vscode.Disposable {
   }
 
   private lastColumn: vscode.ViewColumn | undefined;
+
+  /**
+   * A Pass / Fail / Blocked click re-renders (the choice lights up); a note
+   * keystroke is stored without re-rendering, or the textarea being typed
+   * in would be replaced under the user's cursor. The key the next update
+   * compares against is advanced so the stored note alone triggers nothing.
+   */
+  private async recordHumanCheck(message: HumanCheckMessage): Promise<void> {
+    const run = this.controller.currentSelection.selected;
+    if (!run) {
+      return;
+    }
+    const noteOnly = message.outcome === undefined;
+    await this.controller.setHumanCheck(run.id, message.key, { outcome: message.outcome, note: message.note }, !noteOnly);
+    if (noteOnly) {
+      this.lastHtmlKey = JSON.stringify(await this.buildModel());
+    }
+  }
 
   /**
    * The editor group the Overview lives in (current when visible, else the
@@ -114,15 +135,17 @@ export class OverviewPanelManager implements vscode.Disposable {
       const run = selection.selected;
       const stage = currentStageOf(run);
       const association = run.kind === "stage" ? this.controller.planAssociation(run.id) : undefined;
-      const [handoff, sparring, briefText, planText, associatedText] = await Promise.all([
-        exists(path.join(stage.dir, HANDOFF_FILENAME)),
+      const [handoffText, sparring, briefText, notesText, planText, associatedText] = await Promise.all([
+        readHead(path.join(stage.dir, HANDOFF_FILENAME), HANDOFF_READ_LIMIT),
         exists(path.join(stage.dir, SPARRING_FILENAME)),
         readHead(path.join(stage.dir, BRIEF_FILENAME)),
+        readHead(path.join(stage.dir, NOTES_FILENAME), NOTES_READ_LIMIT),
         run.kind === "plan" ? readHead(run.planPath, PLAN_READ_LIMIT) : Promise.resolve(undefined),
         association ? readHead(association.path, PLAN_READ_LIMIT) : Promise.resolve(undefined),
       ]);
       artifacts = {
-        handoff,
+        handoff: handoffText !== undefined,
+        handoffText,
         sparring,
         brief: briefText !== undefined,
         briefText,
@@ -131,6 +154,8 @@ export class OverviewPanelManager implements vscode.Disposable {
         git: await gitContext(run.location.repoRoot),
         associatedPlan: association ? { path: association.path, exists: associatedText !== undefined, text: associatedText, manualMatch: association.match } : undefined,
         accepting: this.controller.isAccepting(run.id),
+        humanChecks: this.controller.humanChecks(run.id),
+        notesText,
       };
     }
     return buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.executionFor(selection.selected?.id));
@@ -158,8 +183,27 @@ function isActionMessage(message: unknown): message is { type: "action"; action:
   );
 }
 
+function isHumanCheckMessage(message: unknown): message is HumanCheckMessage {
+  if (typeof message !== "object" || message === null) {
+    return false;
+  }
+  const record = message as Record<string, unknown>;
+  if (record["type"] !== "humanCheck" || typeof record["key"] !== "string" || !/^[0-9a-f]{1,16}$/.test(record["key"])) {
+    return false;
+  }
+  const outcome = record["outcome"];
+  const note = record["note"];
+  const outcomeOk = outcome === undefined || outcome === null || (CHECK_OUTCOMES as readonly string[]).includes(String(outcome));
+  const noteOk = note === undefined || note === null || (typeof note === "string" && note.length <= 20_000);
+  return outcomeOk && noteOk && (outcome != null || note != null);
+}
+
 /** Only the Goal paragraph is ever displayed; a brief is never read past this many bytes. */
 const BRIEF_READ_LIMIT = 64 * 1024;
+/** handoff.md is read for its ## Git context branch only; never past this many bytes. */
+const HANDOFF_READ_LIMIT = 256 * 1024;
+/** notes.md is read for its ## Human evidence section only; never past this many bytes. */
+const NOTES_READ_LIMIT = 256 * 1024;
 /** A plan document is read for its headings and one opening paragraph only; never past this many bytes. */
 const PLAN_READ_LIMIT = 512 * 1024;
 

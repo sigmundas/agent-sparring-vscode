@@ -1,5 +1,6 @@
 /**
- * Recognise `sparring run-loop / run-plan / resume-plan` invocations seen as
+ * Recognise `sparring run-loop / run-sparring / run-plan / resume-plan`
+ * invocations seen as
  * terminal command lines (VS Code shell integration reports the text the
  * user typed) and tie them to a discovered run in the right repository.
  *
@@ -17,11 +18,11 @@ import * as crypto from "node:crypto";
 import * as path from "node:path";
 import { runIdFor, type RunSnapshot, type SparringLocation } from "./discovery";
 
-export type SparringSubcommand = "run-loop" | "run-plan" | "resume-plan";
+export type SparringSubcommand = "run-loop" | "run-sparring" | "run-plan" | "resume-plan";
 
 export interface ParsedSparringCommand {
   subcommand: SparringSubcommand;
-  /** Stage id for run-loop. */
+  /** Stage id for run-loop / run-sparring. */
   stageId?: string;
   /** Plan path as typed for run-plan / resume-plan. */
   planPath?: string;
@@ -30,7 +31,7 @@ export interface ParsedSparringCommand {
   expectedBranch?: string;
 }
 
-const SUBCOMMANDS: ReadonlySet<string> = new Set<SparringSubcommand>(["run-loop", "run-plan", "resume-plan"]);
+const SUBCOMMANDS: ReadonlySet<string> = new Set<SparringSubcommand>(["run-loop", "run-sparring", "run-plan", "resume-plan"]);
 /** Executable names that stand for the engine CLI, with any directory and Windows extension stripped. */
 const EXECUTABLE_NAMES: ReadonlySet<string> = new Set(["sparring"]);
 
@@ -155,7 +156,7 @@ export function parseSparringCommand(commandLine: string): ParsedSparringCommand
   if (positionals.length === 0) {
     return undefined;
   }
-  if (parsed.subcommand === "run-loop") {
+  if (parsed.subcommand === "run-loop" || parsed.subcommand === "run-sparring") {
     parsed.stageId = positionals[0];
   } else {
     parsed.planPath = positionals[0];

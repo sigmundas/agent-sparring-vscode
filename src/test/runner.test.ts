@@ -85,10 +85,12 @@ describe("stage run action", () => {
     assert.deepEqual(stageRunAction(await standalone(ws)), { kind: "resume", label: "Resume stage", primary: false });
     const model = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, ALL, T0);
     assert.equal(model.stageStatus, "Needs you");
-    assert.deepEqual(model.banner, { kind: "stop", text: "Needs you — Pick a colour" });
+    assert.equal(model.banner, undefined);
+    assert.deepEqual(model.actionRequired?.resume, { action: "runStage", label: "Resume stage", detail: "sparring run-loop s: the stage agent implements again first, then the reviewer looks. Use it when there is work to do, not to hand over evidence." });
     const html = renderOverviewHtml(model, "n", "c");
-    assert.match(html, /<div class="banner stop">Needs you — Pick a colour<\/div>/);
+    assert.match(html, /<p class="summary">Pick a colour<\/p>/);
     assert.ok(!/class="primary" data-action="runStage"/.test(html), "Resume does not answer the human gate, so it is not the primary button");
+    assert.match(html, /class="quiet" data-action="runStage"[^>]*>Resume stage \(implementation\)</);
     assert.ok(!/NEEDS_YOU/.test(normalUi(html)), "the engine word appears in tooltips and the footer only");
     await ws.writeStage("s", { status: "working", implementation_session_id: "x" }, { "sparring.md": sparringMarkdown("SEND_BACK", "fix") });
     assert.deepEqual(stageRunAction(await standalone(ws)), { kind: "resume", label: "Resume stage", primary: true });

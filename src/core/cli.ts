@@ -8,6 +8,7 @@
  *   sparring [--sparring-dir DIR] run-plan    PLAN --repo-root ROOT --expected-branch BRANCH
  *   sparring [--sparring-dir DIR] resume-plan PLAN --repo-root ROOT --expected-branch BRANCH [--evidence TEXT]
  *   sparring [--sparring-dir DIR] run-loop    STAGE --repo-root ROOT --expected-branch BRANCH
+ *   sparring [--sparring-dir DIR] run-sparring STAGE --repo-root ROOT --expected-branch BRANCH
  *   sparring [--sparring-dir DIR] freeze-candidate STAGE --repo-root ROOT --expected-branch BRANCH
  *   sparring [--sparring-dir DIR] accept-candidate STAGE --repo-root ROOT --expected-branch BRANCH
  *   sparring [--sparring-dir DIR] new-stage   STAGE [--brief-file PATH]   (engine 7b6b2d8)
@@ -51,6 +52,17 @@ export interface LoopInvocation {
 /** `sparring [--sparring-dir DIR] run-loop STAGE --repo-root ROOT --expected-branch BRANCH` (cli.py: run_loop). */
 export function buildRunLoopArgs(invocation: LoopInvocation): string[] {
   return [...globalArgs(invocation), "run-loop", invocation.stageId, ...loopArgs(invocation)];
+}
+
+/**
+ * `sparring [--sparring-dir DIR] run-sparring STAGE --repo-root ROOT --expected-branch BRANCH`
+ * (cli.py: run_sparring → run_sparring_agent): one independent-review turn,
+ * resuming the stage's recorded sparring session when there is one. It does
+ * not run the stage agent, so it is what asks the reviewer to look again at
+ * the unchanged candidate plus the human evidence in the handoff.
+ */
+export function buildRunSparringArgs(invocation: LoopInvocation): string[] {
+  return [...globalArgs(invocation), "run-sparring", invocation.stageId, ...loopArgs(invocation)];
 }
 
 /** `sparring [--sparring-dir DIR] freeze-candidate STAGE --repo-root ROOT --expected-branch BRANCH` (cli.py: freeze_candidate). */

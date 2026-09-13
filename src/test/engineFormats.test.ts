@@ -107,7 +107,7 @@ describe("plan stage headings", () => {
 describe("sparring.md routing outcome", () => {
   it("reads action, summary and reason", () => {
     const outcome = parseSparringOutcome(sparringMarkdown("NEEDS_YOU", "Confirm on device", "device_manual_check"));
-    assert.deepEqual(outcome, { action: "NEEDS_YOU", summary: "Confirm on device", needsYouReason: "device_manual_check" });
+    assert.deepEqual(outcome, { action: "NEEDS_YOU", summary: "Confirm on device", needsYouReason: "device_manual_check", deferred: undefined });
   });
 
   it("returns undefined for the untouched template", () => {
