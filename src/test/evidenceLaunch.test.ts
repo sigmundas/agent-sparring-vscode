@@ -254,6 +254,19 @@ describe("one launcher for every engine action", () => {
     }
   });
 
+  it("and only the terminal pool opens terminals", async () => {
+    for (const file of ["vscode/commands.ts", "vscode/controller.ts", "vscode/commandRunner.ts", "vscode/overview/overviewPanel.ts", "vscode/git.ts"]) {
+      assert.ok(!/createTerminal\(/.test(await read(file)), `${file} does not open its own terminal`);
+    }
+    // The launcher opens exactly one kind of terminal itself: the dedicated
+    // one whose process *is* the engine, used when no shell can be watched.
+    const tracker = await read("vscode/executionTracker.ts");
+    assert.equal((tracker.match(/vscode\.window\.createTerminal\(/g) ?? []).length, 1, "only the shell-less fallback");
+    assert.match(tracker, /this\.terminals\.acquire\(options\.cwd\)/, "everything else is leased from the pool");
+    assert.match(tracker, /item\.lease\?\.release\(\)/, "and handed back when the execution ends, not when the terminal closes");
+    assert.match(await read("vscode/commandRunner.ts"), /this\.terminals\.acquire\(options\.cwd\)/);
+  });
+
   it("both of those hand the arguments over through the one shared function", async () => {
     for (const file of ["vscode/executionTracker.ts", "vscode/commandRunner.ts"]) {
       const source = await read(file);

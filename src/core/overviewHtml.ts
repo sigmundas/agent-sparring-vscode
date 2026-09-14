@@ -38,6 +38,7 @@ export type OverviewAction =
   | "clearMatch"
   | "startNextStage"
   | "continueAutomatically"
+  | "showRunningPlan"
   | "stopRunner"
   | "openPlanSection"
   | "submitForReview";
@@ -111,6 +112,7 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "clearMatch",
   "startNextStage",
   "continueAutomatically",
+  "showRunningPlan",
   "stopRunner",
   "openPlanSection",
   "submitForReview",
@@ -511,6 +513,9 @@ function renderStageCard(model: OverviewModel): string {
   // always want to drive one stage by hand.
   // While the Action required panel is up it carries the offer instead, so
   // the same button is never in two places.
+  if (model.followPlan) {
+    buttons.push(button("showRunningPlan", model.followPlan.label, true, model.followPlan.detail, "primary"));
+  }
   const auto = model.actionRequired ? undefined : model.continueAutomatically;
   if (auto && !handedOver) {
     buttons.push(button("continueAutomatically", auto.label, true, auto.detail, auto.primary ? "primary" : "quiet"));
@@ -601,6 +606,9 @@ function renderStageCard(model: OverviewModel): string {
 <div class="block"><h3>${icon("doc")}Last meaningful event</h3>${last}</div>`;
 
   const position = model.positionNote ? `<span class="muted" title="${escapeHtml(model.position ?? "")}">${escapeHtml(model.positionNote)}</span><span class="sep">·</span>` : "";
+  // Where the work actually is, when this screen is a finished stage of a
+  // run that has moved on. Said once, above everything this stage can offer.
+  const elsewhere = model.followPlan ? `<p class="elsewhere">${icon("warn", "accent")}${escapeHtml(model.followPlan.text)}</p>` : "";
   const left = `${goal}${sparring}${planPlace}`;
   return `<section class="card stage">
 <div class="stagehead">
@@ -608,6 +616,7 @@ function renderStageCard(model: OverviewModel): string {
 <div class="substatus">${position}${statusWord}${cycle}<span class="${accepted ? "complete" : "muted"}">${escapeHtml(model.stageLine ?? "")}</span></div></div>
 <div class="actions">${buttons.join("")}</div>
 </div>
+${elsewhere}
 <div class="columns${left ? "" : " single"}">
 ${left ? `<div class="col">${left}</div>` : ""}
 <div class="col right">
@@ -695,6 +704,12 @@ function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
       );
       buttons.push(openNext("Open in plan"));
       buttons.push(button("matchStage", "Change match…", true, MATCH_TITLE, "quiet"));
+      break;
+    case "next-created":
+      if (model.followPlan) {
+        buttons.push(button("showRunningPlan", model.followPlan.label, true, model.followPlan.detail, "primary"));
+      }
+      buttons.push(openNext("Open in plan", model.followPlan ? "" : "primary"));
       break;
     case "next-unclear":
       buttons.push(openNext("Open in plan", "primary"));
@@ -943,6 +958,8 @@ h2 .icon.escalate { color: var(--bad); }
 .status.escalate { color: var(--bad); }
 .status.finalizing { color: var(--info); }
 .status.stopped { color: var(--warn); }
+/* The stage on screen is history; the live managed run is elsewhere. */
+.elsewhere { margin: 0 0 10px; padding: 6px 8px; border-left: 2px solid var(--warn-border); background: var(--warn-surface); color: var(--vscode-foreground); }
 .next { font-weight: 600; }
 .complete { color: var(--good); font-weight: 600; }
 .whatsnext .nextstage { font-size: 1.15em; font-weight: 600; margin: 2px 0 2px; }

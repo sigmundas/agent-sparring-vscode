@@ -325,6 +325,43 @@ run them.
 
 Deleting `activity.jsonl` removes the live decoration and nothing else.
 
+### Terminals
+
+There is **one reusable terminal per project**, `Agent Sparring — <project>`.
+Run stage, Accept stage, run-plan and every resume-plan of a long managed run
+share it, so a plan does not leave a row of dead tabs behind. It is leased for
+the duration of each command: a terminal that is busy is never sent a second
+one (a second terminal is opened instead), a terminal you closed is replaced,
+and projects never share one. Only terminals the extension opened are ever
+written to — a command you type in your own terminal is observed, never
+interrupted.
+
+Terminal identity is not liveness. Every shell execution is tracked
+separately, so a finished command can never keep the Overview `Running`
+because its terminal is still open, and Stop still reaches exactly the
+terminal hosting the live execution.
+
+### Which run the Overview follows
+
+In order:
+
+1. the run you chose explicitly, while that choice still holds;
+2. the active managed plan run of the project;
+3. the active standalone stage;
+4. otherwise the remembered run, then the most recent finished one.
+
+A choice stops holding when a managed plan run of the same project has
+**advanced past** the finished stage you had chosen — which is what happens
+when a stage you adopted is accepted and the engine moves to the next one.
+The Overview then follows the managed run to its current stage. The stage it
+came from stays discoverable as history, and opening it deliberately is
+respected (the plan has not advanced since you opened it); that screen then
+says which run has taken over, offers **Show running plan**, and withholds
+what the live run already owns — Continue plan automatically, and Start next
+stage for a stage the engine has already created. Every "a runner is already
+alive" message offers **Show running plan** too, rather than leaving you on a
+screen whose buttons cannot work.
+
 ### Runner lifecycle
 
 Two things are kept strictly apart:
@@ -341,7 +378,7 @@ Liveness sources, most exact first:
 
 | Source | How it is observed | Ends when |
 | --- | --- | --- |
-| Launched from the extension | A fresh integrated terminal (your normal shell, cwd = project) runs `sparring` through the terminal shell-integration API with an argument array (see "Free-text arguments" for the one case that is quoted here instead). | The shell-execution end event fires (normal exit, non-zero exit, Ctrl-C), another command starts in that terminal, or the terminal closes. |
+| Launched from the extension | This project's integrated terminal (your normal shell, cwd = project) runs `sparring` through the terminal shell-integration API with an argument array (see "Free-text arguments" for the one case that is quoted here instead). | The shell-execution end event fires (normal exit, non-zero exit, Ctrl-C), another command starts in that terminal, or the terminal closes. |
 | Dedicated terminal (fallback) | Only if shell integration does not activate within 5 s: a terminal whose process *is* `sparring` (argument array, no shell). | That terminal closes, which VS Code does as soon as the process exits. |
 | Typed in an integrated terminal | Shell integration reports the command line and cwd; `sparring run-loop <stage>`, `run-plan` and `resume-plan` are recognised and tied to the project by `--repo-root` / `--sparring-dir` / cwd (nested projects match their own root). | Same as a launched command. |
 | Re-found after a window reload | Launches are recorded in `workspaceState`; after a reload the hosting terminal is re-found by process id and, on macOS/Linux, a `ps` probe checks that the runner still runs under it. | The probe no longer finds it, or a shell execution starts/ends in that terminal. On Windows the state stays `unknown`. |

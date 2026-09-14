@@ -94,6 +94,8 @@ async function buildFixture(): Promise<{ root: string; workspaceFile: string }> 
       'argv_log="$(dirname "$0")/../fake-argv.log"',
       'printf \'[%s]\\n\' "$0" > "$argv_log"',
       'for a in "$@"; do printf \'<%s>\\n\' "$a" >> "$argv_log"; done',
+      '# A reader can only trust the log once this last line is there.',
+      'printf \'[end]\\n\' >> "$argv_log"',
       'sub="$1"',
       'stage="$2"',
       'shift 2; root=; brief_file=; brief_flag=',

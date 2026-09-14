@@ -20,6 +20,7 @@ import {
   totalStagesOf,
   type Discovery,
   type LocateOptions,
+  type RunPreference,
   type RunSelection,
   type RunSnapshot,
   type SparringLocation,
@@ -40,9 +41,12 @@ import {
 } from "../core/stageRepositories";
 import { deriveStatus } from "../core/status";
 import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
+import { TerminalPool } from "./terminalPool";
 import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult } from "./executionTracker";
 
 const SELECTED_RUN_KEY = "agentSparring.selectedRunId";
+/** When that choice was made, so a managed run that advances afterwards can overtake it. */
+const SELECTED_AT_KEY = "agentSparring.selectedRunAtMs";
 /** The run last shown, whether chosen explicitly or automatically; restores across reloads. */
 const STICKY_RUN_KEY = "agentSparring.lastShownRunId";
 const OUTPUT_CHANNEL_NAME = "Agent Sparring";
@@ -63,6 +67,8 @@ export class SparringController implements vscode.Disposable {
   private readonly tracker: ExecutionTracker;
   /** Short commands (freeze / accept) run to completion; never tracked as runners. */
   private readonly commands: SparringCommandRunner;
+  /** The integrated terminals this extension owns: one per project, reused. */
+  private readonly terminals: TerminalPool;
   private reattached = false;
   /** Run ids whose Accept stage operation from this window is still in flight. */
   private readonly accepting = new Set<string>();
@@ -87,17 +93,20 @@ export class SparringController implements vscode.Disposable {
     this.statusBar.name = "Agent Sparring";
     this.statusBar.command = "agentSparring.openOverview";
     this.disposables.push(this.output, this.statusBar, this.changeEmitter);
+    this.terminals = new TerminalPool((message) => this.log(message));
     this.tracker = new ExecutionTracker(
       context,
       (message) => this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} ${message}`),
       () => this.locations,
+      this.terminals,
     );
     this.onCommandNotFound = this.tracker.onCommandNotFound;
     this.onEngineFailed = this.tracker.onEngineFailed;
-    this.commands = new SparringCommandRunner((message) => this.log(message));
+    this.commands = new SparringCommandRunner((message) => this.log(message), this.terminals);
     this.disposables.push(
       this.tracker,
       this.commands,
+      this.terminals,
       // A runner ending may have left new authoritative files behind; a
       // start or liveness change only needs re-rendering.
       this.tracker.onDidChange((change) => (change === "ended" ? void this.refresh() : this.render())),
@@ -175,7 +184,7 @@ export class SparringController implements vscode.Disposable {
     }));
     const report = await diagnoseDiscovery(folders, {
       ...this.locateOptions(),
-      preferredId: this.context.workspaceState.get<string>(SELECTED_RUN_KEY),
+      preferredId: this.preference()?.id,
       stickyId: this.attachedRunId ?? this.context.workspaceState.get<string>(STICKY_RUN_KEY),
     });
     this.output.appendLine("");
@@ -266,9 +275,8 @@ export class SparringController implements vscode.Disposable {
     this.refreshTimer = undefined;
     await this.relocate();
     this.discovery = await discoverRuns(this.locations);
-    const preferred = this.context.workspaceState.get<string>(SELECTED_RUN_KEY);
     const sticky = this.attachedRunId ?? this.context.workspaceState.get<string>(STICKY_RUN_KEY);
-    this.selection = selectRun(this.discovery.runs, preferred, sticky);
+    this.selection = selectRun(this.discovery.runs, this.preference(), sticky);
     if (this.selection.selected && this.selection.selected.id !== this.context.workspaceState.get<string>(STICKY_RUN_KEY)) {
       await this.context.workspaceState.update(STICKY_RUN_KEY, this.selection.selected.id);
     }
@@ -460,8 +468,15 @@ export class SparringController implements vscode.Disposable {
     return this.locations;
   }
 
+  /** The run the user chose, with the moment they chose it (see selectRun). */
+  private preference(): RunPreference | undefined {
+    const id = this.context.workspaceState.get<string>(SELECTED_RUN_KEY);
+    return id ? { id, atMs: this.context.workspaceState.get<number>(SELECTED_AT_KEY) } : undefined;
+  }
+
   async chooseRun(run: RunSnapshot | undefined): Promise<void> {
     await this.context.workspaceState.update(SELECTED_RUN_KEY, run?.id);
+    await this.context.workspaceState.update(SELECTED_AT_KEY, run ? Date.now() : undefined);
     await this.refresh();
   }
 

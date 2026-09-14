@@ -194,6 +194,33 @@ export interface OverviewArtifacts {
    * Ignored unless the run's recorded current stage is one of them.
    */
   manifestStages?: ManifestStageView[];
+  /**
+   * The managed plan run that is live in this project while a *standalone*
+   * stage is being shown — the stage a managed run adopted and has since
+   * advanced past. Everything that would sequence this stage by hand is the
+   * live run's business now, so those offers are withdrawn and the Overview
+   * points at it instead.
+   */
+  activePlanRun?: ActivePlanRun;
+  /**
+   * Stage ids the engine has already created in this project. Start next
+   * stage is not offered for one of them: `sparring new-stage` refuses an
+   * existing stage, and a managed run creates the next stage itself.
+   */
+  existingStageIds?: readonly string[];
+}
+
+/** A managed plan run in the same project as the standalone stage on screen. */
+export interface ActivePlanRun {
+  runId: string;
+  /** The plan's display name, as the run list shows it. */
+  planName: string;
+  /** The stage the managed run is at now. */
+  stageId: string;
+  /** Its plan identity when the manifest gives one (`Stage 4`). */
+  stageLabel?: string;
+  /** The engine's recorded status of the run (`running`, `paused`, …). */
+  status: string;
 }
 
 export type PlanContinuation = "automatic" | "manual";
@@ -269,6 +296,7 @@ export interface WhatsNext {
     | "continue" // managed run: the engine's next stage; Continue plan runs it
     | "last-managed" // managed run: no stage follows; Continue plan closes the run
     | "next-stage" // associated plan, matched: the next stage by label, with a clear section; Start next stage
+    | "next-created" // associated plan, matched: the next stage exists already (a managed run created it, or it was created by hand)
     | "next-unclear" // associated plan, matched: a later label exists but the plan defines it unclearly; read the plan
     | "last-stage" // associated plan, matched: no later stage label in the plan
     | "no-labels" // associated plan, matched to a plain heading: the plan has no stage labels to order by
@@ -407,6 +435,11 @@ export interface OverviewModel {
    * nothing is running; see the function of the same name.
    */
   continueAutomatically?: { label: string; detail: string; primary: boolean; kind: "adopt" | "continue" };
+  /**
+   * This standalone stage's project has a managed plan run in progress: what
+   * it is at, and the one action that makes sense here — switch to it.
+   */
+  followPlan?: { runId: string; label: string; text: string; detail: string };
   /** An Accept stage operation from this window is in flight. */
   accepting?: { label: string; detail: string };
   /** A runner observed for this run: alive (Stop offered) or stopped. */
@@ -593,6 +626,13 @@ export function buildOverviewModel(
   }
   model.planName = plan?.name;
   model.continueAutomatically = continueAutomatically(run, plan, artifacts, model, liveness);
+  model.followPlan = followPlan(run, artifacts);
+  if (model.followPlan) {
+    // The managed run owns the sequencing of this project now. Adopting it a
+    // second time, or creating a stage it has already created, are both
+    // refusals waiting to happen; the way forward is that run's own screen.
+    delete model.continueAutomatically;
+  }
   model.actionRequired = actionRequired(run, presentation, outcome, plan, artifacts, model, branchGuard, liveness);
   if (model.actionRequired) {
     if (model.continueAutomatically?.kind === "adopt") {
@@ -876,6 +916,28 @@ function continueAutomatically(
     primary: true,
     kind: "adopt",
     detail: `Adopt the existing stages into a managed plan and continue until Agent Sparring needs you. (sparring run-plan --manifest … --adopt over ${plan.name}: accepted stages are verified and advanced past, this stage keeps its sessions and its recorded review, and the engine takes the sequencing from there.)`,
+  };
+}
+
+/**
+ * A standalone stage screen while a managed plan run of the same project is
+ * in progress. That happens after a stage is adopted and the managed run
+ * advances: the stage it left behind is an accepted stage of its own again,
+ * and everything this screen would offer to sequence it by hand — Continue
+ * plan automatically, Start next stage — belongs to the live run. Say where
+ * the work actually is, and offer the way there.
+ */
+function followPlan(run: RunSnapshot, artifacts: OverviewArtifacts): OverviewModel["followPlan"] {
+  const active = artifacts.activePlanRun;
+  if (run.kind !== "stage" || !active) {
+    return undefined;
+  }
+  const at = active.stageLabel ? `${active.stageLabel} (${active.stageId})` : active.stageId;
+  return {
+    runId: active.runId,
+    label: "Show running plan",
+    text: `${active.planName} is being run by the engine as a managed plan run, now at ${at}. This stage is part of that run's history.`,
+    detail: `Follow the managed run of ${active.planName} (${active.status}, currently ${at}) instead of this finished stage`,
   };
 }
 
@@ -1282,7 +1344,21 @@ function whatsNext(run: RunSnapshot, plan: PlanContext | undefined, artifacts: O
   }
   const next = plan.next;
   const entry = index.find((candidate) => candidate.label === next.label);
-  const start = entry && next.defined ? proposeNextStage(entry) : undefined;
+  const proposal = entry && next.defined ? proposeNextStage(entry) : undefined;
+  // `sparring new-stage` refuses a stage that exists, and a managed run
+  // creates its own next stage: in both cases the button could only fail.
+  const created = proposal && artifacts.existingStageIds?.includes(proposal.stageId) ? proposal.stageId : undefined;
+  const start = created ? undefined : proposal;
+  if (created) {
+    return {
+      kind: "next-created",
+      heading: next.display,
+      summary: next.summary,
+      text: artifacts.activePlanRun
+        ? `${next.display} already exists (${created}); the managed plan run is sequencing it.`
+        : `${next.display} already exists as ${created}, so there is nothing to create. Select that stage to work on it.`,
+    };
+  }
   if (start) {
     return { kind: "next-stage", heading: next.display, summary: next.summary, text: "Start next stage creates it with the engine, using this plan section as its brief. Run stage then begins implementation.", start };
   }

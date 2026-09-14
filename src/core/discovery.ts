@@ -456,9 +456,48 @@ export function isOpenRun(run: RunSnapshot): boolean {
 }
 
 /**
+ * What the user explicitly chose, and when. The timestamp is what lets an
+ * old choice be told from a deliberate one: a managed plan run that has
+ * advanced *since* the choice has overtaken it (see `supersedingPlanRun`),
+ * while opening a finished stage as history right now is respected.
+ */
+export interface RunPreference {
+  id: string;
+  /** When it was chosen (epoch ms); absent means "long ago", from before this was recorded. */
+  atMs?: number;
+}
+
+/**
+ * The open plan run that has taken over from `run` — undefined when none
+ * has. A managed run adopts stages that existed on their own; when it then
+ * advances, the stage it has left behind becomes an accepted standalone run
+ * again (the plan document's own stage list does not always name it, and
+ * only the plan's *current* stage is claimed). Following that stage would
+ * show a finished screen offering actions the live plan has already taken.
+ *
+ * `sinceMs` keeps a deliberate visit to that history: only a plan run whose
+ * state was written after that moment counts as having advanced past it.
+ */
+export function supersedingPlanRun(run: RunSnapshot, runs: readonly RunSnapshot[], sinceMs = 0): PlanRunSnapshot | undefined {
+  if (run.kind !== "stage" || isOpenRun(run)) {
+    return undefined;
+  }
+  return runs.find(
+    (candidate): candidate is PlanRunSnapshot =>
+      candidate.kind === "plan" &&
+      isOpenRun(candidate) &&
+      candidate.location.projectDir === run.location.projectDir &&
+      candidate.stateMtimeMs > sinceMs &&
+      candidate.currentStage.stageId !== run.stage.stageId,
+  );
+}
+
+/**
  * Deterministic selection:
- *  1. an explicitly preferred run (by id) that still exists always wins, even
- *     when it has become terminal (complete / accepted);
+ *  1. an explicitly preferred run (by id) that still exists wins, even when
+ *     it has become terminal (complete / accepted) — unless a managed plan
+ *     run in the same project has advanced past it since it was chosen, in
+ *     which case the cockpit follows the plan (`supersedingPlanRun`);
  *  2. exactly one open plan run (status running/paused) is selected;
  *  3. several open plan runs: the remembered (`stickyId`) one if it is among
  *     them, otherwise ambiguous and nothing is selected;
@@ -470,11 +509,12 @@ export function isOpenRun(run: RunSnapshot): boolean {
  * `stickyId` is what the caller last showed; it is a tie-breaker and a
  * fallback, never a reason to ignore a newly started open run.
  */
-export function selectRun(runs: RunSnapshot[], preferredId?: string, stickyId?: string): RunSelection {
-  if (preferredId) {
-    const preferred = runs.find((run) => run.id === preferredId);
-    if (preferred) {
-      return { selected: preferred, ambiguous: [] };
+export function selectRun(runs: RunSnapshot[], preferred?: string | RunPreference, stickyId?: string): RunSelection {
+  const pick = typeof preferred === "string" ? { id: preferred } : preferred;
+  if (pick) {
+    const chosen = runs.find((run) => run.id === pick.id);
+    if (chosen && !supersedingPlanRun(chosen, runs, pick.atMs ?? 0)) {
+      return { selected: chosen, ambiguous: [] };
     }
   }
   const sticky = stickyId ? runs.find((run) => run.id === stickyId) : undefined;

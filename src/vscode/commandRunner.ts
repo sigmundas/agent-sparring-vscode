@@ -16,16 +16,17 @@
  * rather than a reinstall suggestion.
  *
  * Runner liveness is untouched: these commands never register with the
- * ExecutionTracker, and they run in their own terminal, never in one that
- * hosts a loop runner.
+ * ExecutionTracker. They run in the project's own reusable terminal
+ * (terminalPool.ts), which is leased for the duration, so they can never be
+ * sent into a terminal that is already running something.
  */
 
 import { execFile } from "node:child_process";
-import * as vscode from "vscode";
 import type { CommandOutcome } from "../core/acceptance";
 import { executableWord, planExecutable, type ExecutablePlan } from "../core/cli";
 import { awaitExecutionEnd, awaitShellIntegration, executeThroughShell, hostEnv } from "./shellIntegration";
 import { collectOutput } from "./terminalOutput";
+import type { TerminalPool } from "./terminalPool";
 
 export { stripAnsi } from "./terminalOutput";
 
@@ -41,25 +42,13 @@ export interface RunCommandOptions {
 export type RunCommandResult = { ok: true; outcome: CommandOutcome; via: "shell" | "process"; plan: ExecutablePlan } | { ok: false; error: string; problem: "configured-invalid" | "unresolvable" };
 
 export class SparringCommandRunner {
-  private readonly terminals = new Map<string, vscode.Terminal>();
-  private readonly disposables: vscode.Disposable[] = [];
-
-  constructor(private readonly log: (message: string) => void) {
-    this.disposables.push(
-      vscode.window.onDidCloseTerminal((terminal) => {
-        for (const [key, known] of this.terminals) {
-          if (known === terminal) {
-            this.terminals.delete(key);
-          }
-        }
-      }),
-    );
-  }
+  constructor(
+    private readonly log: (message: string) => void,
+    private readonly terminals: TerminalPool,
+  ) {}
 
   dispose(): void {
-    for (const disposable of this.disposables.splice(0)) {
-      disposable.dispose();
-    }
+    // The terminals belong to the pool, which the controller disposes.
   }
 
   async run(options: RunCommandOptions): Promise<RunCommandResult> {
@@ -67,17 +56,24 @@ export class SparringCommandRunner {
     if (!configured.ok) {
       return { ok: false, error: configured.error, problem: configured.problem };
     }
-    const terminal = this.terminalFor(options.cwd, options.name);
-    const integration = await awaitShellIntegration(terminal);
+    // The project's own terminal, for as long as this command runs.
+    const lease = this.terminals.acquire(options.cwd);
+    const integration = await awaitShellIntegration(lease.terminal);
     const word = executableWord(configured.plan);
     const request = integration ? executeThroughShell(integration, word, options.args) : undefined;
     if (request) {
-      terminal.show(true);
+      lease.terminal.show(true);
       const output = collectOutput(request.execution);
-      const exitCode = await awaitExecutionEnd(request.execution, terminal);
+      const exitCode = await awaitExecutionEnd(request.execution, lease.terminal);
       const text = await output;
+      lease.release();
       this.log(`ran ${options.name} via shell integration (${word}, ${options.args.length} args${request.quotedHere ? ", command line quoted here" : ""}, cwd ${options.cwd}); exit ${exitCode === undefined ? "unknown" : exitCode}`);
       return { ok: true, outcome: { exitCode, output: text, resolvedBy: configured.plan.kind === "shell" ? "shell" : "path" }, via: "shell", plan: configured.plan };
+    }
+    if (integration) {
+      lease.release();
+    } else {
+      lease.discard();
     }
     // No shell to resolve a bare name (or none whose quoting can be written
     // here): fall back to this process's view and an argument array.
@@ -89,16 +85,6 @@ export class SparringCommandRunner {
     const outcome = await runProcess(path, options.args, options.cwd);
     this.log(`ran ${options.name} as a direct process (${path}, ${options.args.length} args, cwd ${options.cwd}; shell integration unavailable); exit ${outcome.exitCode === undefined ? "unknown" : outcome.exitCode}`);
     return { ok: true, outcome, via: "process", plan: direct.plan };
-  }
-
-  private terminalFor(cwd: string, name: string): vscode.Terminal {
-    const known = this.terminals.get(cwd);
-    if (known && known.exitStatus === undefined) {
-      return known;
-    }
-    const terminal = vscode.window.createTerminal({ name: `Agent Sparring: ${name}`, cwd, iconPath: new vscode.ThemeIcon("debug-alt") });
-    this.terminals.set(cwd, terminal);
-    return terminal;
   }
 }
 

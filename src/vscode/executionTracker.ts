@@ -2,9 +2,11 @@
  * Observes `sparring` runner processes so liveness never rests on telemetry.
  *
  * Sources, most exact first:
- *  - launches by this extension through the terminal shell-integration API
- *    (`executeCommand(executable, args)`: argument array, no quoting), ended
- *    by the matching shell-execution end event;
+ *  - launches by this extension through the terminal shell-integration API,
+ *    in this project's reusable terminal (terminalPool.ts), ended by the
+ *    matching shell-execution end event. The terminal is shared over a run's
+ *    lifetime; the executions in it are tracked one by one and a finished
+ *    one never keeps the UI running;
  *  - launches in a dedicated terminal whose process is the runner, used only
  *    when shell integration never becomes available; ended when that
  *    terminal closes (VS Code closes it as soon as the process exits);
@@ -30,6 +32,7 @@ import { commandLineRuns, matchSparringCommand, parseSparringCommand, type Sparr
 import { listProcesses, processProbeSupported } from "./processProbe";
 import { awaitShellIntegration, executeThroughShell, hostEnv, SHELL_INTEGRATION_TIMEOUT_MS } from "./shellIntegration";
 import { collectOutput } from "./terminalOutput";
+import type { TerminalLease, TerminalPool } from "./terminalPool";
 
 export { SHELL_INTEGRATION_TIMEOUT_MS };
 
@@ -97,6 +100,8 @@ interface Tracked {
   plan?: ExecutablePlan;
   /** Everything the launched execution printed; resolves when it ends. */
   output?: Promise<string>;
+  /** The project terminal this command holds until it ends. */
+  lease?: TerminalLease;
 }
 
 interface PersistedLaunch {
@@ -131,6 +136,7 @@ export class ExecutionTracker implements vscode.Disposable {
     private readonly context: vscode.ExtensionContext,
     private readonly log: (message: string) => void,
     private readonly locations: () => SparringLocation[],
+    private readonly terminals: TerminalPool,
   ) {
     this.disposables.push(
       this.changeEmitter,
@@ -207,31 +213,38 @@ export class ExecutionTracker implements vscode.Disposable {
       this.log(`refused to launch ${options.name}: ${configured.error}`);
       return { ok: false, error: configured.error, problem: configured.problem };
     }
-    const title = `Agent Sparring: ${options.name}`;
-    const shellTerminal = vscode.window.createTerminal({ name: title, cwd: options.cwd, iconPath: new vscode.ThemeIcon("debug-alt") });
+    // This project's terminal, reused when it is idle: a plan run is a long
+    // series of commands and each one used to leave a dead tab behind.
+    const lease = this.terminals.acquire(options.cwd);
     if (options.reveal) {
-      shellTerminal.show(true);
+      lease.terminal.show(true);
     }
-    const integration = await awaitShellIntegration(shellTerminal);
+    const integration = await awaitShellIntegration(lease.terminal);
     const word = executableWord(configured.plan);
     const request = integration ? executeThroughShell(integration, word, options.args) : undefined;
     if (request) {
       this.dropEnded(options.runId);
-      const item = this.track(options, "launched", shellTerminal, request.execution);
+      const item = this.track(options, "launched", lease.terminal, request.execution);
       item.word = word;
       item.plan = configured.plan;
+      item.lease = lease;
       item.output = collectOutput(request.execution);
       this.log(
         `launched ${options.name} via shell integration (${configured.plan.kind === "shell" ? `'${word}' resolved by the shell` : word}, ${options.args.length} args${request.quotedHere ? ", command line quoted here" : ""}, cwd ${options.cwd})`,
       );
-      void this.persistWithPid(item, shellTerminal);
+      void this.persistWithPid(item, lease.terminal);
       this.changeEmitter.fire("started");
       return { ok: true, record: item.record, via: "shell" };
     }
     if (integration) {
+      // The shell is fine, it just cannot carry this command line; keep it.
       this.log(`${options.name}: this shell's quoting cannot be written safely, so the engine is run without a shell`);
+      lease.release();
+    } else {
+      // A shell that never reported integration cannot be watched: nothing
+      // would tell us when the command ended. It is of no further use.
+      lease.discard();
     }
-    shellTerminal.dispose();
     const direct = await planExecutable(options.configured, hostEnv(options.cwd), false);
     if (!direct.ok) {
       this.log(`could not launch ${options.name}: shell integration unavailable and ${direct.error}`);
@@ -240,7 +253,7 @@ export class ExecutionTracker implements vscode.Disposable {
     this.dropEnded(options.runId);
     const path = executableWord(direct.plan);
     const dedicated = vscode.window.createTerminal({
-      name: title,
+      name: `Agent Sparring — ${options.name}`,
       shellPath: path,
       shellArgs: options.args,
       cwd: options.cwd,
@@ -348,6 +361,9 @@ export class ExecutionTracker implements vscode.Disposable {
       return;
     }
     this.stopProbe(item);
+    // The command is over, so the terminal is free for the next one. The
+    // record of this execution lives on independently of that terminal.
+    item.lease?.release();
     item.record = { ...item.record, state: "ended", endedAtMs: Date.now(), exitCode, detail };
     const how = exitCode === undefined ? "ended without an exit code (Ctrl-C, signal or terminal closed)" : exitCode === 0 ? "exited normally" : `exited with code ${exitCode}`;
     this.log(`${describe(item)} ${how}${detail ? ` — ${detail}` : ""}`);

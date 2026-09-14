@@ -68,6 +68,8 @@ export async function run(): Promise<void> {
     ["plan", () => planAssociationAssertions(report, reportedRepo, fixtureRoot)],
     ["gate", () => gateClickAssertions()],
     ["evidence", () => evidenceLaunchAssertions(reportedRepo, fixtureRoot)],
+    ["advance", () => advancementAssertions(reportedRepo)],
+    ["terminals", () => terminalReuseAssertions(report, reportedRepo)],
   ];
   const only = (process.env.AGENT_SPARRING_IT_ONLY ?? "").split(",").map((name) => name.trim()).filter(Boolean);
   for (const [name, section] of sections) {
@@ -213,6 +215,10 @@ interface ModelReport {
   secondaryAction?: { kind: string; label: string };
   banner?: { kind: string; text: string };
   actions?: { plan: boolean; choosePlan: boolean; changePlan: boolean; matchStage: boolean };
+  stageId?: string;
+  stageHeading?: string;
+  followPlan?: { runId: string; label: string; text: string };
+  continueAutomatically?: { label: string; kind: string };
   plan?: { source: string; name: string; current?: string; matched?: string; next?: { display: string; line: number; summary?: string } };
   whatsNext?: { kind: string; heading?: string; summary?: string; text: string; hints?: string[]; start?: { stageId: string; label: string } };
 }
@@ -540,6 +546,173 @@ async function gateClickAssertions(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------- the managed run advances, and the cockpit follows
+
+/**
+ * Stage 3D on its own, explicitly chosen; then a managed plan run adopts it,
+ * accepts it and advances to Stage 4. The Overview must follow the managed
+ * run — the reported bug was that it kept showing
+ * "Standalone stage · Stage 3D · Accepted" and the actions that go with it.
+ *
+ * The plan document is written the way the real one is, with `## Stage 3D
+ * handoff — …` records above the stage sections: the engine-shaped parser
+ * refuses it, so the plan run claims no stage list and the stage it advances
+ * past really does become a standalone run again.
+ */
+async function advancementAssertions(reportedRepo: string): Promise<void> {
+  const model = async () => (await vscode.commands.executeCommand("agentSparring._test.overviewModel")) as ModelReport;
+  const sparring = path.join(reportedRepo, ".sparring");
+  const planState = path.join(sparring, "plans", `${GATE_PLAN_KEY}.json`);
+  const stage4 = "stage-4-editor-and-ui-inspection-and-guarded-editing";
+  await fs.mkdir(path.join(reportedRepo, "plans"), { recursive: true });
+  await fs.mkdir(path.join(sparring, "plans"), { recursive: true });
+  await fs.mkdir(path.join(sparring, "stages", GATE_STAGE), { recursive: true });
+  await fs.writeFile(
+    path.join(reportedRepo, "plans", "reported-statistics.md"),
+    [
+      "# Reported statistics",
+      "",
+      "## Stage 3D handoff — 2026-09-14 (current stage)",
+      "",
+      "Status: implemented and self-verified.",
+      "",
+      "## Stage 3D — Snapshot v2 and attachment/export/import transport",
+      "",
+      "The transport.",
+      "",
+      "## Stage 4 — Editor and UI inspection and guarded editing",
+      "",
+      "The editor.",
+      "",
+    ].join("\n"),
+  );
+  await fs.writeFile(path.join(sparring, "stages", GATE_STAGE, "state.json"), JSON.stringify({ status: "accepted", base_sha: null, candidate_sha: "c".repeat(40), implementation_session_id: "impl", sparring_session_id: "spar" }));
+
+  // Before adoption: Stage 3D stands on its own and the user chooses it.
+  await fs.rm(planState, { force: true });
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  const before = (await vscode.commands.executeCommand("agentSparring.diagnoseDiscovery")) as DiscoveryDiagnostic;
+  const stageRunId = before.runs.find((run) => run.id.endsWith(`stage:${GATE_STAGE}`))?.id;
+  assert.ok(stageRunId, "the stage is discovered on its own");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", stageRunId), stageRunId);
+  assert.equal((await model()).runKind, "Standalone stage", "which is what the Overview shows");
+
+  // The managed run has since accepted it and advanced to Stage 4.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await fs.mkdir(path.join(sparring, "stages", stage4), { recursive: true });
+  await fs.writeFile(path.join(sparring, "stages", stage4, "state.json"), JSON.stringify({ status: "working", base_sha: null, candidate_sha: null, implementation_session_id: null, sparring_session_id: null }));
+  await fs.writeFile(planState, JSON.stringify({ current_stage: stage4, current_stage_index: 6, expected_branch: "feature/reported-statistics", plan: GATE_PLAN_LABEL, plan_digest: "0".repeat(64), source: "manifest", status: "running" }));
+  // The manifest this managed run executes, as the extension wrote it when
+  // the plan was adopted: it is what gives Stage 4 its plan identity.
+  const manifests = (await vscode.commands.executeCommand("agentSparring._test.manifestDirectory")) as string;
+  await fs.mkdir(manifests, { recursive: true });
+  await fs.writeFile(
+    path.join(manifests, `${GATE_PLAN_KEY}.manifest.json`),
+    JSON.stringify({
+      version: 1,
+      plan: GATE_PLAN_LABEL,
+      plan_digest: "0".repeat(64),
+      stages: [
+        { stage_id: GATE_STAGE, label: "Stage 3D", title: "Snapshot v2 and attachment/export/import transport", brief: "The transport." },
+        { stage_id: stage4, label: "Stage 4", title: "Editor and UI inspection and guarded editing", brief: "The editor." },
+      ],
+    }),
+  );
+  await vscode.commands.executeCommand("agentSparring.refresh");
+
+  const after = await model();
+  assert.equal(after.runKind, "Plan run", `the cockpit follows the managed run, got ${String(after.runKind)} · ${String(after.stageHeading)}`);
+  assert.equal(after.stageId, stage4, "at the stage that run is actually on");
+  assert.match(after.stageHeading ?? "", /^Stage 4 — Editor and UI inspection/, `named as the plan names it, got ${String(after.stageHeading)}`);
+  assert.notEqual(after.stageStatus, "Accepted", "not the finished stage it came from");
+
+  // Opening that finished stage deliberately is still allowed, and then the
+  // screen says where the work is instead of offering to sequence it here.
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", stageRunId), stageRunId);
+  // With the plan linked to the finished stage, this screen is exactly the
+  // one that offered Continue plan automatically and Start next stage.
+  const planFile = path.join(reportedRepo, "plans", "reported-statistics.md");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.associatePlan", planFile), planFile);
+  const history = await model();
+  assert.equal(history.runKind, "Standalone stage", "a deliberate visit is respected");
+  assert.match(history.followPlan?.text ?? "", /now at Stage 4/, "and it names the run that has taken over");
+  assert.equal(history.followPlan?.label, "Show running plan");
+  assert.equal(history.continueAutomatically, undefined, "adopting again is not offered");
+  assert.equal(history.whatsNext?.kind, "next-created", "nor creating a stage the engine already created");
+
+  // And that button switches to it.
+  await vscode.commands.executeCommand("agentSparring._test.associatePlan", undefined);
+  await vscode.commands.executeCommand("agentSparring._test.chooseRun", stageRunId);
+  await vscode.commands.executeCommand("agentSparring._test.overviewAction", "showRunningPlan");
+  const followed = await model();
+  assert.equal(followed.runKind, "Plan run");
+  assert.equal(followed.stageId, stage4);
+  console.log("integration: after the managed run advanced, the Overview follows it to Stage 4; the finished stage stays reachable as history");
+}
+
+// ---------------------------------------------------------------- one reusable terminal per project
+
+/** The terminals this extension owns, in the order VS Code lists them. */
+function ownTerminals(): vscode.Terminal[] {
+  return vscode.window.terminals.filter((terminal) => terminal.name.startsWith("Agent Sparring"));
+}
+
+/**
+ * A plan is a long series of engine commands, and each one used to leave a
+ * terminal behind. One terminal per project is reused instead — while every
+ * execution in it is still tracked, ended and reported on its own.
+ */
+async function terminalReuseAssertions(report: DiscoveryDiagnostic, reportedRepo: string): Promise<void> {
+  if (!(await shellIntegrationAvailable(reportedRepo))) {
+    console.log("integration: shell integration unavailable in this host; terminal-reuse scenario skipped");
+    return;
+  }
+  for (const terminal of ownTerminals()) {
+    terminal.dispose();
+  }
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  const runId = runIdOf(report, reportedRepo, "stage-reported-statistics-typed-parser");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+  await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=1\nexit_with=0\n");
+
+  await vscode.commands.executeCommand("agentSparring.runStage");
+  const first = await waitFor(runId, (liveness) => liveness.state === "running", 15_000, "the first run starts");
+  const opened = ownTerminals();
+  assert.equal(opened.length, 1, `one terminal, named for the project, got: ${JSON.stringify(vscode.window.terminals.map((terminal) => terminal.name))}`);
+  assert.equal(opened[0].name, "Agent Sparring — sporely-py-reported-statistics");
+  const stopped = await waitFor(runId, (liveness) => liveness.state === "stopped", 20_000, "and it ends");
+  assert.equal(stopped.execution?.exitCode, 0, "a finished execution cannot keep the UI running");
+
+  await vscode.commands.executeCommand("agentSparring.runStage");
+  const second = await waitFor(runId, (liveness) => liveness.state === "running" && liveness.execution?.id !== stopped.execution?.id, 15_000, "a second Run stage");
+  assert.deepEqual(ownTerminals(), opened, "the same terminal object ran it: nothing new was opened");
+  assert.notEqual(second.execution?.id, first.execution?.id, "while the two executions are tracked separately");
+  await waitFor(runId, (liveness) => liveness.state === "stopped", 20_000, "the second ends too");
+
+  // Accept stage is a different code path (the short-command runner) and
+  // must land in the same terminal rather than one of its own.
+  const acceptId = runIdOf(report, reportedRepo, "stage-review-complete");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", acceptId), acceptId);
+  await vscode.commands.executeCommand("agentSparring._test.acceptStage");
+  assert.deepEqual(ownTerminals(), opened, "freeze and accept reused it as well");
+
+  // A terminal the user closed is replaced, not resurrected.
+  opened[0].dispose();
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+  await vscode.commands.executeCommand("agentSparring.runStage");
+  await waitFor(runId, (liveness) => liveness.state === "running", 15_000, "a run after the terminal was closed");
+  const reopened = ownTerminals();
+  assert.equal(reopened.length, 1, "exactly one again");
+  assert.notEqual(reopened[0], opened[0], "a fresh one, because the old one is gone");
+  await waitFor(runId, (liveness) => liveness.state === "stopped", 20_000, "and it ends");
+  for (const terminal of ownTerminals()) {
+    terminal.dispose();
+  }
+  console.log("integration: four engine commands, one reusable terminal per project, each execution tracked on its own");
+}
+
 // ---------------------------------------------------------------- Submit result and continue: resume-plan --evidence reaches the engine
 
 /**
@@ -590,6 +763,7 @@ async function evidenceLaunchAssertions(reportedRepo: string, fixtureRoot: strin
   try {
     await vscode.commands.executeCommand("agentSparring._test.overviewAction", "submitForReview");
     const argv = await waitForFile(argvLog, 20_000, "the configured executable is reached by Submit result and continue");
+    assert.match(argv, /\[end\]/, "the whole argv was recorded");
     const executable = /^\[(.+)\]$/m.exec(argv)?.[1];
     const args = [...argv.matchAll(/<([^]*?)>\n/g)].map((match) => match[1]);
 
@@ -636,11 +810,12 @@ function stubDialogs(branch: string, confirm: string): () => void {
   };
 }
 
+/** Wait for the fake engine's argv log to be complete (it ends with its own marker). */
 async function waitForFile(file: string, timeoutMs: number, what: string): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const text = await fs.readFile(file, "utf8").catch(() => undefined);
-    if (text) {
+    if (text?.includes("[end]")) {
       return text;
     }
     assert.ok(Date.now() < deadline, what);

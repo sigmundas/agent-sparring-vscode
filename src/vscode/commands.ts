@@ -21,6 +21,7 @@ import {
   currentStageOf,
   isInsidePath,
   runIdFor,
+  supersedingPlanRun,
   type PlanRunSnapshot,
   type RunSnapshot,
   type SparringLocation,
@@ -57,7 +58,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.selectRun", () => selectRunCommand(controller)),
     vscode.commands.registerCommand("agentSparring.diagnoseDiscovery", () => controller.diagnoseDiscovery()),
     vscode.commands.registerCommand("agentSparring.openOverview", () => openOverviewCommand(controller, overview)),
-    vscode.commands.registerCommand("agentSparring.runPlan", () => runPlanCommand(controller)),
+    vscode.commands.registerCommand("agentSparring.runPlan", () => runPlanCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.resumePlan", () => resumePlanCommand(controller)),
     vscode.commands.registerCommand("agentSparring.runStage", () => runStageCommand(controller)),
     vscode.commands.registerCommand("agentSparring.acceptStage", () => acceptStageCommand(controller, overview)),
@@ -130,6 +131,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
       await controller.setHumanCheck(run.id, key, { outcome, note });
       return controller.humanChecks(run.id)[key];
     }),
+    vscode.commands.registerCommand("agentSparring._test.manifestDirectory", () => controller.manifestDirectoryPath),
     vscode.commands.registerCommand("agentSparring._test.lastEngineFailure", () => lastEngineFailure),
     controller.onEngineFailed((event) => {
       lastEngineFailure = event;
@@ -264,7 +266,7 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       await overview.update();
       return;
     case "runPlan":
-      return runPlanCommand(controller);
+      return runPlanCommand(controller, overview);
     case "resumePlan":
       await resumePlanCommand(controller, run?.kind === "plan" ? run : undefined);
       await overview.update();
@@ -317,6 +319,17 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
     case "submitForReview":
       await submitForReviewCommand(controller, overview);
       return;
+    case "showRunningPlan": {
+      // The stage on screen is history; its project's managed run is live.
+      const plan = run ? supersedingPlanRun(run, controller.currentDiscovery.runs) : undefined;
+      if (!plan) {
+        void vscode.window.showInformationMessage("Agent Sparring: no managed plan run is in progress for this project any more.");
+        await overview.update();
+        return;
+      }
+      await showRun(controller, overview, plan);
+      return;
+    }
   }
 }
 
@@ -435,7 +448,7 @@ async function acceptStageCommand(controller: SparringController, overview: Over
   }
   const liveness = controller.livenessFor(run.id);
   if (blocksLaunch(liveness) === "running") {
-    void vscode.window.showInformationMessage(`Agent Sparring: a runner is still alive for ${run.stage.stageId}; wait for it to finish before accepting.`);
+    await sayRunnerAlive(controller, overview, `a runner is still alive for ${run.stage.stageId}; wait for it to finish before accepting.`, run.id);
     return;
   }
   if (controller.isAccepting(run.id)) {
@@ -1013,6 +1026,26 @@ async function explainExecutableProblem(error: string): Promise<void> {
   }
 }
 
+/**
+ * A runner is alive somewhere else. Saying so is not enough: the run it
+ * belongs to is what the user wants to see, so offer to go there. `runId`
+ * is the run that is busy; the Overview switches to it and opens.
+ */
+async function sayRunnerAlive(controller: SparringController, overview: OverviewPanelManager, message: string, runId: string): Promise<void> {
+  const run = controller.currentDiscovery.runs.find((candidate) => candidate.id === runId);
+  const choice = await vscode.window.showInformationMessage(`Agent Sparring: ${message}`, ...(run ? ["Show running plan"] : []));
+  if (choice === "Show running plan" && run) {
+    await showRun(controller, overview, run);
+  }
+}
+
+/** Follow `run` in the Overview: it becomes the explicit selection and the panel opens. */
+async function showRun(controller: SparringController, overview: OverviewPanelManager, run: RunSnapshot): Promise<void> {
+  await controller.chooseRun(run);
+  await overview.show();
+  await overview.update();
+}
+
 async function explainCommandNotFound(word: string): Promise<void> {
   await explainExecutableProblem(commandNotFoundMessage(word));
 }
@@ -1061,7 +1094,7 @@ async function launch(controller: SparringController, location: SparringLocation
   await explainLaunch(result);
 }
 
-async function runPlanCommand(controller: SparringController): Promise<void> {
+async function runPlanCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
   const location = await pickLocation(controller);
   if (!location) {
     return;
@@ -1077,7 +1110,7 @@ async function runPlanCommand(controller: SparringController): Promise<void> {
   const args = buildRunPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir });
   const runId = planRunId(location, planPath);
   if (controller.livenessFor(runId).state === "running") {
-    void vscode.window.showInformationMessage("Agent Sparring: a runner for this plan is alive in a terminal of this window.");
+    await sayRunnerAlive(controller, overview, "a runner for this plan is alive in a terminal of this window.", runId);
     return;
   }
   await launch(controller, location, args, "run-plan", planPath);
@@ -1412,7 +1445,7 @@ async function performContinueAutomatically(controller: SparringController, over
     return { ok: false, reason: "complete" };
   }
   if (controller.livenessFor(runId).state === "running") {
-    void vscode.window.showInformationMessage(`Agent Sparring: a runner for ${label} is already alive in a terminal of this window.`);
+    await sayRunnerAlive(controller, overview, `a runner for ${label} is already alive in a terminal of this window.`, runId);
     return { ok: false, reason: "running" };
   }
 

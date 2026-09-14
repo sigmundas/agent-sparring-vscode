@@ -9,11 +9,11 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, type RunSnapshot } from "../../core/discovery";
+import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, supersedingPlanRun, type RunSnapshot } from "../../core/discovery";
 import { parseStageState, type StageStatus } from "../../core/engineFormats";
 import { manifestFileName, readManifestStages } from "../../core/manifest";
 import { isActionMessage, isHumanCheckMessage, renderOverviewHtml, type HumanCheckMessage, type OverviewAction } from "../../core/overviewHtml";
-import { buildOverviewModel, type ManifestStageView, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
+import { buildOverviewModel, type ActivePlanRun, type ManifestStageView, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
 import { locateStage, parsePlanHeadings, type HeadingRef } from "../../core/planAssociation";
 import { planKey, planLabel } from "../../core/sparringCommand";
 import type { DeclaredRepository } from "../../core/stageRepositories";
@@ -163,9 +163,55 @@ export class OverviewPanelManager implements vscode.Disposable {
         continuation: planContinuation(),
         siblingRepositories: this.siblingRepositories(run, run.kind === "plan" ? planText : associatedText, briefText, association?.match),
         manifestStages: await this.manifestStages(run),
+        activePlanRun: await this.activePlanRun(run),
+        existingStageIds: this.existingStageIds(run),
       };
     }
     return buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.executionFor(selection.selected?.id));
+  }
+
+  /**
+   * The managed plan run in progress in this project while a standalone
+   * stage is on screen — the run that adopted this stage and has advanced
+   * past it. Selection already follows such a run on its own
+   * (`supersedingPlanRun`); this is for the case where the user is looking
+   * at the finished stage deliberately, so the screen can say where the work
+   * is instead of offering to sequence a stage the engine owns.
+   */
+  private async activePlanRun(run: RunSnapshot): Promise<ActivePlanRun | undefined> {
+    const plan = supersedingPlanRun(run, this.controller.currentDiscovery.runs);
+    if (!plan) {
+      return undefined;
+    }
+    const stages = await this.manifestStages(plan);
+    return {
+      runId: plan.id,
+      planName: planLabel(plan.planPath, plan.location.repoRoot),
+      stageId: plan.currentStage.stageId,
+      stageLabel: stages?.find((stage) => stage.stageId === plan.currentStage.stageId)?.label,
+      status: plan.state.status,
+    };
+  }
+
+  /** Every stage id the engine has created in this project, however it was created. */
+  private existingStageIds(run: RunSnapshot): string[] {
+    const ids = new Set<string>();
+    for (const other of this.controller.currentDiscovery.runs) {
+      if (other.location.projectDir !== run.location.projectDir) {
+        continue;
+      }
+      if (other.kind === "plan") {
+        ids.add(other.currentStage.stageId);
+        for (const stage of other.stages) {
+          if (stage.state) {
+            ids.add(stage.stageId);
+          }
+        }
+      } else {
+        ids.add(other.stage.stageId);
+      }
+    }
+    return [...ids];
   }
 
   /**
