@@ -22,8 +22,7 @@ navigates.
   everything from disk after a reload.
 - Launches `sparring run-plan` / `sparring resume-plan` / `sparring run-loop`
   in an integrated terminal through the shell-integration API (executable +
-  argument array, no quoting) and observes when the process ends; see
-  "Runner lifecycle".
+  argument array) and observes when the process ends; see "Runner lifecycle".
 - **Continues a whole plan automatically**: interprets the plan document once
   into an execution manifest and hands it to the engine's managed run, which
   then goes from stage to stage on its own and stops when it needs you. One
@@ -69,13 +68,33 @@ navigates.
 
 | Situation | What runs | On failure |
 | --- | --- | --- |
-| Nothing configured, terminal shell integration available (the normal case) | Your integrated shell receives `sparring` plus the argument array through the shell-integration API; the shell's own `PATH`, venv activation and profile apply. Nothing is pre-checked from the extension host. | If the shell itself reports the command as not found (exit 127, or 9009 on cmd.exe), the extension says so and offers **Open Settings** / **Choose executable…**. |
+| Nothing configured, terminal shell integration available (the normal case) | Your integrated shell receives `sparring` plus the argument array through the shell-integration API; the shell's own `PATH`, venv activation and profile apply. Nothing is pre-checked from the extension host. | Only here can an exit code mean a missing CLI: if the shell reports the bare word as not found (exit 127, or 9009 on cmd.exe), the extension says so and offers **Open Settings** / **Choose executable…**. |
 | `agentSparring.executable` set | Exactly that path (relative paths resolve against the project). It is validated before anything is launched. | `agentSparring.executable points at …, which does not exist or is not executable.` |
 | Nothing configured, no shell integration within 5 s | A best-effort `PATH` search in the extension host, then a dedicated terminal whose process is `sparring`. | `Agent Sparring could not resolve the CLI from this VS Code environment. Set agentSparring.executable to the full path.` (never a suggestion to reinstall the engine). |
 
 Short commands (Accept stage) use the same rule: your shell through shell
 integration when available (the output is read back for translation and
 the log), otherwise a direct process with a host-resolved path.
+
+A configured or host-resolved path is checked before anything runs, so a
+bad exit code from *that* is the command's own: the extension reports
+`sparring <subcommand> exited with code N` with what it printed, and never
+sends you to the executable setting for an executable it just ran. The full
+output is in the Output Channel.
+
+### Free-text arguments
+
+`resume-plan --evidence` carries a whole `## Human evidence` entry — a
+gate check's backticked id, the note you typed, several lines. VS Code's
+`executeCommand(executable, args)` double-quotes an argument only when it
+holds whitespace and none of `"`, `'` or a backtick, and appends everything
+else raw, so such an entry would reach the shell as syntax rather than as
+text. When an argument would not survive that escaping, the extension quotes
+the command line itself (POSIX single quotes) and hands it over as one
+string; on a shell whose quoting is not written here (cmd.exe, PowerShell)
+it bypasses the shell and runs the process with an argument array instead.
+Every other invocation — flags, stage ids, paths — is unaffected and still
+goes through VS Code's own escaping.
 
 ## What the words mean
 
@@ -322,7 +341,7 @@ Liveness sources, most exact first:
 
 | Source | How it is observed | Ends when |
 | --- | --- | --- |
-| Launched from the extension | A fresh integrated terminal (your normal shell, cwd = project) runs `sparring` through the terminal shell-integration API with an argument array; no quoted command line is built. | The shell-execution end event fires (normal exit, non-zero exit, Ctrl-C), another command starts in that terminal, or the terminal closes. |
+| Launched from the extension | A fresh integrated terminal (your normal shell, cwd = project) runs `sparring` through the terminal shell-integration API with an argument array (see "Free-text arguments" for the one case that is quoted here instead). | The shell-execution end event fires (normal exit, non-zero exit, Ctrl-C), another command starts in that terminal, or the terminal closes. |
 | Dedicated terminal (fallback) | Only if shell integration does not activate within 5 s: a terminal whose process *is* `sparring` (argument array, no shell). | That terminal closes, which VS Code does as soon as the process exits. |
 | Typed in an integrated terminal | Shell integration reports the command line and cwd; `sparring run-loop <stage>`, `run-plan` and `resume-plan` are recognised and tied to the project by `--repo-root` / `--sparring-dir` / cwd (nested projects match their own root). | Same as a launched command. |
 | Re-found after a window reload | Launches are recorded in `workspaceState`; after a reload the hosting terminal is re-found by process id and, on macOS/Linux, a `ps` probe checks that the runner still runs under it. | The probe no longer finds it, or a shell execution starts/ends in that terminal. On Windows the state stays `unknown`. |

@@ -3,17 +3,17 @@
  * completion and reports their exit code and output.
  *
  * Preferred path: the user's own integrated shell through terminal shell
- * integration (`executeCommand(executable, args)`: argument array, no
- * quoted command line), so a bare `sparring` resolves exactly as it does
- * when the user types it, and the output stays visible in that terminal.
- * The execution's output stream is read for the log and for translating
- * refusals.
+ * integration (see `executeThroughShell`), so a bare `sparring` resolves
+ * exactly as it does when the user types it, and the output stays visible
+ * in that terminal. The execution's output stream is read for the log and
+ * for translating refusals.
  *
- * Fallback when shell integration never appears: the executable is resolved
- * on the extension host's side (configured path, or the bare name along
- * this process's PATH) and spawned directly with the argument array. When
- * that cannot resolve either, the caller gets an honest configuration
- * message rather than a reinstall suggestion.
+ * Fallback when shell integration never appears — or when this shell's
+ * quoting is not one the extension can write: the executable is resolved on
+ * the extension host's side (configured path, or the bare name along this
+ * process's PATH) and spawned directly with the argument array. When that
+ * cannot resolve either, the caller gets an honest configuration message
+ * rather than a reinstall suggestion.
  *
  * Runner liveness is untouched: these commands never register with the
  * ExecutionTracker, and they run in their own terminal, never in one that
@@ -24,9 +24,10 @@ import { execFile } from "node:child_process";
 import * as vscode from "vscode";
 import type { CommandOutcome } from "../core/acceptance";
 import { executableWord, planExecutable, type ExecutablePlan } from "../core/cli";
-import { awaitExecutionEnd, awaitShellIntegration, hostEnv } from "./shellIntegration";
+import { awaitExecutionEnd, awaitShellIntegration, executeThroughShell, hostEnv } from "./shellIntegration";
+import { collectOutput } from "./terminalOutput";
 
-const OUTPUT_CAP = 64 * 1024;
+export { stripAnsi } from "./terminalOutput";
 
 export interface RunCommandOptions {
   /** The configured `agentSparring.executable`, possibly empty. */
@@ -68,17 +69,18 @@ export class SparringCommandRunner {
     }
     const terminal = this.terminalFor(options.cwd, options.name);
     const integration = await awaitShellIntegration(terminal);
-    if (integration) {
-      const word = executableWord(configured.plan);
-      const execution = integration.executeCommand(word, options.args);
+    const word = executableWord(configured.plan);
+    const request = integration ? executeThroughShell(integration, word, options.args) : undefined;
+    if (request) {
       terminal.show(true);
-      const output = collectOutput(execution);
-      const exitCode = await awaitExecutionEnd(execution, terminal);
+      const output = collectOutput(request.execution);
+      const exitCode = await awaitExecutionEnd(request.execution, terminal);
       const text = await output;
-      this.log(`ran ${options.name} via shell integration (${word}, ${options.args.length} args, cwd ${options.cwd}); exit ${exitCode === undefined ? "unknown" : exitCode}`);
-      return { ok: true, outcome: { exitCode, output: text }, via: "shell", plan: configured.plan };
+      this.log(`ran ${options.name} via shell integration (${word}, ${options.args.length} args${request.quotedHere ? ", command line quoted here" : ""}, cwd ${options.cwd}); exit ${exitCode === undefined ? "unknown" : exitCode}`);
+      return { ok: true, outcome: { exitCode, output: text, resolvedBy: configured.plan.kind === "shell" ? "shell" : "path" }, via: "shell", plan: configured.plan };
     }
-    // No shell to resolve a bare name: fall back to this process's view.
+    // No shell to resolve a bare name (or none whose quoting can be written
+    // here): fall back to this process's view and an argument array.
     const direct = await planExecutable(options.configured, hostEnv(options.cwd), false);
     if (!direct.ok) {
       return { ok: false, error: direct.error, problem: direct.problem };
@@ -100,41 +102,23 @@ export class SparringCommandRunner {
   }
 }
 
-async function collectOutput(execution: vscode.TerminalShellExecution): Promise<string> {
-  let text = "";
-  try {
-    for await (const chunk of execution.read()) {
-      if (text.length < OUTPUT_CAP) {
-        text += chunk;
-      }
-    }
-  } catch {
-    // Reading is best effort: some shells report no data stream.
-  }
-  return stripAnsi(text);
-}
-
-/** Remove terminal control sequences (CSI and OSC, the latter used by shell integration itself) from captured output. */
-export function stripAnsi(text: string): string {
-  // eslint-disable-next-line no-control-regex
-  return text.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "").replace(/\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g, "").replace(/\r/g, "");
-}
-
 function runProcess(file: string, args: string[], cwd: string): Promise<CommandOutcome> {
   return new Promise((resolve) => {
     execFile(file, args, { cwd, maxBuffer: 4 * 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
       const output = `${stdout ?? ""}${stderr ?? ""}`;
       if (!error) {
-        resolve({ exitCode: 0, output });
+        resolve({ exitCode: 0, output, resolvedBy: "path" });
         return;
       }
       const code = (error as NodeJS.ErrnoException & { code?: number | string }).code;
       if (typeof code === "number") {
-        resolve({ exitCode: code, output });
+        resolve({ exitCode: code, output, resolvedBy: "path" });
       } else if (code === "ENOENT") {
-        resolve({ exitCode: 127, output: `${output}${file}: not found\n` });
+        // The path was checked before the spawn, so this means it vanished
+        // in between; the output says so rather than a shell being blamed.
+        resolve({ exitCode: 127, output: `${output}${file}: not found\n`, resolvedBy: "path" });
       } else {
-        resolve({ exitCode: undefined, output: `${output}${error.message}\n` });
+        resolve({ exitCode: undefined, output: `${output}${error.message}\n`, resolvedBy: "path" });
       }
     });
   });

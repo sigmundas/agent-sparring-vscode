@@ -25,6 +25,12 @@ export interface CommandOutcome {
   exitCode: number | undefined;
   /** Combined stdout/stderr as captured (may be empty when the terminal could not be read). */
   output: string;
+  /**
+   * How the executable was found: `shell` means a bare word the shell had to
+   * resolve — the only case in which an exit code can mean "no such command".
+   * `path` means the extension handed over a file it had already checked.
+   */
+  resolvedBy?: "shell" | "path";
 }
 
 export type AcceptStep = "freeze" | "accept";
@@ -80,7 +86,9 @@ export interface AcceptanceExplanation {
  */
 export function explainAcceptanceFailure(step: AcceptStep, outcome: CommandOutcome, platform: NodeJS.Platform = process.platform): AcceptanceExplanation {
   const text = outcome.output;
-  if (isCommandNotFoundExit(outcome.exitCode, platform)) {
+  // Only a bare word the shell had to resolve can be missing; a path this
+  // extension checked and then ran owns its own exit code, 127 included.
+  if (outcome.resolvedBy !== "path" && isCommandNotFoundExit(outcome.exitCode, platform)) {
     return { message: "The sparring CLI could not be found by your shell. Set agentSparring.executable to its full path.", retryable: false, commandNotFound: true };
   }
   if (outcome.exitCode === undefined) {

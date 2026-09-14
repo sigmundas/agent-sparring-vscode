@@ -41,7 +41,8 @@ import { planKey, planLabel, planRunId, type SparringSubcommand } from "../core/
 import { manifestRepositories, relativeRepositoryPath, type DeclaredRepository } from "../core/stageRepositories";
 import { withTemporaryFile } from "../core/tempFile";
 import type { SparringController } from "./controller";
-import type { LaunchResult } from "./executionTracker";
+import type { EngineFailure, LaunchResult } from "./executionTracker";
+import { outputTail } from "./terminalOutput";
 import { currentBranch, knownRepositories, pendingChanges } from "./git";
 import { manifestSupport } from "./engineProbe";
 import { openCandidateDiff } from "./overview/gitDiff";
@@ -68,6 +69,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.stageRepositories", () => stageRepositoriesCommand(controller)),
     vscode.commands.registerCommand("agentSparring.chooseExecutable", () => chooseExecutableCommand()),
     controller.onCommandNotFound((event) => void explainCommandNotFound(event.word)),
+    controller.onEngineFailed((event) => void explainEngineFailure(controller, event)),
     // Not contributed in package.json (never in the palette): hooks for the
     // extension-host integration tests, which cannot drive QuickPicks.
     vscode.commands.registerCommand("agentSparring._test.chooseRun", async (runId: string) => {
@@ -118,10 +120,25 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     controller.onCommandNotFound((event) => {
       lastCommandNotFound = event;
     }),
+    // The webview's own actions, as the Overview's buttons deliver them.
+    vscode.commands.registerCommand("agentSparring._test.overviewAction", (action: OverviewAction) => handleOverviewAction(controller, overview, action)),
+    vscode.commands.registerCommand("agentSparring._test.recordHumanCheck", async (key: string, outcome: "pass" | "fail" | "blocked", note?: string) => {
+      const run = controller.currentSelection.selected;
+      if (!run) {
+        return undefined;
+      }
+      await controller.setHumanCheck(run.id, key, { outcome, note });
+      return controller.humanChecks(run.id)[key];
+    }),
+    vscode.commands.registerCommand("agentSparring._test.lastEngineFailure", () => lastEngineFailure),
+    controller.onEngineFailed((event) => {
+      lastEngineFailure = event;
+    }),
   );
 }
 
 let lastCommandNotFound: { runId: string; word: string; exitCode: number } | undefined;
+let lastEngineFailure: EngineFailure | undefined;
 
 // ---------------------------------------------------------------- select run
 
@@ -1000,6 +1017,20 @@ async function explainCommandNotFound(word: string): Promise<void> {
   await explainExecutableProblem(commandNotFoundMessage(word));
 }
 
+/**
+ * The engine ran and failed. Its own last words are shown — not a guess at
+ * the cause, and never a configuration message: the executable was found,
+ * so nothing about the configuration is in question. The full output is in
+ * the Output Channel.
+ */
+async function explainEngineFailure(controller: SparringController, failure: EngineFailure): Promise<void> {
+  const tail = outputTail(failure.output);
+  const choice = await vscode.window.showErrorMessage(`Agent Sparring: sparring ${failure.kind} exited with code ${failure.exitCode}.${tail ? ` ${tail}` : ""}`, "Show log");
+  if (choice === "Show log") {
+    controller.showLog();
+  }
+}
+
 /** Pick the sparring CLI with a file dialog and store it as `agentSparring.executable`. */
 async function chooseExecutableCommand(): Promise<void> {
   const chosen = await vscode.window.showOpenDialog({
@@ -1021,9 +1052,11 @@ async function chooseExecutableCommand(): Promise<void> {
 
 async function launch(controller: SparringController, location: SparringLocation, args: string[], kind: SparringSubcommand, planPath: string, manifest?: string): Promise<void> {
   // The command runs inside the user's normal integrated terminal through
-  // shell integration (executable + argument array, no quoting), so the user
-  // sees the engine's own output and the terminal follows VS Code's normal
-  // persistence; the run id is the one the engine will write state under.
+  // shell integration, so the user sees the engine's own output and the
+  // terminal follows VS Code's normal persistence; the run id is the one the
+  // engine will write state under. Every engine action in this file takes
+  // this same route (controller.launch / controller.runCommand): nothing
+  // here builds a command line or starts a process of its own.
   const result = await controller.launch({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: kind, runId: planRunId(location, planPath), kind, planPath, manifest, reveal: true });
   await explainLaunch(result);
 }

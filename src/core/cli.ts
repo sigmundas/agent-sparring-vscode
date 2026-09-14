@@ -1,5 +1,6 @@
 /**
- * Building `sparring` invocations and resolving the executable.
+ * Building `sparring` invocations, resolving the executable, and handing the
+ * result to a shell without the shell re-reading it as syntax.
  *
  * Arguments are always returned as arrays for a shell-less spawn; nothing is
  * quoted or joined, so paths with spaces are safe on every platform.
@@ -236,10 +237,14 @@ export function executableWord(plan: ExecutablePlan): string {
 }
 
 /**
- * Whether an exit code means the shell could not find the command: 127 on
- * POSIX shells, 9009 from cmd.exe. PowerShell reports 1 for an unknown
- * command, which is indistinguishable from an ordinary failure, so it is
- * not claimed here.
+ * Whether an exit code *could* mean the shell could not find the command:
+ * 127 on POSIX shells, 9009 from cmd.exe. PowerShell reports 1 for an
+ * unknown command, which is indistinguishable from an ordinary failure, so
+ * it is not claimed here.
+ *
+ * The code alone is never enough — 127 is also what a shell reports when
+ * something the *engine* ran was missing, and what a program may exit with
+ * for its own reasons. Use `wasCommandNotFound`.
  */
 export function isCommandNotFoundExit(exitCode: number | undefined, platform: NodeJS.Platform): boolean {
   if (exitCode === undefined) {
@@ -248,9 +253,135 @@ export function isCommandNotFoundExit(exitCode: number | undefined, platform: No
   return exitCode === 127 || (platform === "win32" && exitCode === 9009);
 }
 
+/**
+ * Whether the launch itself failed because the command word could not be
+ * found. Only a bare word the *shell* had to resolve can fail that way: when
+ * the extension handed over a path it had already checked exists and is
+ * executable (`configured` / `resolved`), the executable was invoked and the
+ * exit code belongs to it. Claiming otherwise sends the user off to fix a
+ * setting that is correct, and hides the engine's real complaint.
+ */
+export function wasCommandNotFound(exitCode: number | undefined, platform: NodeJS.Platform, plan: ExecutablePlan | undefined): boolean {
+  return plan?.kind === "shell" && isCommandNotFoundExit(exitCode, platform);
+}
+
 /** The message shown when the user's shell itself reported the command missing. */
 export function commandNotFoundMessage(word: string): string {
   return `Your shell could not find '${word}'. Set agentSparring.executable to the full path of the sparring CLI, or make it available on your shell's PATH.`;
+}
+
+// ---------------------------------------------------------------------------
+// handing a command to a shell
+// ---------------------------------------------------------------------------
+
+/**
+ * How VS Code escapes `executeCommand(executable, args)`
+ * (ExtHostTerminalShellIntegration, verbatim):
+ *
+ *   for (const arg of args) {
+ *     !arg.match(/["'`]/) && arg.match(/\s/) ? line += ` "${arg}"` : line += ` ${arg}`;
+ *   }
+ *
+ * An argument is double-quoted only when it holds whitespace and none of
+ * `"`, `'` or a backtick; anything else is appended to the command line raw.
+ * That is exact for subcommands, flags and ordinary paths, and wrong for
+ * anything a person wrote: a backtick becomes command substitution, an
+ * apostrophe opens a quote, a newline starts a second command, `$` expands,
+ * and an empty argument disappears entirely. `resume-plan --evidence` is
+ * exactly that kind of text.
+ *
+ * This says whether the shell will parse VS Code's line back into the
+ * argument it was given. It is deliberately strict: an argument qualifies
+ * only if it is made of characters no shell touches.
+ */
+export function vscodeQuotingIsFaithful(arg: string): boolean {
+  if (arg === "") {
+    return false; // appended as nothing at all: the argument would vanish
+  }
+  if (/["'`]/.test(arg)) {
+    return false; // never quoted, so every metacharacter in it is live
+  }
+  if (/[\n\r]/.test(arg)) {
+    // Whether or not it is quoted, a newline makes this a multi-line command
+    // line; the extension writes those itself rather than rely on how a
+    // shell and shell integration reconcile them.
+    return false;
+  }
+  if (/\s/.test(arg)) {
+    // Double-quoted by VS Code: expansion and history are still active inside.
+    return !/[$\\!]/.test(arg);
+  }
+  return !SHELL_ACTIVE.test(arg);
+}
+
+/** Anything outside this set can mean something to a shell when unquoted. */
+const SHELL_ACTIVE = /[^\p{L}\p{N}_@%+=:,./-]/u;
+
+/** Whether the extension must build the command line itself for these arguments. */
+export function needsOwnQuoting(args: readonly string[]): boolean {
+  return args.some((arg) => !vscodeQuotingIsFaithful(arg));
+}
+
+/**
+ * The shells the extension knows how to quote for. `cmd` stands for every
+ * shell whose quoting is not reproduced here — cmd.exe (which cannot carry a
+ * newline in an argument at all) and PowerShell (whose native-command
+ * argument passing differs between 5.1 and 7.3+). For those the caller must
+ * bypass the shell and pass an argument array to the process directly.
+ */
+export type ShellFamily = "posix" | "cmd";
+
+const POSIX_SHELLS: ReadonlySet<string> = new Set(["sh", "bash", "zsh", "dash", "ksh", "ash", "fish"]);
+
+/** The family of `shell` (a shell path, e.g. VS Code's `env.shell`). */
+export function shellFamily(shell: string | undefined, platform: NodeJS.Platform): ShellFamily {
+  const name = (shell ?? "").replace(/\\/g, "/").split("/").pop()?.toLowerCase().replace(/\.exe$/, "") ?? "";
+  if (POSIX_SHELLS.has(name)) {
+    return "posix";
+  }
+  return platform === "win32" ? "cmd" : "posix";
+}
+
+/**
+ * A command line that `family` parses back into exactly `[word, ...args]`,
+ * or undefined when this family's quoting is not reproduced here. Arguments
+ * a shell would not touch are left bare so the terminal still shows a
+ * readable command.
+ */
+export function shellCommandLine(word: string, args: readonly string[], family: ShellFamily): string | undefined {
+  if (family !== "posix") {
+    return undefined;
+  }
+  return [word, ...args].map((part) => (SHELL_ACTIVE.test(part) || part === "" ? posixQuote(part) : part)).join(" ");
+}
+
+/**
+ * Single quotes are the one POSIX construct that is literal throughout: no
+ * expansion, no history, no line continuation. A single quote inside is
+ * closed, escaped and reopened — the `'\''` idiom, which sh, bash, zsh and
+ * fish all read the same way.
+ */
+export function posixQuote(value: string): string {
+  return `'${value.split("'").join("'\\''")}'`;
+}
+
+/**
+ * How a command should be handed to a shell:
+ *  - `arguments`: VS Code's own escaping is exact for these, so nothing
+ *    changes — this is every flag-and-path invocation the extension makes;
+ *  - `command-line`: an argument would not survive that escaping, so the
+ *    line is quoted here and passed as one string;
+ *  - `no-shell`: this shell's quoting is not written here, so the caller
+ *    must reach the process with an argument array and no shell at all.
+ */
+export type ShellHandover = { via: "arguments" } | { via: "command-line"; commandLine: string } | { via: "no-shell" };
+
+export function planShellHandover(word: string, args: readonly string[], family: ShellFamily): ShellHandover {
+  if (!needsOwnQuoting(args)) {
+    return { via: "arguments" };
+  }
+  const commandLine = shellCommandLine(word, args, family);
+  return commandLine === undefined ? { via: "no-shell" } : { via: "command-line", commandLine };
 }
 
 function withExtensions(candidate: string, isWindows: boolean, pathext: string | undefined): string[] {

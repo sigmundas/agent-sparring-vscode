@@ -40,7 +40,7 @@ import {
 } from "../core/stageRepositories";
 import { deriveStatus } from "../core/status";
 import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
-import { ExecutionTracker, type CommandNotFound, type LaunchOptions, type LaunchResult } from "./executionTracker";
+import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult } from "./executionTracker";
 
 const SELECTED_RUN_KEY = "agentSparring.selectedRunId";
 /** The run last shown, whether chosen explicitly or automatically; restores across reloads. */
@@ -72,6 +72,8 @@ export class SparringController implements vscode.Disposable {
   readonly onDidChange = this.changeEmitter.event;
   /** A launch from this window ended because the shell could not find the command. */
   readonly onCommandNotFound: vscode.Event<CommandNotFound>;
+  /** A launch from this window ran the engine and it exited non-zero. */
+  readonly onEngineFailed: vscode.Event<EngineFailure>;
 
   private refreshTimer: ReturnType<typeof setTimeout> | undefined;
   private pollTimer: ReturnType<typeof setTimeout> | undefined;
@@ -91,6 +93,7 @@ export class SparringController implements vscode.Disposable {
       () => this.locations,
     );
     this.onCommandNotFound = this.tracker.onCommandNotFound;
+    this.onEngineFailed = this.tracker.onEngineFailed;
     this.commands = new SparringCommandRunner((message) => this.log(message));
     this.disposables.push(
       this.tracker,

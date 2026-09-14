@@ -22,13 +22,14 @@
  */
 
 import * as vscode from "vscode";
-import { executableWord, isCommandNotFoundExit, planExecutable, type ExecutableProblem } from "../core/cli";
+import { executableWord, planExecutable, wasCommandNotFound, type ExecutablePlan, type ExecutableProblem } from "../core/cli";
 import type { SparringLocation } from "../core/discovery";
 import type { ExecutionRecord, ExecutionSource } from "../core/liveness";
 import { findDescendant } from "../core/processTree";
 import { commandLineRuns, matchSparringCommand, parseSparringCommand, type SparringSubcommand } from "../core/sparringCommand";
 import { listProcesses, processProbeSupported } from "./processProbe";
-import { awaitShellIntegration, hostEnv, SHELL_INTEGRATION_TIMEOUT_MS } from "./shellIntegration";
+import { awaitShellIntegration, executeThroughShell, hostEnv, SHELL_INTEGRATION_TIMEOUT_MS } from "./shellIntegration";
+import { collectOutput } from "./terminalOutput";
 
 export { SHELL_INTEGRATION_TIMEOUT_MS };
 
@@ -62,6 +63,24 @@ export interface CommandNotFound {
   exitCode: number;
 }
 
+/**
+ * The engine was launched and exited non-zero. This is the other half of
+ * what a bad exit code can mean, and the common half: the executable ran,
+ * so what the user needs is what it printed, not advice about PATH.
+ */
+export interface EngineFailure {
+  runId: string;
+  kind: SparringSubcommand;
+  /** The command word or path that ran. */
+  word: string;
+  exitCode: number;
+  /** What the command printed, as the terminal reported it (may be empty). */
+  output: string;
+}
+
+/** A deliberate interruption (Ctrl-C, SIGTERM): not a failure to report. */
+const INTERRUPTED_EXITS: ReadonlySet<number> = new Set([130, 143]);
+
 interface Tracked {
   record: ExecutionRecord;
   kind: SparringSubcommand;
@@ -74,6 +93,10 @@ interface Tracked {
   probeTimer?: ReturnType<typeof setInterval>;
   /** The command word or path this window launched (undefined for observed / reattached runs). */
   word?: string;
+  /** How that word was arrived at, so an exit code is read honestly. */
+  plan?: ExecutablePlan;
+  /** Everything the launched execution printed; resolves when it ends. */
+  output?: Promise<string>;
 }
 
 interface PersistedLaunch {
@@ -99,6 +122,9 @@ export class ExecutionTracker implements vscode.Disposable {
   private readonly notFoundEmitter = new vscode.EventEmitter<CommandNotFound>();
   /** A launch from this window ended with the shell's command-not-found code. */
   readonly onCommandNotFound = this.notFoundEmitter.event;
+  private readonly engineFailedEmitter = new vscode.EventEmitter<EngineFailure>();
+  /** A launch from this window ran and exited non-zero. */
+  readonly onEngineFailed = this.engineFailedEmitter.event;
   private counter = 0;
 
   constructor(
@@ -109,6 +135,7 @@ export class ExecutionTracker implements vscode.Disposable {
     this.disposables.push(
       this.changeEmitter,
       this.notFoundEmitter,
+      this.engineFailedEmitter,
       vscode.window.onDidStartTerminalShellExecution((event) => this.onExecutionStarted(event)),
       vscode.window.onDidEndTerminalShellExecution((event) => this.onExecutionEnded(event)),
       vscode.window.onDidCloseTerminal((terminal) => this.onTerminalClosed(terminal)),
@@ -163,11 +190,16 @@ export class ExecutionTracker implements vscode.Disposable {
    * user's normal shell, cwd = project) through shell integration, handing
    * the shell a bare `sparring` (or the configured path) as executable plus
    * an argument array, so the shell's own PATH and environment resolve it;
-   * the extension host's PATH is never consulted for that. Falls back to a
-   * dedicated terminal whose process is the runner when shell integration
-   * does not appear in time; then a bare name must be resolvable from this
-   * process, or the launch fails with a configuration message. Never builds
-   * a quoted command line.
+   * the extension host's PATH is never consulted for that. Arguments that
+   * VS Code's own escaping would hand the shell as syntax rather than as
+   * text — free-text `--evidence`, above all — are quoted here instead
+   * (`executeThroughShell`).
+   *
+   * Falls back to a dedicated terminal whose process *is* the runner, with
+   * the argument array passed to the process and no shell in between, when
+   * shell integration does not appear in time or when this shell's quoting
+   * is not one the extension can write. Then a bare name must be resolvable
+   * from this process, or the launch fails with a configuration message.
    */
   async launch(options: LaunchOptions): Promise<LaunchResult> {
     const configured = await planExecutable(options.configured, hostEnv(options.cwd), true);
@@ -181,16 +213,23 @@ export class ExecutionTracker implements vscode.Disposable {
       shellTerminal.show(true);
     }
     const integration = await awaitShellIntegration(shellTerminal);
-    if (integration) {
+    const word = executableWord(configured.plan);
+    const request = integration ? executeThroughShell(integration, word, options.args) : undefined;
+    if (request) {
       this.dropEnded(options.runId);
-      const word = executableWord(configured.plan);
-      const execution = integration.executeCommand(word, options.args);
-      const item = this.track(options, "launched", shellTerminal, execution);
+      const item = this.track(options, "launched", shellTerminal, request.execution);
       item.word = word;
-      this.log(`launched ${options.name} via shell integration (${configured.plan.kind === "shell" ? `'${word}' resolved by the shell` : word}, ${options.args.length} args, cwd ${options.cwd})`);
+      item.plan = configured.plan;
+      item.output = collectOutput(request.execution);
+      this.log(
+        `launched ${options.name} via shell integration (${configured.plan.kind === "shell" ? `'${word}' resolved by the shell` : word}, ${options.args.length} args${request.quotedHere ? ", command line quoted here" : ""}, cwd ${options.cwd})`,
+      );
       void this.persistWithPid(item, shellTerminal);
       this.changeEmitter.fire("started");
       return { ok: true, record: item.record, via: "shell" };
+    }
+    if (integration) {
+      this.log(`${options.name}: this shell's quoting cannot be written safely, so the engine is run without a shell`);
     }
     shellTerminal.dispose();
     const direct = await planExecutable(options.configured, hostEnv(options.cwd), false);
@@ -212,6 +251,7 @@ export class ExecutionTracker implements vscode.Disposable {
     }
     const item = this.track(options, "terminal", dedicated, undefined);
     item.word = path;
+    item.plan = direct.plan;
     this.log(`launched ${options.name} in a dedicated terminal (shell integration unavailable; ${path}, ${options.args.length} args, cwd ${options.cwd})`);
     void this.persistWithPid(item, dedicated);
     this.changeEmitter.fire("started");
@@ -313,10 +353,30 @@ export class ExecutionTracker implements vscode.Disposable {
     this.log(`${describe(item)} ${how}${detail ? ` — ${detail}` : ""}`);
     void this.persist();
     this.changeEmitter.fire("ended");
-    if (item.record.source === "launched" && item.word && isCommandNotFoundExit(exitCode, process.platform)) {
+    if (item.record.source !== "launched" || !item.word) {
+      return;
+    }
+    if (wasCommandNotFound(exitCode, process.platform, item.plan)) {
       this.log(`the shell reported '${item.word}' as not found (exit ${exitCode})`);
       this.notFoundEmitter.fire({ runId: item.record.runId, word: item.word, exitCode: exitCode as number });
+      return;
     }
+    if (exitCode !== undefined && exitCode !== 0 && !INTERRUPTED_EXITS.has(exitCode)) {
+      void this.reportEngineFailure(item, exitCode);
+    }
+  }
+
+  /**
+   * The executable ran and failed. What the user needs is what it printed,
+   * so the whole output goes to the log and the event carries it; nothing
+   * here guesses at a cause from the exit code.
+   */
+  private async reportEngineFailure(item: Tracked, exitCode: number): Promise<void> {
+    const output = (await item.output) ?? "";
+    for (const line of output.split("\n").map((line) => line.trimEnd()).filter((line) => line.trim() !== "")) {
+      this.log(`  ${line}`);
+    }
+    this.engineFailedEmitter.fire({ runId: item.record.runId, kind: item.kind, word: item.word as string, exitCode, output });
   }
 
   // ---------------------------------------------------------------- persistence + reload

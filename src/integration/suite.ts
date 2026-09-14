@@ -67,6 +67,7 @@ export async function run(): Promise<void> {
     ["accept", () => acceptStageAssertions(report, reportedRepo)],
     ["plan", () => planAssociationAssertions(report, reportedRepo, fixtureRoot)],
     ["gate", () => gateClickAssertions()],
+    ["evidence", () => evidenceLaunchAssertions(reportedRepo, fixtureRoot)],
   ];
   const only = (process.env.AGENT_SPARRING_IT_ONLY ?? "").split(",").map((name) => name.trim()).filter(Boolean);
   for (const [name, section] of sections) {
@@ -536,6 +537,125 @@ async function gateClickAssertions(): Promise<void> {
   } finally {
     panel.dispose();
     await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------- Submit result and continue: resume-plan --evidence reaches the engine
+
+/**
+ * The reported regression, in the shape it was reported in: a managed
+ * manifest plan run at a structured NEEDS_YOU, one gate check recorded PASS,
+ * and Submit result and continue pressed. The engine is the fixture's fake,
+ * configured as an absolute path exactly as the user configures theirs, and
+ * it records the argv it was given.
+ *
+ * What is asserted is what the user could not get: the configured executable
+ * itself runs, and the multi-line `## Human evidence` entry — backticked
+ * check id, apostrophes and all — arrives as one argument after --evidence
+ * rather than as shell syntax. Then the fake exits 127 deliberately, and the
+ * extension must report that the engine failed, never that the shell could
+ * not find a CLI it has just run.
+ */
+async function evidenceLaunchAssertions(reportedRepo: string, fixtureRoot: string): Promise<void> {
+  if (!(await shellIntegrationAvailable(reportedRepo))) {
+    console.log("integration: shell integration unavailable in this host; evidence-launch scenario skipped");
+    return;
+  }
+  const sparring = path.join(reportedRepo, ".sparring");
+  const argvLog = path.join(fixtureRoot, "fake-argv.log");
+  await fs.mkdir(path.join(sparring, "stages", GATE_STAGE), { recursive: true });
+  await fs.writeFile(path.join(sparring, "stages", GATE_STAGE, "state.json"), JSON.stringify({ status: "working", base_sha: null, candidate_sha: null, implementation_session_id: "impl", sparring_session_id: "spar" }));
+  await fs.writeFile(path.join(sparring, "stages", GATE_STAGE, "sparring.md"), gateSparring());
+  await fs.mkdir(path.join(sparring, "plans"), { recursive: true });
+  await fs.writeFile(
+    path.join(sparring, "plans", `${GATE_PLAN_KEY}.json`),
+    JSON.stringify({ current_stage: GATE_STAGE, current_stage_index: 0, expected_branch: "feature/reported-statistics", plan: GATE_PLAN_LABEL, plan_digest: "0".repeat(64), source: "manifest", status: "paused" }),
+  );
+  await fs.mkdir(path.join(reportedRepo, "plans"), { recursive: true });
+  await fs.writeFile(path.join(reportedRepo, "plans", "reported-statistics.md"), "# Reported statistics\n\n## Stage 3D — Snapshot v2 and attachment/export/import transport\n\nThe transport.\n");
+  // The engine is launched, runs, and fails on its own terms.
+  await fs.writeFile(path.join(sparring, "fake-runner.conf"), "resume_exit=127\nresume_output='sparring: resume-plan refused: the recorded digest does not match'\n");
+  await fs.rm(argvLog, { force: true });
+
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  const report = (await vscode.commands.executeCommand("agentSparring.diagnoseDiscovery")) as DiscoveryDiagnostic;
+  const runId = report.runs.find((run) => run.id.startsWith(`${reportedRepo}|`) && run.id.includes("plan:"))?.id;
+  assert.ok(runId, "the managed plan run is discovered");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+  const recorded = await vscode.commands.executeCommand("agentSparring._test.recordHumanCheck", GATE_CHECK_ID, "pass", "Checked on the reviewer's build; the placeholder doesn't flash.");
+  assert.deepEqual(recorded, { outcome: "pass", note: "Checked on the reviewer's build; the placeholder doesn't flash." }, "the gate check is recorded PASS, as clicking Pass records it");
+
+  const beforeNotFound = await vscode.commands.executeCommand("agentSparring._test.lastCommandNotFound");
+  const restore = stubDialogs("feature/reported-statistics", "Submit for review");
+  try {
+    await vscode.commands.executeCommand("agentSparring._test.overviewAction", "submitForReview");
+    const argv = await waitForFile(argvLog, 20_000, "the configured executable is reached by Submit result and continue");
+    const executable = /^\[(.+)\]$/m.exec(argv)?.[1];
+    const args = [...argv.matchAll(/<([^]*?)>\n/g)].map((match) => match[1]);
+
+    assert.equal(executable, vscode.workspace.getConfiguration("agentSparring").get<string>("executable"), "the exact configured absolute executable ran");
+    assert.equal(args.length, 9, `resume-plan carries nine arguments, not a sentence split into words: ${JSON.stringify(args)}`);
+    assert.equal(args[0], "resume-plan");
+    assert.deepEqual([args[1], args[3], args[5], args[7]], ["--manifest", "--repo-root", "--expected-branch", "--evidence"], "each flag with its own value");
+    assert.equal(args[4], reportedRepo);
+    assert.equal(args[6], "feature/reported-statistics");
+    const evidence = args[8];
+    assert.match(evidence, new RegExp(`check \\\`${GATE_CHECK_ID}\\\``), "the backticked gate id arrives as text, not as command substitution");
+    assert.match(evidence, /Checked on the reviewer's build; the placeholder doesn't flash\./, "apostrophes and the semicolon survive");
+    assert.ok(evidence.includes("\n"), "and it is still one multi-line entry");
+    assert.match(evidence, /^\d{4}-\d{2}-\d{2} — manual verification recorded in VS Code/, "the whole entry, from its first character");
+
+    // The fake exited 127 with its own complaint. That is an engine failure.
+    const failure = (await waitFor127()) as { runId: string; kind: string; exitCode: number; output: string } | undefined;
+    assert.ok(failure, "a non-zero exit from a launched engine is reported");
+    assert.equal(failure.kind, "resume-plan");
+    assert.equal(failure.exitCode, 127);
+    assert.match(failure.output, /the recorded digest does not match/, `what the engine printed is what the user is shown, got: ${JSON.stringify(failure.output)}`);
+    assert.deepEqual(
+      await vscode.commands.executeCommand("agentSparring._test.lastCommandNotFound"),
+      beforeNotFound,
+      "and nothing claims the shell could not find an executable it just ran",
+    );
+    console.log("integration: resume-plan --evidence reached the configured executable as 9 arguments; its 127 was reported as an engine failure");
+  } finally {
+    restore();
+    await fs.writeFile(path.join(sparring, "fake-runner.conf"), "sleep_for=3\nexit_with=0\n");
+  }
+}
+
+/** Answer the branch prompt and the Submit confirmation the way a person does. */
+function stubDialogs(branch: string, confirm: string): () => void {
+  const window = vscode.window as unknown as Record<string, unknown>;
+  const inputBox = window["showInputBox"];
+  const information = window["showInformationMessage"];
+  window["showInputBox"] = async () => branch;
+  window["showInformationMessage"] = async (_message: string, ...rest: unknown[]) => (rest.flat().includes(confirm) ? confirm : undefined);
+  return () => {
+    window["showInputBox"] = inputBox;
+    window["showInformationMessage"] = information;
+  };
+}
+
+async function waitForFile(file: string, timeoutMs: number, what: string): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const text = await fs.readFile(file, "utf8").catch(() => undefined);
+    if (text) {
+      return text;
+    }
+    assert.ok(Date.now() < deadline, what);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+}
+
+async function waitFor127(): Promise<unknown> {
+  const deadline = Date.now() + 20_000;
+  for (;;) {
+    const failure = await vscode.commands.executeCommand("agentSparring._test.lastEngineFailure");
+    if (failure || Date.now() >= deadline) {
+      return failure;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
   }
 }
 
