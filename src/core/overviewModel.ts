@@ -21,7 +21,8 @@
 import { parseBriefGoal } from "./brief";
 import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
-import { parseHandoffBranch, type SparringOutcome } from "./engineFormats";
+import { parseHandoffBranch, type SparringOutcome, type StateRepository } from "./engineFormats";
+import type { DeclaredRepository } from "./stageRepositories";
 import { deriveVerification, parseHumanEvidence, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
 import { formatTime } from "./logFormat";
 import { deriveLiveness, type ExecutionRecord, type LivenessState, type RunnerLiveness } from "./liveness";
@@ -147,6 +148,14 @@ export interface OverviewArtifacts {
    * only ever offer engine operations; the extension never sequences.
    */
   continuation?: PlanContinuation;
+  /**
+   * Sibling repositories declared for this stage in VS Code (workspace
+   * state, emitted into the execution manifest). Shown quietly next to what
+   * the engine has actually recorded in `state.json`: a declaration says
+   * which repositories the candidate set spans, a pin says which commit was
+   * frozen, and the two are labelled differently because they are.
+   */
+  siblingRepositories?: DeclaredRepository[];
 }
 
 export type PlanContinuation = "automatic" | "manual";
@@ -426,7 +435,7 @@ export function buildOverviewModel(
       matchStage: run.kind === "stage" && plan?.source === "associated" && plan.hasHeadings,
       diff: diffAction(stage),
     },
-    facts: facts(run, stage, artifacts.git, presentation, artifacts.associatedPlan),
+    facts: facts(run, stage, artifacts.git, presentation, artifacts.associatedPlan, artifacts.siblingRepositories),
     goal: artifacts.brief ? parseBriefGoal(artifacts.briefText) : undefined,
     activity: activityLine(live, halted, nowMs, uncertain),
     history: history(live),
@@ -1134,7 +1143,14 @@ function diffAction(stage: StageSnapshot): OverviewActions["diff"] {
 }
 
 /** Quiet metadata for the bottom of the page; nothing here is primary content. The engine's own vocabulary lives here. */
-function facts(run: RunSnapshot, stage: StageSnapshot, git: GitContext | undefined, presentation: StagePresentation, associated: AssociatedPlan | undefined): { label: string; value: string }[] {
+function facts(
+  run: RunSnapshot,
+  stage: StageSnapshot,
+  git: GitContext | undefined,
+  presentation: StagePresentation,
+  associated: AssociatedPlan | undefined,
+  siblings: DeclaredRepository[] | undefined,
+): { label: string; value: string }[] {
   const out: { label: string; value: string }[] = [{ label: "Repository", value: run.location.folderName }];
   if (run.kind === "plan") {
     out.push({ label: "Plan", value: run.state.status });
@@ -1161,5 +1177,25 @@ function facts(run: RunSnapshot, stage: StageSnapshot, git: GitContext | undefin
   if (stage.state?.sparringSessionId) {
     out.push({ label: "Sparring thread", value: shortenId(stage.state.sparringSessionId, 12) ?? "" });
   }
+  out.push(...siblingFacts(stage.state?.repositories ?? [], siblings ?? []));
   return out;
+}
+
+/**
+ * The stage's candidate set beyond the primary repository, said exactly as
+ * far as the data goes: a commit the engine pinned is a pin, a repository
+ * the engine recorded without one is recorded, and one that so far exists
+ * only as this window's declaration says so. Nothing here claims a sibling
+ * was reviewed or is up to date.
+ */
+function siblingFacts(recorded: StateRepository[], declared: DeclaredRepository[]): { label: string; value: string }[] {
+  const names = [...new Set([...recorded.map((entry) => entry.name), ...declared.map((entry) => entry.name)])].sort();
+  return names.map((name) => {
+    const pinned = recorded.find((entry) => entry.name === name);
+    const local = declared.find((entry) => entry.name === name);
+    const branch = pinned?.branch ?? local?.branch;
+    const sha = pinned?.candidateSha ? shortenId(pinned.candidateSha) : undefined;
+    const note = pinned ? (sha ? "pinned by the engine" : "recorded for this stage") : "declared in VS Code";
+    return { label: "Also reviews", value: `${name}${branch ? ` on ${branch}` : ""}${sha ? ` @ ${sha}` : ""} (${note})` };
+  });
 }

@@ -10,7 +10,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { buildManifest, manifestFileName, renderManifest, sourceDigest, type KnownStage } from "../core/manifest";
+import { adoptionGaps, buildManifest, manifestFileName, renderManifest, sourceDigest, type KnownStage } from "../core/manifest";
 
 const PLAN_LABEL = "docs/plans/active/reported-statistics.md";
 const PLAN_NAME = "reported-statistics.md";
@@ -149,6 +149,74 @@ describe("building an execution manifest from a human plan", () => {
     );
   });
 
+  it("briefs an already-executed stage from its own brief.md, and a future stage from the plan", () => {
+    // The real Stage 3D case. The plan's Stage 3D section was rewritten
+    // after the work was done — it now records what was implemented — while
+    // the stage itself still holds the brief it was actually started with,
+    // and two live sessions. The brief that was implemented and reviewed
+    // against is the contract, so it is carried verbatim; Stage 4, which
+    // does not exist yet, is briefed from the plan's current section.
+    const original = ["# Stage brief: stage-3d-snapshot-v2-and-attachment-export-import-transport", "", `Stage 3D from plan \`${PLAN_NAME}\`. Implement only this section; the other stages are separate.`, "", "## Stage 3D — Snapshot v2 and attachment/export/import transport", "", "Future stage; starts after Stage 3C is accepted.", ""].join("\n");
+    const evolved = PLAN.replace("Owns the frozen-evidence representation of enhanced content.", ["Owns the frozen-evidence representation of enhanced content.", "", "### Implementation record — 2026-09-14", "", "Snapshot v2 landed in both repositories; candidates pushed.", ""].join("\n"));
+
+    const built = buildManifest({
+      markdown: evolved,
+      planLabel: PLAN_LABEL,
+      planName: PLAN_NAME,
+      known: [{ label: "3D", stageId: "stage-3d-snapshot-v2-and-attachment-export-import-transport", brief: original }],
+    });
+
+    assert.ok(built.ok);
+    const stage3d = built.manifest.stages.find((stage) => stage.label === "Stage 3D")!;
+    assert.equal(stage3d.brief, original, "the brief the work was reviewed against, byte for byte");
+    assert.ok(!stage3d.brief.includes("Implementation record"), "the plan's later record is not smuggled into the executed stage's contract");
+    const stage4 = built.manifest.stages.find((stage) => stage.label === "Stage 4")!;
+    assert.match(stage4.brief, /Guarded editing in the UI\./, "a stage that has not run yet is briefed from the plan as it stands");
+  });
+
+  it("keeps a preserved stage even after its heading became a record of what happened", () => {
+    // Nothing has to be extracted from the plan for a stage whose brief is
+    // already known, so a plan that turned its section into a handoff note
+    // must not silently shorten the sequence.
+    const rewritten = PLAN.replace("## Stage 3D — Snapshot v2 and attachment/export/import transport", "## Stage 3D handoff — 2026-09-14 (candidates pushed)");
+    const brief = "# Stage brief: stage-3d-snapshot-v2\n\nSnapshot v2 transport.\n";
+
+    const built = buildManifest({ markdown: rewritten, planLabel: PLAN_LABEL, planName: PLAN_NAME, known: [{ label: "3D", stageId: "stage-3d-snapshot-v2", brief }] });
+
+    assert.ok(built.ok);
+    const stage3d = built.manifest.stages.find((stage) => stage.stage_id === "stage-3d-snapshot-v2");
+    assert.ok(stage3d, "the executed stage stays in the sequence");
+    assert.equal(stage3d.brief, brief);
+    assert.equal(stage3d.label, "Stage 3D");
+    assert.ok(stage3d.title.length > 0, "a display title is still produced");
+    assert.ok(
+      !built.skipped.some((problem) => problem.label === "3D"),
+      "and it is not reported as skipped",
+    );
+  });
+
+  it("a preserved brief does not excuse an ambiguous stage: identity is still refused", () => {
+    const ambiguous = buildManifest({
+      markdown: `${PLAN}\n## Stage 3D — Snapshot v2, revised\n\nA second definition.\n`,
+      planLabel: PLAN_LABEL,
+      planName: PLAN_NAME,
+      known: [{ label: "3D", stageId: "stage-3d-snapshot-v2", brief: "# Stage brief\n\nBody.\n" }],
+    });
+    assert.ok(!ambiguous.ok);
+    assert.deepEqual(
+      ambiguous.problems.map((problem) => problem.label),
+      ["3D"],
+    );
+  });
+
+  it("an existing stage with no execution history is still briefed from the plan", () => {
+    // No brief is supplied for such a stage: there is no history to protect,
+    // and the plan as it stands is the better text.
+    const built = build([{ label: "4", stageId: "stage-4-editor-and-ui-inspection" }]);
+    assert.ok(built.ok);
+    assert.match(built.manifest.stages.find((stage) => stage.label === "Stage 4")!.brief, /Guarded editing in the UI\./);
+  });
+
   it("is deterministic: the same plan and matches always produce the same bytes", () => {
     const first = build();
     const second = build();
@@ -210,6 +278,32 @@ describe("building an execution manifest from a human plan", () => {
     const prose = buildManifest({ markdown: "# Notes\n\nJust prose.\n", planLabel: PLAN_LABEL, planName: PLAN_NAME });
     assert.ok(!prose.ok);
     assert.match(prose.problems[0].reason, /no stage with a section to run/);
+  });
+
+  it("spots a stage that would be created inside a sequence that has already run past it", () => {
+    // The real hazard behind the preserved-brief rule: matching is
+    // deliberately conservative, so an old brief whose opening paragraph
+    // mentions three stage numbers matches none of them, the stage keeps its
+    // history under its own id, and the manifest proposes a fresh one for
+    // that label. Adopting that would re-implement accepted work.
+    const built = build([{ label: "3D", stageId: "stage-3d-snapshot-v2" }]);
+    assert.ok(built.ok);
+    const existing = new Set(["stage-3c-cloud-schema-rpc-and-sync-transport", "stage-3d-snapshot-v2"]);
+
+    assert.deepEqual(
+      adoptionGaps(built.manifest, existing).map((stage) => stage.label),
+      ["Stage 1"],
+      "Stage 1 comes before stages that exist, so its absence is a hole, not the future",
+    );
+    assert.deepEqual(adoptionGaps(built.manifest, new Set([...existing, "stage-reported-statistics-contract"])).map((stage) => stage.label), ["Stage 1"], "an existing stage under an id the manifest does not use is still a hole");
+  });
+
+  it("stages after the last existing one are the future, not a gap", () => {
+    const built = build();
+    assert.ok(built.ok);
+    assert.deepEqual(adoptionGaps(built.manifest, new Set(["stage-1-contract-and-compatibility-fixtures"])), []);
+    assert.deepEqual(adoptionGaps(built.manifest, new Set()), [], "a plan that has never run is all future");
+    assert.deepEqual(adoptionGaps(built.manifest, new Set(built.manifest.stages.map((stage) => stage.stage_id))), [], "a fully existing sequence has no hole");
   });
 
   it("names the manifest file after the plan key, so regenerating overwrites in place", () => {

@@ -31,7 +31,7 @@ async function commandsSource(): Promise<string> {
 }
 
 function fn(source: string, name: string): string {
-  const found = new RegExp(`async function ${name}[\\s\\S]*?\\n}\\n`).exec(source)?.[0] ?? "";
+  const found = new RegExp(`(?:async )?function ${name}[\\s\\S]*?\\n}\\n`).exec(source)?.[0] ?? "";
   assert.ok(found, `${name} exists`);
   return found;
 }
@@ -84,6 +84,49 @@ describe("the automatic path is one engine call, not a loop", () => {
     assert.ok(dir, "manifestDirectory exists");
     assert.match(dir, /globalStorageUri\.fsPath/, "the extension's own storage, not the workspace");
     assert.ok(!/repoRoot|sparringDir|workspaceFolder/.test(dir), "its location is never derived from a repository");
+  });
+
+  it("both manifest build sites see the same stage history and the same declarations", async () => {
+    // Starting and resuming must produce byte-identical manifests from an
+    // unchanged plan: the engine refuses a run whose digest moved. So
+    // neither call may know something the other does not.
+    const source = await commandsSource();
+    for (const where of ["performContinueAutomatically", "planInvocationFor"]) {
+      const body = fn(source, where);
+      assert.match(body, /known: await knownStageIds\(/, `${where} carries the project's existing stage ids and briefs`);
+      assert.match(body, /repositories: manifestRepositories\(controller\.stageRepositories\(/, `${where} carries the declared sibling repositories`);
+    }
+  });
+
+  it("an already-executed stage is briefed from its own brief.md, not from the plan as it now reads", async () => {
+    const source = await commandsSource();
+    const known = fn(source, "knownStageIds");
+    assert.match(known, /hasExecutionHistory\(candidate\.stage\)/, "only a stage that really ran keeps its brief");
+    assert.match(known, /executed && briefText !== undefined \? \{ brief: briefText \}/);
+    const history = fn(source, "hasExecutionHistory");
+    assert.match(history, /status === "accepted"/);
+    assert.match(history, /implementationSessionId !== null/);
+    assert.match(history, /sparringSessionId !== null/);
+    assert.match(history, /candidateSha !== null/);
+  });
+
+  it("the current stage of a managed run is not lost from the manifest just because the plan run claims it", async () => {
+    // Discovery stops listing a plan run's stages standalone, so building
+    // the known set from standalone runs alone would rebuild the manifest
+    // around a different id and brief on the next resume — and the engine
+    // would then refuse the digest.
+    const stages = fn(await commandsSource(), "stagesOfProject");
+    assert.match(stages, /candidate\.kind === "stage" \? \[candidate\.stage\] : \[\.\.\.candidate\.stages, candidate\.currentStage\]/);
+    assert.match(stages, /if \(!stage\.exists \|\| seen\.has\(stage\.stageId\)\)/, "each stage counted once, and only if it is on disk");
+  });
+
+  it("nothing in the declaration flow asks a human for a commit", async () => {
+    // Which commit was reviewed is the freeze boundary's answer. A typed
+    // SHA would be exactly the stale pin the verification exists to catch.
+    const add = fn(await commandsSource(), "addStageRepository");
+    assert.equal((add.match(/showInputBox\(/g) ?? []).length, 2, "exactly two things are asked: the expected branch and the display name");
+    assert.ok(!/candidate_?[Ss]ha/.test(add), "no commit is collected");
+    assert.match(add, /controller\.declareStageRepository\(key, label, \{ name: name\.trim\(\), path: chosen\.rootPath, branch: branch\.trim\(\) \}\)/);
   });
 
   it("resumes a manifest-started run with --manifest, because the engine refuses the other input", async () => {

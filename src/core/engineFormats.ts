@@ -64,12 +64,27 @@ export function parsePlanRunState(text: string): PlanRunState {
 
 export type StageStatus = "working" | "frozen" | "accepted";
 
+/**
+ * One repository of a cross-repository stage's candidate set, as the engine
+ * records it (stage.py: `CandidateRepository`). `candidateSha` is null until
+ * the freeze boundary resolves and pins that repository's reviewed commit;
+ * acceptance then re-verifies every pin.
+ */
+export interface StateRepository {
+  name: string;
+  path: string;
+  branch: string;
+  candidateSha: string | null;
+}
+
 export interface StageState {
   status: StageStatus;
   implementationSessionId: string | null;
   sparringSessionId: string | null;
   baseSha: string | null;
   candidateSha: string | null;
+  /** Declared sibling repositories; empty for the ordinary single-repository stage. */
+  repositories: StateRepository[];
 }
 
 const STAGE_STATUSES: ReadonlySet<string> = new Set(["working", "frozen", "accepted"]);
@@ -86,7 +101,35 @@ export function parseStageState(text: string): StageState {
     sparringSessionId: optionalString(payload, "sparring_session_id"),
     baseSha: optionalString(payload, "base_sha"),
     candidateSha: optionalString(payload, "candidate_sha"),
+    repositories: stateRepositories(payload["repositories"]),
   };
+}
+
+/**
+ * The recorded candidate set. A stage written before the field existed omits
+ * it entirely, so absence means "one repository", not an error; an entry
+ * missing a name, path or branch is dropped rather than half-shown, because
+ * the Overview may only state what the engine actually recorded.
+ */
+function stateRepositories(raw: unknown): StateRepository[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: StateRepository[] = [];
+  for (const value of raw) {
+    if (!value || typeof value !== "object") {
+      continue;
+    }
+    const entry = value as Record<string, unknown>;
+    const name = typeof entry["name"] === "string" ? entry["name"].trim() : "";
+    const repoPath = typeof entry["path"] === "string" ? entry["path"].trim() : "";
+    const branch = typeof entry["branch"] === "string" ? entry["branch"].trim() : "";
+    const sha = typeof entry["candidate_sha"] === "string" ? entry["candidate_sha"].trim() : "";
+    if (name && repoPath && branch) {
+      out.push({ name, path: repoPath, branch, candidateSha: sha || null });
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

@@ -55,6 +55,35 @@ describe("stage state (state.json)", () => {
   it("rejects a wrong-typed session id like the engine does", () => {
     assert.throws(() => parseStageState(JSON.stringify({ implementation_session_id: 5 })), EngineFormatError);
   });
+
+  it("reads a cross-repository stage's candidate set, pinned or not", () => {
+    const state = parseStageState(
+      JSON.stringify({
+        status: "frozen",
+        candidate_sha: "a".repeat(40),
+        repositories: [
+          { name: "sporely-web", path: "../sporely-web-worktree", branch: "feature/cloud", candidate_sha: "b".repeat(40) },
+          { name: "sporely-docs", path: "../docs", branch: "main", candidate_sha: null },
+        ],
+      }),
+    );
+    assert.deepEqual(state.repositories, [
+      { name: "sporely-web", path: "../sporely-web-worktree", branch: "feature/cloud", candidateSha: "b".repeat(40) },
+      { name: "sporely-docs", path: "../docs", branch: "main", candidateSha: null },
+    ]);
+  });
+
+  it("treats an absent candidate set as one repository, and drops entries it cannot state", () => {
+    // A stage written before the field existed omits it; an entry missing a
+    // name, path or branch is not half-shown, because the Overview may only
+    // say what the engine actually recorded.
+    assert.deepEqual(parseStageState("{}").repositories, []);
+    assert.deepEqual(parseStageState(JSON.stringify({ repositories: "nonsense" })).repositories, []);
+    assert.deepEqual(
+      parseStageState(JSON.stringify({ repositories: [{ name: "half", path: "../x" }, { name: "whole", path: "../y", branch: "main" }, null] })).repositories,
+      [{ name: "whole", path: "../y", branch: "main", candidateSha: null }],
+    );
+  });
 });
 
 describe("activity lines", () => {

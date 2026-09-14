@@ -62,6 +62,38 @@ describe("overview view model", () => {
     ]);
   });
 
+  it("a cross-repository stage's siblings sit quietly in the metadata, each said only as far as the data goes", async () => {
+    const ws = await planWorkspace("running", 1, {
+      stageState: {
+        repositories: [
+          { name: "sporely-web", path: "../sporely-web-worktree", branch: "feature/cloud", candidate_sha: "d".repeat(40) },
+          { name: "sporely-docs", path: "../docs", branch: "main", candidate_sha: null },
+        ],
+      },
+    });
+    const model = buildOverviewModel(await selection(ws), undefined, { ...ALL, siblingRepositories: [{ name: "sporely-mobile", path: "/Code/sporely-mobile", branch: "feature/cloud" }] }, NOW);
+
+    assert.deepEqual(
+      model.facts?.filter((fact) => fact.label === "Also reviews").map((fact) => fact.value),
+      [
+        // Recorded by the engine, no commit pinned yet.
+        "sporely-docs on main (recorded for this stage)",
+        // Declared in this window; the engine has not seen it yet.
+        "sporely-mobile on feature/cloud (declared in VS Code)",
+        // Pinned at the freeze boundary; acceptance re-verifies this commit.
+        `sporely-web on feature/cloud @ ${shortenId("d".repeat(40))} (pinned by the engine)`,
+      ],
+    );
+  });
+
+  it("an ordinary single-repository stage says nothing about siblings", async () => {
+    const model = buildOverviewModel(await selection(await planWorkspace("running", 1)), undefined, ALL, NOW);
+    assert.deepEqual(
+      model.facts?.filter((fact) => fact.label === "Also reviews"),
+      [],
+    );
+  });
+
   it("SEND_BACK outcome on a running stage reads as correcting", async () => {
     const ws = await planWorkspace("running", 2, { sparring: sparringMarkdown("SEND_BACK", "Empty vs missing statistics state conflated."), stageState: { base_sha: "a".repeat(40) } });
     const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);

@@ -41,6 +41,7 @@ navigates.
 | `Agent Sparring: Match Stage to Plan Section…` | When the Overview cannot tell which stage of the associated plan the selected stage is, pick it from the plan's stages (also **Match this stage…** / **Change match…** in the Overview). Stored with the association in VS Code workspace state, never in engine state. |
 | `Agent Sparring: Start Next Stage from Plan…` | For an accepted standalone stage with an associated plan: create the stage that follows it (by stage label) with the engine's own `sparring new-stage <id>`, after a confirmation naming the title, the proposed id and the plan section. The Overview switches to the new stage, the plan association follows it, and its fresh `brief.md` opens beside the plan section for you to fill in before **Run stage**. Also **Start next stage** in the Overview. |
 | `Agent Sparring: Continue Plan Automatically` | Build the execution manifest for the plan of the selected run and start (or resume) the engine's managed plan run against it: `sparring run-plan --manifest … [--adopt]` / `sparring resume-plan --manifest …`. The engine then sequences the stages itself. One confirmation before the first stage; none between stages. Also **Continue automatically** in the Overview. |
+| `Agent Sparring: Sibling Repositories for a Plan Stage…` | Declare which *other* repositories a plan stage's reviewed candidate spans, so acceptance pins and verifies the complete set instead of the primary commit alone. Pick the stage, pick a repository this window knows (or browse to one) and confirm the branch its candidate must be on; no commit is ever asked for. Stored in VS Code workspace state per plan and stage label, emitted into the execution manifest, and shown quietly in the Overview. Removing a declaration is the same command. |
 | `Agent Sparring: Choose sparring Executable…` | Pick the `sparring` CLI with a file dialog and store it as `agentSparring.executable`. |
 | `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / finalizing / future stages), the current stage as primary content (`Stage N — title`, a human state word with one explaining sentence, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), latest sparring result, small Stage Agent / Sparrer cards, Brief / Handoff / Sparring report / Diff / Plan / Log buttons, and quiet metadata (where the engine's own words live). Never auto-opens; updates in place. |
 | `Agent Sparring: Show Log` | Focus the Output Channel. |
@@ -132,23 +133,45 @@ Headings that only *record* what happened — `## Stage 3D handoff — 2026-09-1
 (accepted at …)` — are left in the plan and never run; the Output Channel
 names each one it skipped.
 
+**Stages that have already run keep their own brief.** A stage with real
+execution history — it is accepted, or holds a session or a candidate commit —
+is briefed in the manifest from its own `brief.md`, not from the plan's
+section for it. That brief is the contract the work was actually implemented
+and reviewed against, and the plan section usually moves on afterwards, when
+the plan is rewritten to record what was built. Re-extracting it would claim
+the stage was briefed with text it never saw, and the engine would refuse to
+adopt the sequence unless the stage were deleted or the plan rolled back.
+Stages that do not exist yet are briefed from the plan as it stands. So one
+manifest describes both the preserved history and the future execution, and
+neither the plan nor a live stage has to be rewritten to run it.
+
+That only works while every existing stage is recognised, and matching is
+deliberately conservative — an old brief whose opening paragraph mentions
+three stage numbers matches none of them. So if a stage would be *created*
+before stages that already exist, automatic continuation refuses and names
+it: a hole in a sequence that has already run past that point is almost
+always a stage under an id nobody recognised, and starting it would
+re-implement accepted work. Use **Match Stage to Plan Section…** on that
+stage and continue.
+
 **Cross-repository stages.** A stage whose reviewed candidate also lives in a
 second repository must declare it, or acceptance would pin only the primary
-commit and let the sibling move. The extension has no UI for that yet: add
-the declaration by hand to the stage's `.sparring/stages/<id>/state.json`,
+commit and let the sibling move between review and acceptance. **Agent
+Sparring: Sibling Repositories for a Plan Stage…** declares it: pick the
+stage, pick a repository this window already knows (or browse to one), and
+confirm the branch its candidate must be on. You are never asked for a
+commit — which commit was reviewed is the freeze boundary's answer, and a
+hand-typed SHA would be the stale pin the verification exists to catch.
 
-```json
-"repositories": [
-  {"name": "sporely-web", "path": "../sporely-web-worktree",
-   "branch": "feature/cloud-transport", "candidate_sha": null}
-]
-```
-
-and both the manual **Accept stage** and the managed run honour it: freeze
-pins each sibling after the same branch / clean / pushed checks the primary
-gets, and acceptance refuses if one has moved. A manifest may carry the same
-declaration per stage; when it does not, an existing one in `state.json` is
-left alone.
+The declaration is VS Code workspace state, kept per plan and stage label,
+and it goes into the execution manifest; the engine writes it into that
+stage's `state.json` when the run reaches it. Both the manual **Accept
+stage** and the managed run then honour it: freeze pins each sibling after
+the same branch / clean / pushed checks the primary gets, and acceptance
+re-verifies every pin and refuses if one has moved. Declared and pinned
+repositories are listed quietly at the bottom of the Overview, each said only
+as far as the data goes — *declared in VS Code*, *recorded for this stage*, or
+*pinned by the engine* with the commit.
 
 **Pause after each stage** (`manual`) keeps the per-stage checkpoints below
 unchanged, for when you want to look before every provider turn. In automatic
@@ -247,6 +270,7 @@ run them.
 | "The brief lists later work that is in this plan" | `Stage <label>` mentions in the current stage's `brief.md`, shown only when the plan has those headings (display only) |
 | "Claude working", "Codex sparring", active-turn duration, loop cycle, last visible event, changed files, verdict chronology | `activity.jsonl` (observational only; the Overview and the Output Channel share one filter for what counts as visible activity) |
 | Goal paragraph in the Overview | `## Goal` in the current stage's `brief.md` (display only) |
+| **Also reviews** — a stage's sibling repositories | *pinned by the engine* and *recorded for this stage* come from `repositories` in that stage's `state.json` (with the commit only when the freeze has pinned one); *declared in VS Code* is a declaration in workspace state that the engine has not written yet. Nothing here claims a sibling was reviewed or is current |
 
 Deleting `activity.jsonl` removes the live decoration and nothing else.
 

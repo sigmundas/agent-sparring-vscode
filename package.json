@@ -92,6 +92,11 @@
         "category": "Agent Sparring"
       },
       {
+        "command": "agentSparring.stageRepositories",
+        "title": "Sibling Repositories for a Plan Stage…",
+        "category": "Agent Sparring"
+      },
+      {
         "command": "agentSparring.chooseExecutable",
         "title": "Choose sparring Executable…",
         "category": "Agent Sparring"

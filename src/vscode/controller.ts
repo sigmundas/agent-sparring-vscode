@@ -29,6 +29,15 @@ import { applyEvent, emptyLiveState, type LiveState } from "../core/liveState";
 import { HUMAN_CHECKS_KEY, humanChecksFor, withHumanCheck, withoutHumanChecks, type CheckRecord, type HumanCheckDrafts } from "../core/humanChecks";
 import { LogRenderer } from "../core/logFormat";
 import { PLAN_ASSOCIATIONS_KEY, planAssociationFor, withAssociation, withManualMatch, type HeadingRef, type PlanAssociation, type PlanAssociations } from "../core/planAssociation";
+import {
+  STAGE_REPOSITORIES_KEY,
+  repositoriesForPlan,
+  repositoriesForStage,
+  withStageRepository,
+  withoutStageRepository,
+  type DeclaredRepository,
+  type StageRepositories,
+} from "../core/stageRepositories";
 import { deriveStatus } from "../core/status";
 import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
 import { ExecutionTracker, type CommandNotFound, type LaunchOptions, type LaunchResult } from "./executionTracker";
@@ -365,6 +374,33 @@ export class SparringController implements vscode.Disposable {
     await this.context.workspaceState.update(PLAN_ASSOCIATIONS_KEY, next);
     const stage = runId.split("|").pop();
     this.log(match ? `matched ${stage} to plan heading ${match.label ? `Stage ${match.label} — ` : ""}${match.title} (VS Code workspace state only)` : `cleared the manual plan heading match of ${stage}`);
+    this.render();
+  }
+
+  // ---------------------------------------------------------------- sibling repositories (declaration, emitted into the manifest)
+
+  /** Every stage's declared sibling repositories for one plan, keyed by label (`3D`). Workspace state; never written into engine state. */
+  stageRepositories(planKey: string): Record<string, DeclaredRepository[]> {
+    return repositoriesForPlan(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey);
+  }
+
+  /** One stage's declarations. */
+  stageRepositoriesFor(planKey: string, label: string): DeclaredRepository[] {
+    return repositoriesForStage(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, label);
+  }
+
+  /** Declare (or re-declare, by name) a sibling repository this stage's candidate spans. No commit is recorded: the engine pins that at the freeze boundary. */
+  async declareStageRepository(planKey: string, label: string, repository: DeclaredRepository): Promise<void> {
+    const next = withStageRepository(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, label, repository);
+    await this.context.workspaceState.update(STAGE_REPOSITORIES_KEY, next);
+    this.log(`Stage ${label}: also reviews ${repository.name} on ${repository.branch} (${repository.path}); it goes into the execution manifest, and the engine pins and re-verifies its commit`);
+    this.render();
+  }
+
+  async undeclareStageRepository(planKey: string, label: string, name: string): Promise<void> {
+    const next = withoutStageRepository(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, label, name);
+    await this.context.workspaceState.update(STAGE_REPOSITORIES_KEY, next);
+    this.log(`Stage ${label}: no longer declares ${name}; already-recorded pins stay in the stage's state.json until the next run rewrites the declaration`);
     this.render();
   }
 

@@ -9,10 +9,13 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, currentStageOf } from "../../core/discovery";
+import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, currentStageOf, type RunSnapshot } from "../../core/discovery";
 import { CHECK_OUTCOMES } from "../../core/humanChecks";
 import { OVERVIEW_ACTIONS, renderOverviewHtml, type HumanCheckMessage, type OverviewAction } from "../../core/overviewHtml";
 import { buildOverviewModel, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
+import { locateStage, parsePlanHeadings, type HeadingRef } from "../../core/planAssociation";
+import { planKey, planLabel } from "../../core/sparringCommand";
+import type { DeclaredRepository } from "../../core/stageRepositories";
 import { documentViewColumn } from "../../core/viewColumn";
 import type { SparringController } from "../controller";
 import { gitContext } from "../git";
@@ -157,9 +160,26 @@ export class OverviewPanelManager implements vscode.Disposable {
         humanChecks: this.controller.humanChecks(run.id),
         notesText,
         continuation: planContinuation(),
+        siblingRepositories: this.siblingRepositories(run, run.kind === "plan" ? planText : associatedText, briefText, association?.match),
       };
     }
     return buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.executionFor(selection.selected?.id));
+  }
+
+  /**
+   * The sibling repositories declared for *this* stage. Declarations are
+   * kept per plan and stage label, so the stage has to be located in its
+   * plan the same way everything else locates it; when it cannot be located
+   * unambiguously, nothing is shown rather than another stage's declaration.
+   */
+  private siblingRepositories(run: RunSnapshot, markdown: string | undefined, briefText: string | undefined, manual: HeadingRef | undefined): DeclaredRepository[] {
+    if (!markdown) {
+      return [];
+    }
+    const key = run.kind === "plan" ? run.planKey : planKey(planLabel(this.controller.associatedPlan(run.id) ?? "", run.location.repoRoot));
+    const stage = currentStageOf(run);
+    const label = locateStage(parsePlanHeadings(markdown), { stageId: stage.stageId, title: stage.title, briefText, manual })?.stage?.label;
+    return label ? this.controller.stageRepositoriesFor(key, label) : [];
   }
 
   dispose(): void {
