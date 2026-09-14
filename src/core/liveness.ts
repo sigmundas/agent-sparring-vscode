@@ -14,6 +14,16 @@
  * promoted to a certain `running`; without an observation the state is
  * `unknown`.
  *
+ * `unknown` is a waiting room, not a resting place. A run with an unmatched
+ * `turn.started` and no execution to point at used to stay there for ever —
+ * the case that matters is precisely the one where the runner is dead and
+ * the user needs to resume. So a run this window never watched is resolved
+ * by reading the process table for the project (runnerProcesses.ts, driven
+ * from executionTracker.probeProject): a runner found there is `running`
+ * with source `probed`, and none found is `stopped`. It stays `unknown`
+ * only while the probe has not answered, when the platform has no `ps`, or
+ * when a sparring runner exists that cannot be tied to any project.
+ *
  * `deriveLiveness` combines the two into what the UI may honestly show and
  * a presented copy of the activity fold in which turns the runner can no
  * longer be executing are cleared. Nothing here mutates engine files or the
@@ -33,7 +43,9 @@ export type ExecutionSource =
   /** A command typed in an integrated terminal, observed through shell integration start/end events. */
   | "observed"
   /** A launch recorded before a window reload whose hosting terminal was found again; liveness re-established by a process probe. */
-  | "reattached";
+  | "reattached"
+  /** No execution was ever watched for this run; the process table was read directly (runnerProcesses.ts). */
+  | "probed";
 
 export type ExecutionState =
   /** The process is observed to be alive right now. */
@@ -178,6 +190,8 @@ function runningDetail(execution: ExecutionRecord): string {
       return "A sparring command typed in an integrated terminal is running (exact: its shell execution has not ended).";
     case "reattached":
       return "The runner launched before the window reloaded is still running (its process was found under the reconnected terminal).";
+    case "probed":
+      return "A sparring runner for this project is in the process table. Nothing in this window launched it, so it cannot be stopped from here.";
   }
 }
 

@@ -14,13 +14,19 @@
  *    the shell-integration start event's command line and cwd;
  *  - launches recorded in workspaceState before a window reload, re-found by
  *    their terminal's process id and, on POSIX, confirmed alive by a
- *    process-table probe; without a probe they stay `unknown`.
+ *    process-table probe; without a probe they stay `unknown`;
+ *  - and, for a run none of the above ever saw, the process table read
+ *    directly for its project (`probeProject`). That is the only way to
+ *    answer for a runner whose terminal was closed before a reload, or one
+ *    started outside VS Code entirely.
  *
  * Any shell execution starting or ending in a terminal that hosts a tracked
  * runner, and the terminal closing, end that runner: a shell runs one
  * foreground command at a time. Ended records are kept (until the next
  * launch for the same run) so a stale `turn.started` can be presented as
- * "interrupted" instead of "running".
+ * "interrupted" instead of "running" — and they are persisted across a
+ * window reload for the same reason, since a reload does not un-observe a
+ * runner's death.
  */
 
 import * as vscode from "vscode";
@@ -28,6 +34,7 @@ import { executableWord, planExecutable, wasCommandNotFound, type ExecutablePlan
 import type { SparringLocation } from "../core/discovery";
 import type { ExecutionRecord, ExecutionSource } from "../core/liveness";
 import { findDescendant } from "../core/processTree";
+import { probeRunnerProcesses, type RunnerProbe } from "../core/runnerProcesses";
 import { commandLineRuns, matchSparringCommand, parseSparringCommand, type SparringSubcommand } from "../core/sparringCommand";
 import { listProcesses, processProbeSupported } from "./processProbe";
 import { awaitShellIntegration, executeThroughShell, hostEnv, SHELL_INTEGRATION_TIMEOUT_MS } from "./shellIntegration";
@@ -115,7 +122,19 @@ interface PersistedLaunch {
   startedAtMs: number;
   terminalPid: number;
   terminalName: string;
+  /**
+   * Present only for a launch that had already ended when the window
+   * reloaded. That a runner was seen to die is as much an observation as
+   * that it was seen to start, and it is the more useful one: without it a
+   * reload turned "the terminal was closed, so the loop is over" back into
+   * "no idea", and a stale `turn.started` was presented as possibly-working
+   * for ever.
+   */
+  ended?: { atMs: number; exitCode?: number; detail?: string };
 }
+
+/** How many ended executions are kept per run across a reload; only the last one is ever presented. */
+const ENDED_KEPT_PER_RUN = 1;
 
 export type TrackerChange = "started" | "ended" | "changed";
 
@@ -173,6 +192,13 @@ export class ExecutionTracker implements vscode.Disposable {
     return best;
   }
 
+  /** What a window reload would find in workspaceState, reduced to run id and state. */
+  persisted(): { runId: string; state: "running" | "ended" }[] {
+    return this.context.workspaceState
+      .get<PersistedLaunch[]>(LAUNCHES_KEY, [])
+      .map((launch) => ({ runId: launch.runId, state: launch.ended ? ("ended" as const) : ("running" as const) }));
+  }
+
   /** Send Ctrl-C to the exact terminal hosting this run's live execution. */
   stop(runId: string): boolean {
     const item = this.liveItemFor(runId);
@@ -183,6 +209,31 @@ export class ExecutionTracker implements vscode.Disposable {
     item.terminal.show(true);
     this.log(`sent Ctrl-C to the terminal running ${describe(item)}`);
     return true;
+  }
+
+  /**
+   * The latest execution this window actually watched, ignoring anything a
+   * process probe inferred. A probe is a snapshot of one moment with no
+   * event to tell it when that moment passed; a watched execution outranks
+   * it and must never be replaced by one.
+   */
+  private watchedExecutionFor(runId: string): ExecutionRecord | undefined {
+    let best: ExecutionRecord | undefined;
+    for (const { record } of this.tracked.values()) {
+      if (record.runId === runId && record.source !== "probed" && (!best || record.startedAtMs > best.startedAtMs)) {
+        best = record;
+      }
+    }
+    return best;
+  }
+
+  private dropProbed(runId: string): void {
+    for (const [id, item] of this.tracked) {
+      if (item.record.runId === runId && item.record.source === "probed") {
+        this.stopProbe(item);
+        this.tracked.delete(id);
+      }
+    }
   }
 
   private liveItemFor(runId: string): Tracked | undefined {
@@ -407,24 +458,34 @@ export class ExecutionTracker implements vscode.Disposable {
   }
 
   private async persist(): Promise<void> {
-    const launches: PersistedLaunch[] = [];
+    const live: PersistedLaunch[] = [];
+    const ended: PersistedLaunch[] = [];
     for (const item of this.tracked.values()) {
-      if (item.record.state !== "ended" && item.terminalPid !== undefined && item.terminal) {
-        launches.push({
-          id: item.record.id,
-          runId: item.record.runId,
-          kind: item.kind,
-          stageId: item.stageId,
-          planPath: item.planPath,
-          manifest: item.manifest,
-          source: item.record.source,
-          startedAtMs: item.record.startedAtMs,
-          terminalPid: item.terminalPid,
-          terminalName: item.terminal.name,
-        });
+      if (item.record.source === "probed") {
+        // An inference about one past moment, with no terminal behind it and
+        // nothing to re-tie it to after a reload. The next window reads the
+        // process table itself rather than inheriting this one's answer.
+        continue;
+      }
+      const common = {
+        id: item.record.id,
+        runId: item.record.runId,
+        kind: item.kind,
+        stageId: item.stageId,
+        planPath: item.planPath,
+        manifest: item.manifest,
+        source: item.record.source,
+        startedAtMs: item.record.startedAtMs,
+        terminalPid: item.terminalPid ?? 0,
+        terminalName: item.terminal?.name ?? "",
+      };
+      if (item.record.state === "ended") {
+        ended.push({ ...common, ended: { atMs: item.record.endedAtMs ?? Date.now(), exitCode: item.record.exitCode, detail: item.record.detail } });
+      } else if (item.terminalPid !== undefined && item.terminal) {
+        live.push(common);
       }
     }
-    await this.context.workspaceState.update(LAUNCHES_KEY, launches);
+    await this.context.workspaceState.update(LAUNCHES_KEY, [...live, ...newestEndedPerRun(ended)]);
   }
 
   /**
@@ -434,13 +495,17 @@ export class ExecutionTracker implements vscode.Disposable {
    * Found and a shell terminal → a POSIX process probe decides running /
    * ended; elsewhere the state stays `unknown`. Not found within the
    * reconnect grace period → ended (the shell that hosted it is gone).
+   *
+   * A launch recorded as already ended is restored as ended and nothing is
+   * looked for: the observation that it died was made before the reload and
+   * a reload does not un-make it.
    */
   async reattach(): Promise<void> {
     const launches = this.context.workspaceState.get<PersistedLaunch[]>(LAUNCHES_KEY, []);
     if (launches.length === 0) {
       return;
     }
-    const pending = new Map<string, PersistedLaunch>(launches.map((launch) => [launch.id, launch]));
+    const pending = new Map<string, PersistedLaunch>();
     for (const launch of launches) {
       const item: Tracked = {
         record: {
@@ -458,10 +523,19 @@ export class ExecutionTracker implements vscode.Disposable {
         manifest: launch.manifest,
         terminalPid: launch.terminalPid,
       };
+      if (launch.ended) {
+        item.record = { ...item.record, state: "ended", endedAtMs: launch.ended.atMs, exitCode: launch.ended.exitCode, detail: launch.ended.detail };
+      } else {
+        pending.set(launch.id, launch);
+      }
       this.tracked.set(launch.id, item);
     }
     this.changeEmitter.fire("changed");
-    this.log(`window reloaded with ${launches.length} recorded launch(es); re-establishing runner liveness`);
+    const reviving = launches.length - pending.size;
+    this.log(`window reloaded with ${launches.length} recorded launch(es)${reviving > 0 ? ` (${reviving} already ended before the reload)` : ""}; re-establishing runner liveness`);
+    if (pending.size === 0) {
+      return;
+    }
 
     const tryTerminal = async (terminal: vscode.Terminal) => {
       let pid: number | undefined;
@@ -547,6 +621,70 @@ export class ExecutionTracker implements vscode.Disposable {
       item.probeTimer = undefined;
     }
   }
+
+  // ---------------------------------------------------------------- untracked runs
+
+  /**
+   * Establish liveness for a run this window has no execution of at all, by
+   * reading the process table for its project.
+   *
+   * This is the case a closed terminal plus a reload leaves behind, and the
+   * case of a loop started outside VS Code. Neither can be answered from
+   * anything this window watched, and `unknown` is the wrong place to leave
+   * a plan whose runner is simply dead.
+   *
+   * Records a `probed` execution only when the answer is definite. No `ps`
+   * on this platform, or a sparring runner that cannot be tied to a project,
+   * records nothing: `unknown` is then the honest state and a second runner
+   * must not be offered on a guess. Returns whether anything was recorded.
+   */
+  async probeProject(location: SparringLocation, runId: string, kind: SparringSubcommand): Promise<boolean> {
+    if (this.watchedExecutionFor(runId) || !processProbeSupported()) {
+      return false;
+    }
+    let probe: RunnerProbe;
+    try {
+      probe = probeRunnerProcesses(await listProcesses(), location);
+    } catch (error) {
+      this.log(`could not read the process table for ${location.projectDir}: ${(error as Error).message}`);
+      return false;
+    }
+    // A real observation may have arrived while `ps` ran; it outranks a probe.
+    if (this.watchedExecutionFor(runId)) {
+      return false;
+    }
+    // An earlier probe's answer is about an earlier moment. This one replaces
+    // it, so a runner that has since started is not masked by "it was gone".
+    this.dropProbed(runId);
+    if (probe.kind === "unattributable") {
+      this.log(`a sparring runner is running but names no --repo-root or --sparring-dir, so it cannot be tied to ${location.projectDir}; liveness stays unknown`);
+      return false;
+    }
+    const item = this.track({ runId, kind }, "probed", undefined, undefined);
+    if (probe.kind === "alive") {
+      this.log(`no execution of ${kind} was watched from this window, but a sparring runner for ${location.projectDir} is running (pid ${probe.process.pid})`);
+      this.changeEmitter.fire("started");
+      return true;
+    }
+    item.record = {
+      ...item.record,
+      state: "ended",
+      endedAtMs: Date.now(),
+      detail: "The plan runner is no longer running: no sparring process for this project exists.",
+    };
+    this.log(`no execution of ${kind} was watched from this window and no sparring runner for ${location.projectDir} is running; the runner is gone`);
+    this.changeEmitter.fire("ended");
+    return true;
+  }
+}
+
+/** Keep only the most recent ended execution per run; older ones say nothing the newest does not. */
+function newestEndedPerRun(ended: PersistedLaunch[]): PersistedLaunch[] {
+  const byRun = new Map<string, PersistedLaunch[]>();
+  for (const launch of ended) {
+    byRun.set(launch.runId, [...(byRun.get(launch.runId) ?? []), launch]);
+  }
+  return [...byRun.values()].flatMap((launches) => launches.sort((a, b) => b.startedAtMs - a.startedAtMs).slice(0, ENDED_KEPT_PER_RUN));
 }
 
 function describe(item: Tracked): string {

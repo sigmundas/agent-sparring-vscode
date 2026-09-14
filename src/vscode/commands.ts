@@ -82,6 +82,9 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
       return { state: liveness.state, source: liveness.source, turnActive: liveness.turnActive, interrupted: liveness.interrupted, detail: liveness.detail, execution: liveness.execution };
     }),
     vscode.commands.registerCommand("agentSparring._test.stop", (runId: string) => controller.stopRunner(runId)),
+    // What a window reload would find: the launches recorded in workspaceState,
+    // including the ones already known to have ended.
+    vscode.commands.registerCommand("agentSparring._test.persistedLaunches", () => controller.persistedLaunches()),
     vscode.commands.registerCommand("agentSparring._test.acceptStage", async () => {
       const run = controller.currentSelection.selected;
       return run?.kind === "stage" ? performAcceptStage(controller, run) : undefined;

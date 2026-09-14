@@ -70,6 +70,7 @@ export async function run(): Promise<void> {
     ["evidence", () => evidenceLaunchAssertions(reportedRepo, fixtureRoot)],
     ["advance", () => advancementAssertions(reportedRepo)],
     ["terminals", () => terminalReuseAssertions(report, reportedRepo)],
+    ["closed", () => closedTerminalAssertions(report, reportedRepo)],
   ];
   const only = (process.env.AGENT_SPARRING_IT_ONLY ?? "").split(",").map((name) => name.trim()).filter(Boolean);
   for (const [name, section] of sections) {
@@ -135,10 +136,25 @@ async function staleTelemetryAssertions(report: DiscoveryDiagnostic, reportedRep
   assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", staleId), staleId);
   await vscode.commands.executeCommand("agentSparring.refresh");
   const liveness = await livenessOf(staleId);
-  assert.equal(liveness.turnActive, true, "the replayed turn.started is described as activity");
-  assert.equal(liveness.state, "unknown", "but the freshly activated extension does not call it Running");
-  assert.equal(liveness.source, "telemetry");
-  assert.equal(liveness.execution, undefined);
+  assert.notEqual(liveness.state, "running", "a replayed turn.started is never promoted to Running");
+
+  if (process.platform !== "darwin" && process.platform !== "linux") {
+    assert.equal(liveness.state, "unknown", "without a process table there is nothing to resolve it with");
+    assert.equal(liveness.source, "telemetry");
+    assert.equal(liveness.execution, undefined);
+    return;
+  }
+
+  // On a platform with `ps` the extension does not stop at "unknown": no
+  // sparring runner exists for this project, so the replayed turn cannot be
+  // executing and the run is stopped. Leaving it unknown for ever was the
+  // dead end that hid Resume plan (see core/runnerProcesses.ts).
+  assert.equal(liveness.state, "stopped", "the process table settles it");
+  assert.equal(liveness.source, "execution");
+  assert.equal(liveness.execution?.source, "probed", "and says so: nothing in this window watched that runner");
+  assert.equal(liveness.interrupted, true, "the turn was open when the runner disappeared");
+  assert.equal(liveness.turnActive, false, "so no turn is presented as in progress");
+  assert.match(liveness.detail, /no longer running/);
 }
 
 // ---------------------------------------------------------------- launched runner: exit, then Ctrl-C
@@ -711,6 +727,65 @@ async function terminalReuseAssertions(report: DiscoveryDiagnostic, reportedRepo
     terminal.dispose();
   }
   console.log("integration: four engine commands, one reusable terminal per project, each execution tracked on its own");
+}
+
+// ---------------------------------------------------------------- the terminal closed mid-run
+
+/**
+ * What the user actually did: closed `Agent Sparring — <project>` while the
+ * runner inside it was working, and later reloaded the window.
+ *
+ * Closing the terminal kills the shell and with it the runner, so the
+ * extension must treat that as the end of the execution there and then —
+ * and the record of that end must survive a reload, because a reload does
+ * not un-observe a death. Without both halves the run came back after the
+ * reload with nothing but an unmatched `turn.started`, and the Overview sat
+ * at "Run status unknown" with every action withheld.
+ */
+async function closedTerminalAssertions(report: DiscoveryDiagnostic, reportedRepo: string): Promise<void> {
+  if (!(await shellIntegrationAvailable(reportedRepo))) {
+    console.log("integration: shell integration unavailable in this host; closed-terminal scenario skipped");
+    return;
+  }
+  for (const terminal of ownTerminals()) {
+    terminal.dispose();
+  }
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  const runId = runIdOf(report, reportedRepo, "stage-reported-statistics-typed-parser");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+  // A runner that writes turn.started and then works for two minutes: the
+  // turn is open when the terminal goes away, exactly as it was.
+  await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=120\nexit_with=0\n");
+  await vscode.commands.executeCommand("agentSparring.runStage");
+  await waitFor(runId, (liveness) => liveness.state === "running", 15_000, "the runner starts");
+  await waitFor(runId, (liveness) => liveness.turnActive, 10_000, "and a turn is open");
+
+  const live = (await vscode.commands.executeCommand("agentSparring._test.persistedLaunches")) as { runId: string; state: string }[];
+  assert.ok(
+    live.some((launch) => launch.runId === runId && launch.state === "running"),
+    "while it runs, a reload would find it recorded as running",
+  );
+
+  const [terminal] = ownTerminals();
+  assert.ok(terminal, "the extension's terminal is open");
+  terminal.dispose();
+
+  const stopped = await waitFor(runId, (liveness) => liveness.state === "stopped", 15_000, "closing the terminal ends the execution immediately");
+  assert.equal(stopped.interrupted, true, "the open turn is presented as interrupted, never as still working");
+  assert.equal(stopped.turnActive, false);
+  assert.equal(stopped.execution?.state, "ended");
+
+  const after = (await vscode.commands.executeCommand("agentSparring._test.persistedLaunches")) as { runId: string; state: string }[];
+  assert.ok(
+    after.some((launch) => launch.runId === runId && launch.state === "ended"),
+    `a reload must still find that this runner died, got ${JSON.stringify(after)}`,
+  );
+  assert.ok(
+    !after.some((launch) => launch.runId === runId && launch.state === "running"),
+    "and must not find it recorded as running",
+  );
+  console.log("integration: closing the extension's terminal ends the execution at once, and the reload record says so");
 }
 
 // ---------------------------------------------------------------- Submit result and continue: resume-plan --evidence reaches the engine

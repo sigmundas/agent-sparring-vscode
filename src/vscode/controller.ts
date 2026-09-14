@@ -50,6 +50,8 @@ const SELECTED_AT_KEY = "agentSparring.selectedRunAtMs";
 /** The run last shown, whether chosen explicitly or automatically; restores across reloads. */
 const STICKY_RUN_KEY = "agentSparring.lastShownRunId";
 const OUTPUT_CHANNEL_NAME = "Agent Sparring";
+/** How often the process table may be read for one run whose liveness nothing in this window watched. */
+const PROBE_COOLDOWN_MS = 15_000;
 
 export class SparringController implements vscode.Disposable {
   readonly output: vscode.OutputChannel;
@@ -70,6 +72,8 @@ export class SparringController implements vscode.Disposable {
   /** The integrated terminals this extension owns: one per project, reused. */
   private readonly terminals: TerminalPool;
   private reattached = false;
+  /** When the process table was last read for a run id; see resolveUnwatchedRunner. */
+  private readonly probed = new Map<string, number>();
   /** Run ids whose Accept stage operation from this window is still in flight. */
   private readonly accepting = new Set<string>();
 
@@ -282,6 +286,39 @@ export class SparringController implements vscode.Disposable {
     }
     await this.attachToSelected();
     this.render();
+    await this.resolveUnwatchedRunner();
+  }
+
+  /**
+   * Settle the liveness of the selected run when this window watched no
+   * execution for it and telemetry claims a turn is in progress.
+   *
+   * That combination is what a closed terminal plus a reload leaves, and
+   * what a loop started outside VS Code looks like. It used to present as
+   * "Working?" / "Run status unknown" indefinitely, with every action
+   * withheld — including the Resume plan the situation actually called for.
+   * The process table answers it (ExecutionTracker.probeProject); when it
+   * cannot, the state stays unknown, which is still the honest answer.
+   *
+   * `turnActive` is the trigger, and it is precise: deriveLiveness reports
+   * it only when telemetry alone claims a turn, which is exactly the case
+   * nothing this window watched can settle. A later turn puts the run back
+   * in that state, so the question is asked again rather than answered from
+   * an earlier probe — throttled, because it reads the process table.
+   */
+  private async resolveUnwatchedRunner(): Promise<void> {
+    const run = this.selection.selected;
+    if (!run || !this.livenessFor(run.id).turnActive) {
+      return;
+    }
+    const last = this.probed.get(run.id) ?? 0;
+    if (Date.now() - last < PROBE_COOLDOWN_MS) {
+      return;
+    }
+    this.probed.set(run.id, Date.now());
+    if (await this.tracker.probeProject(run.location, run.id, run.kind === "plan" ? "resume-plan" : "run-loop")) {
+      this.render();
+    }
   }
 
   get currentSelection(): RunSelection {
@@ -457,6 +494,11 @@ export class SparringController implements vscode.Disposable {
 
   livenessFor(runId: string | undefined): RunnerLiveness {
     return deriveLiveness(this.live, this.tracker.executionFor(runId), Date.now());
+  }
+
+  /** What a window reload would find recorded about this window's launches (integration tests). */
+  persistedLaunches(): { runId: string; state: "running" | "ended" }[] {
+    return this.tracker.persisted();
   }
 
   /** Live state as presented: turns a runner known to have ended cannot be executing are cleared. */
