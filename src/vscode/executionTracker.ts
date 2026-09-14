@@ -663,6 +663,10 @@ export class ExecutionTracker implements vscode.Disposable {
     const item = this.track({ runId, kind }, "probed", undefined, undefined);
     if (probe.kind === "alive") {
       this.log(`no execution of ${kind} was watched from this window, but a sparring runner for ${location.projectDir} is running (pid ${probe.process.pid})`);
+      // Nothing will tell us when it ends: there is no terminal behind it and
+      // no shell execution to fire an end event. Keep asking the process
+      // table, or this record would hold the UI at Running for ever.
+      item.probeTimer = setInterval(() => void this.reprobe(item, location), PROBE_INTERVAL_MS);
       this.changeEmitter.fire("started");
       return true;
     }
@@ -675,6 +679,23 @@ export class ExecutionTracker implements vscode.Disposable {
     this.log(`no execution of ${kind} was watched from this window and no sparring runner for ${location.projectDir} is running; the runner is gone`);
     this.changeEmitter.fire("ended");
     return true;
+  }
+
+  /** Keep a probed-alive record honest: end it when its project's runner is gone. */
+  private async reprobe(item: Tracked, location: SparringLocation): Promise<void> {
+    if (item.record.state === "ended" || !this.tracked.has(item.record.id)) {
+      this.stopProbe(item);
+      return;
+    }
+    let probe: RunnerProbe;
+    try {
+      probe = probeRunnerProcesses(await listProcesses(), location);
+    } catch {
+      return; // A transient `ps` failure is not evidence that anything ended.
+    }
+    if (probe.kind === "none") {
+      this.end(item, undefined, "The runner that was found in the process table is no longer running.");
+    }
   }
 }
 
