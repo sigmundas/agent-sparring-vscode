@@ -14,8 +14,14 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import * as crypto from "node:crypto";
+import * as os from "node:os";
 import type { DiscoveryDiagnostic } from "../core/diagnose";
+import { discoverRuns, selectRun } from "../core/discovery";
+import { isHumanCheckMessage, renderOverviewHtml } from "../core/overviewHtml";
+import { withHumanCheck, type HumanCheckDrafts } from "../core/humanChecks";
 import type { ExecutionRecord, LivenessState, RunnerLiveness } from "../core/liveness";
+import { buildOverviewModel, type ManifestStageView, type OverviewArtifacts } from "../core/overviewModel";
 
 const STAGES = ["stage-reported-statistics-contract", "stage-reported-statistics-local-schema-barrier", "stage-reported-statistics-typed-parser", "stage-review-complete", "stage-review-complete-dirty", "stage-stale-turn"];
 
@@ -60,6 +66,7 @@ export async function run(): Promise<void> {
     ["notfound", () => commandNotFoundAssertions(report, reportedRepo)],
     ["accept", () => acceptStageAssertions(report, reportedRepo)],
     ["plan", () => planAssociationAssertions(report, reportedRepo, fixtureRoot)],
+    ["gate", () => gateClickAssertions()],
   ];
   const only = (process.env.AGENT_SPARRING_IT_ONLY ?? "").split(",").map((name) => name.trim()).filter(Boolean);
   for (const [name, section] of sections) {
@@ -67,7 +74,7 @@ export async function run(): Promise<void> {
       await section();
     }
   }
-  console.log(only.length > 0 ? `integration: sections ${only.join(", ")} verified` : "integration: discovery, stale telemetry, launched runner exit, Ctrl-C, observed terminal command, bare executable via the shell, command-not-found, Accept stage and plan association all verified");
+  console.log(only.length > 0 ? `integration: sections ${only.join(", ")} verified` : "integration: discovery, stale telemetry, launched runner exit, Ctrl-C, observed terminal command, bare executable via the shell, command-not-found, Accept stage, plan association and the structured-gate click path all verified");
 }
 
 // ---------------------------------------------------------------- discovery (unchanged shape)
@@ -437,6 +444,125 @@ async function startNextStageAssertions(report: DiscoveryDiagnostic, reportedRep
   assert.equal(await fs.readFile(callsLog, "utf8").catch(() => ""), "", "no engine command was issued for an existing stage");
   await vscode.commands.executeCommand("agentSparring._test.associatePlan", undefined);
   console.log("integration: Start next stage created the next stage with the engine's new-stage through the configured executable and carried the plan match over");
+}
+
+// ---------------------------------------------------------------- a structured gate's Pass button, clicked for real
+
+const GATE_STAGE = "stage-3d-snapshot-v2-and-attachment-export-import-transport";
+const GATE_PLAN_KEY = "reported-statistics-1cd13d24";
+const GATE_PLAN_LABEL = "plans/reported-statistics.md";
+/** The reviewer's stable check id: a slug, which is exactly the shape the host used to refuse. */
+const GATE_CHECK_ID = "pre-activation-desktop-v2-feed";
+
+/**
+ * The one thing a rendered snapshot cannot show: that clicking Pass does
+ * anything.
+ *
+ * A real Chromium webview inside this real VS Code renders the document the
+ * Overview renders, its own shipped script binds the click listener, a real
+ * `click()` on the real button bubbles to it, and the message it posts
+ * arrives over VS Code's own webview channel. The host's parser then decides
+ * whether that message is usable — the step that dropped every structured
+ * gate's message — and the draft it produces is fed back through the model.
+ *
+ * The panel this uses is the test's own: the extension's Overview cannot be
+ * clicked from here, and its handler is one line (`isHumanCheckMessage(m) →
+ * recordHumanCheck`) covered by the unit tests. Everything else on the wire
+ * is the shipped code, running where it really runs.
+ */
+async function gateClickAssertions(): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "agent-sparring-gate-"));
+  const stages = path.join(root, ".sparring", "stages");
+  await fs.mkdir(path.join(stages, GATE_STAGE), { recursive: true });
+  await fs.mkdir(path.join(stages, "stage-1-contract"), { recursive: true });
+  await fs.writeFile(path.join(stages, "stage-1-contract", "state.json"), JSON.stringify({ status: "accepted", base_sha: null, candidate_sha: "c".repeat(40), implementation_session_id: null, sparring_session_id: null }));
+  await fs.writeFile(path.join(stages, GATE_STAGE, "state.json"), JSON.stringify({ status: "working", base_sha: null, candidate_sha: null, implementation_session_id: "impl", sparring_session_id: "spar" }));
+  await fs.writeFile(path.join(stages, GATE_STAGE, "sparring.md"), gateSparring());
+  await fs.mkdir(path.join(root, ".sparring", "plans"), { recursive: true });
+  await fs.writeFile(
+    path.join(root, ".sparring", "plans", `${GATE_PLAN_KEY}.json`),
+    JSON.stringify({ current_stage: GATE_STAGE, current_stage_index: 1, expected_branch: "feature/x", plan: GATE_PLAN_LABEL, plan_digest: "0".repeat(64), source: "manifest", status: "paused" }),
+  );
+  await fs.mkdir(path.join(root, "plans"), { recursive: true });
+  await fs.writeFile(path.join(root, "plans", "reported-statistics.md"), "# Reported statistics\n\n## Stage 3D — Snapshot v2 and attachment/export/import transport\n\nThe transport.\n");
+
+  const location = { sparringDir: path.join(root, ".sparring"), projectDir: root, repoRoot: root, workspaceFolder: root, folderName: path.basename(root) };
+  const manifestStages: ManifestStageView[] = [
+    { stageId: "stage-1-contract", label: "Stage 1", title: "Contract", status: "accepted" },
+    { stageId: GATE_STAGE, label: "Stage 3D", title: "Snapshot v2 and attachment/export/import transport", status: "working" },
+  ];
+  const selection = selectRun((await discoverRuns([location])).runs);
+  const runId = selection.selected?.id;
+  assert.ok(runId, "the managed plan run is discovered");
+  const view = (drafts: HumanCheckDrafts) => {
+    const artifacts: OverviewArtifacts = { handoff: false, sparring: true, brief: false, plan: false, git: { branch: "feature/x" }, humanChecks: drafts[runId] ?? {}, manifestStages };
+    return buildOverviewModel(selection, undefined, artifacts, Date.now());
+  };
+
+  const before = view({});
+  assert.equal(before.actionRequired?.required[0]?.key, GATE_CHECK_ID, "the gate's own id is the control's key");
+  assert.equal(before.actionRequired?.progress, "0 / 1 verified");
+  assert.equal(before.actionRequired?.submit.enabled, false);
+
+  const nonce = crypto.randomBytes(16).toString("base64");
+  const panel = vscode.window.createWebviewPanel("agentSparring.gateClickTest", "gate click", { viewColumn: vscode.ViewColumn.Active, preserveFocus: true }, { enableScripts: true, localResourceRoots: [] });
+  try {
+    const received = new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("no message arrived from the webview within 15s")), 15_000);
+      panel.webview.onDidReceiveMessage((message: Record<string, unknown>) => {
+        if (message?.["type"] === "humanCheck") {
+          clearTimeout(timer);
+          resolve(message);
+        }
+      });
+    });
+    // The document the Overview renders, plus one script that clicks the
+    // button a person would click. The click is a real DOM event; everything
+    // it reaches is the shipped listener.
+    const clicker = `<script nonce="${nonce}">document.querySelector('button[data-outcome="pass"]').click();</script>`;
+    panel.webview.html = renderOverviewHtml(before, nonce, panel.webview.cspSource).replace("</body>", `${clicker}</body>`);
+    const message = await received;
+
+    assert.deepEqual(message, { type: "humanCheck", key: GATE_CHECK_ID, outcome: "pass" }, "the click posted the gate's id and the outcome");
+    assert.ok(isHumanCheckMessage(message), "and the host accepts it — this is what silently failed");
+
+    const after = view(withHumanCheck({}, runId, message.key as string, { outcome: "pass" }));
+    assert.equal(after.actionRequired?.required[0]?.record?.outcome, "pass");
+    assert.equal(after.actionRequired?.progress, "1 / 1 verified");
+    assert.equal(after.actionRequired?.submit.enabled, true);
+    const html = renderOverviewHtml(after, nonce, panel.webview.cspSource);
+    assert.match(html, new RegExp(`class="choice pass on" data-check="${GATE_CHECK_ID}"`), "Pass is visibly selected on the next render");
+    assert.match(html, /data-action="submitForReview" title="[^"]*">Submit result and continue</, "and Submit result and continue is enabled");
+  } finally {
+    panel.dispose();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+function gateSparring(): string {
+  const gate = {
+    category: "DEVICE_MANUAL_CHECK",
+    title: "Confirm the supported pre-activation desktop reads snapshot-v2 feeds safely",
+    checks: [{ id: GATE_CHECK_ID, instruction: "Run the oldest supported desktop build against a feed containing one snapshot_version 2 row.", pass_criteria: "Pass if the feed loads and the row keeps its details.", source: null }],
+  };
+  return [
+    "# Sparring: stage 3d",
+    "",
+    "## Routing outcome",
+    "",
+    "- Action: `NEEDS_YOU`",
+    "- Summary: One compatibility check is the sole acceptance blocker.",
+    "- Needs-you reason: DEVICE/MANUAL CHECK -- a pre-activation desktop against a v2 feed.",
+    "",
+    "## NEEDS YOU",
+    "",
+    "<!-- human-gate:v1 -->",
+    "",
+    "```json",
+    JSON.stringify(gate, null, 2),
+    "```",
+    "",
+  ].join("\n");
 }
 
 // ---------------------------------------------------------------- helpers

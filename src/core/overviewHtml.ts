@@ -13,7 +13,7 @@
  * meaningful event on the right); provider cards; recent events; metadata.
  */
 
-import { CHECK_OUTCOMES, type CheckItem, type CheckOutcome } from "./humanChecks";
+import { CHECK_OUTCOMES, isCheckKey, type CheckItem, type CheckOutcome } from "./humanChecks";
 import { humanTask, splitPassCriteria } from "./humanTask";
 import { TIMELINE_STATE_WORD, type ActionRequired, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { MatchSource } from "./planAssociation";
@@ -42,12 +42,54 @@ export type OverviewAction =
   | "openPlanSection"
   | "submitForReview";
 
-/** A Pass / Fail / Blocked click or a note edit on one manual check, posted by the webview as it happens. */
+/** A Pass / Fail / Can't test click or a note edit on one manual check, posted by the webview as it happens. */
 export interface HumanCheckMessage {
   type: "humanCheck";
   key: string;
   outcome?: CheckOutcome;
   note?: string;
+}
+
+/** An action button click, posted by the webview. */
+export interface ActionMessage {
+  type: "action";
+  action: OverviewAction;
+}
+
+/**
+ * Reading a message the webview posted.
+ *
+ * These live beside {@link SCRIPT}, which is the only thing that produces
+ * them, because the two ends of that wire have to agree about the payload
+ * and nothing else in the extension can check that they do. They were on the
+ * host side, where the key was tested against the shape of a *derived*
+ * check's hash — so every message a structured gate's control sent was
+ * dropped before it reached the draft state, and the buttons did nothing at
+ * all. A webview message is still untrusted input: what is loosened here is
+ * only the key's shape, to the one definition the renderer also uses.
+ */
+export function isActionMessage(message: unknown): message is ActionMessage {
+  const record = asRecord(message);
+  return record !== undefined && record["type"] === "action" && ACTIONS.has(String(record["action"]));
+}
+
+export function isHumanCheckMessage(message: unknown): message is HumanCheckMessage {
+  const record = asRecord(message);
+  if (!record || record["type"] !== "humanCheck" || !isCheckKey(record["key"])) {
+    return false;
+  }
+  const outcome = record["outcome"];
+  const note = record["note"];
+  const outcomeOk = outcome === undefined || outcome === null || (CHECK_OUTCOMES as readonly string[]).includes(String(outcome));
+  const noteOk = note === undefined || note === null || (typeof note === "string" && note.length <= NOTE_MAX_LENGTH);
+  return outcomeOk && noteOk && (outcome != null || note != null);
+}
+
+/** A note is free text a person typed; long enough for evidence, bounded so a message cannot be a payload. */
+export const NOTE_MAX_LENGTH = 20_000;
+
+function asRecord(message: unknown): Record<string, unknown> | undefined {
+  return typeof message === "object" && message !== null ? (message as Record<string, unknown>) : undefined;
 }
 
 export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
@@ -73,6 +115,8 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "openPlanSection",
   "submitForReview",
 ];
+
+const ACTIONS: ReadonlySet<string> = new Set<string>(OVERVIEW_ACTIONS);
 
 export function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch] as string);

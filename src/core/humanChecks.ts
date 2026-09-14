@@ -176,6 +176,39 @@ function listItems(section: string, sectionLine: number): ListItem[] {
   return out;
 }
 
+/**
+ * The engine's own limit on a gate check id (human_gate.py: _MAX_ID_LENGTH).
+ * A draft key is never longer, because a gate check's key *is* that id.
+ */
+export const CHECK_KEY_MAX_LENGTH = 128;
+
+/**
+ * Is this a draft key this extension could have written into a control?
+ *
+ * Two shapes reach the same place, and forgetting the second one is what
+ * made every structured gate's Pass / Fail / Can't test button inert: a
+ * check derived from plan or reviewer prose is keyed by {@link checkKey}, a
+ * short hex hash, but a **gate check is keyed by the reviewer's own stable
+ * id** (`pre-activation-desktop-v2-feed`) — that is the entire point of the
+ * id, since it is what makes a recorded result survive the reviewer
+ * rewording the check. A host-side guard that only knew the hash shape
+ * silently dropped every message the gate panel sent.
+ *
+ * So this is the one definition of the shape, used by the renderer (which
+ * must never emit a control the host would refuse) and by the host's own
+ * check on messages arriving from the webview. The engine accepts any
+ * non-empty text up to 128 characters; refused here are only the characters
+ * that would break a surface the key crosses — control characters, and the
+ * backtick that delimits the id inside the `## Human evidence` line.
+ */
+export function isCheckKey(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= CHECK_KEY_MAX_LENGTH && !UNUSABLE_IN_KEY.test(value);
+}
+
+/** A backtick delimits the id inside a `## Human evidence` line; control characters belong in no key at all. */
+// eslint-disable-next-line no-control-regex -- refusing control characters is precisely the point
+const UNUSABLE_IN_KEY = /[\u0060\u0000-\u001f\u007f]/;
+
 /** djb2 over the whitespace-normalised, case-folded text; short hex. */
 export function checkKey(text: string): string {
   const normalised = normalise(text);
@@ -594,7 +627,11 @@ export function deriveVerification(plan: PlanChecks, outcome: SparringOutcome | 
  */
 function gateItems(gate: HumanGate): CheckItem[] {
   return gate.checks.map((check) => ({
-    key: check.id,
+    // The reviewer's id, unless it is a shape the panel cannot round-trip —
+    // then the instruction's own hash, so the control still works and the
+    // result is matched by its wording instead. A check whose button does
+    // nothing is worse than one whose result is matched less precisely.
+    key: isCheckKey(check.id) ? check.id : checkKey(check.instruction),
     text: check.instruction,
     origin: "gate" as const,
     passCriteria: check.passCriteria,

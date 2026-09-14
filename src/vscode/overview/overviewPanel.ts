@@ -12,8 +12,7 @@ import * as vscode from "vscode";
 import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, type RunSnapshot } from "../../core/discovery";
 import { parseStageState, type StageStatus } from "../../core/engineFormats";
 import { manifestFileName, readManifestStages } from "../../core/manifest";
-import { CHECK_OUTCOMES } from "../../core/humanChecks";
-import { OVERVIEW_ACTIONS, renderOverviewHtml, type HumanCheckMessage, type OverviewAction } from "../../core/overviewHtml";
+import { isActionMessage, isHumanCheckMessage, renderOverviewHtml, type HumanCheckMessage, type OverviewAction } from "../../core/overviewHtml";
 import { buildOverviewModel, type ManifestStageView, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
 import { locateStage, parsePlanHeadings, type HeadingRef } from "../../core/planAssociation";
 import { planKey, planLabel } from "../../core/sparringCommand";
@@ -223,31 +222,6 @@ export class OverviewPanelManager implements vscode.Disposable {
   }
 }
 
-const ACTIONS: ReadonlySet<string> = new Set<OverviewAction>(OVERVIEW_ACTIONS);
-
-function isActionMessage(message: unknown): message is { type: "action"; action: OverviewAction } {
-  return (
-    typeof message === "object" &&
-    message !== null &&
-    (message as Record<string, unknown>)["type"] === "action" &&
-    ACTIONS.has(String((message as Record<string, unknown>)["action"]))
-  );
-}
-
-function isHumanCheckMessage(message: unknown): message is HumanCheckMessage {
-  if (typeof message !== "object" || message === null) {
-    return false;
-  }
-  const record = message as Record<string, unknown>;
-  if (record["type"] !== "humanCheck" || typeof record["key"] !== "string" || !/^[0-9a-f]{1,16}$/.test(record["key"])) {
-    return false;
-  }
-  const outcome = record["outcome"];
-  const note = record["note"];
-  const outcomeOk = outcome === undefined || outcome === null || (CHECK_OUTCOMES as readonly string[]).includes(String(outcome));
-  const noteOk = note === undefined || note === null || (typeof note === "string" && note.length <= 20_000);
-  return outcomeOk && noteOk && (outcome != null || note != null);
-}
 
 /** Only the Goal paragraph is ever displayed; a brief is never read past this many bytes. */
 const BRIEF_READ_LIMIT = 64 * 1024;
