@@ -87,6 +87,11 @@
         "category": "Agent Sparring"
       },
       {
+        "command": "agentSparring.continueAutomatically",
+        "title": "Continue Plan Automatically",
+        "category": "Agent Sparring"
+      },
+      {
         "command": "agentSparring.chooseExecutable",
         "title": "Choose sparring Executable…",
         "category": "Agent Sparring"
@@ -99,6 +104,19 @@
           "type": "string",
           "default": "",
           "markdownDescription": "Full path to the `sparring` executable. Leave empty to let your integrated shell resolve `sparring` from its own `PATH` (the same way it does when you type the command). Set it when the shell reports the command as not found, or when terminal shell integration is unavailable."
+        },
+        "agentSparring.planContinuation": {
+          "type": "string",
+          "enum": [
+            "automatic",
+            "manual"
+          ],
+          "default": "automatic",
+          "enumDescriptions": [
+            "Hand the whole plan to the engine as one managed run. It continues from stage to stage on its own and stops when it needs you.",
+            "Keep the explicit per-stage checkpoints: Accept stage, Start next stage, Run stage."
+          ],
+          "markdownDescription": "How a plan progresses.\n\n**Continue automatically** (default) builds an execution manifest from the plan and starts the engine's own managed run (`sparring run-plan --manifest …`). The engine sequences the stages, accepts each READY candidate through its existing hard gate, and stops at NEEDS_YOU, an escalation, a failure, or the end of the plan. You confirm once, at the start — never between stages.\n\n**Pause after each stage** keeps the per-stage actions, for when you want a checkpoint before every provider turn. Both modes only ever run engine operations; the extension never sequences stages itself."
         },
         "agentSparring.pollIntervalMs": {
           "type": "number",

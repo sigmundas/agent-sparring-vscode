@@ -1,0 +1,188 @@
+/**
+ * The two plan modes.
+ *
+ * **Continue automatically** (the default) hands the whole plan to the
+ * engine as one managed run and lets it sequence: no Accept stage / Start
+ * next stage / Run stage click between healthy stages, and one confirmation
+ * before the first. **Pause after each stage** keeps those per-stage
+ * checkpoints exactly as they were.
+ *
+ * What both must never do is sequence in the extension. These tests hold
+ * that line at the source: the automatic path only ever builds a manifest
+ * and launches one engine command.
+ */
+
+import assert from "node:assert/strict";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { describe, it } from "node:test";
+import { buildResumePlanArgs, buildRunPlanArgs } from "../core/cli";
+import { discoverRuns, selectRun } from "../core/discovery";
+import { renderOverviewHtml } from "../core/overviewHtml";
+import { buildOverviewModel, type OverviewArtifacts } from "../core/overviewModel";
+import { commandLineRuns, parseSparringCommand } from "../core/sparringCommand";
+import { FOO_PLAN_KEY, FOO_PLAN_LABEL, FOO_STAGE_IDS, Workspace, sparringMarkdown } from "./fixtures";
+
+const NOW = Date.parse("2026-09-14T10:00:00.000Z");
+const PLAN = ["# Plan", "", "## Stage 3B — Barrier", "", "Local barrier.", "", "## Stage 3C — Cloud schema", "", "Cloud side.", ""].join("\n");
+
+async function commandsSource(): Promise<string> {
+  return fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "commands.ts"), "utf8");
+}
+
+function fn(source: string, name: string): string {
+  const found = new RegExp(`async function ${name}[\\s\\S]*?\\n}\\n`).exec(source)?.[0] ?? "";
+  assert.ok(found, `${name} exists`);
+  return found;
+}
+
+describe("the engine command the automatic mode issues", () => {
+  it("run-plan --manifest, with --adopt only when asked", () => {
+    assert.deepEqual(buildRunPlanArgs({ manifest: "/tmp/m.json", repoRoot: "/code/app", expectedBranch: "feature/x" }), ["run-plan", "--manifest", "/tmp/m.json", "--repo-root", "/code/app", "--expected-branch", "feature/x"]);
+    assert.deepEqual(buildRunPlanArgs({ manifest: "/tmp/m.json", repoRoot: "/code/app", expectedBranch: "feature/x", adopt: true }), ["run-plan", "--manifest", "/tmp/m.json", "--repo-root", "/code/app", "--expected-branch", "feature/x", "--adopt"]);
+    assert.deepEqual(buildResumePlanArgs({ manifest: "/tmp/m.json", repoRoot: "/code/app", expectedBranch: "feature/x", evidence: "done" }), ["resume-plan", "--manifest", "/tmp/m.json", "--repo-root", "/code/app", "--expected-branch", "feature/x", "--evidence", "done"]);
+  });
+
+  it("a plan path and a manifest are alternatives, never both", () => {
+    assert.deepEqual(buildRunPlanArgs({ planPath: "docs/plan.md", repoRoot: "/r", expectedBranch: "b" }), ["run-plan", "docs/plan.md", "--repo-root", "/r", "--expected-branch", "b"]);
+    assert.throws(() => buildRunPlanArgs({ repoRoot: "/r", expectedBranch: "b" }), /planPath or manifest/);
+  });
+
+  it("a manifest run typed in a terminal is recognised and matched by its file", () => {
+    const parsed = parseSparringCommand("sparring run-plan --manifest /tmp/foo.manifest.json --repo-root /code/app --expected-branch feature/x --adopt");
+    assert.equal(parsed?.subcommand, "run-plan");
+    assert.equal(parsed?.manifest, "/tmp/foo.manifest.json");
+    assert.equal(parsed?.planPath, undefined);
+    assert.ok(commandLineRuns("sparring resume-plan --manifest /other/dir/foo.manifest.json --repo-root /r --expected-branch b", { kind: "resume-plan", manifest: "/tmp/foo.manifest.json" }));
+    assert.ok(!commandLineRuns("sparring resume-plan --manifest /tmp/other.manifest.json --repo-root /r --expected-branch b", { kind: "resume-plan", manifest: "/tmp/foo.manifest.json" }));
+  });
+});
+
+describe("the automatic path is one engine call, not a loop", () => {
+  it("builds a manifest and launches exactly one run-plan / resume-plan", async () => {
+    const source = fn(await commandsSource(), "performContinueAutomatically");
+    assert.match(source, /buildManifest\(\{/, "the plan is interpreted once, here");
+    assert.match(source, /buildRunPlanArgs\(\{ \.\.\.invocation, adopt \}\) : buildResumePlanArgs\(invocation\)/, "one command, chosen by whether a run is already recorded");
+    assert.equal((source.match(/controller\.launch\(/g) ?? []).length, 1, "exactly one launch");
+    assert.ok(!/buildRunLoopArgs|buildFreezeCandidateArgs|buildAcceptCandidateArgs|buildNewStageArgs|acceptStage\(/.test(source), "no per-stage command: the engine sequences, freezes and accepts");
+    assert.ok(!/for \(|while \(|forEach\(.*launch/.test(source.replace(/for \(const problem of built\.skipped\)[\s\S]*?\n {2}}/, "")), "nothing here iterates over stages to run them");
+  });
+
+  it("confirms once, before the first stage, and never in a loop", async () => {
+    const source = fn(await commandsSource(), "performContinueAutomatically");
+    assert.match(source, /Run this plan automatically until Agent Sparring needs you\?/);
+    assert.equal((source.match(/showInformationMessage\(\s*"Run this plan/g) ?? []).length, 1);
+    assert.match(source, /if \(options\.confirm\)/, "the one confirmation is skippable only by the test hook");
+    const describePlan = /function describePlan\([\s\S]*?\n}\n/.exec(await commandsSource())?.[0] ?? "";
+    assert.match(describePlan, /with no further confirmation/, "the dialog says plainly that nothing else will be asked");
+    assert.match(describePlan, /stops when the reviewer needs you, escalates, something fails, or the plan is complete/);
+  });
+
+  it("keeps the manifest out of every repository", async () => {
+    const controller = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "controller.ts"), "utf8");
+    const dir = /async manifestDirectory\(\)[\s\S]*?\n {2}}\n/.exec(controller)?.[0] ?? "";
+    assert.ok(dir, "manifestDirectory exists");
+    assert.match(dir, /globalStorageUri\.fsPath/, "the extension's own storage, not the workspace");
+    assert.ok(!/repoRoot|sparringDir|workspaceFolder/.test(dir), "its location is never derived from a repository");
+  });
+
+  it("resumes a manifest-started run with --manifest, because the engine refuses the other input", async () => {
+    const source = fn(await commandsSource(), "planInvocationFor");
+    assert.match(source, /run\.state\.source !== "manifest"/, "the engine's own record of which input the run executes");
+    assert.match(source, /return \{ planPath: run\.planPath \}/, "a markdown run keeps its plan path");
+    assert.match(source, /buildManifest\(\{/, "a manifest run gets its manifest rebuilt, deterministically");
+  });
+});
+
+describe("what the Overview offers in each mode", () => {
+  async function standalone(continuation: "automatic" | "manual" | undefined, status: "working" | "accepted" = "working") {
+    const ws = await Workspace.create();
+    await ws.writeStage("stage-3b-barrier", { status, implementation_session_id: status === "accepted" ? "impl" : null, candidate_sha: status === "accepted" ? "c".repeat(40) : null }, status === "accepted" ? { "sparring.md": sparringMarkdown("READY", "Looks done") } : {});
+    const planPath = path.join(ws.root, "docs", "plan.md");
+    await fs.mkdir(path.dirname(planPath), { recursive: true });
+    await fs.writeFile(planPath, PLAN);
+    const artifacts: OverviewArtifacts = {
+      handoff: false,
+      sparring: status === "accepted",
+      brief: false,
+      plan: false,
+      associatedPlan: { path: planPath, exists: true, text: PLAN, manualMatch: { label: "3B", title: "Barrier" } },
+      continuation,
+    };
+    return buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, artifacts, NOW);
+  }
+
+  it("automatic is the default and leads; the per-stage action stays beside it", async () => {
+    const model = await standalone(undefined);
+    assert.equal(model.continueAutomatically?.label, "Continue automatically");
+    assert.match(model.continueAutomatically!.detail, /sparring run-plan --manifest/);
+    assert.equal(model.stageAction?.label, "Run stage", "the per-stage action is still there");
+    const html = renderOverviewHtml(model, "n", "c");
+    assert.match(html, /class="primary" data-action="continueAutomatically"/);
+    assert.match(html, /class="quiet" data-action="runStage"/, "demoted, not removed");
+    assert.equal((html.match(/class="primary"/g) ?? []).length, 1, "one obvious next step");
+  });
+
+  it("manual mode offers no automatic continuation at all", async () => {
+    const model = await standalone("manual");
+    assert.equal(model.continueAutomatically, undefined);
+    assert.equal(model.stageAction?.label, "Run stage");
+    const html = renderOverviewHtml(model, "n", "c");
+    assert.ok(!html.includes("continueAutomatically"));
+    assert.match(html, /class="primary" data-action="runStage"/, "the per-stage checkpoint is the primary step again");
+  });
+
+  it("an accepted stage in automatic mode hands the rest of the plan over; in manual mode it starts one stage", async () => {
+    const auto = await standalone(undefined, "accepted");
+    assert.equal(auto.whatsNext?.kind, "next-stage");
+    const autoHtml = renderOverviewHtml(auto, "n", "c");
+    assert.match(autoHtml, /class="primary" data-action="continueAutomatically"/);
+    assert.match(autoHtml, /class="quiet" data-action="startNextStage"/);
+
+    const manual = await standalone("manual", "accepted");
+    assert.equal(manual.continueAutomatically, undefined);
+    assert.match(renderOverviewHtml(manual, "n", "c"), /class="primary" data-action="startNextStage"/);
+  });
+
+  it("a managed plan run offers to continue itself, and says it resumes rather than starts", async () => {
+    const ws = await Workspace.create();
+    await ws.writePlan();
+    await ws.writePlanRun(FOO_PLAN_KEY, { plan: FOO_PLAN_LABEL, status: "paused", current_stage_index: 0, current_stage: FOO_STAGE_IDS[0] });
+    await ws.writeStage(FOO_STAGE_IDS[0], { status: "working" });
+    const model = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, { handoff: false, sparring: false, brief: false, plan: true, planText: "# Foo plan\n" }, NOW);
+    assert.match(model.continueAutomatically!.detail, /sparring resume-plan --manifest/);
+  });
+
+  it("a complete plan run offers nothing to continue", async () => {
+    const ws = await Workspace.create();
+    await ws.writePlan();
+    await ws.writePlanRun(FOO_PLAN_KEY, { plan: FOO_PLAN_LABEL, status: "complete", current_stage_index: 2, current_stage: FOO_STAGE_IDS[2] });
+    await ws.writeStage(FOO_STAGE_IDS[2], { status: "accepted", candidate_sha: "c".repeat(40) });
+    const model = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, { handoff: false, sparring: false, brief: false, plan: true, planText: "# Foo plan\n" }, NOW);
+    assert.equal(model.continueAutomatically, undefined);
+  });
+
+  it("a stage waiting for a human offers Submit for review instead: the plan cannot advance until the gate is answered", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("stage-3b-barrier", { status: "working", implementation_session_id: "impl", sparring_session_id: "spar" }, { "sparring.md": sparringMarkdown("NEEDS_YOU", "Check it on a device", "DEVICE/MANUAL CHECK -- verify the barrier on a real device") });
+    const planPath = path.join(ws.root, "docs", "plan.md");
+    await fs.mkdir(path.dirname(planPath), { recursive: true });
+    await fs.writeFile(planPath, PLAN);
+    const model = buildOverviewModel(
+      selectRun((await discoverRuns([ws.location])).runs),
+      undefined,
+      { handoff: false, sparring: true, brief: false, plan: false, associatedPlan: { path: planPath, exists: true, text: PLAN, manualMatch: { label: "3B", title: "Barrier" } } },
+      NOW,
+    );
+    assert.equal(model.actionRequired?.kind, "needs_you");
+    assert.equal(model.continueAutomatically, undefined);
+    assert.ok(!renderOverviewHtml(model, "n", "c").includes("continueAutomatically"));
+  });
+
+  it("no plan, no automatic continuation: there is nothing to hand over", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("stage-x", { status: "working" });
+    const model = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, { handoff: false, sparring: false, brief: false, plan: false }, NOW);
+    assert.equal(model.continueAutomatically, undefined);
+  });
+});

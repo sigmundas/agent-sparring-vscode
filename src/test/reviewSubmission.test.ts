@@ -5,7 +5,7 @@ import { describe, it } from "node:test";
 import { buildRunSparringArgs } from "../core/cli";
 import { discoverRuns, locateSparringDirs, selectRun } from "../core/discovery";
 import { parseHandoffBranch } from "../core/engineFormats";
-import { appendHumanEvidence, checkKey, insertHandoffEvidence, parseHumanEvidence, renderHumanEvidence, submittableChecks } from "../core/humanChecks";
+import { appendHumanEvidence, checkKey, parseHumanEvidence, renderHumanEvidence, submittableChecks } from "../core/humanChecks";
 import type { ExecutionRecord } from "../core/liveness";
 import { foldEvents } from "../core/liveState";
 import { renderOverviewHtml } from "../core/overviewHtml";
@@ -197,25 +197,33 @@ describe("what the reviewer answers next", () => {
 });
 
 describe("the evidence the reviewer actually reads", () => {
-  it("goes into handoff.md's own ## Human evidence section, not after the sections that follow it", () => {
-    const entry = renderHumanEvidence([{ text: LIVE, origin: "reviewer", record: { outcome: "pass", note: "Both clients agree." } }], new Date(NOW))!;
-    const updated = insertHandoffEvidence(HANDOFF, entry);
-    const lines = updated.split("\n");
-    const evidenceAt = lines.indexOf("## Human evidence");
-    const nextSectionAt = lines.indexOf("## Previous unresolved sparring findings");
-    const entryAt = lines.findIndex((line) => line.startsWith(`- Pass — ${LIVE}`));
-    assert.ok(evidenceAt < entryAt && entryAt < nextSectionAt, "the entry sits inside the section the reviewer reads");
-    assert.ok(updated.includes("2026-09-13 (branch owner): migration list reviewed."), "the earlier evidence is kept");
-    assert.equal(updated.split("## Human evidence").length, 2, "the heading is not duplicated");
-    assert.equal(parseHandoffBranch(updated), BRANCH, "the git context is untouched");
-    assert.deepEqual(HANDOFF, HANDOFF);
+  it("goes into notes.md only: the engine reads that section live when it builds the sparring prompt", async () => {
+    const commands = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "commands.ts"), "utf8");
+    const record = /async function recordEvidence[\s\S]*?\n}\n/.exec(commands)?.[0] ?? "";
+    assert.ok(record, "recordEvidence exists");
+    assert.match(record, /appendHumanEvidence\(notes, entry\)/, "the engine's own append shape, in the engine's own file");
+    assert.ok(!/HANDOFF_FILENAME|handoff/i.test(record), "handoff.md is no longer mirrored: notes.md is the one canonical source");
   });
 
-  it("creates the section when the handoff has none, and reads back as recorded evidence", () => {
+  it("appends under one ## Human evidence heading and reads back as recorded evidence", () => {
+    const entry = renderHumanEvidence([{ text: LIVE, origin: "reviewer", record: { outcome: "pass", note: "Both clients agree." } }], new Date(NOW))!;
+    const notes = appendHumanEvidence("# Notes: x\n\n## Human evidence\n\n2026-09-13 (branch owner): migration list reviewed.\n", entry);
+    assert.equal(notes.split("## Human evidence").length, 2, "the heading is not duplicated");
+    assert.ok(notes.includes("2026-09-13 (branch owner): migration list reviewed."), "the earlier evidence is kept");
+    const entries = parseHumanEvidence(notes);
+    assert.equal(entries.at(-1)?.checkText, LIVE);
+    assert.equal(entries.at(-1)?.outcome, "pass");
+  });
+
+  it("creates the heading when notes.md has none", () => {
     const entry = renderHumanEvidence([{ text: LIVE, origin: "reviewer", record: { outcome: "pass" } }], new Date(NOW))!;
-    const updated = insertHandoffEvidence("# Handoff: x\n\n## Claims\n\nDone.\n", entry);
-    assert.equal(updated, `# Handoff: x\n\n## Claims\n\nDone.\n\n## Human evidence\n\n${entry.trim()}\n`);
-    assert.equal(parseHumanEvidence(updated)[1].checkText, LIVE);
+    const notes = appendHumanEvidence("# Notes: x\n", entry);
+    assert.equal(notes, `# Notes: x\n\n## Human evidence\n\n${entry.trim()}\n`);
+    assert.equal(parseHumanEvidence(notes)[1].checkText, LIVE);
+  });
+
+  it("the handoff itself is left alone", () => {
+    assert.equal(parseHandoffBranch(HANDOFF), BRANCH);
   });
 });
 

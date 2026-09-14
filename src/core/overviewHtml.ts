@@ -35,6 +35,7 @@ export type OverviewAction =
   | "matchStage"
   | "clearMatch"
   | "startNextStage"
+  | "continueAutomatically"
   | "stopRunner"
   | "openPlanSection"
   | "submitForReview";
@@ -64,6 +65,7 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "matchStage",
   "clearMatch",
   "startNextStage",
+  "continueAutomatically",
   "stopRunner",
   "openPlanSection",
   "submitForReview",
@@ -229,8 +231,13 @@ function renderActionRequired(model: OverviewModel, panel: ActionRequired): stri
     body = `<p class="muted">${escapeHtml(panel.noChecks ?? "")}</p>`;
   } else {
     const parts: string[] = [];
-    // Plan requirement: the plan's words, never rewritten.
-    if (panel.explicitCount > 0) {
+    if (panel.source === "gate") {
+      // The reviewer said exactly what blocks this stage; nothing is added
+      // from the plan and nothing is mined from prose.
+      parts.push(
+        `<div class="part"><h4>What the reviewer requires</h4><p class="criterion parent">${escapeHtml(panel.gate?.title ?? "")}</p><p class="muted small">${escapeHtml(categoryWord(panel.gate?.category))} · ${panel.recorded.length + panel.required.length} check${panel.recorded.length + panel.required.length === 1 ? "" : "s"}, exactly as the reviewer listed them. Deployment, rollout and follow-up the reviewer mentioned are in the detailed review, not here — they do not block this stage.</p></div>`,
+      );
+    } else if (panel.explicitCount > 0) {
       parts.push(`<div class="part"><h4>Plan requirement</h4><p class="muted small">${panel.explicitCount} explicit check${panel.explicitCount === 1 ? "" : "s"} under the plan's <em>Manual verification</em> list, shown below as written.</p>${panel.parents.map((parent) => `<p class="criterion parent">${escapeHtml(parent.text)}</p>`).join("")}</div>`);
     } else if (panel.parents.length > 0) {
       parts.push(`<div class="part"><h4>Plan requirement</h4>${panel.parents.map((parent) => `<p class="criterion parent" title="${escapeHtml(`Plan line ${parent.line}`)}">${escapeHtml(parent.text)}</p>`).join("")}${panel.reviewerCount > 0 ? `<p class="muted small">The plan states this as prose; the checks below are the reviewer's more specific requests, not plan text.</p>` : ""}</div>`);
@@ -261,8 +268,32 @@ function renderActionRequired(model: OverviewModel, panel: ActionRequired): stri
 </section>`;
 }
 
+/** `DEVICE_MANUAL_CHECK` → `Device manual check`; the engine's own category, just made readable. */
+export function categoryWord(category: string | undefined): string {
+  if (!category) {
+    return "Human gate";
+  }
+  const words = category.toLowerCase().replace(/_/g, " ").trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : "Human gate";
+}
+
 function originTag(item: CheckItem): string {
+  if (item.origin === "gate") {
+    return `<span class="tag reviewer" title="${escapeHtml(`The reviewer's own check, id ${item.key}`)}">Reviewer</span>`;
+  }
   return item.origin === "plan" ? `<span class="tag plan" title="${escapeHtml(item.line ? `Plan line ${item.line}` : "From the plan")}">Plan</span>` : `<span class="tag reviewer" title="From the sparring report, not the plan">Reviewer</span>`;
+}
+
+/** The reviewer's pass criteria and plan reference, for a gate check. */
+function checkDetail(item: CheckItem): string {
+  const parts: string[] = [];
+  if (item.passCriteria) {
+    parts.push(`<p class="muted small pass-criteria"><strong>Pass when:</strong> ${escapeHtml(item.passCriteria)}</p>`);
+  }
+  if (item.source) {
+    parts.push(`<p class="muted small source">Defined in ${escapeHtml(item.source)}</p>`);
+  }
+  return parts.join("");
 }
 
 /** ✓ text — recorded in notes.md; the excerpt says which entry, so a wrong match is visible. */
@@ -270,15 +301,16 @@ function renderRecorded(item: CheckItem): string {
   const outcome = item.evidence?.outcome;
   const mark = outcome === "fail" ? "✗" : outcome === "blocked" ? "⊘" : "✓";
   const word = outcome ? `<span class="outcome ${outcome}">${OUTCOME_WORDS[outcome]}</span> ` : "";
-  return `<li class="check done ${escapeHtml(outcome ?? "pass")}"><div class="checkrow"><span class="mark">${mark}</span><div class="checkbody"><p class="criterion">${word}${escapeHtml(item.text)} ${originTag(item)}</p><p class="muted small evidence" title="${item.evidence?.how === "exact" ? "A result recorded from this panel" : "A ## Human evidence entry naming this check"}">notes.md: ${escapeHtml(item.evidence?.excerpt ?? "")}</p></div></div></li>`;
+  const how = item.evidence?.how === "id" ? "A result recorded from this panel for this exact check" : item.evidence?.how === "exact" ? "A result recorded from this panel" : "A ## Human evidence entry naming this check";
+  return `<li class="check done ${escapeHtml(outcome ?? "pass")}"><div class="checkrow"><span class="mark">${mark}</span><div class="checkbody"><p class="criterion">${word}${escapeHtml(item.text)} ${originTag(item)}</p><p class="muted small evidence" title="${escapeHtml(how)}">notes.md: ${escapeHtml(item.evidence?.excerpt ?? "")}</p></div></div></li>`;
 }
 
-/** ○ text with Pass / Fail / Blocked and a note. */
+/** ○ text with the reviewer's pass criteria, then Pass / Fail / Blocked and a note. */
 function renderRequired(item: CheckItem): string {
   const outcome = item.record?.outcome;
   const choices = CHECK_OUTCOMES.map((candidate) => `<button type="button" class="choice ${candidate}${outcome === candidate ? " on" : ""}" data-check="${escapeHtml(item.key)}" data-outcome="${candidate}" aria-pressed="${outcome === candidate}">${OUTCOME_WORDS[candidate]}</button>`).join("");
   return `<li class="check${outcome ? ` ${outcome}` : ""}">
-<div class="checkrow"><span class="mark">○</span><div class="checkbody"><p class="criterion">${escapeHtml(item.text)} ${originTag(item)}</p></div></div>
+<div class="checkrow"><span class="mark">○</span><div class="checkbody"><p class="criterion">${escapeHtml(item.text)} ${originTag(item)}</p>${checkDetail(item)}</div></div>
 <div class="record"><span class="choices">${choices}</span><textarea class="note" data-check="${escapeHtml(item.key)}" rows="1" placeholder="Evidence or note (optional)">${escapeHtml(item.record?.note ?? "")}</textarea></div>
 </li>`;
 }
@@ -328,13 +360,21 @@ function renderStageCard(model: OverviewModel): string {
       : "";
   const cycle = model.cycle !== undefined ? `<span class="muted" title="loop cycle from telemetry">cycle ${model.cycle}</span><span class="sep">·</span>` : "";
   const buttons: string[] = [];
+  // In automatic mode the whole plan is the unit of work, so Continue
+  // automatically is the primary button and the per-stage operations stay
+  // available as the quieter alternatives — never removed, since a user may
+  // always want to drive one stage by hand.
+  const auto = model.continueAutomatically;
+  if (auto && !handedOver) {
+    buttons.push(button("continueAutomatically", auto.label, true, auto.detail, "primary"));
+  }
   if (model.stageAction && !handedOver) {
     // While the human is asked for something, the resume lives in the Action required panel.
-    buttons.push(stageActionButton(model.stageAction, model.stageId));
+    buttons.push(stageActionButton(model.stageAction, model.stageId, auto ? "quiet" : model.stageAction.primary ? "primary" : ""));
   }
   if (model.planAction && !accepted && !handedOver) {
     // For an accepted stage the plan action is the primary button of What's next instead.
-    buttons.push(button("resumePlan", model.planAction.label, true, model.planAction.detail, model.planAction.primary ? "primary" : ""));
+    buttons.push(button("resumePlan", model.planAction.label, true, model.planAction.detail, model.planAction.primary && !auto ? "primary" : ""));
   }
   if (model.accepting) {
     buttons.push(`<span class="busy accepting" title="${escapeHtml(model.accepting.detail)}">${icon("dot", "dot")}${escapeHtml(model.accepting.label)}</span>`);
@@ -470,18 +510,32 @@ function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
   const buttons: string[] = [];
   const planName = plan?.name ?? "the plan";
   const openNext = (label: string, cls = "") => button(plan?.next?.line ? "openNextStage" : "openPlan", label, true, plan?.next?.line ? `Open ${planName} at ${plan.next.display}` : `Open ${planName}`, cls);
+  // In automatic mode the rest of the plan goes to the engine in one step;
+  // the per-stage operation stays as the quieter alternative.
+  const auto = model.continueAutomatically;
+  if (auto && (next.kind === "continue" || next.kind === "last-managed" || next.kind === "next-stage")) {
+    buttons.push(button("continueAutomatically", auto.label, true, auto.detail, "primary"));
+  }
   switch (next.kind) {
     case "continue":
     case "last-managed":
       if (model.planAction) {
-        buttons.push(button("resumePlan", model.planAction.label, true, model.planAction.detail, "primary"));
+        buttons.push(button("resumePlan", model.planAction.label, true, model.planAction.detail, auto ? "" : "primary"));
       }
       if (model.actions?.plan) {
         buttons.push(openNext("Open in plan"));
       }
       break;
     case "next-stage":
-      buttons.push(button("startNextStage", "Start next stage", true, `sparring new-stage ${next.start?.stageId ?? ""} --brief-file … — creates the stage with this plan section as its brief.md; Run stage then begins implementation`, "primary"));
+      buttons.push(
+        button(
+          "startNextStage",
+          "Start next stage",
+          true,
+          `sparring new-stage ${next.start?.stageId ?? ""} --brief-file … — creates the stage with this plan section as its brief.md; Run stage then begins implementation`,
+          auto ? "quiet" : "primary",
+        ),
+      );
       buttons.push(openNext("Open in plan"));
       buttons.push(button("matchStage", "Change match…", true, MATCH_TITLE, "quiet"));
       break;

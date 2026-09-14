@@ -1,7 +1,23 @@
 /**
  * Manual verification for a stage the reviewer handed back to the human
- * (NEEDS_YOU / ESCALATE). Everything here is *derived presentation* of the
- * stage's existing artifacts; nothing is a second source of truth:
+ * (NEEDS_YOU / ESCALATE).
+ *
+ * **The gate decides.** When the recorded sparring result carries a
+ * structured `human_gate` (engine `human_gate.py`; parsed by
+ * engineFormats.ts), its `checks` are *exactly* the Pass / Fail / Blocked
+ * controls this panel shows — one per check, in the reviewer's order,
+ * with its instruction, its pass criteria and its plan reference. Nothing
+ * is added from the plan, and nothing is mined from prose.
+ *
+ * That rule exists because mining could not tell what actually blocks a
+ * stage. A reviewer who says, in one paragraph, that a pre-activation
+ * desktop must be tested, that production deployment stays with the release
+ * owner, and that the rollout gates remain closed, is naming one check and
+ * two things that happen after acceptance. Sentence-splitting produced
+ * three, and asked a human to "pass" two of them.
+ *
+ * Everything below the gate is the **legacy path**, used only for results
+ * recorded before the engine emitted structured gates:
  *
  *  - **plan checks** come from the matched plan stage section. When the
  *    section has an explicit `### Manual verification` sub-heading with
@@ -13,22 +29,25 @@
  *  - **reviewer requested checks** are the request clauses of the latest
  *    sparring result (`## Deferred`, else the needs-you reason), split only
  *    at sentence and semicolon boundaries and always labelled as the
- *    reviewer's, never shown as plan text;
+ *    reviewer's, never shown as plan text.
+ *
+ * Both paths then share:
+ *
  *  - **recorded evidence** is the `## Human evidence` section of notes.md
  *    (the engine's own place for a human's check results; stage.py:
- *    HUMAN_EVIDENCE_HEADING). A check counts as recorded when an entry of
- *    that section names it: exactly (the lines Submit evidence writes) or
- *    by clear word overlap with an entry that does not itself say the
+ *    HUMAN_EVIDENCE_HEADING). A gate check counts as recorded when an entry
+ *    names its id; otherwise when an entry names its text exactly (the lines
+ *    Submit for review writes) or overlaps it clearly without saying the
  *    check is still pending. Recorded checks leave "Still required";
  *  - the outcomes the user is recording now (Pass / Fail / Blocked plus a
  *    note) are drafts in VS Code workspace state until submitted, when they
- *    are rendered as prose under `## Human evidence` and the same stage
- *    resumes. Nothing here marks anything READY or accepted.
+ *    are rendered as prose under `## Human evidence` and the reviewer is
+ *    asked to rule again. Nothing here marks anything READY or accepted.
  *
  * No dependency on the vscode API.
  */
 
-import type { SparringOutcome } from "./engineFormats";
+import type { HumanGate, SparringOutcome } from "./engineFormats";
 import { extractPlanSection } from "./nextStage";
 
 // ---------------------------------------------------------------- plan checks
@@ -356,17 +375,25 @@ export const HUMAN_EVIDENCE_HEADING = "## Human evidence";
 /** One entry of `## Human evidence`: a list item (with continuation lines) or a paragraph. */
 export interface EvidenceEntry {
   text: string;
-  /** Set for the structured lines Submit evidence writes (`- Pass — <check>`). */
+  /** Set for the structured lines Submit for review writes (`- Pass — <check>`). */
   outcome?: CheckOutcome;
-  /** The check text of such a line, origin suffix removed. */
+  /** The check text of such a line, origin and id suffixes removed. */
   checkText?: string;
+  /** The gate check's stable id, when the line names one (`· check `pre-activation-desktop``). */
+  checkId?: string;
   /** The entry says something is still pending / not claimed; it is not evidence of completion. */
   negative: boolean;
 }
 
 /** Wording by which a human entry says a check is *not* done; such an entry never counts as completion evidence. */
 const NEGATIVE_RE = /\b(still pending|not claimed|not yet|cannot|can no longer|could not|unverified|not (?:done|verified|observed|run|tested|checked|exercised)|remains? (?:pending|open|outstanding|unverified)|outstanding:)\b/i;
-const STRUCTURED_RE = /^(Pass|Fail|Blocked)\s+—\s+(.+?)(?:\s+·\s+reviewer request)?$/;
+/**
+ * A result line this panel wrote: the outcome, the check's own wording, and
+ * an optional origin marker. `· check \`<id>\`` carries the gate check's
+ * stable id, which is what makes a recorded result survive the reviewer
+ * rewording the same check on a later turn.
+ */
+const STRUCTURED_RE = /^(Pass|Fail|Blocked)\s+—\s+(.+?)(?:\s+·\s+check\s+`([^`]+)`)?(?:\s+·\s+reviewer request)?$/;
 
 /** The `## Human evidence` section of notes.md as entries; empty when absent. */
 export function parseHumanEvidence(notes: string | undefined): EvidenceEntry[] {
@@ -393,6 +420,7 @@ export function parseHumanEvidence(notes: string | undefined): EvidenceEntry[] {
       text,
       outcome: structured ? (structured[1].toLowerCase() as CheckOutcome) : undefined,
       checkText: structured ? structured[2] : undefined,
+      checkId: structured ? structured[3] : undefined,
       negative: NEGATIVE_RE.test(text),
     });
   };
@@ -437,17 +465,28 @@ export interface RecordedEvidence {
   excerpt: string;
   /** From a structured line; undefined for prose evidence (which is shown as recorded, never as passed). */
   outcome?: CheckOutcome;
-  how: "exact" | "prose";
+  /** `id`: the entry names this gate check's stable id. `exact`: it quotes the check. `prose`: word overlap. */
+  how: "id" | "exact" | "prose";
 }
 
 /**
- * The recorded evidence for a check, if any: a structured line whose check
- * text is this check (exact, normalised), else the prose entry sharing the
- * most significant words with it, at least EVIDENCE_MATCH_MIN_OVERLAP,
- * uniquely, and not itself negative. The excerpt is shown so the reader
- * can see why the check counts as recorded.
+ * The recorded evidence for a check, if any, in decreasing order of
+ * certainty: a structured line naming the check's stable gate id; else one
+ * whose check text is this check (exact, normalised); else the prose entry
+ * sharing the most significant words with it, at least
+ * EVIDENCE_MATCH_MIN_OVERLAP, uniquely, and not itself negative. The
+ * excerpt is shown so the reader can see why the check counts as recorded.
+ *
+ * A gate check falls back to text and prose matching too, so evidence
+ * recorded before the reviewer supplied structured gates still counts.
  */
-export function recordedEvidenceFor(check: { text: string }, entries: EvidenceEntry[]): RecordedEvidence | undefined {
+export function recordedEvidenceFor(check: { text: string; key?: string; origin?: CheckOrigin }, entries: EvidenceEntry[]): RecordedEvidence | undefined {
+  if (check.origin === "gate" && check.key) {
+    const byId = entries.filter((entry) => entry.checkId === check.key).pop();
+    if (byId) {
+      return { excerpt: excerpt(byId.text), outcome: byId.outcome, how: "id" };
+    }
+  }
   const exact = entries.filter((entry) => entry.checkText !== undefined && normalise(entry.checkText) === normalise(check.text)).pop();
   if (exact) {
     return { excerpt: excerpt(exact.text), outcome: exact.outcome, how: "exact" };
@@ -465,13 +504,17 @@ function excerpt(text: string, max = EXCERPT_MAX_LENGTH): string {
 
 // ---------------------------------------------------------------- putting it together
 
-export type CheckOrigin = "plan" | "reviewer";
+export type CheckOrigin = "gate" | "plan" | "reviewer";
 
 /** One verification check as the panel shows it, with where it came from and what is known about it. */
 export interface CheckItem {
   key: string;
   text: string;
   origin: CheckOrigin;
+  /** The reviewer's own pass/fail criteria; gate checks only. */
+  passCriteria?: string;
+  /** Where the full test is defined, as the reviewer named it; gate checks only. */
+  source?: string;
   /** Plan line for plan checks. */
   line?: number;
   /** The user's unsubmitted draft. */
@@ -481,7 +524,15 @@ export interface CheckItem {
 }
 
 export interface VerificationView {
-  /** Prose requirements from the plan, verbatim (fallback when the plan has no explicit checklist). */
+  /**
+   * Where the check list came from. `gate`: the reviewer's structured
+   * human_gate, which is authoritative and complete. `derived`: the legacy
+   * plan/prose path, for a result recorded before gates existed.
+   */
+  source: "gate" | "derived";
+  /** The gate's own category and title, when the reviewer supplied one. */
+  gate?: { category: string; title: string };
+  /** Prose requirements from the plan, verbatim (legacy path only). */
   parents: ManualCheck[];
   explicitCount: number;
   reviewerCount: number;
@@ -500,25 +551,20 @@ export interface VerificationView {
 }
 
 /**
- * Derive the panel's lists. Recordable checks are the explicit plan checks
- * plus the reviewer's requested checks (a reviewer clause that overlaps an
- * explicit plan check is the same check and is dropped); without either,
- * the parent requirements themselves are the recordable units. Each check
- * is then either recorded (notes.md names it) or still required.
+ * Derive the panel's lists.
+ *
+ * With a structured gate, the checks are the gate's checks and nothing else.
+ * Without one, the legacy path applies: the explicit plan checks plus the
+ * reviewer's requested clauses (a clause overlapping an explicit plan check
+ * is the same check and is dropped); without either, the parent
+ * requirements themselves are the recordable units.
+ *
+ * Either way, each check is then either recorded (notes.md names it) or
+ * still required.
  */
 export function deriveVerification(plan: PlanChecks, outcome: SparringOutcome | undefined, evidence: EvidenceEntry[], drafts: Record<string, CheckRecord>): VerificationView {
-  const items: CheckItem[] = plan.explicit.map((check) => ({ key: check.key, text: check.text, origin: "plan", line: check.line }));
-  let reviewerCount = 0;
-  for (const text of reviewerChecks(outcome)) {
-    if (plan.explicit.length > 0 && matchReviewerRequest(plan.explicit, text) !== undefined) {
-      continue;
-    }
-    items.push({ key: checkKey(text), text, origin: "reviewer" });
-    reviewerCount++;
-  }
-  if (items.length === 0) {
-    items.push(...plan.parents.map((check): CheckItem => ({ key: check.key, text: check.text, origin: "plan", line: check.line })));
-  }
+  const gate = outcome?.humanGate;
+  const items = gate ? gateItems(gate) : derivedItems(plan, outcome);
   for (const item of items) {
     item.evidence = recordedEvidenceFor(item, evidence);
     if (!item.evidence) {
@@ -528,14 +574,46 @@ export function deriveVerification(plan: PlanChecks, outcome: SparringOutcome | 
   const recorded = items.filter((item) => item.evidence);
   const required = items.filter((item) => !item.evidence);
   return {
-    parents: plan.parents,
-    explicitCount: plan.explicit.length,
-    reviewerCount,
+    source: gate ? "gate" : "derived",
+    gate: gate ? { category: gate.category, title: gate.title } : undefined,
+    parents: gate ? [] : plan.parents,
+    explicitCount: gate ? 0 : plan.explicit.length,
+    reviewerCount: gate ? 0 : items.filter((item) => item.origin === "reviewer").length,
     recorded,
     required,
     progress: progressText(items),
     ready: items.length > 0 && required.every((item) => item.record?.outcome !== undefined),
   };
+}
+
+/**
+ * The gate's checks, 1:1 and in the reviewer's order. The check's own `id`
+ * is the draft key, so a draft survives the reviewer restating the gate
+ * with different wording — which is the whole reason the engine requires a
+ * stable id.
+ */
+function gateItems(gate: HumanGate): CheckItem[] {
+  return gate.checks.map((check) => ({
+    key: check.id,
+    text: check.instruction,
+    origin: "gate" as const,
+    passCriteria: check.passCriteria,
+    source: check.source,
+  }));
+}
+
+function derivedItems(plan: PlanChecks, outcome: SparringOutcome | undefined): CheckItem[] {
+  const items: CheckItem[] = plan.explicit.map((check) => ({ key: check.key, text: check.text, origin: "plan", line: check.line }));
+  for (const text of reviewerChecks(outcome)) {
+    if (plan.explicit.length > 0 && matchReviewerRequest(plan.explicit, text) !== undefined) {
+      continue;
+    }
+    items.push({ key: checkKey(text), text, origin: "reviewer" });
+  }
+  if (items.length === 0) {
+    items.push(...plan.parents.map((check): CheckItem => ({ key: check.key, text: check.text, origin: "plan", line: check.line })));
+  }
+  return items;
 }
 
 /** `2 / 3 verified`: recorded evidence that is not a Fail/Blocked line, plus Pass drafts, over all checks; failed / blocked counts when any. */
@@ -557,13 +635,17 @@ export interface RecordedCheck {
   text: string;
   origin: CheckOrigin;
   record: CheckRecord;
+  /** The gate check's stable id, written into the line so the result is matched by id next turn. */
+  id?: string;
 }
 
 /**
  * The prose entry for `## Human evidence`: one line per check with a
- * recorded outcome, the check's own wording quoted (reviewer checks
- * marked as such), the note beneath it. Checks without an outcome are not
- * mentioned (nothing is claimed about them). The date is the only thing
+ * recorded outcome, the check's own wording quoted, the note beneath it.
+ * A gate check's line carries its stable id, so the reviewer restating the
+ * same check with different wording still finds this result; a legacy
+ * reviewer-derived check is marked as such. Checks without an outcome are
+ * not mentioned (nothing is claimed about them). The date is the only thing
  * added that the user did not type.
  */
 export function renderHumanEvidence(checks: RecordedCheck[], date: Date, planName?: string): string | undefined {
@@ -572,9 +654,11 @@ export function renderHumanEvidence(checks: RecordedCheck[], date: Date, planNam
     return undefined;
   }
   const day = date.toISOString().slice(0, 10);
-  const lines = [`${day} — manual verification recorded in VS Code${planName ? ` against the plan checks of ${planName}` : ""}:`, ""];
+  const against = planName ? ` against the checks of ${planName}` : "";
+  const lines = [`${day} — manual verification recorded in VS Code${against}:`, ""];
   for (const check of recorded) {
-    lines.push(`- ${OUTCOME_WORDS[check.record.outcome as CheckOutcome]} — ${check.text}${check.origin === "reviewer" ? " · reviewer request" : ""}`);
+    const suffix = check.id ? ` · check \`${check.id}\`` : check.origin === "reviewer" ? " · reviewer request" : "";
+    lines.push(`- ${OUTCOME_WORDS[check.record.outcome as CheckOutcome]} — ${check.text}${suffix}`);
     if (check.record.note?.trim()) {
       for (const noteLine of check.record.note.trim().split(/\r?\n/)) {
         lines.push(`  ${noteLine}`);
@@ -584,12 +668,12 @@ export function renderHumanEvidence(checks: RecordedCheck[], date: Date, planNam
   return lines.join("\n");
 }
 
-/** The checks Submit evidence will write: outstanding checks with a drafted outcome. */
+/** The checks Submit for review will write: outstanding checks with a drafted outcome. */
 export function submittableChecks(view: VerificationView): RecordedCheck[] {
   const out: RecordedCheck[] = [];
   for (const item of view.required) {
     if (item.record?.outcome) {
-      out.push({ text: item.text, origin: item.origin, record: item.record });
+      out.push({ text: item.text, origin: item.origin, record: item.record, id: item.origin === "gate" ? item.key : undefined });
     }
   }
   return out;
@@ -609,39 +693,10 @@ export function appendHumanEvidence(notes: string, entry: string): string {
   return `${body}\n\n${entry.trim()}\n`;
 }
 
-/**
- * The same entry inside a stage's `handoff.md`, at the end of its existing
- * `## Human evidence` section (handoff.py renders that section from notes.md
- * in the middle of the document, so appending at the end of the file would
- * file the entry under whatever section comes last). Without such a section
- * the heading and entry are appended at the end, which is where handoff.py
- * puts a first one relative to the sections that follow it.
- *
- * Why write handoff.md at all: the sparring prompt shows the reviewer the
- * stage brief, the project context and `handoff.md` verbatim
- * (sparring_prompt.py), and the engine only folds notes.md's human evidence
- * into the handoff when the *stage agent* regenerates it. Sending evidence
- * to the reviewer without running the stage agent therefore means putting it
- * where the reviewer actually reads, in the engine's own section and shape.
- * The next handoff the engine generates replaces the file wholesale from
- * notes.md, which holds the same entry.
- */
-export function insertHandoffEvidence(handoff: string, entry: string): string {
-  const lines = handoff.replace(/\n+$/, "").split(/\r?\n/);
-  const start = lines.findIndex((line) => line.trim() === HUMAN_EVIDENCE_HEADING);
-  if (start < 0) {
-    return `${lines.join("\n")}\n\n${HUMAN_EVIDENCE_HEADING}\n\n${entry.trim()}\n`;
-  }
-  let end = lines.length;
-  for (let index = start + 1; index < lines.length; index++) {
-    if (/^#{1,2}\s/.test(lines[index])) {
-      end = index;
-      break;
-    }
-  }
-  const before = lines.slice(0, end);
-  while (before.length > 0 && !before[before.length - 1].trim()) {
-    before.pop();
-  }
-  return `${[...before, "", entry.trim(), "", ...lines.slice(end)].join("\n").replace(/\n+$/, "")}\n`;
-}
+// The extension used to mirror the same entry into the stage's handoff.md,
+// because the reviewer's prompt embedded handoff.md verbatim and only a
+// *stage-agent* turn folded notes.md's evidence into it — so evidence sent
+// without running the stage agent was invisible. The engine now reads the
+// `## Human evidence` section of notes.md live when it builds the sparring
+// prompt (sparring_prompt.py), so notes.md is the one canonical place and
+// nothing here maintains a duplicate.

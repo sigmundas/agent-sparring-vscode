@@ -235,8 +235,8 @@ describe("new-stage is the engine's own lifecycle", () => {
     const commandWrites = (await fs.readFile(path.join(src, "vscode", "commands.ts"), "utf8")).match(/\bfs\.writeFile\([^\n]*/g) ?? [];
     assert.deepEqual(
       commandWrites.map((call) => /\(([^,]+),/.exec(call)?.[1]),
-      ["notesPath", "handoffPath"],
-      "the only workspace files the extension writes are the stage's notes.md (the engine's own '## Human evidence' append) and the same entry in handoff.md, which is what the reviewer's prompt reads",
+      ["notesPath", "file", "manifestPath"],
+      "the only workspace file the extension writes is the stage's notes.md (the engine's own '## Human evidence' append, which the engine then reads live); the other two are execution manifests, written to the extension's own global storage and never into a repository",
     );
     const temp = await fs.readFile(path.join(src, "core", "tempFile.ts"), "utf8");
     assert.match(temp, /mkdtemp\(path\.join\(os\.tmpdir\(\)/, "the temporary file lives under the OS temporary directory");
@@ -276,7 +276,14 @@ describe("the Overview after Start next stage", () => {
     assert.equal(model.plan?.current, "Stage 3C — Cloud schema and synchronization");
     assert.equal(model.plan?.matched, "manual");
     assert.equal(model.plan?.next?.display, "Stage 3D — Client sync");
-    assert.match(renderOverviewHtml(model, "n", "c"), /<button type="button" class="primary" data-action="runStage"/);
+    // Automatic continuation is the default, so it holds the primary slot and
+    // Run stage stays available beside it as the per-stage alternative.
+    const html = renderOverviewHtml(model, "n", "c");
+    assert.match(html, /<button type="button" class="primary" data-action="continueAutomatically"/);
+    assert.match(html, /data-action="runStage"/);
+    const manual = buildOverviewModel(selection, undefined, { ...artifacts, continuation: "manual" as const }, Date.parse("2026-09-12T19:00:00.000Z"));
+    assert.equal(manual.continueAutomatically, undefined, "Pause after each stage keeps the per-stage checkpoints only");
+    assert.match(renderOverviewHtml(manual, "n", "c"), /<button type="button" class="primary" data-action="runStage"/);
 
     // Without the manual match the brief's own header still places the stage.
     const byBrief = buildOverviewModel(selection, undefined, { ...artifacts, associatedPlan: { path: planFile, exists: true, text: RANGE_PLAN } }, Date.parse("2026-09-12T19:00:00.000Z"));

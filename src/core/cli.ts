@@ -4,9 +4,9 @@
  * Arguments are always returned as arrays for a shell-less spawn; nothing is
  * quoted or joined, so paths with spaces are safe on every platform.
  *
- * CLI surface used (cli.py at f7740e7):
- *   sparring [--sparring-dir DIR] run-plan    PLAN --repo-root ROOT --expected-branch BRANCH
- *   sparring [--sparring-dir DIR] resume-plan PLAN --repo-root ROOT --expected-branch BRANCH [--evidence TEXT]
+ * CLI surface used (cli.py at 35a2fb2):
+ *   sparring [--sparring-dir DIR] run-plan    (PLAN | --manifest FILE) --repo-root ROOT --expected-branch BRANCH [--adopt]
+ *   sparring [--sparring-dir DIR] resume-plan (PLAN | --manifest FILE) --repo-root ROOT --expected-branch BRANCH [--evidence TEXT]
  *   sparring [--sparring-dir DIR] run-loop    STAGE --repo-root ROOT --expected-branch BRANCH
  *   sparring [--sparring-dir DIR] run-sparring STAGE --repo-root ROOT --expected-branch BRANCH
  *   sparring [--sparring-dir DIR] freeze-candidate STAGE --repo-root ROOT --expected-branch BRANCH
@@ -23,23 +23,51 @@ import * as path from "node:path";
 export const DEFAULT_EXECUTABLE = "sparring";
 
 export interface PlanInvocation {
-  planPath: string;
+  /** The reviewed Markdown plan; omitted when `manifest` is given. */
+  planPath?: string;
+  /**
+   * An execution manifest, passed as `--manifest` instead of the positional
+   * plan. The engine then runs the stages the extension listed, in that
+   * order, with those exact briefs (manifest.ts).
+   */
+  manifest?: string;
   repoRoot: string;
   expectedBranch: string;
   /** Passed as the global `--sparring-dir` when it is not `<repoRoot>/.sparring`. */
   sparringDir?: string;
 }
 
-export function buildRunPlanArgs(invocation: PlanInvocation): string[] {
-  return [...globalArgs(invocation), "run-plan", invocation.planPath, ...loopArgs(invocation)];
+/**
+ * `sparring run-plan (<plan> | --manifest <file>) --repo-root … --expected-branch …`
+ * (cli.py: run_plan). `adopt` adds `--adopt`, which lets the run take over
+ * stages that already exist instead of refusing them — each one checked and
+ * reported by the engine, never silently inherited.
+ */
+export function buildRunPlanArgs(invocation: PlanInvocation & { adopt?: boolean }): string[] {
+  const args = [...globalArgs(invocation), "run-plan", ...planInput(invocation), ...loopArgs(invocation)];
+  if (invocation.adopt) {
+    args.push("--adopt");
+  }
+  return args;
 }
 
 export function buildResumePlanArgs(invocation: PlanInvocation & { evidence?: string }): string[] {
-  const args = [...globalArgs(invocation), "resume-plan", invocation.planPath, ...loopArgs(invocation)];
+  const args = [...globalArgs(invocation), "resume-plan", ...planInput(invocation), ...loopArgs(invocation)];
   if (invocation.evidence && invocation.evidence.trim()) {
     args.push("--evidence", invocation.evidence.trim());
   }
   return args;
+}
+
+/** Exactly one plan input, as the engine requires: the manifest flag or the positional plan. */
+function planInput(invocation: PlanInvocation): string[] {
+  if (invocation.manifest) {
+    return ["--manifest", invocation.manifest];
+  }
+  if (!invocation.planPath) {
+    throw new Error("a plan invocation needs either planPath or manifest");
+  }
+  return [invocation.planPath];
 }
 
 export interface LoopInvocation {

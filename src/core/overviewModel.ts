@@ -139,7 +139,17 @@ export interface OverviewArtifacts {
   notesText?: string;
   /** Contents of the stage's handoff.md when readable; only its `## Git context` branch line is consulted. */
   handoffText?: string;
+  /**
+   * How the user wants a plan to progress (`agentSparring.planContinuation`):
+   * `automatic` hands the whole plan to the engine as one managed run and
+   * offers no per-stage clicks between healthy stages; `manual` keeps the
+   * explicit Accept stage / Start next stage / Run stage checkpoints. Both
+   * only ever offer engine operations; the extension never sequences.
+   */
+  continuation?: PlanContinuation;
 }
+
+export type PlanContinuation = "automatic" | "manual";
 
 export interface OverviewActions {
   handoff: boolean;
@@ -321,6 +331,12 @@ export interface OverviewModel {
   secondaryAction?: StageRunAction;
   /** Resume plan / Continue plan for a managed plan run. */
   planAction?: PlanAction;
+  /**
+   * Hand the whole plan to the engine (automatic mode). Present only when
+   * `agentSparring.planContinuation` is `automatic`, a plan is known and
+   * nothing is running; see the function of the same name.
+   */
+  continueAutomatically?: { label: string; detail: string; primary: boolean };
   /** An Accept stage operation from this window is in flight. */
   accepting?: { label: string; detail: string };
   /** A runner observed for this run: alive (Stop offered) or stopped. */
@@ -486,8 +502,14 @@ export function buildOverviewModel(
     model.whatsNext = whatsNext(run, plan, artifacts, model.planAction);
   }
   model.planName = plan?.name;
+  model.continueAutomatically = continueAutomatically(run, plan, artifacts, model, liveness);
   model.actionRequired = actionRequired(run, presentation, outcome, plan, artifacts, model, branchGuard, liveness);
   if (model.actionRequired) {
+    // Automatic continuation is not on the table while the reviewer is
+    // waiting for a human: the plan cannot advance until the gate is
+    // answered, and Submit for review is what does that. The engine
+    // continues on its own from there.
+    delete model.continueAutomatically;
     // The panel names and explains the action; no banner repeats it.
     delete model.banner;
     if (model.actionRequired.ready && model.actionRequired.kind === "needs_you") {
@@ -567,7 +589,9 @@ function actionRequired(
   const kind = outcome.action === "NEEDS_YOU" ? "needs_you" : "escalate";
   const planText = run.kind === "plan" ? artifacts.planText : artifacts.associatedPlan?.text;
   const sectionLine = plan?.currentLine;
-  const checks = planText && sectionLine ? planChecks(planText, sectionLine) : { explicit: [], parents: [] };
+  // With a structured gate the reviewer already said exactly what blocks
+  // this stage, so the plan is not consulted for checks at all.
+  const checks = !outcome.humanGate && planText && sectionLine ? planChecks(planText, sectionLine) : { explicit: [], parents: [] };
   const view = deriveVerification(checks, outcome, parseHumanEvidence(artifacts.notesText), artifacts.humanChecks ?? {});
   let noChecks: string | undefined;
   if (view.recorded.length === 0 && view.required.length === 0) {
@@ -623,6 +647,53 @@ function actionRequired(
     resume,
     planSection: Boolean(sectionLine && (run.kind === "plan" ? artifacts.plan : artifacts.associatedPlan?.exists)),
     review: artifacts.sparring,
+  };
+}
+
+/**
+ * Hand the whole plan to the engine and let it run.
+ *
+ * Offered when the user is in automatic mode (the default) and a plan
+ * document is known — the engine's own for a managed run, the associated
+ * file for a standalone stage. It is the *primary* next step whenever there
+ * is a plan to continue: the point of the mode is that healthy stages need
+ * no clicks, so Accept stage / Start next stage / Run stage become the
+ * quieter alternatives rather than the path.
+ *
+ * Nothing is offered while a runner is alive or its liveness is unknown
+ * mid-turn, when the branch is wrong, or when the managed run is complete.
+ * Manual mode omits it entirely, which is exactly what that mode is for.
+ */
+function continueAutomatically(
+  run: RunSnapshot,
+  plan: PlanContext | undefined,
+  artifacts: OverviewArtifacts,
+  model: OverviewModel,
+  liveness: RunnerLiveness,
+): OverviewModel["continueAutomatically"] {
+  if ((artifacts.continuation ?? "automatic") !== "automatic") {
+    return undefined;
+  }
+  if (!plan || model.branchGuard || blocked(model) || model.accepting) {
+    return undefined;
+  }
+  if (liveness.state === "running") {
+    return undefined;
+  }
+  if (run.kind === "plan") {
+    if (run.state.status === "complete") {
+      return undefined;
+    }
+    return {
+      label: "Continue automatically",
+      primary: true,
+      detail: `sparring resume-plan --manifest …: the engine continues this managed run of ${plan.name} stage by stage, accepting each READY candidate through its own gate, and stops when it needs you.`,
+    };
+  }
+  return {
+    label: "Continue automatically",
+    primary: true,
+    detail: `sparring run-plan --manifest …: hands the remaining stages of ${plan.name} to the engine as one managed run. It runs implementation ↔ review per stage, accepts each READY candidate through its own gate, and stops when it needs you.`,
   };
 }
 

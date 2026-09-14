@@ -12,7 +12,7 @@ import * as vscode from "vscode";
 import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, currentStageOf } from "../../core/discovery";
 import { CHECK_OUTCOMES } from "../../core/humanChecks";
 import { OVERVIEW_ACTIONS, renderOverviewHtml, type HumanCheckMessage, type OverviewAction } from "../../core/overviewHtml";
-import { buildOverviewModel, type OverviewArtifacts, type OverviewModel } from "../../core/overviewModel";
+import { buildOverviewModel, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
 import { documentViewColumn } from "../../core/viewColumn";
 import type { SparringController } from "../controller";
 import { gitContext } from "../git";
@@ -156,6 +156,7 @@ export class OverviewPanelManager implements vscode.Disposable {
         accepting: this.controller.isAccepting(run.id),
         humanChecks: this.controller.humanChecks(run.id),
         notesText,
+        continuation: planContinuation(),
       };
     }
     return buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.executionFor(selection.selected?.id));
@@ -229,4 +230,15 @@ async function exists(file: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * The user's plan-progression mode. `automatic` is the default: a plan
+ * belongs to the engine's managed run, which continues from stage to stage
+ * on its own and stops when it needs a human. `manual` keeps the explicit
+ * per-stage checkpoints for people who want them.
+ */
+function planContinuation(): PlanContinuation {
+  const configured = vscode.workspace.getConfiguration("agentSparring").get<string>("planContinuation", "automatic");
+  return configured === "manual" ? "manual" : "automatic";
 }

@@ -325,7 +325,7 @@ describe("recorded outcomes (drafts) and the ## Human evidence entry", () => {
     assert.equal(
       entry,
       [
-        "2026-09-13 — manual verification recorded in VS Code against the plan checks of Reported statistics and explicit range semantics:",
+        "2026-09-13 — manual verification recorded in VS Code against the checks of Reported statistics and explicit range semantics:",
         "",
         "- Pass — Exercise live enhanced push · reviewer request",
         "  Both clients agree;",

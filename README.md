@@ -24,6 +24,10 @@ navigates.
   in an integrated terminal through the shell-integration API (executable +
   argument array, no quoting) and observes when the process ends; see
   "Runner lifecycle".
+- **Continues a whole plan automatically**: interprets the plan document once
+  into an execution manifest and hands it to the engine's managed run, which
+  then goes from stage to stage on its own and stops when it needs you. One
+  confirmation, at the start. See "Two ways to progress a plan".
 
 ## Commands
 
@@ -36,6 +40,7 @@ navigates.
 | `Agent Sparring: Choose Plan for Stage…` | Associate a Markdown plan file (any location, ordinary file picker) with the selected standalone stage. Stored in VS Code workspace state per repository + stage id, never in engine state; gives the Overview a **Plan** button, this stage's place in the document and, once accepted, **What's next**. Change or remove it the same way. |
 | `Agent Sparring: Match Stage to Plan Section…` | When the Overview cannot tell which stage of the associated plan the selected stage is, pick it from the plan's stages (also **Match this stage…** / **Change match…** in the Overview). Stored with the association in VS Code workspace state, never in engine state. |
 | `Agent Sparring: Start Next Stage from Plan…` | For an accepted standalone stage with an associated plan: create the stage that follows it (by stage label) with the engine's own `sparring new-stage <id>`, after a confirmation naming the title, the proposed id and the plan section. The Overview switches to the new stage, the plan association follows it, and its fresh `brief.md` opens beside the plan section for you to fill in before **Run stage**. Also **Start next stage** in the Overview. |
+| `Agent Sparring: Continue Plan Automatically` | Build the execution manifest for the plan of the selected run and start (or resume) the engine's managed plan run against it: `sparring run-plan --manifest … [--adopt]` / `sparring resume-plan --manifest …`. The engine then sequences the stages itself. One confirmation before the first stage; none between stages. Also **Continue automatically** in the Overview. |
 | `Agent Sparring: Choose sparring Executable…` | Pick the `sparring` CLI with a file dialog and store it as `agentSparring.executable`. |
 | `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / finalizing / future stages), the current stage as primary content (`Stage N — title`, a human state word with one explaining sentence, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), latest sparring result, small Stage Agent / Sparrer cards, Brief / Handoff / Sparring report / Diff / Plan / Log buttons, and quiet metadata (where the engine's own words live). Never auto-opens; updates in place. |
 | `Agent Sparring: Show Log` | Focus the Output Channel. |
@@ -50,6 +55,8 @@ navigates.
   with its own `PATH` exactly as when you type it; the extension host's
   `PATH` is never consulted for that, so "works in the terminal" means
   "works from the button". See "Executable resolution" below.
+- `agentSparring.planContinuation` — `automatic` (default) or `manual`. See
+  "Two ways to progress a plan".
 - `agentSparring.pollIntervalMs` — fallback poll interval for the activity log.
 - `agentSparring.nestedSearchDepth` — how many levels below each workspace
   folder are searched for nested projects with their own `.sparring`
@@ -85,6 +92,49 @@ words stay in tooltips, the metadata footer and the Output Channel.
 | **Finalizing stage…** | The moment between the two acceptance steps. If it persists, *Finalizing did not complete. Use Accept stage to finish it.* (re-freezing is allowed by the engine). | stage `frozen` |
 | **Accepted** — *Stage complete.* | Nothing further runs for this stage; **What's next** says what to do now (see below). | stage `accepted` |
 | **Stopped** — *The last run was interrupted.* | The runner ended mid-turn (Ctrl-C, crash, reload); **Resume stage** returns. | runner liveness, see below |
+
+## Two ways to progress a plan
+
+`agentSparring.planContinuation` picks one; both only ever run engine
+operations, and the extension never sequences stages itself.
+
+**Continue automatically** (the default) treats the plan as the unit of work.
+The extension interprets the document once — which headings are canonical
+stages, how `3A`/`3B`/`3C` order, which sections are historical handoffs that
+define nothing, which stage ids this project already uses, what each brief
+says — writes that out as an **execution manifest**, and starts or resumes the
+engine's own managed run against it:
+
+```sh
+sparring run-plan    --manifest <manifest> --repo-root <project> --expected-branch <branch> [--adopt]
+sparring resume-plan --manifest <manifest> --repo-root <project> --expected-branch <branch>
+```
+
+From there the engine sequences: implementation ↔ review per stage, and on
+READY it freezes and accepts the exact pushed commit through its existing
+hard gate and starts the next stage. There is no Accept stage / Start next
+stage / Run stage click between healthy stages, and no second confirmation —
+you are asked once, *Run this plan automatically until Agent Sparring needs
+you?*, with the ordered stage list and which ones are already accepted. The
+run stops at NEEDS_YOU, an escalation, a failure, or the end of the plan.
+
+The manifest is a derived file: regenerated on every launch, byte-stable
+while the plan is unchanged, and written to the extension's own global
+storage — never into a repository, where the engine's freeze would rightly
+refuse it as an unrepresented change. It carries stage ids, labels, titles,
+briefs and the order, and no status, position, verdict or session: those stay
+in `.sparring/plans/` and each stage's `state.json`, exactly as before.
+`--adopt` is added only for a fresh run whose stages already exist from
+stage-by-stage work; the engine then checks each one and reports what it
+inherits, and refuses anything it would have to guess at.
+
+Headings that only *record* what happened — `## Stage 3D handoff — 2026-09-14
+(accepted at …)` — are left in the plan and never run; the Output Channel
+names each one it skipped.
+
+**Pause after each stage** (`manual`) keeps the per-stage checkpoints below
+unchanged, for when you want to look before every provider turn. In automatic
+mode those actions are still there, just no longer the obvious path.
 
 ## Plans: managed runs and associated files
 
@@ -147,15 +197,16 @@ line and a **What's next** block:
 | Standalone stage, plan linked but not matched | *The plan is linked, but Agent Sparring doesn't yet know where this stage belongs in it.* **Match this stage…**, **Open plan**; plan stages the brief lists as later work are shown as a hint |
 | Standalone stage, no plan | *This stage has been accepted. Choose a plan to see what comes next.* **Choose plan…** |
 
-**Start next stage** proposes `stage-<label>-<slug>` (for example
-`stage-3c-cloud-schema-and-synchronization`), confirms *Start Stage 3C —
-…?* with the id and the plan section, and runs the engine's
-`sparring new-stage <id>` through the configured executable. The engine
-writes the stage directory, `state.json` and the template `brief.md`; the
-extension writes nothing under `.sparring`. Because the engine has no
-operation that fills a standalone stage's brief from a plan section, the
-new brief opens beside that section for you to complete, then **Run
-stage** runs it as usual.
+**Start next stage** (the per-stage path) proposes `stage-<label>-<slug>`
+(for example `stage-3c-cloud-schema-and-synchronization`), confirms *Start
+Stage 3C — …?* with the id and the plan section, and runs the engine's
+`sparring new-stage <id> --brief-file …` through the configured executable
+with that plan section as the brief. The engine writes the stage directory,
+`state.json` and `brief.md`; the extension writes nothing under `.sparring`.
+It deliberately does not launch anything: **Run stage** is the separate,
+deliberate step that spends provider tokens. **Continue automatically** does
+the same interpretation for every remaining stage at once and lets the engine
+run them.
 
 ## Source-of-truth rule
 
@@ -165,11 +216,12 @@ stage** runs it as usual.
 | working / frozen / accepted per stage | `.sparring/stages/<id>/state.json` |
 | stage count and titles | the plan Markdown named in the run state |
 | Changes requested / Needs you / Escalated / Review complete | `## Routing outcome` in the current stage's `sparring.md` |
-| **Plan requirement** in the Action required panel | the matched plan stage section: task-list items under its `### Manual verification` heading are rendered 1:1 as checks; without such a list, the human-worded list items (`Human-gated …`, `Manual: …`) stay visible as prose parents and are never split into a checklist the plan does not spell out. Always the plan's own words; the plan file is never modified (its stage sections are digest-guarded) |
-| **Reviewer note** / **Reviewer requested checks** | `sparring.md`: the needs-you reason is the one compact note; the request clauses of `## Deferred` (else of the reason), split only at sentence and semicolon boundaries, are the reviewer's checks, tagged *Reviewer* and never shown as plan text; a clause that is the same check as an explicit plan item is dropped |
-| **Evidence already recorded** vs **Still required** | the `## Human evidence` section of the stage's `notes.md`: a check is recorded when an entry names it — exactly (the `- Pass — …` lines the panel writes) or by clear word overlap with an entry that does not itself say the check is still pending — and the entry is shown beneath it; everything else is still required |
+| **What the reviewer requires** — the Pass / Fail / Blocked list | the structured `human_gate` of the recorded verdict: the JSON block behind the `<!-- human-gate:v1 -->` marker in `sparring.md`. One control per `checks` entry, in the reviewer's order, showing its instruction, its *Pass when* criteria and the plan reference it names, keyed by its stable `id`. Nothing is added from the plan and nothing is inferred from prose — the engine requires a NEEDS_YOU to name what blocks the stage, and things the reviewer says about *after* acceptance (deployment, rollout, monitoring) belong to `findings`/`deferred` and are not shown as checks |
+| **Reviewer note** | `sparring.md`'s needs-you reason: one compact line, verbatim |
+| the same panel for a verdict recorded **before** structured gates existed | the legacy derivation, unchanged: task-list items under the matched plan section's `### Manual verification` heading 1:1, else its human-worded list items as prose parents, plus the request clauses of `## Deferred` (else of the reason) split at sentence and semicolon boundaries and tagged *Reviewer*. The plan file is never modified (its stage sections are digest-guarded) |
+| **Evidence already recorded** vs **Still required** | the `## Human evidence` section of the stage's `notes.md`: a check is recorded when an entry names its stable gate id (`· check \`…\``, which is why a result survives the reviewer rewording the same check), else names it exactly, else overlaps it clearly without itself saying the check is still pending — and the entry is shown beneath it; everything else is still required |
 | `N / M verified`, Pass / Fail / Blocked and notes before submitting | drafts in VS Code workspace state per repository + stage id; only outstanding checks take a new outcome |
-| **Submit for review** | enabled once every requested check has an outcome. It records the drafted results as prose under `## Human evidence` in the stage's `notes.md` (the engine's own append shape) and mirrors the same entry into `handoff.md`'s section of that name, because the reviewer's prompt shows `handoff.md` verbatim and only a stage-agent turn would otherwise fold notes.md into it. Then the **reviewer** runs: `sparring run-sparring <stage>` for a standalone stage, which resumes the recorded sparring session against the unchanged candidate, or the engine's own `resume-plan --evidence` inside a managed plan run. The stage agent is not started — there is no implementation work in handing over evidence — and nothing is frozen or accepted: the reviewer rules on its next turn |
+| **Submit for review** | enabled once every requested check has an outcome. It records the drafted results as prose under `## Human evidence` in the stage's `notes.md`, the engine's own append shape — and only there: the engine reads that section live when it builds the sparring prompt, so nothing has to be mirrored into `handoff.md` any more. Then the **reviewer** runs: `sparring run-sparring <stage>` for a standalone stage, which resumes the recorded sparring session against the unchanged candidate, or the engine's own `resume-plan --evidence` inside a managed plan run, which records the evidence and resumes the sparrer against that same candidate. The stage agent is not started — there is no implementation work in handing over evidence — and nothing is frozen or accepted: the reviewer rules on its next turn, and inside a managed run the engine carries on from there by itself |
 | **Resume stage (implementation)** | the separate, quiet action: `run-loop`, which starts the stage agent again. Use it when there is work to do, not to hand over evidence |
 | Plan button, this stage's section, the next stage label and "What's next" for a standalone stage | the Markdown file you associated and, when you picked one, the stage you matched (VS Code workspace state; display only) |
 | A new stage started from the plan | `sparring new-stage <id>` (the engine writes the skeleton; the extension proposes the id and confirms) |

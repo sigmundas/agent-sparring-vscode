@@ -26,6 +26,8 @@ export interface ParsedSparringCommand {
   stageId?: string;
   /** Plan path as typed for run-plan / resume-plan. */
   planPath?: string;
+  /** Execution manifest as typed (`--manifest`), in place of a plan path. */
+  manifest?: string;
   repoRoot?: string;
   sparringDir?: string;
   expectedBranch?: string;
@@ -146,6 +148,9 @@ export function parseSparringCommand(commandLine: string): ParsedSparringCommand
         case "--expected-branch":
           parsed.expectedBranch = value;
           break;
+        case "--manifest":
+          parsed.manifest = value;
+          break;
         default:
           break;
       }
@@ -153,13 +158,19 @@ export function parseSparringCommand(commandLine: string): ParsedSparringCommand
     }
     positionals.push(token);
   }
-  if (positionals.length === 0) {
-    return undefined;
-  }
   if (parsed.subcommand === "run-loop" || parsed.subcommand === "run-sparring") {
+    if (positionals.length === 0) {
+      return undefined;
+    }
     parsed.stageId = positionals[0];
-  } else {
+    return parsed;
+  }
+  // A plan command names its plan positionally or as --manifest; exactly one.
+  if (positionals.length > 0) {
     parsed.planPath = positionals[0];
+  }
+  if (!parsed.planPath && !parsed.manifest) {
+    return undefined;
   }
   return parsed;
 }
@@ -285,6 +296,11 @@ export function matchSparringCommand(parsed: ParsedSparringCommand, cwd: string 
   }
   const planPath = resolve(parsed.planPath);
   if (!planPath) {
+    // A `--manifest` invocation names the plan inside the manifest file, so
+    // its run id cannot be derived from the command line alone. The
+    // extension's own launches pass their run id explicitly; a manifest run
+    // typed by hand in a terminal is simply not tied to a discovered run,
+    // rather than tied to the wrong one.
     return undefined;
   }
   const key = planKey(planLabel(planPath, location.repoRoot));
@@ -310,13 +326,16 @@ function deepestContaining(locations: SparringLocation[], dir: string): Sparring
 }
 
 /** Whether a process command line is the runner for `match` (used by the post-reload process probe). */
-export function commandLineRuns(commandLine: string, match: { kind: SparringSubcommand; stageId?: string; planPath?: string }): boolean {
+export function commandLineRuns(commandLine: string, match: { kind: SparringSubcommand; stageId?: string; planPath?: string; manifest?: string }): boolean {
   const parsed = parseSparringCommand(commandLine);
   if (!parsed || parsed.subcommand !== match.kind) {
     return false;
   }
-  if (match.kind === "run-loop") {
+  if (match.kind === "run-loop" || match.kind === "run-sparring") {
     return parsed.stageId === match.stageId;
+  }
+  if (match.manifest) {
+    return Boolean(parsed.manifest && path.basename(parsed.manifest) === path.basename(match.manifest));
   }
   return Boolean(parsed.planPath && match.planPath && path.basename(parsed.planPath) === path.basename(match.planPath));
 }

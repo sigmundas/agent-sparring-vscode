@@ -431,7 +431,9 @@ describe("Overview plan actions", () => {
     });
     html = renderOverviewHtml(accepted, "n", "c");
     assert.match(html, /What's next<\/h3><p class="nextstage">Stage 3C — Cloud schema and synchronization<\/p><p class="muted summary">text<\/p>/);
-    assert.match(html, /<button type="button" class="primary" data-action="startNextStage" title="sparring new-stage stage-3c-cloud-schema-and-synchronization[^"]*">Start next stage<\/button><button type="button" data-action="openNextStage"[^>]*>Open in plan<\/button><button type="button" class="quiet" data-action="matchStage"[^>]*>Change match…<\/button>/);
+    // Automatic continuation (the default) leads; Start next stage stays as
+    // the per-stage alternative right after it.
+    assert.match(html, /<button type="button" class="primary" data-action="continueAutomatically"[^>]*>Continue automatically<\/button><button type="button" class="quiet" data-action="startNextStage" title="sparring new-stage stage-3c-cloud-schema-and-synchronization[^"]*">Start next stage<\/button><button type="button" data-action="openNextStage"[^>]*>Open in plan<\/button><button type="button" class="quiet" data-action="matchStage"[^>]*>Change match…<\/button>/);
     assert.match(html, /Current plan stage<\/h3><p class="nextstage">Stage 3B — Reported statistics local schema barrier<\/p><p class="muted matched">Matched automatically<button type="button" class="quiet" data-action="associatePlan"[^>]*>Remove plan association<\/button>/);
     assert.ok(!/Continue plan|Open next in plan/.test(html));
     assert.ok(!html.includes("Current activity"), "the accepted screen answers what to do next instead of watching activity");
@@ -572,7 +574,7 @@ describe("Overview plan actions", () => {
     assert.equal(model.stageLine, "Stage complete. Continue plan starts the next stage.");
     assert.deepEqual(model.whatsNext, { kind: "continue", heading: "Stage 3 — Device/UI check!", summary: "Manual check.", text: "Continue plan starts it." });
     const html = renderOverviewHtml(model, "n", "c");
-    assert.match(html, /What's next<\/h3><p class="nextstage">Stage 3 — Device\/UI check!<\/p><p class="muted summary">Manual check\.<\/p><p class="muted">Continue plan starts it\.<\/p><div class="actions"><button type="button" class="primary" data-action="resumePlan" [^>]*>Continue plan<\/button><button type="button" data-action="openNextStage"[^>]*>Open in plan<\/button><\/div>/);
+    assert.match(html, /What's next<\/h3><p class="nextstage">Stage 3 — Device\/UI check!<\/p><p class="muted summary">Manual check\.<\/p><p class="muted">Continue plan starts it\.<\/p><div class="actions"><button type="button" class="primary" data-action="continueAutomatically"[^>]*>Continue automatically<\/button><button type="button" data-action="resumePlan" [^>]*>Continue plan<\/button><button type="button" data-action="openNextStage"[^>]*>Open in plan<\/button><\/div>/);
     assert.equal((html.match(/>Continue plan</g) ?? []).length, 1, "one Continue plan button, in What's next");
     assert.ok(!html.includes('data-action="associatePlan"'));
     assert.ok(!html.includes('data-action="matchStage"'));
@@ -591,7 +593,7 @@ describe("Overview plan actions", () => {
     await ws.writeStage(FOO_STAGE_IDS[2], { status: "accepted", candidate_sha: "c".repeat(40) });
     const last = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, ALL, T0);
     assert.deepEqual(last.whatsNext, { kind: "last-managed", text: "No stage follows this one in the plan. Continue plan hands the finished run back to the engine." });
-    assert.match(renderOverviewHtml(last, "n", "c"), /<button type="button" class="primary" data-action="resumePlan" [^>]*>Continue plan<\/button>/);
+    assert.match(renderOverviewHtml(last, "n", "c"), /<button type="button" data-action="resumePlan" [^>]*>Continue plan<\/button>/);
     await ws.writePlanRun(FOO_PLAN_KEY, { plan: FOO_PLAN_LABEL, status: "complete", current_stage_index: 2, current_stage: FOO_STAGE_IDS[2] });
     const complete = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, ALL, T0);
     assert.equal(complete.whatsNext, undefined);
@@ -612,7 +614,7 @@ describe("Overview plan actions", () => {
     await ws.writePlanRun(FOO_PLAN_KEY, { plan: FOO_PLAN_LABEL, status: "paused", current_stage_index: 0, current_stage: FOO_STAGE_IDS[0] });
     const paused = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, ALL, T0);
     assert.deepEqual(paused.planAction && [paused.planAction.kind, paused.planAction.label, paused.planAction.primary], ["resume", "Resume plan", true]);
-    assert.match(renderOverviewHtml(paused, "n", "c"), /<div class="actions"><button type="button" class="primary" data-action="resumePlan"/, "not accepted: the plan action stays in the toolbar");
+    assert.match(renderOverviewHtml(paused, "n", "c"), /<div class="actions"><button type="button" class="primary" data-action="continueAutomatically"[^>]*><\/button>|<div class="actions"><button type="button" class="primary" data-action="continueAutomatically"[^>]*>Continue automatically<\/button><button type="button" data-action="resumePlan"/, "not accepted: the plan action stays in the toolbar, behind Continue automatically");
     await ws.writePlanRun(FOO_PLAN_KEY, { plan: FOO_PLAN_LABEL, status: "complete", current_stage_index: 2, current_stage: FOO_STAGE_IDS[2] });
     await ws.writeStage(FOO_STAGE_IDS[2], { status: "accepted" });
     const complete = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, ALL, T0);

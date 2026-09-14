@@ -48,6 +48,8 @@ export interface LaunchOptions {
   kind: SparringSubcommand;
   stageId?: string;
   planPath?: string;
+  /** The execution manifest a plan command was launched with, when it was (`--manifest`). */
+  manifest?: string;
   reveal: boolean;
 }
 
@@ -65,6 +67,7 @@ interface Tracked {
   kind: SparringSubcommand;
   stageId?: string;
   planPath?: string;
+  manifest?: string;
   terminal?: vscode.Terminal;
   terminalPid?: number;
   execution?: vscode.TerminalShellExecution;
@@ -79,6 +82,7 @@ interface PersistedLaunch {
   kind: SparringSubcommand;
   stageId?: string;
   planPath?: string;
+  manifest?: string;
   source: ExecutionSource;
   startedAtMs: number;
   terminalPid: number;
@@ -214,13 +218,14 @@ export class ExecutionTracker implements vscode.Disposable {
     return { ok: true, record: item.record, via: "terminal" };
   }
 
-  private track(options: Pick<LaunchOptions, "runId" | "kind" | "stageId" | "planPath">, source: ExecutionSource, terminal: vscode.Terminal | undefined, execution: vscode.TerminalShellExecution | undefined, startedAtMs = Date.now()): Tracked {
+  private track(options: Pick<LaunchOptions, "runId" | "kind" | "stageId" | "planPath" | "manifest">, source: ExecutionSource, terminal: vscode.Terminal | undefined, execution: vscode.TerminalShellExecution | undefined, startedAtMs = Date.now()): Tracked {
     const id = `${startedAtMs}-${++this.counter}`;
     const item: Tracked = {
       record: { id, runId: options.runId, kind: options.kind, source, state: "running", startedAtMs },
       kind: options.kind,
       stageId: options.stageId,
       planPath: options.planPath,
+      manifest: options.manifest,
       terminal,
       execution,
     };
@@ -335,6 +340,7 @@ export class ExecutionTracker implements vscode.Disposable {
           kind: item.kind,
           stageId: item.stageId,
           planPath: item.planPath,
+          manifest: item.manifest,
           source: item.record.source,
           startedAtMs: item.record.startedAtMs,
           terminalPid: item.terminalPid,
@@ -373,6 +379,7 @@ export class ExecutionTracker implements vscode.Disposable {
         kind: launch.kind,
         stageId: launch.stageId,
         planPath: launch.planPath,
+        manifest: launch.manifest,
         terminalPid: launch.terminalPid,
       };
       this.tracked.set(launch.id, item);
@@ -440,7 +447,7 @@ export class ExecutionTracker implements vscode.Disposable {
     let found = false;
     try {
       const processes = await listProcesses();
-      found = findDescendant(processes, item.terminalPid, (commandLine) => commandLineRuns(commandLine, { kind: item.kind, stageId: item.stageId, planPath: item.planPath })) !== undefined;
+      found = findDescendant(processes, item.terminalPid, (commandLine) => commandLineRuns(commandLine, { kind: item.kind, stageId: item.stageId, planPath: item.planPath, manifest: item.manifest })) !== undefined;
     } catch (error) {
       item.record = { ...item.record, state: "unknown", detail: `The terminal that hosted this run survived the reload, but the process probe failed: ${(error as Error).message}` };
       this.stopProbe(item);
@@ -467,5 +474,5 @@ export class ExecutionTracker implements vscode.Disposable {
 }
 
 function describe(item: Tracked): string {
-  return `${item.kind} ${item.stageId ?? item.planPath ?? ""}`.trim();
+  return `${item.kind} ${item.stageId ?? item.planPath ?? item.manifest ?? ""}`.trim();
 }

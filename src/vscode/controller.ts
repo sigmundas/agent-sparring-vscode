@@ -305,6 +305,26 @@ export class SparringController implements vscode.Disposable {
     this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} ${message}`);
   }
 
+  // ---------------------------------------------------------------- execution manifests
+
+  /**
+   * Where the execution manifests this extension hands the engine are kept:
+   * the extension's own global storage, deliberately outside every
+   * repository.
+   *
+   * A manifest is a derived artifact — regenerated from the plan on each
+   * invocation and byte-stable while the plan is unchanged — so it must not
+   * appear in the user's worktree, where the engine's own freeze would then
+   * refuse it as an unrepresented change. Keeping it here also means it
+   * survives for the whole run, which a temporary file deleted after launch
+   * would not.
+   */
+  async manifestDirectory(): Promise<string> {
+    const dir = path.join(this.context.globalStorageUri.fsPath, "manifests");
+    await vscode.workspace.fs.createDirectory(vscode.Uri.file(dir));
+    return dir;
+  }
+
   // ---------------------------------------------------------------- acceptance in flight
 
   isAccepting(runId: string | undefined): boolean {

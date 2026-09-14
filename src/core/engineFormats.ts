@@ -25,7 +25,16 @@ export interface PlanRunState {
   /** Stage id of the current stage (`<plan key>-stage-<n>-<slug>`). */
   currentStage: string;
   status: PlanRunStatus;
+  /**
+   * Which plan input this run executes. The engine refuses to resume a run
+   * from a different kind of input, so a run started from a manifest must
+   * be continued with `--manifest`, never with the plan's own path. Absent
+   * from state written before manifests existed, and read as `markdown`.
+   */
+  source: PlanRunSource;
 }
+
+export type PlanRunSource = "markdown" | "manifest";
 
 const PLAN_RUN_STATUSES: ReadonlySet<string> = new Set(["running", "paused", "complete"]);
 
@@ -44,7 +53,9 @@ export function parsePlanRunState(text: string): PlanRunState {
   if (!Number.isInteger(currentStageIndex) || currentStageIndex < 0) {
     throw new EngineFormatError("current_stage_index must be a non-negative integer");
   }
-  return { plan, planDigest, expectedBranch, currentStageIndex, currentStage, status: status as PlanRunStatus };
+  const rawSource = payload["source"];
+  const source: PlanRunSource = rawSource === "manifest" ? "manifest" : "markdown";
+  return { plan, planDigest, expectedBranch, currentStageIndex, currentStage, status: status as PlanRunStatus, source };
 }
 
 // ---------------------------------------------------------------------------
@@ -266,12 +277,99 @@ export type RoutingAction = "SEND_BACK" | "READY" | "NEEDS_YOU" | "ESCALATE";
 
 const ROUTING_ACTIONS: ReadonlySet<string> = new Set(["SEND_BACK", "READY", "NEEDS_YOU", "ESCALATE"]);
 
+/**
+ * One thing a human must finish before the stage can be READY
+ * (human_gate.py: HumanCheck). `id` is stable across sparring turns, so a
+ * recorded Pass/Fail/Blocked survives the reviewer restating its gate.
+ */
+export interface HumanGateCheck {
+  id: string;
+  instruction: string;
+  passCriteria: string;
+  /** Where the full test is defined, when the reviewer said. */
+  source?: string;
+}
+
+/** The structured NEEDS_YOU gate (human_gate.py: HumanGate). */
+export interface HumanGate {
+  /** `DEVICE_MANUAL_CHECK`, `PRODUCT_PREFERENCE`, … */
+  category: string;
+  title: string;
+  checks: HumanGateCheck[];
+}
+
+/**
+ * The marker sparring_exchange.py writes immediately before the gate's
+ * canonical JSON block. An HTML comment, so it is invisible when the file
+ * is rendered, and versioned so a later shape is detectable rather than
+ * silently misparsed.
+ */
+export const HUMAN_GATE_MARKER = "<!-- human-gate:v1 -->";
+
 export interface SparringOutcome {
   action: RoutingAction;
   summary: string;
   needsYouReason?: string;
   /** The body of the engine-rendered `## Deferred` section (the sparrer's deferred / human-gated items), when present and non-empty. */
   deferred?: string;
+  /**
+   * The structured human gate, when the recorded verdict carries one. This
+   * is the only trustworthy list of what a human must do: everything else in
+   * sparring.md is prose, and prose was previously mined for checks, which
+   * cannot tell a blocking device test from a deployment step mentioned in
+   * the same paragraph. Absent for results recorded before the engine had
+   * structured gates.
+   */
+  humanGate?: HumanGate;
+}
+
+/**
+ * The gate's canonical JSON, from the fenced block that follows
+ * {@link HUMAN_GATE_MARKER}. Undefined when there is no marker, no fence
+ * after it, or the block is not a well-formed gate — a reader of a recorded
+ * file never throws, and a caller falls back to treating the result as
+ * unstructured rather than inventing checks.
+ */
+export function parseHumanGate(markdown: string): HumanGate | undefined {
+  const at = markdown.indexOf(HUMAN_GATE_MARKER);
+  if (at < 0) {
+    return undefined;
+  }
+  const after = markdown.slice(at + HUMAN_GATE_MARKER.length);
+  const fence = /^[^\S\n]*```[^\n]*\n([\s\S]*?)\n[^\S\n]*```/m.exec(after);
+  if (!fence) {
+    return undefined;
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(fence[1]);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(raw)) {
+    return undefined;
+  }
+  const category = typeof raw["category"] === "string" ? raw["category"].trim() : "";
+  const title = typeof raw["title"] === "string" ? raw["title"].trim() : "";
+  const rawChecks = raw["checks"];
+  if (!category || !title || !Array.isArray(rawChecks) || rawChecks.length === 0) {
+    return undefined;
+  }
+  const checks: HumanGateCheck[] = [];
+  for (const entry of rawChecks) {
+    if (!isRecord(entry)) {
+      return undefined;
+    }
+    const id = typeof entry["id"] === "string" ? entry["id"].trim() : "";
+    const instruction = typeof entry["instruction"] === "string" ? entry["instruction"].trim() : "";
+    const passCriteria = typeof entry["pass_criteria"] === "string" ? entry["pass_criteria"].trim() : "";
+    if (!id || !instruction || !passCriteria || checks.some((check) => check.id === id)) {
+      return undefined;
+    }
+    const source = typeof entry["source"] === "string" && entry["source"].trim() ? entry["source"].trim() : undefined;
+    checks.push({ id, instruction, passCriteria, source });
+  }
+  return { category, title, checks };
 }
 
 /**
@@ -312,7 +410,13 @@ export function parseSparringOutcome(markdown: string): SparringOutcome | undefi
   if (!action || !ROUTING_ACTIONS.has(action)) {
     return undefined;
   }
-  return { action: action as RoutingAction, summary, needsYouReason, deferred: sectionBody(lines, "## Deferred") };
+  return {
+    action: action as RoutingAction,
+    summary,
+    needsYouReason,
+    deferred: sectionBody(lines, "## Deferred"),
+    humanGate: action === "NEEDS_YOU" ? parseHumanGate(markdown) : undefined,
+  };
 }
 
 /** The trimmed prose under a `##` heading of sparring.md, up to the next `#`/`##` heading; undefined when absent, empty or the template's `(none)`. */
