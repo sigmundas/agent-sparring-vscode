@@ -132,6 +132,24 @@ Headings that only *record* what happened — `## Stage 3D handoff — 2026-09-1
 (accepted at …)` — are left in the plan and never run; the Output Channel
 names each one it skipped.
 
+**Cross-repository stages.** A stage whose reviewed candidate also lives in a
+second repository must declare it, or acceptance would pin only the primary
+commit and let the sibling move. The extension has no UI for that yet: add
+the declaration by hand to the stage's `.sparring/stages/<id>/state.json`,
+
+```json
+"repositories": [
+  {"name": "sporely-web", "path": "../sporely-web-worktree",
+   "branch": "feature/cloud-transport", "candidate_sha": null}
+]
+```
+
+and both the manual **Accept stage** and the managed run honour it: freeze
+pins each sibling after the same branch / clean / pushed checks the primary
+gets, and acceptance refuses if one has moved. A manifest may carry the same
+declaration per stage; when it does not, an existing one in `state.json` is
+left alone.
+
 **Pause after each stage** (`manual`) keeps the per-stage checkpoints below
 unchanged, for when you want to look before every provider turn. In automatic
 mode those actions are still there, just no longer the obvious path.
