@@ -328,10 +328,14 @@ export class SparringController implements vscode.Disposable {
    * survives for the whole run, which a temporary file deleted after launch
    * would not.
    */
+  get manifestDirectoryPath(): string {
+    return path.join(this.context.globalStorageUri.fsPath, "manifests");
+  }
+
+  /** The same directory, created; readers use {@link manifestDirectoryPath} and never write while rendering. */
   async manifestDirectory(): Promise<string> {
-    const dir = path.join(this.context.globalStorageUri.fsPath, "manifests");
-    await vscode.workspace.fs.createDirectory(vscode.Uri.file(dir));
-    return dir;
+    await vscode.workspace.fs.createDirectory(vscode.Uri.file(this.manifestDirectoryPath));
+    return this.manifestDirectoryPath;
   }
 
   // ---------------------------------------------------------------- acceptance in flight

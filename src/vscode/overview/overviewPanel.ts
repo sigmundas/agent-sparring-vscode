@@ -9,10 +9,12 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, currentStageOf, type RunSnapshot } from "../../core/discovery";
+import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, type RunSnapshot } from "../../core/discovery";
+import { parseStageState, type StageStatus } from "../../core/engineFormats";
+import { manifestFileName, readManifestStages } from "../../core/manifest";
 import { CHECK_OUTCOMES } from "../../core/humanChecks";
 import { OVERVIEW_ACTIONS, renderOverviewHtml, type HumanCheckMessage, type OverviewAction } from "../../core/overviewHtml";
-import { buildOverviewModel, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
+import { buildOverviewModel, type ManifestStageView, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
 import { locateStage, parsePlanHeadings, type HeadingRef } from "../../core/planAssociation";
 import { planKey, planLabel } from "../../core/sparringCommand";
 import type { DeclaredRepository } from "../../core/stageRepositories";
@@ -161,9 +163,37 @@ export class OverviewPanelManager implements vscode.Disposable {
         notesText,
         continuation: planContinuation(),
         siblingRepositories: this.siblingRepositories(run, run.kind === "plan" ? planText : associatedText, briefText, association?.match),
+        manifestStages: await this.manifestStages(run),
       };
     }
     return buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.executionFor(selection.selected?.id));
+  }
+
+  /**
+   * The stages of the manifest this managed run executes, each with the
+   * status the engine recorded for it.
+   *
+   * The extension wrote that manifest, deterministically, from the plan the
+   * run names; reading it back is what lets the Overview call the current
+   * stage `Stage 3D` instead of "the sixth entry", and draw the journey a
+   * manifest run otherwise cannot have. Every status is still the stage's own
+   * `state.json` — nothing here is inferred from the manifest's order.
+   */
+  private async manifestStages(run: RunSnapshot): Promise<ManifestStageView[] | undefined> {
+    if (run.kind !== "plan" || run.state.source !== "manifest") {
+      return undefined;
+    }
+    const file = path.join(this.controller.manifestDirectoryPath, manifestFileName(run.planKey));
+    const stages = readManifestStages(await readHead(file, MANIFEST_READ_LIMIT));
+    if (!stages) {
+      return undefined;
+    }
+    return Promise.all(
+      stages.map(async (stage) => ({
+        ...stage,
+        status: await recordedStatus(path.join(run.location.sparringDir, STAGES_DIRNAME, stage.stageId, STATE_FILENAME)),
+      })),
+    );
   }
 
   /**
@@ -227,6 +257,24 @@ const HANDOFF_READ_LIMIT = 256 * 1024;
 const NOTES_READ_LIMIT = 256 * 1024;
 /** A plan document is read for its headings and one opening paragraph only; never past this many bytes. */
 const PLAN_READ_LIMIT = 512 * 1024;
+/** A manifest carries every stage's brief verbatim, so it is the largest of them; only its stage identities are read. */
+const MANIFEST_READ_LIMIT = 4 * 1024 * 1024;
+
+/** A stage's recorded status, or undefined when it has none the engine wrote. */
+async function recordedStatus(stateFile: string): Promise<StageStatus | undefined> {
+  const text = await readHead(stateFile, STATE_READ_LIMIT);
+  if (text === undefined) {
+    return undefined;
+  }
+  try {
+    return parseStageState(text).status;
+  } catch {
+    return undefined;
+  }
+}
+
+/** state.json is a handful of fields; never read past this many bytes. */
+const STATE_READ_LIMIT = 64 * 1024;
 
 /** The beginning of a text file, or undefined when it does not exist / cannot be read. */
 async function readHead(file: string, limit = BRIEF_READ_LIMIT): Promise<string | undefined> {

@@ -809,6 +809,7 @@ async function reviewStageMatchesCommand(controller: SparringController, overvie
     void vscode.window.showInformationMessage("Agent Sparring: choose a plan for this stage first; stage matches are reviewed against one plan.");
     return;
   }
+  let fixing = false;
   for (;;) {
     const markdown = await readOptional(planPath);
     if (markdown === undefined) {
@@ -820,27 +821,39 @@ async function reviewStageMatchesCommand(controller: SparringController, overvie
       void vscode.window.showInformationMessage(`Agent Sparring: this project has no stage directories to match against ${path.basename(planPath)}.`);
       return;
     }
-    const unmatched = rows.filter((row) => !row.label).length;
-    const picked = await vscode.window.showQuickPick(
-      rows.map((row) => ({
-        label: `${row.problem ? "$(warning)" : "$(check)"} ${row.name}`,
-        description: `→ ${row.label ? `Stage ${row.label}` : "unmatched"}`,
-        detail: row.problem ?? `${row.matchedBy === "manual" ? "matched by you" : "matched automatically"} · ${row.stageId}`,
-        row,
-      })),
-      {
-        title: `Stage matches in ${path.basename(planPath)}`,
-        placeHolder: unmatched === 0 ? "Every stage is placed. Pick one to change it." : `${unmatched} stage(s) could not be placed in the plan; pick one to say which section it is.`,
-        matchOnDescription: true,
-        matchOnDetail: true,
-      },
-    );
-    if (!picked) {
+    const problems = rows.filter((row) => row.problem).length;
+    if (fixing && problems === 0) {
+      // The list came up because something needed placing; nothing does any
+      // more, so the list closes instead of reopening as if it still did.
+      void vscode.window.showInformationMessage(`Agent Sparring: every stage is now matched to a section of ${path.basename(planPath)}. Nothing else needs placing.`);
+      await overview.update();
       return;
     }
+    const items: StageMatchItem[] = rows.map((row) => ({
+      label: `${row.problem ? "$(warning)" : "$(check)"} ${row.name}`,
+      description: `→ ${row.label ? `Stage ${row.label}` : "unmatched"}`,
+      detail: row.problem ?? `${row.matchedBy === "manual" ? "matched by you" : "matched automatically"} · ${row.stageId}`,
+      row,
+    }));
+    items.push({ label: "", kind: vscode.QuickPickItemKind.Separator });
+    items.push({ label: "$(check-all) Done", description: problems === 0 ? "nothing here needs a decision" : "leave the rest as it is", done: true });
+    const picked = await vscode.window.showQuickPick(items, {
+      title: `Stage matches in ${path.basename(planPath)}`,
+      // When everything is placed, every row is a change, not a task: say so,
+      // or a list of ticks reads as a list of things still to do.
+      placeHolder: problems === 0 ? "All stages are matched. Select one only if you want to change it." : `${problems} stage(s) could not be placed in the plan; pick one to say which section it is.`,
+      matchOnDescription: true,
+      matchOnDetail: true,
+    });
+    if (!picked || picked.done || !picked.row) {
+      return;
+    }
+    fixing = problems > 0;
     await matchStageCommand(controller, overview, { runId: picked.row.runId, stage: picked.row.stage, planPath });
   }
 }
+
+type StageMatchItem = vscode.QuickPickItem & { row?: StageMatchRow & { stage: StageSnapshot }; done?: boolean };
 
 /** Read what each existing stage needs to be placed, then let the core do the placing. */
 async function collectStageMatches(controller: SparringController, run: RunSnapshot, markdown: string, planPath: string): Promise<(StageMatchRow & { stage: StageSnapshot })[]> {

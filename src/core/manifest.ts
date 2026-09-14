@@ -265,6 +265,62 @@ export function renderManifest(manifest: ExecutionManifest): string {
   return `${JSON.stringify(manifest, null, 2)}\n`;
 }
 
+/** The identity of one manifest stage, as the Overview needs it back. */
+export interface ManifestStageIdentity {
+  stageId: string;
+  /** `Stage 3D`: what a person calls this stage. */
+  label: string;
+  title: string;
+}
+
+/**
+ * Read back the stages of a manifest this extension wrote, for display.
+ *
+ * A manifest run's stages are not the plan document's `## Stage <n>`
+ * headings, so without this the Overview can only call the current stage by
+ * its position in the execution order — "Stage 6" for what everyone involved
+ * calls Stage 3D — and can draw no journey at all.
+ *
+ * Lenient about absence, strict about certainty: a missing file, another
+ * version, or an entry without an id, label and title yields nothing rather
+ * than a partial list, because a half-read journey would misstate where the
+ * run is. The caller checks that the run's recorded current stage is among
+ * the stages before showing any of it.
+ */
+export function readManifestStages(text: string | undefined): ManifestStageIdentity[] | undefined {
+  if (!text) {
+    return undefined;
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (!raw || typeof raw !== "object") {
+    return undefined;
+  }
+  const payload = raw as Record<string, unknown>;
+  if (payload["version"] !== MANIFEST_VERSION || !Array.isArray(payload["stages"]) || payload["stages"].length === 0) {
+    return undefined;
+  }
+  const out: ManifestStageIdentity[] = [];
+  for (const entry of payload["stages"] as unknown[]) {
+    if (!entry || typeof entry !== "object") {
+      return undefined;
+    }
+    const stage = entry as Record<string, unknown>;
+    const stageId = typeof stage["stage_id"] === "string" ? stage["stage_id"].trim() : "";
+    const label = typeof stage["label"] === "string" ? stage["label"].trim() : "";
+    const title = typeof stage["title"] === "string" ? stage["title"].trim() : "";
+    if (!stageId || !label || !title) {
+      return undefined;
+    }
+    out.push({ stageId, label, title });
+  }
+  return out;
+}
+
 /** A stable file name for one plan's manifest, so regenerating it overwrites in place. */
 export function manifestFileName(planKey: string): string {
   return `${planKey}.manifest.json`;

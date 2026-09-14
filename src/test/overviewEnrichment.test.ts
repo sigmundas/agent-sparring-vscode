@@ -47,13 +47,18 @@ describe("goal extraction from brief.md", () => {
     await ws.writeStage("hotfix-1", { status: "working" });
     const selection = selectRun((await discoverRuns([ws.location])).runs);
     const withGoal = buildOverviewModel(selection, undefined, { ...ALL, briefText: "## Goal\nFix it.\n" }, T0);
-    const without = buildOverviewModel(selection, undefined, { ...ALL, briefText: "no goal here" }, T0);
+    // No `## Goal`: the brief's own opening description stands in for it,
+    // rather than a Markdown complaint aimed at whoever wrote the brief.
+    const opening = buildOverviewModel(selection, undefined, { ...ALL, briefText: "# Stage brief: hotfix-1\n\nStop the crash on open.\n" }, T0);
+    const nothing = buildOverviewModel(selection, undefined, { ...ALL, briefText: "# Stage brief: hotfix-1\n" }, T0);
     assert.equal(withGoal.goal, "Fix it.");
-    assert.equal(without.goal, undefined);
-    assert.deepEqual({ ...withGoal, goal: undefined }, { ...without, goal: undefined });
+    assert.equal(opening.goal, "Stop the crash on open.");
+    assert.equal(nothing.goal, undefined);
+    assert.deepEqual({ ...withGoal, goal: undefined }, { ...nothing, goal: undefined });
     assert.equal(buildOverviewModel(selection, undefined, { ...ALL, brief: false, briefText: "## Goal\nstale\n" }, T0).goal, undefined, "no brief → no goal");
     assert.match(renderOverviewHtml(withGoal, "n", "c"), /Goal<\/h3><p class="goal">Fix it.<\/p>/);
-    assert.match(renderOverviewHtml(without, "n", "c"), /Goal<\/h3><p class="muted">brief.md has no ## Goal paragraph.<\/p>/);
+    assert.ok(!/Goal<\/h3>/.test(renderOverviewHtml(nothing, "n", "c")), "nothing to say about the goal: no section, and no complaint");
+    assert.ok(!/has no ## Goal/.test(renderOverviewHtml(nothing, "n", "c")));
   });
 });
 

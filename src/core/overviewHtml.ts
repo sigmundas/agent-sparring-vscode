@@ -13,7 +13,8 @@
  * meaningful event on the right); provider cards; recent events; metadata.
  */
 
-import { CHECK_OUTCOMES, OUTCOME_WORDS, type CheckItem, type CheckOutcome } from "./humanChecks";
+import { CHECK_OUTCOMES, type CheckItem, type CheckOutcome } from "./humanChecks";
+import { humanTask, splitPassCriteria } from "./humanTask";
 import { TIMELINE_STATE_WORD, type ActionRequired, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { MatchSource } from "./planAssociation";
 import type { StageRunAction } from "./runner";
@@ -174,7 +175,11 @@ function renderHeader(model: OverviewModel): string {
   if (model.runKind) {
     pills.push(`<span class="hpill" title="${escapeHtml(model.title)}">${escapeHtml(model.runKind)}</span>`);
   }
-  if (model.position) {
+  if (model.stageLabel) {
+    // What a person calls this stage. Where it sits in the run is secondary
+    // metadata, on the stage card and in this pill's tooltip.
+    pills.push(`<span class="hpill" title="${escapeHtml(model.position ?? "")}">${escapeHtml(model.stageLabel)}</span>`);
+  } else if (model.position) {
     pills.push(`<span class="hpill">${escapeHtml(model.position.replace(/^Stage (\d+) of (\d+)$/, "Stage $1 / $2"))}</span>`);
   }
   if (model.status) {
@@ -213,56 +218,40 @@ function renderBranchGuard(guard: BranchGuard): string {
 // ---------------------------------------------------------------- action required
 
 /**
- * The one place a NEEDS_YOU / ESCALATE outcome is explained: the reviewer's
- * summary once, one compact reviewer note, then Manual verification in
- * four parts — the plan requirement (explicit checks or verbatim prose),
- * the reviewer's requested checks (labelled as reviewer-derived), what
- * notes.md already records, and what is still required with Pass / Fail /
- * Blocked and a note each. Every check appears once, in the recorded or
- * the required list, tagged Plan or Reviewer. Submit evidence & resume
- * records the outcomes under ## Human evidence and resumes the same stage;
- * nothing here marks the stage ready or accepted.
+ * The one place a NEEDS_YOU / ESCALATE outcome is explained.
+ *
+ * Two layers, deliberately. The **primary** layer is what a person needs in
+ * order to act: why the run stopped, the one thing to do, what counts as a
+ * pass, the result controls, and the button that continues. The **technical**
+ * layer — the reviewer's verbatim wording, the gate's category and check ids,
+ * the plan path and line, the failure criteria — sits behind one disclosure,
+ * because it answers "why does the harness believe that", which is a
+ * different question and never a prerequisite for doing the check.
+ *
+ * A structured gate gets the simple presentation: the requirement is stated
+ * once, as the reviewer's own gate title, and each check is its instruction
+ * laid out as steps plus a single "Pass if" line. The legacy derived path
+ * (verdicts recorded before the engine emitted gates) keeps its Plan
+ * requirement / Still required structure, because there the provenance of
+ * each check really is part of what the reader must weigh — but its empty
+ * sections and its explanatory prose are gone from the main flow all the
+ * same.
  */
 function renderActionRequired(model: OverviewModel, panel: ActionRequired): string {
+  const gate = panel.gateTitle !== undefined;
   const summary = panel.subtitle ? `<p class="summary">${escapeHtml(panel.subtitle)}</p>` : panel.summary ? `<p class="summary">${escapeHtml(panel.summary)}</p>` : "";
-  const note = panel.reviewerNote ? `<p class="reason"><span class="tag reviewer">Reviewer note</span> ${escapeHtml(panel.reviewerNote)}</p>` : "";
+  // With a structured gate the reviewer's own note is a restatement of the
+  // gate title; it belongs to the details layer, where the verbatim wording
+  // lives. Without one it is the only compact statement there is.
+  const note = !gate && panel.reviewerNote ? `<p class="reason"><span class="tag reviewer">Reviewer note</span> ${escapeHtml(panel.reviewerNote)}</p>` : "";
   const failure = panel.reviewFailure ? `<p class="failure">${icon("warn", "escalate")}${escapeHtml(panel.reviewFailure)}</p>` : "";
-  const total = panel.recorded.length + panel.required.length;
-  let body = "";
-  if (total === 0) {
-    body = `<p class="muted">${escapeHtml(panel.noChecks ?? "")}</p>`;
-  } else {
-    const parts: string[] = [];
-    if (panel.source === "gate") {
-      // The reviewer said exactly what blocks this stage; nothing is added
-      // from the plan and nothing is mined from prose.
-      parts.push(
-        `<div class="part"><h4>What the reviewer requires</h4><p class="criterion parent">${escapeHtml(panel.gate?.title ?? "")}</p><p class="muted small">${escapeHtml(categoryWord(panel.gate?.category))} · ${panel.recorded.length + panel.required.length} check${panel.recorded.length + panel.required.length === 1 ? "" : "s"}, exactly as the reviewer listed them. Deployment, rollout and follow-up the reviewer mentioned are in the detailed review, not here — they do not block this stage.</p></div>`,
-      );
-    } else if (panel.explicitCount > 0) {
-      parts.push(`<div class="part"><h4>Plan requirement</h4><p class="muted small">${panel.explicitCount} explicit check${panel.explicitCount === 1 ? "" : "s"} under the plan's <em>Manual verification</em> list, shown below as written.</p>${panel.parents.map((parent) => `<p class="criterion parent">${escapeHtml(parent.text)}</p>`).join("")}</div>`);
-    } else if (panel.parents.length > 0) {
-      parts.push(`<div class="part"><h4>Plan requirement</h4>${panel.parents.map((parent) => `<p class="criterion parent" title="${escapeHtml(`Plan line ${parent.line}`)}">${escapeHtml(parent.text)}</p>`).join("")}${panel.reviewerCount > 0 ? `<p class="muted small">The plan states this as prose; the checks below are the reviewer's more specific requests, not plan text.</p>` : ""}</div>`);
-    } else {
-      parts.push(`<div class="part"><h4>Plan requirement</h4><p class="muted small">The plan section for this stage lists no manual check; the checks below are the reviewer's.</p></div>`);
-    }
-    if (panel.reviewerCount > 0) {
-      parts.push(`<div class="part"><h4>Reviewer requested checks</h4><p class="muted small">${panel.reviewerCount} check${panel.reviewerCount === 1 ? "" : "s"} taken from the sparring report's own sentences (marked <span class="tag reviewer">Reviewer</span> below); the wording is the reviewer's, not the plan's.</p></div>`);
-    }
-    parts.push(`<div class="part"><h4>Evidence already recorded</h4>${panel.recorded.length > 0 ? `<ol class="checklist recorded">${panel.recorded.map(renderRecorded).join("")}</ol>` : `<p class="muted small">Nothing under ## Human evidence in notes.md names these checks yet.</p>`}</div>`);
-    parts.push(`<div class="part"><h4>Still required</h4>${panel.required.length > 0 ? `<ol class="checklist">${panel.required.map(renderRequired).join("")}</ol>` : `<p class="muted small">Every check has recorded evidence. Submit nothing new, or resume so the reviewer reads it.</p>`}</div>`);
-    body = parts.join("");
-  }
-  const progress = panel.progress ? `<span class="progress" title="Checks with recorded or drafted Pass, out of all checks">${escapeHtml(panel.progress)}</span>` : "";
+  const body = gate ? renderGateChecks(panel) : renderDerivedChecks(panel);
   const buttons: string[] = [];
   buttons.push(button("submitForReview", panel.submit.label, panel.submit.enabled, panel.submit.detail, "primary"));
   if (panel.planSection) {
     buttons.push(button("openPlanSection", "Open plan section", true, `Open ${model.planName ?? "the plan"} at this stage's section`));
   }
-  buttons.push(button("openSparring", "Open detailed review", panel.review, "Open sparring.md"));
-  if (panel.resume) {
-    buttons.push(button(panel.resume.action, `${panel.resume.label} (implementation)`, true, panel.resume.detail, "quiet"));
-  }
+  buttons.push(button("openSparring", "Open detailed review", panel.review, "Open sparring.md — the reviewer's full findings, in their own words"));
   // Offered here, at a gate, because adopting does not touch the gate: the
   // engine keeps this pause and the next human action is unchanged. It is
   // the only route from a standalone stage into a managed run, so it must be
@@ -271,12 +260,118 @@ function renderActionRequired(model: OverviewModel, panel: ActionRequired): stri
   if (auto?.kind === "adopt") {
     buttons.push(button("continueAutomatically", auto.label, true, auto.detail, "quiet"));
   }
-  return `<section class="card action ${panel.kind}${panel.ready ? " ready" : ""}">
+  // Resuming implementation is a different act from answering the gate, and
+  // at a gate it is almost never the right one: it starts the stage agent
+  // again on a candidate the reviewer has already read. It stays reachable,
+  // one disclosure away, never beside the button that answers the review.
+  if (panel.resume) {
+    buttons.push(
+      `<details class="more"><summary title="Other things that can be run from here">…</summary><div class="actions">${button(panel.resume.action, `${panel.resume.label} (implementation)`, true, panel.resume.detail, "quiet")}</div></details>`,
+    );
+  }
+  return `<section class="card action ${panel.kind}${panel.ready ? " ready" : ""}${gate ? " gate" : ""}">
 <div class="actionhead"><h2>${icon(panel.ready && panel.kind === "needs_you" ? "check" : "warn", panel.ready && panel.kind === "needs_you" ? "ready" : panel.kind)}${escapeHtml(panel.headline)}</h2>${summary}${note}${failure}</div>
-<div class="checks"><h3>${icon("check", "accent")}Manual verification ${progress}</h3>${body}</div>
+${body}
+${renderTechnical(panel)}
 <div class="actions">${buttons.join("")}</div>
 </section>`;
 }
+
+/**
+ * A structured gate: the requirement once, then one task per check. No
+ * heading hierarchy, no counts, no provenance prose — a single check is a
+ * single thing to do, and the panel already said that is what this is.
+ */
+function renderGateChecks(panel: ActionRequired): string {
+  const total = panel.recorded.length + panel.required.length;
+  const title = panel.gateTitle ? `<p class="gatetitle">${escapeHtml(panel.gateTitle)}</p>` : "";
+  // Two or more checks: say how far along the evidence is. One check has no
+  // progress worth reporting — the controls under it are the whole story.
+  const progress = total > 1 && panel.progress ? `<p class="muted small progress">${escapeHtml(panel.progress)}</p>` : "";
+  const required = panel.required.length > 0 ? `<ol class="checklist gate">${panel.required.map(renderTask).join("")}</ol>` : `<p class="muted">Every check the reviewer asked for has a recorded result.</p>`;
+  return `<div class="checks">${title}${progress}${required}${renderPreviousEvidence(panel)}</div>`;
+}
+
+/** Evidence already in notes.md, compact and collapsed; absent when there is none. */
+function renderPreviousEvidence(panel: ActionRequired): string {
+  if (panel.recorded.length === 0) {
+    return "";
+  }
+  return `<details class="prev"><summary>Previous evidence (${panel.recorded.length})</summary><ol class="checklist recorded">${panel.recorded.map(renderRecorded).join("")}</ol></details>`;
+}
+
+/**
+ * The legacy path, for a verdict recorded before structured gates: the plan's
+ * own requirement (verbatim), then what is still required. Where each check
+ * came from is shown per check, as a tag; the paragraphs that used to explain
+ * the derivation are in the technical details.
+ */
+function renderDerivedChecks(panel: ActionRequired): string {
+  const total = panel.recorded.length + panel.required.length;
+  const progress = panel.progress ? `<span class="progress" title="Checks with recorded or drafted Pass, out of all checks">${escapeHtml(panel.progress)}</span>` : "";
+  if (total === 0) {
+    return `<div class="checks"><h3>${icon("check", "accent")}Manual verification ${progress}</h3><p class="muted">${escapeHtml(panel.noChecks ?? "")}</p></div>`;
+  }
+  const parts: string[] = [];
+  if (panel.parents.length > 0) {
+    parts.push(`<div class="part"><h4>Plan requirement</h4>${panel.parents.map((parent) => `<p class="criterion parent" title="${escapeHtml(`Plan line ${parent.line}`)}">${escapeHtml(parent.text)}</p>`).join("")}</div>`);
+  }
+  if (panel.recorded.length > 0) {
+    parts.push(`<div class="part"><h4>Evidence already recorded</h4><ol class="checklist recorded">${panel.recorded.map(renderRecorded).join("")}</ol></div>`);
+  }
+  parts.push(
+    `<div class="part"><h4>Still required</h4>${panel.required.length > 0 ? `<ol class="checklist">${panel.required.map(renderRequired).join("")}</ol>` : `<p class="muted small">Every check has recorded evidence.</p>`}</div>`,
+  );
+  return `<div class="checks"><h3>${icon("check", "accent")}Manual verification ${progress}</h3>${parts.join("")}</div>`;
+}
+
+/** The demoted layer. Collapsed, always available, never in the way. */
+function renderTechnical(panel: ActionRequired): string {
+  if (panel.technical.length === 0) {
+    return "";
+  }
+  const rows = panel.technical.map((row) => `<dt>${escapeHtml(row.label)}</dt><dd>${escapeHtml(row.value)}</dd>`).join("");
+  return `<details class="tech"><summary>Show technical details</summary><dl class="techlist">${rows}</dl></details>`;
+}
+
+/**
+ * One gate check as a task: the reviewer's instruction as its own sentences
+ * (numbered when there is more than one), then what passing means, then the
+ * three results and a note. Nothing is shortened — a check is a test, and a
+ * test loses its meaning one clause at a time.
+ */
+function renderTask(item: CheckItem): string {
+  const task = humanTask(item);
+  const steps = task.steps.length > 1 ? `<ol class="steps">${task.steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol>` : `<p class="instruction">${escapeHtml(task.steps[0] ?? item.text)}</p>`;
+  const passIf = task.passIf ? `<p class="passif"><span class="lead">Pass if:</span> ${escapeHtml(task.passIf)}</p>` : "";
+  return `<li class="check task${item.record?.outcome ? ` ${item.record.outcome}` : ""}">
+<div class="checkbody">${steps}${passIf}</div>
+${renderRecordControls(item)}
+</li>`;
+}
+
+/** Pass / Fail / Can't test, plus the optional note; the same controls wherever a check is shown. */
+function renderRecordControls(item: CheckItem): string {
+  const outcome = item.record?.outcome;
+  const choices = CHECK_OUTCOMES.map(
+    (candidate) =>
+      `<button type="button" class="choice ${candidate}${outcome === candidate ? " on" : ""}" data-check="${escapeHtml(item.key)}" data-outcome="${candidate}" aria-pressed="${outcome === candidate}" title="${escapeHtml(OUTCOME_TITLES[candidate])}">${OUTCOME_LABELS[candidate]}</button>`,
+  ).join("");
+  return `<div class="record"><span class="choices">${choices}</span><textarea class="note" data-check="${escapeHtml(item.key)}" rows="1" placeholder="Evidence or note (optional)">${escapeHtml(item.record?.note ?? "")}</textarea></div>`;
+}
+
+/**
+ * The words on the three buttons. `blocked` is the engine's own value and
+ * the word written into notes.md; what it means to the person pressing it is
+ * that they could not run the check, so that is what the button says.
+ */
+export const OUTCOME_LABELS: Record<CheckOutcome, string> = { pass: "Pass", fail: "Fail", blocked: "Can't test" };
+
+const OUTCOME_TITLES: Record<CheckOutcome, string> = {
+  pass: "The check was performed and met its criteria",
+  fail: "The check was performed and did not meet its criteria",
+  blocked: "You could not perform the check (recorded as Blocked, the engine's own word for it)",
+};
 
 /** `DEVICE_MANUAL_CHECK` → `Device manual check`; the engine's own category, just made readable. */
 export function categoryWord(category: string | undefined): string {
@@ -294,34 +389,27 @@ function originTag(item: CheckItem): string {
   return item.origin === "plan" ? `<span class="tag plan" title="${escapeHtml(item.line ? `Plan line ${item.line}` : "From the plan")}">Plan</span>` : `<span class="tag reviewer" title="From the sparring report, not the plan">Reviewer</span>`;
 }
 
-/** The reviewer's pass criteria and plan reference, for a gate check. */
+/** The reviewer's pass criteria, for a check on the legacy derived path. */
 function checkDetail(item: CheckItem): string {
-  const parts: string[] = [];
-  if (item.passCriteria) {
-    parts.push(`<p class="muted small pass-criteria"><strong>Pass when:</strong> ${escapeHtml(item.passCriteria)}</p>`);
-  }
-  if (item.source) {
-    parts.push(`<p class="muted small source">Defined in ${escapeHtml(item.source)}</p>`);
-  }
-  return parts.join("");
+  const passIf = splitPassCriteria(item.passCriteria).passIf;
+  return passIf ? `<p class="passif"><span class="lead">Pass if:</span> ${escapeHtml(passIf)}</p>` : "";
 }
 
 /** ✓ text — recorded in notes.md; the excerpt says which entry, so a wrong match is visible. */
 function renderRecorded(item: CheckItem): string {
   const outcome = item.evidence?.outcome;
   const mark = outcome === "fail" ? "✗" : outcome === "blocked" ? "⊘" : "✓";
-  const word = outcome ? `<span class="outcome ${outcome}">${OUTCOME_WORDS[outcome]}</span> ` : "";
+  const word = outcome ? `<span class="outcome ${outcome}">${OUTCOME_LABELS[outcome]}</span> ` : "";
   const how = item.evidence?.how === "id" ? "A result recorded from this panel for this exact check" : item.evidence?.how === "exact" ? "A result recorded from this panel" : "A ## Human evidence entry naming this check";
   return `<li class="check done ${escapeHtml(outcome ?? "pass")}"><div class="checkrow"><span class="mark">${mark}</span><div class="checkbody"><p class="criterion">${word}${escapeHtml(item.text)} ${originTag(item)}</p><p class="muted small evidence" title="${escapeHtml(how)}">notes.md: ${escapeHtml(item.evidence?.excerpt ?? "")}</p></div></div></li>`;
 }
 
-/** ○ text with the reviewer's pass criteria, then Pass / Fail / Blocked and a note. */
+/** ○ text with the reviewer's pass criteria, then the three results and a note (legacy derived path). */
 function renderRequired(item: CheckItem): string {
   const outcome = item.record?.outcome;
-  const choices = CHECK_OUTCOMES.map((candidate) => `<button type="button" class="choice ${candidate}${outcome === candidate ? " on" : ""}" data-check="${escapeHtml(item.key)}" data-outcome="${candidate}" aria-pressed="${outcome === candidate}">${OUTCOME_WORDS[candidate]}</button>`).join("");
   return `<li class="check${outcome ? ` ${outcome}` : ""}">
 <div class="checkrow"><span class="mark">○</span><div class="checkbody"><p class="criterion">${escapeHtml(item.text)} ${originTag(item)}</p>${checkDetail(item)}</div></div>
-<div class="record"><span class="choices">${choices}</span><textarea class="note" data-check="${escapeHtml(item.key)}" rows="1" placeholder="Evidence or note (optional)">${escapeHtml(item.record?.note ?? "")}</textarea></div>
+${renderRecordControls(item)}
 </li>`;
 }
 
@@ -339,11 +427,14 @@ function renderJourney(items: TimelineItem[]): string {
   const cells = items.map((item) => {
     const cls = `step ${item.state}${item.current ? " current" : ""}`;
     const word = TIMELINE_STATE_WORD[item.state];
-    const label = `Stage ${item.number} — ${item.title} (${word})`;
+    // The plan's own name for the stage, when the run knows one; its position
+    // in the run stays in the tooltip, where an ordinal belongs.
+    const name = item.label ? `Stage ${item.label}` : `Stage ${item.number}`;
+    const label = `${name} — ${item.title} (${word}) · ${item.number} of ${items.length}`;
     const glyphIcon = JOURNEY_ICON[item.state];
-    const node = glyphIcon ? icon(glyphIcon) : String(item.number);
+    const node = glyphIcon ? icon(glyphIcon) : escapeHtml(item.label ?? String(item.number));
     const state = item.state === "accepted" ? `<span class="state">${icon("check")}${escapeHtml(word)}</span>` : `<span class="state">${escapeHtml(word)}</span>`;
-    return `<li class="${cls}" title="${escapeHtml(label)}"><span class="node">${node}</span><span class="num">${item.number}</span><span class="name">${escapeHtml(item.title)}</span>${state}</li>`;
+    return `<li class="${cls}" title="${escapeHtml(label)}"><span class="node">${node}</span><span class="num">${escapeHtml(item.label ?? String(item.number))}</span><span class="name">${escapeHtml(item.title)}</span>${state}</li>`;
   });
   return `<ol class="journey">${cells.join("")}</ol>`;
 }
@@ -420,9 +511,11 @@ function renderStageCard(model: OverviewModel): string {
     buttons.push(stageActionButton(model.secondaryAction, model.stageId, "quiet"));
   }
 
-  const goal = model.goal
-    ? `<div class="block"><h3>${icon("target", "accent")}Goal</h3><p class="goal">${escapeHtml(model.goal)}</p></div>`
-    : `<div class="block"><h3>${icon("target", "accent")}Goal</h3><p class="muted">${model.actions?.brief ? "brief.md has no ## Goal paragraph." : "No brief.md for this stage yet."}</p></div>`;
+  // No Goal, no section: a brief without a `## Goal` heading is a fact for
+  // the diagnostics command, not a Markdown complaint to put in front of
+  // someone who came here to answer a review. The Brief button already says
+  // whether there is a brief at all.
+  const goal = model.goal ? `<div class="block"><h3>${icon("target", "accent")}Goal</h3><p class="goal">${escapeHtml(model.goal)}</p></div>` : "";
   let sparring = `<div class="block"><h3>${icon("chat")}Latest sparring result</h3><p class="muted">No routing outcome recorded yet.</p></div>`;
   if (handedOver) {
     sparring = ""; // the Action required panel is the latest sparring result
@@ -463,14 +556,16 @@ function renderStageCard(model: OverviewModel): string {
     : `<div class="block"><h3>${icon("pulse", "accent")}Current activity</h3>${current}</div>
 <div class="block"><h3>${icon("doc")}Last meaningful event</h3>${last}</div>`;
 
+  const position = model.positionNote ? `<span class="muted" title="${escapeHtml(model.position ?? "")}">${escapeHtml(model.positionNote)}</span><span class="sep">·</span>` : "";
+  const left = `${goal}${sparring}${planPlace}`;
   return `<section class="card stage">
 <div class="stagehead">
 <div><h2 title="${escapeHtml(model.stageId ?? "")}">${icon("dot", `accent ${escapeHtml(model.stageStatusKind ?? "")}`)}${escapeHtml(model.stageHeading ?? "")}</h2>
-<div class="substatus">${statusWord}${cycle}<span class="${accepted ? "complete" : "muted"}">${escapeHtml(model.stageLine ?? "")}</span></div></div>
+<div class="substatus">${position}${statusWord}${cycle}<span class="${accepted ? "complete" : "muted"}">${escapeHtml(model.stageLine ?? "")}</span></div></div>
 <div class="actions">${buttons.join("")}</div>
 </div>
-<div class="columns">
-<div class="col">${goal}${sparring}${planPlace}</div>
+<div class="columns${left ? "" : " single"}">
+${left ? `<div class="col">${left}</div>` : ""}
 <div class="col right">
 ${right}
 </div>
@@ -494,7 +589,9 @@ function renderPlanPlace(model: OverviewModel): string {
     return "";
   }
   if (plan.current) {
-    return `<div class="block"><h3>${icon("doc")}Current plan stage</h3>${renderCurrentPlanStage(plan.current, plan.matched)}</div>`;
+    // The stage card's own heading is this name now, so the block carries
+    // only how it was decided and the two ways to change it.
+    return `<div class="block"><h3>${icon("doc")}Current plan stage</h3>${renderCurrentPlanStage(plan.current, plan.matched, model.stageHeading === plan.current)}</div>`;
   }
   if (!model.actions?.matchStage) {
     return "";
@@ -502,13 +599,13 @@ function renderPlanPlace(model: OverviewModel): string {
   return `<div class="block"><h3>${icon("doc")}Current plan stage</h3><p class="muted">Agent Sparring doesn't yet know where this stage belongs in ${escapeHtml(plan.name)}. ${button("matchStage", "Match this stage…", true, MATCH_TITLE, "quiet")}</p></div>`;
 }
 
-/** `Stage 3B — title` with how it was decided and the two ways to change it. */
-function renderCurrentPlanStage(current: string, matched: MatchSource | undefined): string {
+/** `Stage 3B — title` with how it was decided and the two ways to change it; the name is dropped when the card heading is already it. */
+function renderCurrentPlanStage(current: string, matched: MatchSource | undefined, named = false): string {
   const how = matched === "manual" ? "Matched manually" : "Matched automatically";
   // Change match… is about this stage and nothing else; the plan-level
   // review sits next to it so fixing *another* stage never starts by
   // remapping the one on screen.
-  return `<p class="nextstage">${escapeHtml(current)}</p><p class="muted matched">${how} ${button("matchStage", "Change match…", true, MATCH_TITLE, "quiet")}${matched === "manual" ? button("clearMatch", "Remove match", true, "Forget the section you picked and match automatically again", "quiet") : ""}${button("reviewStageMatches", "All stage matches…", true, REVIEW_MATCHES_TITLE, "quiet")}</p>`;
+  return `${named ? "" : `<p class="nextstage">${escapeHtml(current)}</p>`}<p class="muted matched">${how} ${button("matchStage", "Change match…", true, MATCH_TITLE, "quiet")}${matched === "manual" ? button("clearMatch", "Remove match", true, "Forget the section you picked and match automatically again", "quiet") : ""}${button("reviewStageMatches", "All stage matches…", true, REVIEW_MATCHES_TITLE, "quiet")}</p>`;
 }
 
 /**
@@ -635,7 +732,19 @@ const STYLE = `
   color-scheme: light dark;
   --good: var(--vscode-testing-iconPassed, var(--vscode-charts-green));
   --info: var(--vscode-charts-blue, var(--vscode-focusBorder));
-  --warn: var(--vscode-charts-orange, var(--vscode-editorWarning-foreground));
+  /*
+   * Warning colours come from the theme's *semantic* warning tokens rather
+   * than the chart palette: charts.orange is chosen to sit on a chart, and on
+   * a dark side-bar background it reads as a muted brown. The notification /
+   * editor warning foreground is the colour a theme guarantees is legible as
+   * a warning, and inputValidation.warning{Background,Border} is the surface
+   * pair it guarantees goes with it — so the warning pill keeps ordinary
+   * foreground text on a tinted ground, and stays distinct without becoming
+   * an alarm.
+   */
+  --warn: var(--vscode-notificationsWarningIcon-foreground, var(--vscode-editorWarning-foreground, var(--vscode-charts-orange)));
+  --warn-surface: var(--vscode-inputValidation-warningBackground, transparent);
+  --warn-border: var(--vscode-inputValidation-warningBorder, var(--warn));
   --bad: var(--vscode-charts-red, var(--vscode-editorError-foreground));
   --claude: var(--vscode-charts-blue, var(--vscode-focusBorder));
   --codex: var(--vscode-charts-purple, var(--vscode-textLink-foreground));
@@ -660,7 +769,10 @@ h1 { font-size: 1.35em; font-weight: 600; margin: 0; }
 .hpill { display: inline-flex; align-items: center; padding: 3px 10px; border: 1px solid var(--line); border-radius: 6px; font-size: 0.9em; background: var(--card); }
 .hpill.good { color: var(--good); border-color: var(--good); }
 .hpill.info { color: var(--info); border-color: var(--info); }
-.hpill.warn { color: var(--warn); border-color: var(--warn); }
+/* Tinted ground + ordinary foreground: the pill stays readable in every
+   theme, and the warning tone is carried by its border and its dot. */
+.hpill.warn { color: var(--vscode-foreground); border-color: var(--warn-border); background: var(--warn-surface); font-weight: 600; }
+.hpill.warn .icon { color: var(--warn); }
 
 .run .plan { font-family: var(--vscode-font-family); font-weight: 600; color: var(--vscode-foreground); }
 .run .sep { margin: 0 6px; }
@@ -672,7 +784,7 @@ h1 { font-size: 1.35em; font-weight: 600; margin: 0; }
 .hpill.bad { color: var(--bad); border-color: var(--bad); }
 .hpill .icon { width: 11px; height: 11px; margin-right: 5px; }
 
-.action { padding: 12px 14px 12px; margin: 8px 0 12px; border-left: 3px solid var(--warn); }
+.action { padding: 12px 14px 12px; margin: 8px 0 12px; border-left: 3px solid var(--warn-border); }
 .action.ready { border-left-color: var(--good); }
 .action.ready h2 .icon { color: var(--good); }
 .failure { display: flex; align-items: flex-start; margin-top: 6px; color: var(--bad); }
@@ -717,7 +829,33 @@ button.choice.on.fail { background: var(--bad); color: var(--vscode-editor-backg
 button.choice.on.blocked { background: var(--warn); color: var(--vscode-editor-background); border-color: var(--warn); font-weight: 600; }
 textarea.note { flex: 1 1 240px; min-height: 26px; padding: 4px 8px; font-family: inherit; font-size: 0.92em; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--line)); border-radius: 6px; resize: vertical; }
 textarea.note:focus { outline: 1px solid var(--vscode-focusBorder); }
-.action > .actions { margin-top: 12px; }
+.action > .actions { margin-top: 12px; align-items: center; }
+
+/* One structured gate: the requirement, the steps, the pass line. */
+.action.gate .checks { margin-top: 10px; padding-top: 10px; }
+.gatetitle { font-size: 1.05em; font-weight: 600; margin: 0 0 6px; }
+.action .progress { margin: 0 0 4px; }
+.checklist.gate .check { border-top: none; padding: 0; }
+.check.task .checkbody { margin-left: 0; }
+.check.task .instruction { margin: 0 0 6px; }
+.steps { margin: 0 0 6px; padding-left: 20px; }
+.steps li { margin: 0 0 2px; line-height: 1.45; }
+.passif { margin: 0 0 2px; }
+.passif .lead { font-weight: 600; color: var(--vscode-descriptionForeground); }
+.checklist.gate .record { margin-left: 0; margin-top: 10px; }
+
+/* The demoted layers: technical details, previous evidence, other actions. */
+details.tech, details.prev { margin-top: 10px; font-size: 0.92em; }
+details.tech > summary, details.prev > summary, details.more > summary { cursor: pointer; color: var(--vscode-descriptionForeground); width: fit-content; }
+details.tech > summary:hover, details.prev > summary:hover, details.more > summary:hover { color: var(--vscode-foreground); }
+details.tech > summary:focus-visible, details.more > summary:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+.techlist { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 8px 0 0; padding: 8px 0 0; border-top: 1px solid var(--line); font-size: 0.95em; }
+.techlist dt { color: var(--vscode-descriptionForeground); }
+.techlist dd { margin: 0; white-space: pre-wrap; }
+details.more { display: inline-block; }
+details.more > summary { padding: 4px 11px; border: 1px solid var(--line); border-radius: 6px; font-size: 0.92em; list-style: none; }
+details.more > summary::-webkit-details-marker { display: none; }
+details.more .actions { margin-top: 6px; }
 
 .banner { margin: 8px 0 10px; padding: 6px 10px; border-left: 3px solid var(--info); background: var(--vscode-textBlockQuote-background); font-weight: 600; }
 .banner.stop, .banner.warn { border-left-color: var(--warn); }
@@ -728,7 +866,7 @@ textarea.note:focus { outline: 1px solid var(--vscode-focusBorder); }
 .step { position: relative; display: flex; flex-direction: column; align-items: center; flex: 1 1 0; min-width: 72px; text-align: center; }
 .step:not(:last-child)::after { content: ""; position: absolute; top: 13px; left: 50%; width: 100%; border-top: 2px solid var(--line); z-index: 0; }
 .step.accepted:not(:last-child)::after { border-top-color: var(--good); }
-.node { position: relative; z-index: 1; display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 50%; background: var(--line); color: var(--vscode-foreground); font-weight: 600; font-size: 0.85em; }
+.node { position: relative; z-index: 1; display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border-radius: 50%; background: var(--line); color: var(--vscode-foreground); font-weight: 600; font-size: 0.8em; }
 .node .icon { margin: 0; width: 14px; height: 14px; }
 .step.accepted .node { background: var(--good); color: var(--vscode-editor-background); }
 .step.active .node { background: var(--info); color: var(--vscode-editor-background); }
@@ -768,6 +906,8 @@ h2 .icon.escalate { color: var(--bad); }
 .whatsnext .actions { margin: 8px 0 6px; }
 .whatsnext .matched { font-size: 0.9em; }
 .columns { display: grid; grid-template-columns: 3fr 2fr; gap: 0 18px; margin-top: 12px; }
+.columns.single { grid-template-columns: 1fr; }
+.columns.single .col.right { border-left: none; padding-left: 0; }
 .col.right { border-left: 1px solid var(--line); padding-left: 18px; }
 .block { padding: 6px 0 10px; }
 .col .block + .block { border-top: 1px solid var(--line); padding-top: 10px; }

@@ -69,6 +69,65 @@ export function parseBriefGoal(markdown: string | undefined | null, maxLength = 
   return text.length > maxLength ? `${text.slice(0, Math.max(1, maxLength - 1)).trimEnd()}…` : text;
 }
 
+/**
+ * The brief's own opening description, for a brief that has no `## Goal`.
+ *
+ * A generated brief (nextStage.ts: renderNextStageBrief) is a title line, one
+ * sentence of provenance ("Stage 3D from plan `…`. Implement only this
+ * section…"), then the plan's section verbatim — so the paragraph worth
+ * showing is the one under the *embedded section's* heading, not the
+ * provenance line. Falling back through: the first paragraph after a second
+ * heading, else the first paragraph after the first heading, else the first
+ * paragraph at all. Lists, tables and fenced code are never a description.
+ *
+ * Display only, like the Goal it stands in for. Undefined when the brief has
+ * no prose paragraph — and then the Overview says nothing rather than
+ * complaining about the Markdown, which is a diagnostic, not something a
+ * person reading a stage needs.
+ */
+export function parseBriefOpening(markdown: string | undefined | null, maxLength = GOAL_MAX_LENGTH): string | undefined {
+  if (typeof markdown !== "string" || !markdown.trim()) {
+    return undefined;
+  }
+  const paragraphs: { text: string; headings: number }[] = [];
+  let headings = 0;
+  let inFence = false;
+  let current: string[] = [];
+  const flush = () => {
+    const text = current.join(" ").replace(/\s+/g, " ").trim();
+    current = [];
+    if (text) {
+      paragraphs.push({ text, headings });
+    }
+  };
+  for (const line of markdown.split(/\r?\n/)) {
+    if (FENCE_RE.test(line)) {
+      inFence = !inFence;
+      flush();
+      continue;
+    }
+    if (inFence) {
+      continue;
+    }
+    if (ANY_HEADING_RE.test(line)) {
+      flush();
+      headings++;
+      continue;
+    }
+    if (!line.trim() || /^\s*(?:[-*+>|]|\d+[.)])\s/.test(line)) {
+      flush(); // a blank line, a list item or a table row ends the paragraph
+      continue;
+    }
+    current.push(line.trim());
+  }
+  flush();
+  const chosen = paragraphs.find((entry) => entry.headings >= 2) ?? paragraphs.find((entry) => entry.headings >= 1) ?? paragraphs[0];
+  if (!chosen) {
+    return undefined;
+  }
+  return chosen.text.length > maxLength ? `${chosen.text.slice(0, Math.max(1, maxLength - 1)).trimEnd()}…` : chosen.text;
+}
+
 // ---------------------------------------------------------------- stage markers
 
 export interface BriefStageMarkers {

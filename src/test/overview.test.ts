@@ -315,7 +315,7 @@ describe("overview HTML", () => {
   it("renders the compact journey, the primary stage block and the small actor cards", async () => {
     const ws = await planWorkspace("paused", 1, { sparring: sparringMarkdown("NEEDS_YOU", "Check") });
     const html = renderOverviewHtml(buildOverviewModel(await selection(ws), undefined, ALL, NOW), "n", "c");
-    assert.match(html, /<ol class="journey"><li class="step accepted" title="Stage 1 — Contract \(Accepted\)"><span class="node"><svg class="icon " [^>]*>.*?<\/svg><\/span><span class="num">1<\/span><span class="name">Contract<\/span><span class="state"><svg[^>]*>.*?<\/svg>Accepted<\/span><\/li>/);
+    assert.match(html, /<ol class="journey"><li class="step accepted" title="Stage 1 — Contract \(Accepted\) · 1 of 3"><span class="node"><svg class="icon " [^>]*>.*?<\/svg><\/span><span class="num">1<\/span><span class="name">Contract<\/span><span class="state"><svg[^>]*>.*?<\/svg>Accepted<\/span><\/li>/);
     assert.match(html, /<li class="step paused current" [^>]*>.*?<span class="name">Schema &amp; API<\/span><span class="state">Paused<\/span><\/li>/);
     assert.match(html, /<li class="step future" [^>]*><span class="node">3<\/span>.*?<span class="state">Pending<\/span><\/li>/);
     assert.match(html, /<span class="hpill" title="docs\/plans\/foo.md">Plan run<\/span><span class="hpill">Stage 2 \/ 3<\/span><span class="hpill warn"><svg[^>]*>.*?<\/svg>Needs you<\/span>/);
@@ -328,9 +328,10 @@ describe("overview HTML", () => {
     assert.ok(!html.includes('class="banner'), "no banner repeats the panel");
     assert.equal((normalUi(html).match(/Needs you/g) ?? []).length, 1, "one primary status badge; the panel is titled Action required");
     assert.match(html, /<h2><svg class="icon needs_you"[^>]*>.*?<\/svg>Action required<\/h2><p class="summary">Check<\/p>/);
-    assert.match(html, /<button type="button" class="primary" data-action="submitForReview" title="[^"]*" disabled>Submit for review<\/button>/);
+    // In a managed plan the button says what the person is doing; the tooltip says who reads it.
+    assert.match(html, /<button type="button" class="primary" data-action="submitForReview" title="[^"]*" disabled>Submit result and continue<\/button>/);
     assert.match(html, /data-action="openSparring"[^>]*>Open detailed review</);
-    assert.match(html, /class="quiet" data-action="resumePlan"[^>]*>Resume plan \(implementation\)</);
+    assert.match(html, /<details class="more"><summary[^>]*>…<\/summary><div class="actions"><button type="button" class="quiet" data-action="resumePlan"[^>]*>Resume plan \(implementation\)</);
     assert.ok(!html.includes("Latest sparring result"), "the panel is the latest sparring result");
     assert.match(html, /<div class="run muted" title="[^"]*"><span class="plan">docs\/plans\/foo.md<\/span><span class="sep">›<\/span><span>Stage 2 — Schema &amp; API<\/span><\/div>/, "the header names the plan (its label when the document is not read), then the stage");
     assert.ok(!html.includes("Last activity"));

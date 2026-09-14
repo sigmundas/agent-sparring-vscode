@@ -164,8 +164,9 @@ describe("the Stage 3D pattern: exactly one control", () => {
 
     const html = renderOverviewHtml(model, "n", "c");
     assert.equal((html.match(/data-outcome="pass"/g) ?? []).length, 1, "one Pass control, for one check");
-    assert.match(html, /<strong>Pass when:<\/strong> The library loads/);
-    assert.match(html, /Defined in docs\/plans\/active\/reported-statistics\.md/);
+    assert.match(html, /<p class="passif"><span class="lead">Pass if:<\/span> The library loads/);
+    // Where the test is defined is provenance: kept, one disclosure away.
+    assert.match(html, /<dt>Check defined in<\/dt><dd>docs\/plans\/active\/reported-statistics\.md/);
     const visible = normalUi(html);
     assert.ok(!/Apply\/deploy|deploy the migration/i.test(visible), "deployment is not offered as a check to pass");
     assert.ok(!/rollout gate/i.test(visible), "nor is a rollout decision");
@@ -181,7 +182,7 @@ describe("the Stage 3D pattern: exactly one control", () => {
       !panel.required.some((item) => item.text.includes("AGENTS.md")),
       "the plan's 'Human-gated under AGENTS.md' bullet is not a check here",
     );
-    assert.match(renderOverviewHtml(model, "n", "c"), /What the reviewer requires/);
+    assert.match(renderOverviewHtml(model, "n", "c"), /<p class="gatetitle">A pre-activation desktop must survive a feed containing snapshot v2<\/p>/);
   });
 
   it("recording it makes the evidence complete and enables Submit for review", async () => {

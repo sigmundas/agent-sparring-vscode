@@ -80,8 +80,8 @@ describe("the automatic path is one engine call, not a loop", () => {
 
   it("keeps the manifest out of every repository", async () => {
     const controller = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "controller.ts"), "utf8");
-    const dir = /async manifestDirectory\(\)[\s\S]*?\n {2}}\n/.exec(controller)?.[0] ?? "";
-    assert.ok(dir, "manifestDirectory exists");
+    const dir = /get manifestDirectoryPath\(\)[\s\S]*?\n {2}}\n/.exec(controller)?.[0] ?? "";
+    assert.ok(dir, "manifestDirectoryPath exists");
     assert.match(dir, /globalStorageUri\.fsPath/, "the extension's own storage, not the workspace");
     assert.ok(!/repoRoot|sparringDir|workspaceFolder/.test(dir), "its location is never derived from a repository");
   });

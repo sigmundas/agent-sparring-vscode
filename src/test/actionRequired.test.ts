@@ -135,7 +135,7 @@ describe("Action required — prose plan (Stage 3C shape)", () => {
     assert.equal(panel.headline, "Action required");
     assert.equal(panel.submit.label, "Submit for review");
     assert.equal(panel.submit.enabled, false);
-    assert.match(panel.submit.detail, /Record Pass, Fail or Blocked for all 3 remaining checks first/);
+    assert.match(panel.submit.detail, /Record a result for all 3 remaining checks first/);
     assert.deepEqual(panel.resume, { action: "runStage", label: "Resume stage", detail: `sparring run-loop ${STAGE_ID}: the stage agent implements again first, then the reviewer looks. Use it when there is work to do, not to hand over evidence.` });
     assert.equal(panel.planSection, true);
   });
@@ -159,7 +159,7 @@ describe("Action required — prose plan (Stage 3C shape)", () => {
     assert.equal(panel.progress, "2 / 3 verified");
     assert.equal(panel.ready, false, "one requested check still has no outcome");
     assert.equal(panel.submit.enabled, false);
-    assert.match(panel.submit.detail, /Record Pass, Fail or Blocked for the remaining check first/);
+    assert.match(panel.submit.detail, /Record a result for the remaining check first/);
     assert.deepEqual(
       submittableChecks(panel).map((check) => check.text),
       [LIVE],
@@ -168,7 +168,7 @@ describe("Action required — prose plan (Stage 3C shape)", () => {
     assert.equal(model.stageStatus, "Needs you", "recording changes nothing about the stage's state");
   });
 
-  it("renders the hierarchy once each: parent prose, reviewer label, recorded ✓ with excerpt, required ○ with controls; no repeated reviewer text", async () => {
+  it("renders the hierarchy once each: parent prose, recorded ✓ with excerpt, required ○ with controls; no repeated reviewer text", async () => {
     const { model } = await stage3c({ notes: NOTES_WITH_DEPLOYMENT, drafts: { [checkKey(LIVE)]: { outcome: "pass", note: "Two <clients> agree." } } });
     const html = renderOverviewHtml(model, "n", "c");
     const ui = normalUi(html);
@@ -176,17 +176,23 @@ describe("Action required — prose plan (Stage 3C shape)", () => {
     assert.equal((ui.match(/EXTERNAL CONDITION/g) ?? []).length, 1, "the reviewer's category line appears once");
     assert.equal((ui.match(/Human-gated checks remain/g) ?? []).length, 0, "the Deferred block is not repeated as prose; its clauses are the checks");
     assert.equal((ui.match(/Needs you/g) ?? []).length, 1, "one primary status badge");
-    assert.ok(html.indexOf("<h4>Plan requirement</h4>") < html.indexOf("<h4>Reviewer requested checks</h4>"));
-    assert.ok(html.indexOf("<h4>Reviewer requested checks</h4>") < html.indexOf("<h4>Evidence already recorded</h4>"));
+    assert.ok(html.indexOf("<h4>Plan requirement</h4>") < html.indexOf("<h4>Evidence already recorded</h4>"));
     assert.ok(html.indexOf("<h4>Evidence already recorded</h4>") < html.indexOf("<h4>Still required</h4>"));
     assert.ok(html.includes(`<p class="criterion parent" title="Plan line 12">${HUMAN_GATED.replace(/'/g, "&#39;")}</p>`), "the plan's own words, escaped only");
-    assert.match(html, /<h4>Reviewer requested checks<\/h4><p class="muted small">3 checks taken from the sparring report/);
+    // How the checks were derived is provenance, not instruction: it moved to
+    // the collapsed technical layer, where the reader can still find it.
+    assert.ok(!/checks taken from the sparring report/.test(ui), "the derivation prose is not part of the human task");
+    assert.match(html, /<dt>How these checks were derived<\/dt><dd>3 of them come from the sparring report/);
     assert.match(html, new RegExp(`<ol class="checklist recorded"><li class="check done pass"><div class="checkrow"><span class="mark">✓</span><div class="checkbody"><p class="criterion">${DEPLOY.replace(/\//g, "\\/")} <span class="tag reviewer"[^>]*>Reviewer</span></p><p class="muted small evidence"[^>]*>notes.md: `));
     const key = checkKey(LIVE);
-    assert.match(html, new RegExp(`<li class="check pass">\\s*<div class="checkrow"><span class="mark">○</span><div class="checkbody"><p class="criterion">${LIVE} <span class="tag reviewer"[^>]*>Reviewer</span></p></div></div>\\s*<div class="record"><span class="choices"><button type="button" class="choice pass on" data-check="${key}" data-outcome="pass" aria-pressed="true">Pass</button><button type="button" class="choice fail" data-check="${key}"`));
+    assert.match(html, new RegExp(`<li class="check pass">\\s*<div class="checkrow"><span class="mark">○</span><div class="checkbody"><p class="criterion">${LIVE} <span class="tag reviewer"[^>]*>Reviewer</span></p></div></div>\\s*<div class="record"><span class="choices"><button type="button" class="choice pass on" data-check="${key}" data-outcome="pass" aria-pressed="true" title="[^"]*">Pass</button><button type="button" class="choice fail" data-check="${key}"`));
     assert.match(html, new RegExp(`<textarea class="note" data-check="${key}" rows="1" placeholder="Evidence or note \\(optional\\)">Two &lt;clients&gt; agree.</textarea>`));
-    assert.ok(!html.includes(`data-check="${checkKey(DEPLOY)}"`), "recorded checks have no Pass / Fail / Blocked controls");
-    assert.match(html, /<button type="button" class="primary" data-action="submitForReview" title="[^"]*" disabled>Submit for review<\/button><button type="button" data-action="openPlanSection"[^>]*>Open plan section<\/button><button type="button" data-action="openSparring"[^>]*>Open detailed review<\/button><button type="button" class="quiet" data-action="runStage"[^>]*>Resume stage \(implementation\)<\/button>/);
+    assert.ok(!html.includes(`data-check="${checkKey(DEPLOY)}"`), "recorded checks have no result controls");
+    assert.match(
+      html,
+      /<button type="button" class="primary" data-action="submitForReview" title="[^"]*" disabled>Submit for review<\/button><button type="button" data-action="openPlanSection"[^>]*>Open plan section<\/button><button type="button" data-action="openSparring"[^>]*>Open detailed review<\/button><button type="button" class="quiet" data-action="continueAutomatically"[^>]*>Continue plan automatically<\/button><details class="more"><summary[^>]*>…<\/summary><div class="actions"><button type="button" class="quiet" data-action="runStage"[^>]*>Resume stage \(implementation\)<\/button>/,
+      "resuming implementation is behind the … disclosure, never beside the button that answers the review",
+    );
     assert.ok(!html.includes('class="banner') && !html.includes("Latest sparring result") && !/<span class="status needs_you"/.test(html));
     assert.ok(!/data-action="acceptStage"/.test(html), "no acceptance is offered from the panel");
   });
@@ -226,8 +232,10 @@ describe("Action required — explicit ### Manual verification checklist", () =>
     assert.equal(panel.reviewerCount, 1);
     assert.equal(panel.progress, "1 / 4 verified");
     const html = renderOverviewHtml(model, "n", "c");
-    assert.match(html, /<h4>Plan requirement<\/h4><p class="muted small">3 explicit checks under the plan's <em>Manual verification<\/em> list/);
     assert.match(html, /<p class="criterion">CAS retry after a concurrent edit keeps the extension group intact\. <span class="tag plan" title="Plan line 19">Plan<\/span><\/p>/);
+    // An explicit plan checklist speaks for itself: the checks are shown as
+    // written, and the count of them is not a thing to read first.
+    assert.ok(!/explicit checks under the plan/.test(normalUi(html)));
   });
 });
 

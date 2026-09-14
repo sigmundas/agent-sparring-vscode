@@ -18,10 +18,10 @@
  * tooltips and the footer.
  */
 
-import { parseBriefGoal } from "./brief";
+import { parseBriefGoal, parseBriefOpening } from "./brief";
 import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
-import { parseHandoffBranch, type SparringOutcome, type StateRepository } from "./engineFormats";
+import { parseHandoffBranch, type PlanRunState, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
 import type { DeclaredRepository } from "./stageRepositories";
 import { deriveVerification, parseHumanEvidence, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
 import { formatTime } from "./logFormat";
@@ -33,6 +33,34 @@ import { hasSessions, planAction, stageActions, type PlanAction, type StageRunAc
 import { QUIET_AFTER_MS, formatAge } from "./status";
 
 export type TimelineState = "accepted" | "finalizing" | "active" | "paused" | "working" | "future";
+
+/**
+ * One stage of the execution manifest a managed run is executing, with what
+ * the engine has recorded for it.
+ *
+ * A manifest run's stages are not the plan document's `## Stage <n>` headings
+ * — that convention is exactly what the manifest exists to replace — so the
+ * journey and the stage's own name have to come from the manifest the engine
+ * was handed. The extension wrote that file and can read it back; `status`
+ * is the stage's own `state.json`, so every word shown about a stage is still
+ * the engine's recorded state.
+ */
+export interface ManifestStageView {
+  stageId: string;
+  /** `Stage 3D` exactly as the manifest labels it; display only, the array order is the execution order. */
+  label: string;
+  title: string;
+  /** `state.json` status; undefined for a stage the engine has not created yet. */
+  status?: StageStatus;
+}
+
+/** The manifest resolved against the run: only ever set when the recorded current stage is one of its stages. */
+interface ManifestView {
+  stages: ManifestStageView[];
+  /** Index of the run's current stage in the manifest. */
+  at: number;
+  current: ManifestStageView;
+}
 
 /** The word shown under a journey node; only the current stage gets one. */
 export const TIMELINE_STATE_WORD: Record<TimelineState, string> = {
@@ -49,6 +77,8 @@ export interface TimelineItem {
   title: string;
   state: TimelineState;
   current: boolean;
+  /** The plan's own label for the stage (`3D`), when the run knows one; the number is then only its position. */
+  label?: string;
 }
 
 export type ActorActivity = "Working" | "Sparring" | "Waiting" | "Idle";
@@ -156,6 +186,14 @@ export interface OverviewArtifacts {
    * frozen, and the two are labelled differently because they are.
    */
   siblingRepositories?: DeclaredRepository[];
+  /**
+   * The stages of the execution manifest this managed run executes, in
+   * execution order, each with its recorded status — supplied by the caller
+   * that can read the manifest file. Used for the stage's plan identity
+   * (`Stage 3D`, not "the manifest's sixth entry") and for the journey.
+   * Ignored unless the run's recorded current stage is one of them.
+   */
+  manifestStages?: ManifestStageView[];
 }
 
 export type PlanContinuation = "automatic" | "manual";
@@ -276,15 +314,38 @@ export interface BranchGuard {
  * derived from the matched plan section, the routing outcome and the
  * notes.md `## Human evidence` section (see humanChecks.ts).
  */
+/**
+ * One demoted fact: the exact reviewer wording, an id, a category, a source
+ * path. Everything a person does not need in order to act, kept one
+ * disclosure away rather than deleted — the normal layer says what to do, the
+ * details layer says why the harness believes it.
+ */
+export interface TechnicalDetail {
+  label: string;
+  value: string;
+}
+
 export interface ActionRequired extends VerificationView {
   kind: "needs_you" | "escalate";
   /** `Needs you` / `Escalated`. */
   word: string;
   /**
-   * The panel's own title: `Action required` while checks are outstanding,
-   * `Evidence ready for review` once every requested check has an outcome.
+   * The panel's own title: `Manual check required` for a structured gate,
+   * `Action required` for the legacy derived path, and `Evidence ready for
+   * review` once every requested check has an outcome.
    */
   headline: string;
+  /**
+   * The gate's own title — the one sentence saying what must be true before
+   * the stage can be READY. Structured gates only; it is the requirement, and
+   * it is stated once.
+   */
+  gateTitle?: string;
+  /**
+   * The reviewer's exact wording, ids, categories and source paths, for the
+   * collapsed technical layer. Never a prerequisite for acting.
+   */
+  technical: TechnicalDetail[];
   /** One sentence under a headline that replaces the reviewer's summary. */
   subtitle?: string;
   /** The reviewer's routing summary (sparring.md), verbatim. */
@@ -365,6 +426,15 @@ export interface OverviewModel {
   timelineNote?: string;
   /** `Stage 2 of 5` for plan runs. */
   position?: string;
+  /**
+   * The plan's own name for the current stage (`Stage 3D`), when the run
+   * knows one. It is what a person calls the stage; the manifest ordinal is
+   * an implementation detail of the execution order and belongs in
+   * `positionNote`, not in the stage's apparent name.
+   */
+  stageLabel?: string;
+  /** `6 of 8`: where the stage sits in the run, as secondary metadata. */
+  positionNote?: string;
   stageAgent?: ActorCard;
   sparrer?: ActorCard;
   stageHeading?: string;
@@ -417,7 +487,8 @@ export function buildOverviewModel(
   const outcome = run.kind === "plan" ? run.currentOutcome : run.outcome;
   const presentation = presentStage(stage.state?.status, outcome, live);
   const fresh = isFreshStage(run, stage, presentation, liveness);
-  const plan = planContext(run, stage, artifacts);
+  const manifest = manifestView(run, artifacts);
+  const plan = planContext(run, stage, artifacts, manifest);
   const branchGuard = branchMismatch(run, artifacts);
 
   const model: OverviewModel = {
@@ -436,7 +507,7 @@ export function buildOverviewModel(
       diff: diffAction(stage),
     },
     facts: facts(run, stage, artifacts.git, presentation, artifacts.associatedPlan, artifacts.siblingRepositories),
-    goal: artifacts.brief ? parseBriefGoal(artifacts.briefText) : undefined,
+    goal: goal(artifacts, plan),
     activity: activityLine(live, halted, nowMs, uncertain),
     history: history(live),
     runKind: run.kind === "plan" ? "Plan run" : "Standalone stage",
@@ -477,13 +548,23 @@ export function buildOverviewModel(
   model.branchGuard = branchGuard;
 
   if (run.kind === "plan") {
-    Object.assign(model, timeline(run));
-    const number = stage.number ?? run.state.currentStageIndex + 1;
-    model.stageHeading = `Stage ${number} — ${stageDisplayName(stage)}`;
-    const total = run.planStages?.length;
+    Object.assign(model, timeline(run, manifest));
+    const number = manifest ? manifest.at + 1 : (stage.number ?? run.state.currentStageIndex + 1);
+    const total = manifest ? manifest.stages.length : run.planStages?.length;
+    // The stage is named as the plan names it; where it sits in the run is
+    // separate, secondary metadata. "Stage 6" was the manifest's execution
+    // order wearing the stage's name.
+    model.stageHeading = manifest ? `${manifest.current.label} — ${manifest.current.title}` : `Stage ${number} — ${stageDisplayName(stage)}`;
+    model.stageLabel = manifest?.current.label;
     model.position = total ? `Stage ${number} of ${total}` : `Stage ${number}`;
+    model.positionNote = total ? `${number} of ${total}` : undefined;
   } else {
-    model.stageHeading = stageDisplayName(stage);
+    // A standalone stage that is matched to a plan section is called what the
+    // plan calls it as well; its engine id stays in the tooltip and the
+    // footer. `3c cloud schema rpc and sync transport` is a slug read aloud.
+    const matched = plan?.source === "associated" ? plan : undefined;
+    model.stageHeading = matched?.current ?? stageDisplayName(stage);
+    model.stageLabel = matched?.currentLabel ? `Stage ${matched.currentLabel}` : undefined;
   }
   model.stageId = stage.stageId;
   if (!stage.exists) {
@@ -636,6 +717,10 @@ function actionRequired(
     run.kind === "plan"
       ? "sparring resume-plan --evidence …: the engine records the evidence and continues the plan at this same stage"
       : `sparring run-sparring ${model.stageId ?? ""}: the recorded sparring session reads the evidence and rules again. The stage agent is not started.`;
+  // In a managed plan the button describes what the person is doing —
+  // recording their result so the run goes on — and the tooltip says who
+  // reads it. Standalone, "Submit for review" is the whole of it.
+  const submitLabel = run.kind === "plan" ? "Submit result and continue" : "Submit for review";
   let submitDetail: string;
   let submitEnabled = false;
   if (branchGuard) {
@@ -643,28 +728,106 @@ function actionRequired(
   } else if (view.recorded.length === 0 && view.required.length === 0) {
     submitDetail = "No requested check is listed, so there is no recorded evidence to send.";
   } else if (!ready) {
-    submitDetail = `Record Pass, Fail or Blocked for ${pending === 1 ? "the remaining check" : `all ${pending} remaining checks`} first. Submitting asks the reviewer to rule on the evidence, so it goes when the evidence is complete.`;
+    submitDetail = `Record a result for ${pending === 1 ? "the remaining check" : `all ${pending} remaining checks`} first. Submitting asks the reviewer to rule on the evidence, so it goes when the evidence is complete.`;
   } else if (blocked(model)) {
     submitDetail = "Nothing can run right now (a runner is alive or its status is unknown).";
   } else {
     submitEnabled = true;
     submitDetail = `Records the drafted results under '## Human evidence' and asks the reviewer to rule on them (${command}). The reviewer decides; nothing is marked ready or accepted here.`;
   }
+  // The simple, gate-shaped presentation: the reviewer stated the
+  // requirement, so it is shown once as their gate title and their note goes
+  // to the details layer with the rest of their verbatim wording.
+  const gateLayer = view.source === "gate" && kind === "needs_you" && view.recorded.length + view.required.length > 0;
   return {
     ...view,
     kind,
     word: actionWord(outcome.action),
     reviewFailure: reviewFailure(liveness),
-    headline: ready && kind === "needs_you" ? "Evidence ready for review" : "Action required",
+    headline: headlineFor(view, kind, ready, gateLayer),
     subtitle: ready && kind === "needs_you" ? "All requested checks have evidence. Send it back to the independent reviewer." : undefined,
     summary: outcome.summary,
     reviewerNote: outcome.needsYouReason,
+    gateTitle: gateLayer ? view.gate?.title : undefined,
+    technical: technicalDetails(view, outcome, plan, sectionLine, { summaryShown: !ready, noteShown: !gateLayer }),
     noChecks,
-    submit: { label: "Submit for review", enabled: submitEnabled, detail: submitDetail },
+    submit: { label: submitLabel, enabled: submitEnabled, detail: submitDetail },
     resume,
     planSection: Boolean(sectionLine && (run.kind === "plan" ? artifacts.plan : artifacts.associatedPlan?.exists)),
     review: artifacts.sparring,
   };
+}
+
+/**
+ * What the panel calls itself. A structured gate is one concrete thing to
+ * do, so it says so; the legacy derived path can be a mixture of plan prose
+ * and reviewer requests, and keeps the older, vaguer title.
+ */
+function headlineFor(view: VerificationView, kind: "needs_you" | "escalate", ready: boolean, gateLayer: boolean): string {
+  if (ready && kind === "needs_you") {
+    return "Evidence ready for review";
+  }
+  if (gateLayer) {
+    const total = view.recorded.length + view.required.length;
+    return total === 1 ? "Manual check required" : `${total} manual checks required`;
+  }
+  return "Action required";
+}
+
+/**
+ * The demoted layer: the reviewer's exact words, the engine's own vocabulary,
+ * the ids a bug report needs, and where the check is defined. Everything here
+ * used to be prerequisite reading in the main flow; none of it is needed to
+ * perform the check, and all of it is needed when something looks wrong.
+ */
+function technicalDetails(
+  view: VerificationView,
+  outcome: SparringOutcome,
+  plan: PlanContext | undefined,
+  sectionLine: number | undefined,
+  shown: { summaryShown: boolean; noteShown: boolean },
+): TechnicalDetail[] {
+  const out: TechnicalDetail[] = [{ label: "Routing action", value: outcome.action }];
+  // Whatever the primary layer already says is not repeated here: reviewer
+  // text is shown once, and this layer exists for what was left out of it.
+  if (outcome.summary && !shown.summaryShown) {
+    out.push({ label: "Reviewer's summary", value: outcome.summary });
+  }
+  if (outcome.needsYouReason && !shown.noteShown) {
+    out.push({ label: "Reviewer's note", value: outcome.needsYouReason });
+  }
+  if (view.gate) {
+    out.push({ label: "Gate category", value: view.gate.category });
+    out.push({ label: "Gate title", value: view.gate.title });
+  }
+  const checks = [...view.required, ...view.recorded];
+  const many = checks.length > 1;
+  checks.forEach((check, at) => {
+    const prefix = many ? `Check ${at + 1} ` : "Check ";
+    if (view.source === "gate") {
+      out.push({ label: `${prefix}id`, value: check.key });
+    }
+    out.push({ label: `${prefix}instruction, verbatim`, value: check.text });
+    if (check.passCriteria) {
+      out.push({ label: `${prefix}pass criteria, verbatim`, value: check.passCriteria });
+    }
+    if (check.source) {
+      out.push({ label: `${prefix}defined in`, value: check.source });
+    }
+    if (check.line !== undefined) {
+      out.push({ label: `${prefix}plan line`, value: String(check.line) });
+    }
+  });
+  if (view.source === "derived" && view.reviewerCount > 0) {
+    out.push({
+      label: "How these checks were derived",
+      value: `${view.reviewerCount} of them come from the sparring report's own sentences, not from the plan; this verdict was recorded before the engine emitted structured gates.`,
+    });
+  }
+  if (plan) {
+    out.push({ label: "Plan", value: sectionLine ? `${plan.name}, line ${sectionLine}` : plan.name });
+  }
+  return out;
 }
 
 /**
@@ -890,13 +1053,64 @@ export function shortenId(id: string | undefined | null, keep = 8): string | und
   return trimmed.length > keep ? `${trimmed.slice(0, keep)}…` : trimmed;
 }
 
-function timeline(run: PlanRunSnapshot): Pick<OverviewModel, "timeline" | "timelineNote"> {
+/**
+ * The manifest this managed run executes, resolved against the run.
+ *
+ * Only ever returned when the run's own recorded current stage is one of the
+ * manifest's stages: the file on disk is regenerated from the plan, and a
+ * generation that no longer contains the stage the engine is on describes a
+ * different sequence. Saying nothing then is right — the engine's recorded
+ * state is the authority, and a journey drawn from a mismatched file would be
+ * a claim nothing supports.
+ */
+function manifestView(run: RunSnapshot, artifacts: OverviewArtifacts): ManifestView | undefined {
+  if (run.kind !== "plan" || run.state.source !== "manifest") {
+    return undefined;
+  }
+  const stages = artifacts.manifestStages;
+  const at = stages?.findIndex((entry) => entry.stageId === run.state.currentStage) ?? -1;
+  if (!stages || at < 0) {
+    return undefined;
+  }
+  return { stages, at, current: stages[at] };
+}
+
+/**
+ * The one-paragraph description of what this stage is for: the brief's
+ * `## Goal`, else the brief's own opening description, else the plan
+ * section's opening paragraph. When none of those exist the Overview says
+ * nothing — a brief without a `## Goal` heading is a fact for diagnostics,
+ * not a complaint to show someone who came here to answer a review.
+ */
+function goal(artifacts: OverviewArtifacts, plan: PlanContext | undefined): string | undefined {
+  const fromBrief = artifacts.brief ? (parseBriefGoal(artifacts.briefText) ?? parseBriefOpening(artifacts.briefText)) : undefined;
+  if (fromBrief) {
+    return fromBrief;
+  }
+  const document = plan?.source === "managed" ? artifacts.planText : artifacts.associatedPlan?.text;
+  return document && plan?.currentLine ? sectionSummary(document, plan.currentLine) : undefined;
+}
+
+function timeline(run: PlanRunSnapshot, manifest: ManifestView | undefined): Pick<OverviewModel, "timeline" | "timelineNote"> {
+  if (manifest) {
+    // The manifest is this run's plan: its stages, in its order, each with the
+    // status the engine recorded for it.
+    return {
+      timeline: manifest.stages.map((stage, index) => ({
+        number: index + 1,
+        label: shortStageLabel(stage.label),
+        title: stage.title,
+        current: index === manifest.at,
+        state: timelineStateOf(stage.status, index, manifest.at, run.state.status),
+      })),
+    };
+  }
   if (!run.planStages || run.planStages.length === 0) {
     // A manifest run's stages are the manifest's, not the plan document's
     // `## Stage <n>` convention, so failing to read that convention says
     // nothing about the plan and must not be reported as if it did.
     if (run.state.source === "manifest") {
-      return { timelineNote: "This run executes an execution manifest, so its journey is not read from the plan document's headings; the recorded stage is shown." };
+      return { timelineNote: "This run executes an execution manifest; its own list of stages could not be read here, so only the recorded stage is shown." };
     }
     return { timelineNote: `Plan document unavailable (${run.planError ?? "no stages"}); showing the recorded stage only.` };
   }
@@ -910,8 +1124,16 @@ function timeline(run: PlanRunSnapshot): Pick<OverviewModel, "timeline" | "timel
   return { timeline: items };
 }
 
+/** `Stage 3D` → `3D`; the journey node is already in a row of stages. */
+export function shortStageLabel(label: string): string {
+  return label.replace(/^stage\s+/i, "").trim() || label;
+}
+
 export function timelineState(stage: StageSnapshot, index: number, current: number, run: PlanRunSnapshot): TimelineState {
-  const status = stage.state?.status;
+  return timelineStateOf(stage.state?.status, index, current, run.state.status);
+}
+
+export function timelineStateOf(status: StageStatus | undefined, index: number, current: number, planStatus: PlanRunState["status"]): TimelineState {
   if (status === "accepted") {
     return "accepted";
   }
@@ -919,7 +1141,7 @@ export function timelineState(stage: StageSnapshot, index: number, current: numb
     return "finalizing";
   }
   if (index === current) {
-    return run.state.status === "paused" ? "paused" : "active";
+    return planStatus === "paused" ? "paused" : "active";
   }
   return index < current ? "working" : "future";
 }
@@ -931,7 +1153,7 @@ export function timelineState(stage: StageSnapshot, index: number, current: numb
  * stage with an associated file: the document's headings, and this stage's
  * place in them only when one heading unambiguously matches.
  */
-function planContext(run: RunSnapshot, stage: StageSnapshot, artifacts: OverviewArtifacts): PlanContext | undefined {
+function planContext(run: RunSnapshot, stage: StageSnapshot, artifacts: OverviewArtifacts, manifest?: ManifestView): PlanContext | undefined {
   const associated = artifacts.associatedPlan;
   if (run.kind === "plan") {
     const stages = run.planStages;
@@ -949,16 +1171,36 @@ function planContext(run: RunSnapshot, stage: StageSnapshot, artifacts: Overview
         summary: inDocument && artifacts.planText ? sectionSummary(artifacts.planText, inDocument.line) : undefined,
         defined: true,
       };
+    } else if (manifest && manifest.at + 1 < manifest.stages.length) {
+      // The engine's next stage for a manifest run: the manifest's own next
+      // entry, located in the document only to open it there.
+      const entry = manifest.stages[manifest.at + 1];
+      const label = shortStageLabel(entry.label);
+      const inDocument = artifacts.planText ? buildStageIndex(parsePlanHeadings(artifacts.planText)).find((candidate) => candidate.label.toUpperCase() === label.toUpperCase())?.canonical : undefined;
+      next = {
+        display: `${entry.label} — ${entry.title}`,
+        label,
+        line: inDocument?.line ?? 0,
+        summary: inDocument && artifacts.planText ? sectionSummary(artifacts.planText, inDocument.line) : undefined,
+        defined: true,
+      };
     }
-    const currentInDocument = artifacts.planText ? parsePlanHeadings(artifacts.planText).find((heading) => heading.label === String(stage.number ?? index + 1) && heading.title === stage.title) : undefined;
+    const headings = artifacts.planText ? parsePlanHeadings(artifacts.planText) : [];
+    // A manifest run's stage is located by the label the manifest gave it
+    // (`Stage 3D`), which is how the plan names it; a Markdown run's by the
+    // engine's own numbering.
+    const currentInDocument = manifest
+      ? buildStageIndex(headings).find((entry) => entry.label.toUpperCase() === shortStageLabel(manifest.current.label).toUpperCase())?.canonical
+      : headings.find((heading) => heading.label === String(stage.number ?? index + 1) && heading.title === stage.title);
     return {
       source: "managed",
       name: (artifacts.planText ? planTitle(artifacts.planText) : undefined) ?? run.state.plan,
-      current: `Stage ${stage.number ?? index + 1} — ${stageDisplayName(stage)}`,
+      current: manifest ? `${manifest.current.label} — ${manifest.current.title}` : `Stage ${stage.number ?? index + 1} — ${stageDisplayName(stage)}`,
+      currentLabel: manifest ? shortStageLabel(manifest.current.label) : undefined,
       currentLine: currentInDocument?.line,
       next,
-      hasHeadings: Boolean(stages && stages.length > 0),
-      hasStageLabels: Boolean(stages && stages.length > 0),
+      hasHeadings: Boolean(manifest || (stages && stages.length > 0)),
+      hasStageLabels: Boolean(manifest || (stages && stages.length > 0)),
       note: "The engine's plan run: it records which stage is current and resume-plan continues it.",
     };
   }

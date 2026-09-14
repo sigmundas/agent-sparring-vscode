@@ -188,10 +188,14 @@ export function sparringMarkdown(action: string, summary: string, reason?: strin
 }
 
 /**
- * The Overview as a non-expert reads it: tooltips (`title="…"`) and the
- * metadata footer are the advanced surfaces where the engine's own words
- * are allowed; everything else must use the human vocabulary.
+ * The Overview as a non-expert reads it: tooltips (`title="…"`), the
+ * metadata footer and the collapsed "Show technical details" block are the
+ * advanced surfaces where the engine's own words are allowed; everything
+ * else must use the human vocabulary.
  */
 export function normalUi(html: string): string {
-  return html.replace(/title="[^"]*"/g, "").replace(/<dl class="facts">[\s\S]*?<\/dl>/g, "");
+  return html
+    .replace(/title="[^"]*"/g, "")
+    .replace(/<dl class="facts">[\s\S]*?<\/dl>/g, "")
+    .replace(/<details class="tech">[\s\S]*?<\/details>/g, "");
 }

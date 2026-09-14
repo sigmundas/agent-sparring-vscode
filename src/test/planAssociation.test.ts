@@ -415,7 +415,12 @@ describe("Overview plan actions", () => {
     let html = renderOverviewHtml(working, "n", "c");
     assert.match(html, /<button type="button" data-action="openPlan" [^>]*>Plan<\/button>/);
     assert.match(html, /data-action="associatePlan" [^>]*>Change plan…<\/button>/);
-    assert.match(html, /Current plan stage<\/h3><p class="nextstage">Stage 3B — Reported statistics local schema barrier<\/p><p class="muted matched">Matched automatically <button type="button" class="quiet" data-action="matchStage"[^>]*>Change match…<\/button><button type="button" class="quiet" data-action="reviewStageMatches"[^>]*>All stage matches…<\/button><\/p>/);
+    // The stage is called what the plan calls it, in the card's own heading;
+    // the block below carries how that was decided, not the name again.
+    assert.equal(working.stageHeading, "Stage 3B — Reported statistics local schema barrier");
+    assert.equal(working.stageLabel, "Stage 3B");
+    assert.match(html, /Current plan stage<\/h3><p class="muted matched">Matched automatically <button type="button" class="quiet" data-action="matchStage"[^>]*>Change match…<\/button><button type="button" class="quiet" data-action="reviewStageMatches"[^>]*>All stage matches…<\/button><\/p>/);
+    assert.equal((html.match(/Stage 3B — Reported statistics local schema barrier/g) ?? []).length, 2, "the crumb and the card heading; not a third time under Current plan stage");
     assert.ok(!html.includes("Remove match"), "nothing to remove for an automatic match");
     assert.ok(!html.includes("What's next"), "What's next is for the accepted screen");
     assert.ok(!html.includes(ws.root), "no filesystem paths in the document");
