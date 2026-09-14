@@ -92,6 +92,11 @@
         "category": "Agent Sparring"
       },
       {
+        "command": "agentSparring.reviewStageMatches",
+        "title": "Review Stage Matches…",
+        "category": "Agent Sparring"
+      },
+      {
         "command": "agentSparring.stageRepositories",
         "title": "Sibling Repositories for a Plan Stage…",
         "category": "Agent Sparring"

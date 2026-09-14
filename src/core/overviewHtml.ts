@@ -33,6 +33,7 @@ export type OverviewAction =
   | "acceptStage"
   | "associatePlan"
   | "matchStage"
+  | "reviewStageMatches"
   | "clearMatch"
   | "startNextStage"
   | "continueAutomatically"
@@ -63,6 +64,7 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "acceptStage",
   "associatePlan",
   "matchStage",
+  "reviewStageMatches",
   "clearMatch",
   "startNextStage",
   "continueAutomatically",
@@ -261,6 +263,14 @@ function renderActionRequired(model: OverviewModel, panel: ActionRequired): stri
   if (panel.resume) {
     buttons.push(button(panel.resume.action, `${panel.resume.label} (implementation)`, true, panel.resume.detail, "quiet"));
   }
+  // Offered here, at a gate, because adopting does not touch the gate: the
+  // engine keeps this pause and the next human action is unchanged. It is
+  // the only route from a standalone stage into a managed run, so it must be
+  // where the user already is.
+  const auto = model.continueAutomatically;
+  if (auto?.kind === "adopt") {
+    buttons.push(button("continueAutomatically", auto.label, true, auto.detail, "quiet"));
+  }
   return `<section class="card action ${panel.kind}${panel.ready ? " ready" : ""}">
 <div class="actionhead"><h2>${icon(panel.ready && panel.kind === "needs_you" ? "check" : "warn", panel.ready && panel.kind === "needs_you" ? "ready" : panel.kind)}${escapeHtml(panel.headline)}</h2>${summary}${note}${failure}</div>
 <div class="checks"><h3>${icon("check", "accent")}Manual verification ${progress}</h3>${body}</div>
@@ -364,13 +374,15 @@ function renderStageCard(model: OverviewModel): string {
   // automatically is the primary button and the per-stage operations stay
   // available as the quieter alternatives — never removed, since a user may
   // always want to drive one stage by hand.
-  const auto = model.continueAutomatically;
+  // While the Action required panel is up it carries the offer instead, so
+  // the same button is never in two places.
+  const auto = model.actionRequired ? undefined : model.continueAutomatically;
   if (auto && !handedOver) {
-    buttons.push(button("continueAutomatically", auto.label, true, auto.detail, "primary"));
+    buttons.push(button("continueAutomatically", auto.label, true, auto.detail, auto.primary ? "primary" : "quiet"));
   }
   if (model.stageAction && !handedOver) {
     // While the human is asked for something, the resume lives in the Action required panel.
-    buttons.push(stageActionButton(model.stageAction, model.stageId, auto ? "quiet" : model.stageAction.primary ? "primary" : ""));
+    buttons.push(stageActionButton(model.stageAction, model.stageId, auto?.primary ? "quiet" : model.stageAction.primary ? "primary" : ""));
   }
   if (model.planAction && !accepted && !handedOver) {
     // For an accepted stage the plan action is the primary button of What's next instead.
@@ -467,7 +479,8 @@ ${right}
 }
 
 const CHOOSE_PLAN_TITLE = "Pick the Markdown plan this stage belongs to (kept in VS Code only; the engine is not told)";
-const MATCH_TITLE = "Pick which section of the linked plan this stage is (kept in VS Code only; the engine is not told)";
+const MATCH_TITLE = "Pick which section of the linked plan THIS stage is — only this one is remapped (kept in VS Code only; the engine is not told)";
+const REVIEW_MATCHES_TITLE = "See every stage of this project and which plan section it resolves to, and fix one that could not be placed — without changing this stage";
 
 /**
  * Where this stage sits in an associated plan, for a stage that is still
@@ -492,7 +505,10 @@ function renderPlanPlace(model: OverviewModel): string {
 /** `Stage 3B — title` with how it was decided and the two ways to change it. */
 function renderCurrentPlanStage(current: string, matched: MatchSource | undefined): string {
   const how = matched === "manual" ? "Matched manually" : "Matched automatically";
-  return `<p class="nextstage">${escapeHtml(current)}</p><p class="muted matched">${how} ${button("matchStage", "Change match…", true, MATCH_TITLE, "quiet")}${matched === "manual" ? button("clearMatch", "Remove match", true, "Forget the section you picked and match automatically again", "quiet") : ""}</p>`;
+  // Change match… is about this stage and nothing else; the plan-level
+  // review sits next to it so fixing *another* stage never starts by
+  // remapping the one on screen.
+  return `<p class="nextstage">${escapeHtml(current)}</p><p class="muted matched">${how} ${button("matchStage", "Change match…", true, MATCH_TITLE, "quiet")}${matched === "manual" ? button("clearMatch", "Remove match", true, "Forget the section you picked and match automatically again", "quiet") : ""}${button("reviewStageMatches", "All stage matches…", true, REVIEW_MATCHES_TITLE, "quiet")}</p>`;
 }
 
 /**

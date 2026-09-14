@@ -12,11 +12,16 @@ import { isInsidePath } from "../core/discovery";
 import { pickBranch, type GitRepositoryInfo } from "../core/runner";
 
 interface GitApi {
-  repositories: { rootUri: vscode.Uri; state: { HEAD?: { name?: string; commit?: string } } }[];
+  repositories: {
+    rootUri: vscode.Uri;
+    state: { HEAD?: { name?: string; commit?: string }; workingTreeChanges?: unknown[]; indexChanges?: unknown[]; mergeChanges?: unknown[] };
+  }[];
 }
 
 interface GitRepositoryView extends GitRepositoryInfo {
   head?: string;
+  /** Working-tree, staged and merge changes together; the freeze gate refuses any of them. */
+  changes: number;
 }
 
 function gitRepositories(): GitRepositoryView[] | undefined {
@@ -25,7 +30,12 @@ function gitRepositories(): GitRepositoryView[] | undefined {
     return undefined;
   }
   try {
-    return extension.exports.getAPI(1).repositories.map((repo) => ({ rootPath: repo.rootUri.fsPath, branch: repo.state.HEAD?.name, head: repo.state.HEAD?.commit }));
+    return extension.exports.getAPI(1).repositories.map((repo) => ({
+      rootPath: repo.rootUri.fsPath,
+      branch: repo.state.HEAD?.name,
+      head: repo.state.HEAD?.commit,
+      changes: (repo.state.workingTreeChanges?.length ?? 0) + (repo.state.indexChanges?.length ?? 0) + (repo.state.mergeChanges?.length ?? 0),
+    }));
   } catch {
     return undefined;
   }
@@ -51,6 +61,22 @@ export async function currentBranch(repoRoot: string): Promise<string | undefine
     }
   }
   return readGitBranch(repoRoot);
+}
+
+/**
+ * How many changes the Git extension sees in the worktree owning
+ * `repoRoot`, or `undefined` when it does not know the repository.
+ *
+ * `undefined` is not "clean": the extension may be inactive, or the
+ * repository may not be open. Callers must make no claim in that case —
+ * saying a worktree is clean when nothing was read would be worse than
+ * saying nothing, because the engine's own freeze is the real check.
+ */
+export function pendingChanges(repoRoot: string): number | undefined {
+  const owner = gitRepositories()
+    ?.filter((repo) => owns(repo, repoRoot))
+    .sort((a, b) => path.resolve(b.rootPath).length - path.resolve(a.rootPath).length)[0];
+  return owner?.changes;
 }
 
 /**

@@ -415,7 +415,7 @@ describe("Overview plan actions", () => {
     let html = renderOverviewHtml(working, "n", "c");
     assert.match(html, /<button type="button" data-action="openPlan" [^>]*>Plan<\/button>/);
     assert.match(html, /data-action="associatePlan" [^>]*>Change plan…<\/button>/);
-    assert.match(html, /Current plan stage<\/h3><p class="nextstage">Stage 3B — Reported statistics local schema barrier<\/p><p class="muted matched">Matched automatically <button type="button" class="quiet" data-action="matchStage"[^>]*>Change match…<\/button><\/p>/);
+    assert.match(html, /Current plan stage<\/h3><p class="nextstage">Stage 3B — Reported statistics local schema barrier<\/p><p class="muted matched">Matched automatically <button type="button" class="quiet" data-action="matchStage"[^>]*>Change match…<\/button><button type="button" class="quiet" data-action="reviewStageMatches"[^>]*>All stage matches…<\/button><\/p>/);
     assert.ok(!html.includes("Remove match"), "nothing to remove for an automatic match");
     assert.ok(!html.includes("What's next"), "What's next is for the accepted screen");
     assert.ok(!html.includes(ws.root), "no filesystem paths in the document");
@@ -433,9 +433,12 @@ describe("Overview plan actions", () => {
     assert.match(html, /What's next<\/h3><p class="nextstage">Stage 3C — Cloud schema and synchronization<\/p><p class="muted summary">text<\/p>/);
     // Automatic continuation (the default) leads; Start next stage stays as
     // the per-stage alternative right after it.
-    assert.match(html, /<button type="button" class="primary" data-action="continueAutomatically"[^>]*>Continue automatically<\/button><button type="button" class="quiet" data-action="startNextStage" title="sparring new-stage stage-3c-cloud-schema-and-synchronization[^"]*">Start next stage<\/button><button type="button" data-action="openNextStage"[^>]*>Open in plan<\/button><button type="button" class="quiet" data-action="matchStage"[^>]*>Change match…<\/button>/);
+    assert.match(html, /<button type="button" class="primary" data-action="continueAutomatically"[^>]*>Continue plan automatically<\/button><button type="button" class="quiet" data-action="startNextStage" title="sparring new-stage stage-3c-cloud-schema-and-synchronization[^"]*">Start next stage<\/button><button type="button" data-action="openNextStage"[^>]*>Open in plan<\/button><button type="button" class="quiet" data-action="matchStage"[^>]*>Change match…<\/button>/);
     assert.match(html, /Current plan stage<\/h3><p class="nextstage">Stage 3B — Reported statistics local schema barrier<\/p><p class="muted matched">Matched automatically<button type="button" class="quiet" data-action="associatePlan"[^>]*>Remove plan association<\/button>/);
-    assert.ok(!/Continue plan|Open next in plan/.test(html));
+    // No managed-run action: the engine has no operation that continues a
+    // standalone stage from a plan. (Continue plan *automatically* is a
+    // different thing — it creates the managed run — and is offered.)
+    assert.ok(!/data-action="resumePlan"|Open next in plan/.test(html));
     assert.ok(!html.includes("Current activity"), "the accepted screen answers what to do next instead of watching activity");
   });
 

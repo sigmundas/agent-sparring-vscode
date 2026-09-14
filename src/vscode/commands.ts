@@ -10,7 +10,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { acceptStage, type AcceptStageResult } from "../core/acceptance";
-import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, type ExecutableProblem } from "../core/cli";
+import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, readGitBranch, type ExecutableProblem } from "../core/cli";
 import { adoptionGaps, buildManifest, manifestFileName, renderManifest, type ExecutionManifest, type KnownStage } from "../core/manifest";
 import {
   BRIEF_FILENAME,
@@ -27,20 +27,23 @@ import {
   type StageSnapshot,
   type StandaloneStageSnapshot,
 } from "../core/discovery";
-import { parsePlanStages } from "../core/engineFormats";
+import { parseHandoffBranch, parsePlanStages } from "../core/engineFormats";
 import { appendHumanEvidence, renderHumanEvidence, submittableChecks } from "../core/humanChecks";
 import { blocksLaunch } from "../core/liveness";
 import type { OverviewAction } from "../core/overviewHtml";
 import { createStage, proposeNextStage, renderNextStageBrief, type NewStageResult } from "../core/nextStage";
 import { buildStageIndex, locateStage, parsePlanHeadings, sectionSummary, type HeadingRef, type PlanHeading, type StageEntry } from "../core/planAssociation";
+import { stageMatchRows, type StageMatchRow, type StageToMatch } from "../core/stageMatches";
 import { buildRunPickItems, describeRun } from "../core/runPick";
+import { stageDisplayName } from "../core/presentation";
 import { stageActions, stageRunAction } from "../core/runner";
 import { planKey, planLabel, planRunId, type SparringSubcommand } from "../core/sparringCommand";
 import { manifestRepositories, relativeRepositoryPath, type DeclaredRepository } from "../core/stageRepositories";
 import { withTemporaryFile } from "../core/tempFile";
 import type { SparringController } from "./controller";
 import type { LaunchResult } from "./executionTracker";
-import { currentBranch, knownRepositories } from "./git";
+import { currentBranch, knownRepositories, pendingChanges } from "./git";
+import { manifestSupport } from "./engineProbe";
 import { openCandidateDiff } from "./overview/gitDiff";
 import { OverviewPanelManager } from "./overview/overviewPanel";
 
@@ -59,6 +62,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.acceptStage", () => acceptStageCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.choosePlan", () => associatePlanCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.matchStage", () => matchStageCommand(controller, overview)),
+    vscode.commands.registerCommand("agentSparring.reviewStageMatches", () => reviewStageMatchesCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.startNextStage", () => startNextStageCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.continueAutomatically", () => void performContinueAutomatically(controller, overview, { confirm: true })),
     vscode.commands.registerCommand("agentSparring.stageRepositories", () => stageRepositoriesCommand(controller)),
@@ -260,6 +264,9 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       return;
     case "matchStage":
       await matchStageCommand(controller, overview);
+      return;
+    case "reviewStageMatches":
+      await reviewStageMatchesCommand(controller, overview);
       return;
     case "clearMatch":
       if (run?.kind === "stage" && controller.planAssociation(run.id)?.match) {
@@ -669,21 +676,44 @@ interface HeadingItem extends vscode.QuickPickItem {
   action?: "clear" | "changePlan" | "remove";
 }
 
+/** One stage to match, addressed explicitly so the plan-level review can fix a stage that is not the selected one. */
+interface MatchTarget {
+  runId: string;
+  stage: StageSnapshot;
+  planPath: string;
+}
+
 /**
  * Let the user say which section of the associated plan this stage is,
  * when automatic matching could not (or chose differently). The choice is
  * a heading identity in VS Code workspace state, never engine state.
+ *
+ * `target` names the stage explicitly; without it the selected run is the
+ * stage, which is the ordinary "Change match…" case. Either way the dialog
+ * names the stage in its title, because this only ever remaps *one* stage
+ * and mistaking which one silently moves a stage's whole history.
  */
-async function matchStageCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
-  const run = controller.currentSelection.selected;
-  if (!run) {
-    return;
+async function matchStageCommand(controller: SparringController, overview: OverviewPanelManager, target?: MatchTarget): Promise<void> {
+  const run = target ? undefined : controller.currentSelection.selected;
+  if (!target) {
+    if (!run) {
+      return;
+    }
+    if (run.kind === "plan") {
+      void vscode.window.showInformationMessage("Agent Sparring: this is an engine-managed plan run; the engine records which stage is current.");
+      return;
+    }
   }
-  if (run.kind === "plan") {
-    void vscode.window.showInformationMessage("Agent Sparring: this is an engine-managed plan run; the engine records which stage is current.");
-    return;
+  const runId = target?.runId ?? run!.id;
+  const stage = target?.stage ?? (run as StandaloneStageSnapshot).stage;
+  if (target && !controller.planAssociation(runId)) {
+    // Reached from the plan-level review: this stage was never opened, so it
+    // has no association of its own, and a manual match without one would be
+    // dropped. Associating it with the plan being reviewed is exactly what
+    // the user is saying by matching it there.
+    await controller.setAssociatedPlan(runId, target.planPath);
   }
-  const association = controller.planAssociation(run.id);
+  const association = controller.planAssociation(runId);
   if (!association) {
     await associatePlanCommand(controller, overview);
     return;
@@ -699,7 +729,6 @@ async function matchStageCommand(controller: SparringController, overview: Overv
     void vscode.window.showInformationMessage(`Agent Sparring: ${path.basename(association.path)} has no '## Stage … — …' or '##' headings to match this stage to.`);
     return;
   }
-  const stage = run.stage;
   const briefText = await readOptional(path.join(stage.dir, BRIEF_FILENAME));
   const current = locateStage(headings, { stageId: stage.stageId, title: stage.title, briefText, manual: association.match });
   const currentLabel = current?.stage?.label;
@@ -728,10 +757,20 @@ async function matchStageCommand(controller: SparringController, overview: Overv
   if (association.match) {
     items.push({ label: "$(discard) Use automatic matching again", description: "forget the section you picked", action: "clear" });
   }
-  items.push({ label: "$(file) Choose another plan file…", description: path.basename(association.path), action: "changePlan" });
-  items.push({ label: "$(close) Remove the plan association", description: "the stage keeps its state; only the plan display goes away", action: "remove" });
+  if (!target) {
+    // Only for the stage the panel is showing: from the plan-level review
+    // the plan is the fixed thing and the stage is what is being placed in
+    // it, so re-associating or dropping it there would be a different act.
+    items.push({ label: "$(file) Choose another plan file…", description: path.basename(association.path), action: "changePlan" });
+    items.push({ label: "$(close) Remove the plan association", description: "the stage keeps its state; only the plan display goes away", action: "remove" });
+  }
+  // The stage this remaps is named in the title, not only in the small
+  // print: the dialog looks the same for every stage, and picking a section
+  // for the wrong one silently moves that stage's whole history.
+  const named = current?.stage?.display ?? stageDisplayName(stage);
   const picked = await vscode.window.showQuickPick(items, {
-    placeHolder: `Which stage of ${path.basename(association.path)} is ${stage.stageId}? (kept in VS Code only; the engine is not told)`,
+    title: `Match "${named}" to which plan section?`,
+    placeHolder: `Only ${stage.stageId} is remapped, in ${path.basename(association.path)} (kept in VS Code only; the engine is not told)`,
     matchOnDescription: true,
     matchOnDetail: true,
   });
@@ -743,13 +782,87 @@ async function matchStageCommand(controller: SparringController, overview: Overv
     return;
   }
   if (picked.action === "remove") {
-    await controller.setAssociatedPlan(run.id, undefined);
+    await controller.setAssociatedPlan(runId, undefined);
   } else if (picked.action === "clear") {
-    await controller.setManualMatch(run.id, undefined);
+    await controller.setManualMatch(runId, undefined);
   } else if (picked.match) {
-    await controller.setManualMatch(run.id, picked.match);
+    await controller.setManualMatch(runId, picked.match);
   }
   await overview.update();
+}
+
+/**
+ * Every stage this project already has, and which section of the plan each
+ * one is — in one place, so a historical stage that nothing could match is
+ * fixed *there* rather than by selecting it and using "Change match…", which
+ * remaps whatever stage happens to be on screen.
+ *
+ * That accident is the reason this exists: matching is deliberately
+ * conservative, an old brief that mentions three stage numbers matches none
+ * of them, and the natural way to "fix Stage 1" was to open the panel — which
+ * was showing Stage 3D — and remap that instead.
+ */
+async function reviewStageMatchesCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
+  const run = controller.currentSelection.selected;
+  const planPath = run ? planDocumentFor(controller, run) : undefined;
+  if (!run || !planPath) {
+    void vscode.window.showInformationMessage("Agent Sparring: choose a plan for this stage first; stage matches are reviewed against one plan.");
+    return;
+  }
+  for (;;) {
+    const markdown = await readOptional(planPath);
+    if (markdown === undefined) {
+      void vscode.window.showWarningMessage(`Agent Sparring: the plan document ${path.basename(planPath)} could not be read.`);
+      return;
+    }
+    const rows = await collectStageMatches(controller, run, markdown, planPath);
+    if (rows.length === 0) {
+      void vscode.window.showInformationMessage(`Agent Sparring: this project has no stage directories to match against ${path.basename(planPath)}.`);
+      return;
+    }
+    const unmatched = rows.filter((row) => !row.label).length;
+    const picked = await vscode.window.showQuickPick(
+      rows.map((row) => ({
+        label: `${row.problem ? "$(warning)" : "$(check)"} ${row.name}`,
+        description: `→ ${row.label ? `Stage ${row.label}` : "unmatched"}`,
+        detail: row.problem ?? `${row.matchedBy === "manual" ? "matched by you" : "matched automatically"} · ${row.stageId}`,
+        row,
+      })),
+      {
+        title: `Stage matches in ${path.basename(planPath)}`,
+        placeHolder: unmatched === 0 ? "Every stage is placed. Pick one to change it." : `${unmatched} stage(s) could not be placed in the plan; pick one to say which section it is.`,
+        matchOnDescription: true,
+        matchOnDetail: true,
+      },
+    );
+    if (!picked) {
+      return;
+    }
+    await matchStageCommand(controller, overview, { runId: picked.row.runId, stage: picked.row.stage, planPath });
+  }
+}
+
+/** Read what each existing stage needs to be placed, then let the core do the placing. */
+async function collectStageMatches(controller: SparringController, run: RunSnapshot, markdown: string, planPath: string): Promise<(StageMatchRow & { stage: StageSnapshot })[]> {
+  const stages: (StageToMatch & { stage: StageSnapshot })[] = [];
+  for (const candidate of stagesOfProject(controller, run.location.projectDir)) {
+    if (!candidate.runId) {
+      continue; // part of a managed run: the engine records which stage is which
+    }
+    const association = controller.planAssociation(candidate.runId);
+    stages.push({
+      runId: candidate.runId,
+      stage: candidate.stage,
+      stageId: candidate.stage.stageId,
+      name: stageDisplayName(candidate.stage),
+      title: candidate.stage.title,
+      briefText: await readOptional(path.join(candidate.stage.dir, BRIEF_FILENAME)),
+      // Another plan's manual match says nothing about this one.
+      manual: association?.path === planPath ? association.match : undefined,
+    });
+  }
+  const placed = stageMatchRows(parsePlanHeadings(markdown), stages);
+  return placed.map((row) => ({ ...row, stage: stages.find((entry) => entry.runId === row.runId)!.stage }));
 }
 
 // ---------------------------------------------------------------- launching
@@ -1187,7 +1300,7 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
 
 export type ContinueAutomaticallyOutcome =
   | { ok: true; runId: string; manifest: string; kind: "run-plan" | "resume-plan"; adopt: boolean; stages: number }
-  | { ok: false; reason: "no-plan" | "unreadable" | "manifest" | "branch" | "complete" | "running" | "cancelled" | "write"; message?: string };
+  | { ok: false; reason: "no-plan" | "unreadable" | "manifest" | "preflight" | "branch" | "complete" | "running" | "cancelled" | "write"; message?: string };
 
 /**
  * Hand the whole plan to the engine and let it run until it needs a human.
@@ -1271,23 +1384,24 @@ async function performContinueAutomatically(controller: SparringController, over
   // and reports what it inherits; nothing is taken over silently.
   const onDisk = await existingStages(controller, location, built.manifest);
   const adopt = kind === "run-plan" && onDisk.size > 0;
-  const gaps = adopt ? adoptionGaps(built.manifest, onDisk) : [];
-  if (gaps.length > 0) {
-    // A stage would be created in the middle of a sequence that has already
-    // run past it: almost always an existing stage this window could not
-    // recognise, and running it would re-implement accepted work under a new
-    // id. Which stage of the plan a stage *is* has an answer here — the user
-    // supplies it — so this asks rather than guesses.
-    const detail = gaps.map((stage) => `• ${stage.label} — ${stage.title}\n   would be created as ${stage.stage_id}`).join("\n");
-    controller.log(`Continue automatically: refused — ${gaps.map((stage) => stage.stage_id).join(", ")} would be created inside a sequence that has already run past them`);
-    const choice = await vscode.window.showWarningMessage("Agent Sparring: some earlier stages of this plan would be started again.", {
-      modal: true,
-      detail: `${detail}\n\nLater stages of this plan already exist, so these are almost certainly stages that ran under different ids and could not be recognised. Select each one and use “Match Stage to Plan Section…” so its history is kept, then continue.`,
-    }, "Match a stage…");
-    if (choice === "Match a stage…") {
-      await matchStageCommand(controller, overview);
+
+  const blockers = await preflight(run, { manifest: built.manifest, location, adopt, onDisk, expectedBranch });
+  if (blockers.length > 0) {
+    controller.log(`Continue automatically: refused — ${blockers.map((problem) => problem.title).join("; ")}`);
+    const detail = blockers.map((problem) => `• ${problem.title}\n   ${problem.fix}`).join("\n\n");
+    const fixes = [...new Set(blockers.map((problem) => problem.action).filter((action): action is PreflightAction => action !== undefined))];
+    const choice = await vscode.window.showWarningMessage(
+      blockers.length === 1 ? "Agent Sparring: one thing needs fixing before this plan can run automatically." : `Agent Sparring: ${blockers.length} things need fixing before this plan can run automatically.`,
+      { modal: true, detail },
+      ...fixes.map((action) => PREFLIGHT_ACTIONS[action]),
+    );
+    const chosen = fixes.find((action) => PREFLIGHT_ACTIONS[action] === choice);
+    if (chosen === "review-matches") {
+      await reviewStageMatchesCommand(controller, overview);
+    } else if (chosen === "declare-siblings") {
+      await stageRepositoriesCommand(controller);
     }
-    return { ok: false, reason: "manifest", message: `${gaps[0].stage_id} would be created inside an already-running sequence` };
+    return { ok: false, reason: "preflight", message: blockers[0].title };
   }
 
   if (options.confirm) {
@@ -1412,6 +1526,121 @@ function stagesOfProject(controller: SparringController, projectDir: string): { 
 function hasExecutionHistory(stage: StageSnapshot): boolean {
   const state = stage.state;
   return state !== undefined && (state.status === "accepted" || state.implementationSessionId !== null || state.sparringSessionId !== null || state.candidateSha !== null);
+}
+
+// ---------------------------------------------------------------- preflight
+
+type PreflightAction = "review-matches" | "declare-siblings";
+
+const PREFLIGHT_ACTIONS: Record<PreflightAction, string> = {
+  "review-matches": "Review stage matches…",
+  "declare-siblings": "Sibling repositories…",
+};
+
+interface PreflightProblem {
+  title: string;
+  /** What to do about it, in one sentence. */
+  fix: string;
+  action?: PreflightAction;
+}
+
+/**
+ * Everything that would make this run fail or do damage, found before the
+ * confirmation rather than in a terminal afterwards.
+ *
+ * The rule this follows: **say nothing when nothing is wrong.** A healthy
+ * plan gets exactly one dialog, the confirmation. Checks that cannot be
+ * answered from data this window actually has — a worktree the Git extension
+ * has not opened, an engine only the user's shell can resolve — return
+ * nothing at all rather than a maybe, because the engine's own refusals are
+ * the authority and a hedged warning in front of a working run is worse than
+ * silence.
+ */
+async function preflight(
+  run: RunSnapshot,
+  context: { manifest: ExecutionManifest; location: SparringLocation; adopt: boolean; onDisk: Set<string>; expectedBranch: string },
+): Promise<PreflightProblem[]> {
+  const { manifest, location } = context;
+  const problems: PreflightProblem[] = [];
+
+  // 1. A stage that would be created inside a sequence that has already run
+  //    past it: an existing stage nothing could recognise. Running it would
+  //    re-implement accepted work under a new id.
+  if (context.adopt) {
+    for (const stage of adoptionGaps(manifest, context.onDisk)) {
+      problems.push({
+        title: `${stage.label} — ${stage.title} would be started again, as a new stage ${stage.stage_id}.`,
+        fix: "Later stages already exist, so this one almost certainly ran under an id nothing could match. Say which stage it is and its history is kept.",
+        action: "review-matches",
+      });
+    }
+  }
+
+  // 2. A declared sibling repository that is not where, or not as, it was
+  //    declared. Acceptance pins each one, and the engine would refuse the
+  //    whole stage at the freeze boundary — after the run had started.
+  for (const stage of manifest.stages) {
+    for (const repository of stage.repositories ?? []) {
+      const root = path.resolve(location.repoRoot, repository.path);
+      if (!(await isDirectory(path.join(root, ".git")))) {
+        problems.push({
+          title: `${stage.label} also reviews ${repository.name}, but ${repository.path} is not a Git repository here.`,
+          fix: "Check it out at that path, or re-declare where it actually is.",
+          action: "declare-siblings",
+        });
+        continue;
+      }
+      const branch = await readGitBranch(root);
+      if (branch && branch !== repository.branch) {
+        problems.push({
+          title: `${repository.name} is on ${branch}, but ${stage.label} declares ${repository.branch}.`,
+          fix: "Check out the declared branch there, or re-declare the branch the candidate is on. Acceptance refuses a sibling on any other branch.",
+          action: "declare-siblings",
+        });
+      }
+    }
+  }
+
+  // 3. The stage's own candidate was built somewhere else. Same source the
+  //    Overview's branch guard uses: the branch written into the last
+  //    handoff, which is the only branch a standalone stage records.
+  const stage = currentStageOf(run);
+  const handoffBranch = parseHandoffBranch((await readOptional(path.join(stage.dir, HANDOFF_FILENAME))) ?? "");
+  if (handoffBranch && handoffBranch !== context.expectedBranch) {
+    problems.push({
+      title: `${context.expectedBranch} is checked out, but this stage's last handoff was written on ${handoffBranch}.`,
+      fix: `Check out ${handoffBranch} first; the run is started for the checked-out branch and the engine refuses every other one.`,
+    });
+  }
+
+  // 4. Uncommitted work. It does not stop the run starting, but it stops the
+  //    first acceptance, which is worse: the run would get that far and halt.
+  const changes = pendingChanges(location.repoRoot);
+  if (changes !== undefined && changes > 0) {
+    problems.push({
+      title: `${location.folderName} has ${changes} uncommitted change${changes === 1 ? "" : "s"}.`,
+      fix: "Commit or stash them. The engine refuses to freeze a candidate from a dirty worktree, so the run would stop at the first stage it tried to accept.",
+    });
+  }
+
+  // 5. An engine that predates the manifest input would fail on the flag,
+  //    in a terminal, having done nothing.
+  if ((await manifestSupport(configuredExecutable(), location.repoRoot)) === "missing-manifest") {
+    problems.push({
+      title: "The configured sparring engine has no `run-plan --manifest`.",
+      fix: "Automatic continuation needs a newer engine. Update it, or keep using the per-stage actions.",
+    });
+  }
+
+  return problems;
+}
+
+async function isDirectory(target: string): Promise<boolean> {
+  try {
+    return (await fs.stat(target)).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 /** Which of the manifest's stages already exist on disk in this project. */

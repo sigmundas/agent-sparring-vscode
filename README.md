@@ -38,7 +38,8 @@ navigates.
 | `Agent Sparring: Run / Resume Stage` | For the selected standalone stage (or after picking one), launch `sparring run-loop <stage> --repo-root <project> --expected-branch <current branch>` in a terminal. The branch comes from the Git repository owning the project (built-in Git API, then `.git/HEAD`); a detached HEAD is refused, never guessed. Also offered as **Run stage** / **Resume stage** in the Overview. |
 | `Agent Sparring: Accept Stage` | For a stage whose independent review passed (**Review complete**): one action that runs the engine's `freeze-candidate` and, only if that succeeds, `accept-candidate` for the selected stage, project and current branch. Refusals are translated (uncommitted changes, not pushed, wrong branch, code changed after the review); the engine's own output goes to the Output Channel. Also offered as **Accept stage** in the Overview. |
 | `Agent Sparring: Choose Plan for Stage…` | Associate a Markdown plan file (any location, ordinary file picker) with the selected standalone stage. Stored in VS Code workspace state per repository + stage id, never in engine state; gives the Overview a **Plan** button, this stage's place in the document and, once accepted, **What's next**. Change or remove it the same way. |
-| `Agent Sparring: Match Stage to Plan Section…` | When the Overview cannot tell which stage of the associated plan the selected stage is, pick it from the plan's stages (also **Match this stage…** / **Change match…** in the Overview). Stored with the association in VS Code workspace state, never in engine state. |
+| `Agent Sparring: Match Stage to Plan Section…` | When the Overview cannot tell which stage of the associated plan the selected stage is, pick it from the plan's stages (also **Match this stage…** / **Change match…** in the Overview). It remaps **only the stage on screen**, and the dialog is titled with that stage's name so it cannot be mistaken for another. Stored with the association in VS Code workspace state, never in engine state. |
+| `Agent Sparring: Review Stage Matches…` | The plan-level view: every stage this project has and which section of the plan it resolves to, with the ones nothing could place — and any two stages claiming the same section — first. Pick one to say which section *it* is. Use this to fix a historical stage; **Change match…** would remap the current one instead. Also **All stage matches…** in the Overview. |
 | `Agent Sparring: Start Next Stage from Plan…` | For an accepted standalone stage with an associated plan: create the stage that follows it (by stage label) with the engine's own `sparring new-stage <id>`, after a confirmation naming the title, the proposed id and the plan section. The Overview switches to the new stage, the plan association follows it, and its fresh `brief.md` opens beside the plan section for you to fill in before **Run stage**. Also **Start next stage** in the Overview. |
 | `Agent Sparring: Continue Plan Automatically` | Build the execution manifest for the plan of the selected run and start (or resume) the engine's managed plan run against it: `sparring run-plan --manifest … [--adopt]` / `sparring resume-plan --manifest …`. The engine then sequences the stages itself. One confirmation before the first stage; none between stages. Also **Continue automatically** in the Overview. |
 | `Agent Sparring: Sibling Repositories for a Plan Stage…` | Declare which *other* repositories a plan stage's reviewed candidate spans, so acceptance pins and verifies the complete set instead of the primary commit alone. Pick the stage, pick a repository this window knows (or browse to one) and confirm the branch its candidate must be on; no commit is ever asked for. Stored in VS Code workspace state per plan and stage label, emitted into the execution manifest, and shown quietly in the Overview. Removing a declaration is the same command. |
@@ -119,6 +120,30 @@ you are asked once, *Run this plan automatically until Agent Sparring needs
 you?*, with the ordered stage list and which ones are already accepted. The
 run stops at NEEDS_YOU, an escalation, a failure, or the end of the plan.
 
+**Adopting a sequence you have been driving by hand.** A standalone stage
+with an associated plan offers **Continue plan automatically** — *adopt the
+existing stages into a managed plan and continue until Agent Sparring needs
+you*. It is offered from the stage you are looking at, including one that is
+waiting for you: adopting does not touch the gate. The engine reads the
+recorded NEEDS_YOU, keeps the pause exactly as it stands — same candidate,
+same sessions, same `sparring.md`, same checks — and stops there with the
+position recorded. Accepted stages are verified and advanced past. Your next
+action is what it already was: **Submit for review**, which the engine now
+answers with `resume-plan --evidence`. At a gate the button is never the
+primary one; the gate is.
+
+**Preflight.** If something would make the run fail or do damage, one modal
+says all of it at once, before the confirmation: a stage that would be
+started again because nothing could place it in the plan, a declared sibling
+repository that is missing or on another branch, a checked-out branch that is
+not the one this stage's candidate was built on, uncommitted changes (the
+engine refuses to freeze from a dirty worktree, so the run would stop at the
+first acceptance), or an engine with no `run-plan --manifest`. If nothing is
+wrong you get the one confirmation and nothing else. Checks that cannot be
+answered from what this window can actually read — a worktree the Git
+extension has not opened, a CLI only your shell can resolve — say nothing at
+all rather than a maybe.
+
 The manifest is a derived file: regenerated on every launch, byte-stable
 while the plan is unchanged, and written to the extension's own global
 storage — never into a repository, where the engine's freeze would rightly
@@ -151,8 +176,10 @@ three stage numbers matches none of them. So if a stage would be *created*
 before stages that already exist, automatic continuation refuses and names
 it: a hole in a sequence that has already run past that point is almost
 always a stage under an id nobody recognised, and starting it would
-re-implement accepted work. Use **Match Stage to Plan Section…** on that
-stage and continue.
+re-implement accepted work. **Review Stage Matches…** lists every stage and
+what it resolves to; fix the one that is unplaced there and continue. (Fixing
+it with **Change match…** would remap the stage on screen instead — which is
+exactly the accident that command's stage-named dialog now prevents.)
 
 **Cross-repository stages.** A stage whose reviewed candidate also lives in a
 second repository must declare it, or acceptance would pin only the primary
@@ -271,6 +298,9 @@ run them.
 | "Claude working", "Codex sparring", active-turn duration, loop cycle, last visible event, changed files, verdict chronology | `activity.jsonl` (observational only; the Overview and the Output Channel share one filter for what counts as visible activity) |
 | Goal paragraph in the Overview | `## Goal` in the current stage's `brief.md` (display only) |
 | **Also reviews** — a stage's sibling repositories | *pinned by the engine* and *recorded for this stage* come from `repositories` in that stage's `state.json` (with the commit only when the freeze has pinned one); *declared in VS Code* is a declaration in workspace state that the engine has not written yet. Nothing here claims a sibling was reviewed or is current |
+
+| **Continue plan automatically** on a standalone stage | the associated plan plus the stage directories on disk. It creates a managed run (`run-plan --manifest … --adopt`); it never edits a stage. A stage already stopped at NEEDS_YOU or ESCALATE keeps that pause — the engine reads the recorded verdict and stops there, running neither agent |
+| The journey of a manifest run | not read from the plan document's `## Stage <n>` headings, because a manifest run does not use that convention; the recorded stage is shown and the note says so |
 
 Deleting `activity.jsonl` removes the live decoration and nothing else.
 

@@ -129,6 +129,32 @@ describe("the automatic path is one engine call, not a loop", () => {
     assert.match(add, /controller\.declareStageRepository\(key, label, \{ name: name\.trim\(\), path: chosen\.rootPath, branch: branch\.trim\(\) \}\)/);
   });
 
+  it("one preflight, and only when something is actually wrong", async () => {
+    // A healthy plan must get exactly one dialog: the confirmation. The
+    // preflight is a single modal listing everything at once, never a chain.
+    const source = await commandsSource();
+    const perform = fn(source, "performContinueAutomatically");
+    assert.match(perform, /const blockers = await preflight\(/);
+    assert.match(perform, /if \(blockers\.length > 0\)/, "silent when there is nothing to say");
+    assert.equal((perform.match(/showWarningMessage\(/g) ?? []).length, 3, "an unreadable plan, an unbuildable one, and the preflight — never two in a row");
+    assert.ok(perform.indexOf("const blockers") < perform.indexOf("if (options.confirm)"), "before the confirmation, not after");
+    const body = fn(source, "preflight");
+    for (const check of [/adoptionGaps\(/, /is not a Git repository here/, /declares \$\{repository\.branch\}/, /last handoff was written on/, /uncommitted change/, /no `run-plan --manifest`/]) {
+      assert.match(body, check, `preflight covers ${check}`);
+    }
+  });
+
+  it("a check that cannot be answered says nothing rather than a maybe", async () => {
+    // The engine's own refusals are the authority; a hedged warning in front
+    // of a working run is worse than silence.
+    const body = fn(await commandsSource(), "preflight");
+    assert.match(body, /changes !== undefined && changes > 0/, "an unread worktree is not claimed clean or dirty");
+    assert.match(body, /=== "missing-manifest"/, "only a definite answer blocks; unknown does not");
+    const probe = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "engineProbe.ts"), "utf8");
+    assert.match(probe, /resolve\("unknown"\); \/\/ it did not run/);
+    assert.match(probe, /planned\.plan\.kind === "shell"/, "a CLI only the user's shell can resolve is not probed");
+  });
+
   it("resumes a manifest-started run with --manifest, because the engine refuses the other input", async () => {
     const source = fn(await commandsSource(), "planInvocationFor");
     assert.match(source, /run\.state\.source !== "manifest"/, "the engine's own record of which input the run executes");
@@ -157,8 +183,10 @@ describe("what the Overview offers in each mode", () => {
 
   it("automatic is the default and leads; the per-stage action stays beside it", async () => {
     const model = await standalone(undefined);
-    assert.equal(model.continueAutomatically?.label, "Continue automatically");
-    assert.match(model.continueAutomatically!.detail, /sparring run-plan --manifest/);
+    assert.equal(model.continueAutomatically?.label, "Continue plan automatically");
+    assert.equal(model.continueAutomatically?.kind, "adopt");
+    assert.match(model.continueAutomatically!.detail, /^Adopt the existing stages into a managed plan and continue until Agent Sparring needs you\./);
+    assert.match(model.continueAutomatically!.detail, /sparring run-plan --manifest … --adopt/);
     assert.equal(model.stageAction?.label, "Run stage", "the per-stage action is still there");
     const html = renderOverviewHtml(model, "n", "c");
     assert.match(html, /class="primary" data-action="continueAutomatically"/);
@@ -218,8 +246,17 @@ describe("what the Overview offers in each mode", () => {
       NOW,
     );
     assert.equal(model.actionRequired?.kind, "needs_you");
-    assert.equal(model.continueAutomatically, undefined);
-    assert.ok(!renderOverviewHtml(model, "n", "c").includes("continueAutomatically"));
+    // Adopting is offered even here — it is the only route from a standalone
+    // stage into a managed run, and it does not touch the gate: the engine
+    // reads the recorded NEEDS_YOU and keeps the pause. But it never leads.
+    assert.equal(model.continueAutomatically?.kind, "adopt");
+    assert.equal(model.continueAutomatically?.primary, false);
+    const html = renderOverviewHtml(model, "n", "c");
+    assert.match(html, /class="quiet" data-action="continueAutomatically"/);
+    assert.equal((html.match(/data-action="continueAutomatically"/g) ?? []).length, 1, "offered once, in the panel the user is already reading");
+    assert.ok(html.indexOf('data-action="continueAutomatically"') > html.indexOf('data-action="submitForReview"'), "after Submit for review, which is what moves this stage");
+    assert.match(html, /class="primary" data-action="submitForReview"/);
+    assert.equal((html.match(/class="primary"/g) ?? []).length, 1, "still one obvious next step");
   });
 
   it("no plan, no automatic continuation: there is nothing to hand over", async () => {

@@ -345,7 +345,7 @@ export interface OverviewModel {
    * `agentSparring.planContinuation` is `automatic`, a plan is known and
    * nothing is running; see the function of the same name.
    */
-  continueAutomatically?: { label: string; detail: string; primary: boolean };
+  continueAutomatically?: { label: string; detail: string; primary: boolean; kind: "adopt" | "continue" };
   /** An Accept stage operation from this window is in flight. */
   accepting?: { label: string; detail: string };
   /** A runner observed for this run: alive (Stop offered) or stopped. */
@@ -514,11 +514,19 @@ export function buildOverviewModel(
   model.continueAutomatically = continueAutomatically(run, plan, artifacts, model, liveness);
   model.actionRequired = actionRequired(run, presentation, outcome, plan, artifacts, model, branchGuard, liveness);
   if (model.actionRequired) {
-    // Automatic continuation is not on the table while the reviewer is
-    // waiting for a human: the plan cannot advance until the gate is
-    // answered, and Submit for review is what does that. The engine
-    // continues on its own from there.
-    delete model.continueAutomatically;
+    if (model.continueAutomatically?.kind === "adopt") {
+      // Adopting is not answering the gate, and it does not touch it: the
+      // engine reads the recorded NEEDS_YOU, keeps the pause exactly as it
+      // stands and stops there. So it stays offered — this is the one place
+      // a standalone stage can become a managed run, and hiding it here is
+      // what made the mode undiscoverable — but never as the primary
+      // action. Submit for review is still what moves this stage.
+      model.continueAutomatically = { ...model.continueAutomatically, primary: false };
+    } else {
+      // A managed run at a gate needs nothing handed to it: it already owns
+      // the sequencing and resumes itself once the gate is answered.
+      delete model.continueAutomatically;
+    }
     // The panel names and explains the action; no banner repeats it.
     delete model.banner;
     if (model.actionRequired.ready && model.actionRequired.kind === "needs_you") {
@@ -696,13 +704,15 @@ function continueAutomatically(
     return {
       label: "Continue automatically",
       primary: true,
+      kind: "continue",
       detail: `sparring resume-plan --manifest …: the engine continues this managed run of ${plan.name} stage by stage, accepting each READY candidate through its own gate, and stops when it needs you.`,
     };
   }
   return {
-    label: "Continue automatically",
+    label: "Continue plan automatically",
     primary: true,
-    detail: `sparring run-plan --manifest …: hands the remaining stages of ${plan.name} to the engine as one managed run. It runs implementation ↔ review per stage, accepts each READY candidate through its own gate, and stops when it needs you.`,
+    kind: "adopt",
+    detail: `Adopt the existing stages into a managed plan and continue until Agent Sparring needs you. (sparring run-plan --manifest … --adopt over ${plan.name}: accepted stages are verified and advanced past, this stage keeps its sessions and its recorded review, and the engine takes the sequencing from there.)`,
   };
 }
 
@@ -882,6 +892,12 @@ export function shortenId(id: string | undefined | null, keep = 8): string | und
 
 function timeline(run: PlanRunSnapshot): Pick<OverviewModel, "timeline" | "timelineNote"> {
   if (!run.planStages || run.planStages.length === 0) {
+    // A manifest run's stages are the manifest's, not the plan document's
+    // `## Stage <n>` convention, so failing to read that convention says
+    // nothing about the plan and must not be reported as if it did.
+    if (run.state.source === "manifest") {
+      return { timelineNote: "This run executes an execution manifest, so its journey is not read from the plan document's headings; the recorded stage is shown." };
+    }
     return { timelineNote: `Plan document unavailable (${run.planError ?? "no stages"}); showing the recorded stage only.` };
   }
   const current = run.state.currentStageIndex;

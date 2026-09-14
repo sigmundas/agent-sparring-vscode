@@ -105,7 +105,7 @@ export class Workspace {
 
   async writePlanRun(
     planKey: string,
-    state: { plan: string; status: "running" | "paused" | "complete"; current_stage_index: number; current_stage: string; expected_branch?: string },
+    state: { plan: string; status: "running" | "paused" | "complete"; current_stage_index: number; current_stage: string; expected_branch?: string; source?: "markdown" | "manifest" },
   ): Promise<string> {
     const dir = path.join(this.sparringDir, "plans");
     await fs.mkdir(dir, { recursive: true });
@@ -117,6 +117,7 @@ export class Workspace {
       plan: state.plan,
       plan_digest: "0".repeat(64),
       status: state.status,
+      ...(state.source ? { source: state.source } : {}),
     };
     await fs.writeFile(file, JSON.stringify(payload, null, 2) + "\n");
     return file;
