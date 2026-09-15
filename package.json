@@ -6,6 +6,10 @@
   "publisher": "sintef",
   "private": true,
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sigmundas/agent-sparring-vscode.git"
+  },
   "engines": {
     "vscode": "^1.90.0",
     "node": ">=20"
@@ -165,7 +169,7 @@
     "test:integration": "npm run bundle && npm run compile-integration && node out/integration/runTests.js",
     "lint": "eslint src",
     "vscode:prepublish": "npm run build",
-    "package:vsix": "vsce package --no-dependencies --allow-missing-repository"
+    "package:vsix": "vsce package --no-dependencies"
   },
   "devDependencies": {
     "@eslint/js": "^9.9.0",
