@@ -362,7 +362,12 @@ export class OverviewPanelManager implements vscode.Disposable {
     if (index.length === 0) {
       return undefined;
     }
-    const wanted = (["stage", "sparrer"] as const).map((role) => latestCapture(index, role)).filter((entry) => entry !== undefined);
+    // Three roles, at most three files: a stage runs a stage agent and a
+    // sparrer, or -- when it is a review-only stage -- an independent
+    // reviewer and neither of the other two.
+    const wanted = (["stage", "sparrer", "reviewer"] as const)
+      .map((role) => latestCapture(index, role))
+      .filter((entry) => entry !== undefined);
     const captured = await Promise.all(
       wanted.map(async (entry) => {
         const text = await readHead(path.join(directory, entry.file), PROMPT_READ_LIMIT);

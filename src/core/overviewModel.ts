@@ -1180,15 +1180,23 @@ function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveSt
   };
 }
 
-/** The captured prompt for this role's latest turn, as the card's view of it. */
+/**
+ * The captured prompt for this role's latest turn, as the card's view of it.
+ *
+ * The reviewing card falls back to the `reviewer` role: a review-only stage
+ * runs no sparrer, and its independent actor is a fresh reviewer over an
+ * already-accepted candidate set. Showing nothing there would hide the one
+ * thing someone opens this card to check — whether the actor working right
+ * now really is that reviewer and not a stage agent. The view it builds says
+ * `Independent reviewer` rather than `Review turn`, so the two are never
+ * mistaken for each other.
+ */
 function promptView(role: "stage" | "sparrer", captures: CapturedPrompt[] | undefined, busy: boolean): PromptView | undefined {
   if (!captures || captures.length === 0) {
     return undefined;
   }
-  const entry = latestCapture(
-    captures.map((capture) => capture.entry),
-    role,
-  );
+  const indexed = captures.map((capture) => capture.entry);
+  const entry = latestCapture(indexed, role) ?? (role === "sparrer" ? latestCapture(indexed, "reviewer") : undefined);
   if (!entry) {
     return undefined;
   }

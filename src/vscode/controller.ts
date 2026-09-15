@@ -62,6 +62,14 @@ import {
   type DeclaredRepository,
   type StageRepositories,
 } from "../core/stageRepositories";
+import {
+  STAGE_MODES_KEY,
+  modeForStage,
+  modesForPlan,
+  withStageMode,
+  type StageMode,
+  type StageModes,
+} from "../core/stageModes";
 import { deriveStatus } from "../core/status";
 import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
 import { TerminalPool } from "./terminalPool";
@@ -488,6 +496,37 @@ export class SparringController implements vscode.Disposable {
     const next = withoutStageRepository(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, label, name);
     await this.context.workspaceState.update(STAGE_REPOSITORIES_KEY, next);
     this.log(`Stage ${label}: no longer declares ${name}; already-recorded pins stay in the stage's state.json until the next run rewrites the declaration`);
+    this.render();
+  }
+
+  // ---------------------------------------------------------------- stage modes (declaration, emitted into the manifest)
+
+  /** Stages of one plan declared review-only, keyed by label (`5`). Workspace state; never written into engine state. */
+  stageModes(planKey: string): Record<string, StageMode> {
+    return modesForPlan(this.context.workspaceState.get<StageModes>(STAGE_MODES_KEY), planKey);
+  }
+
+  /** One stage's declared mode; `implementation` when nothing was declared. */
+  stageModeFor(planKey: string, label: string): StageMode {
+    return modeForStage(this.context.workspaceState.get<StageModes>(STAGE_MODES_KEY), planKey, label);
+  }
+
+  /**
+   * Declare what kind of stage this is. It reaches the engine through the
+   * execution manifest, never by writing engine state — and because the
+   * engine folds a declared mode into the digest that identifies a recorded
+   * run, changing it for a stage of a run already under way is something the
+   * engine refuses to continue across until its `reset-stage` command
+   * re-records that digest. Said here rather than left to be discovered.
+   */
+  async declareStageMode(planKey: string, label: string, mode: StageMode): Promise<void> {
+    const next = withStageMode(this.context.workspaceState.get<StageModes>(STAGE_MODES_KEY), planKey, label, mode);
+    await this.context.workspaceState.update(STAGE_MODES_KEY, next);
+    this.log(
+      mode === "independent_review"
+        ? `Stage ${label}: declared review-only; the execution manifest will carry mode=independent_review, so no implementation agent runs for it and a fresh reviewer inspects the accepted candidate set`
+        : `Stage ${label}: back to the implementation lifecycle; the manifest carries no mode for it, which is the engine's default`,
+    );
     this.render();
   }
 

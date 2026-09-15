@@ -42,6 +42,7 @@ navigates.
 | `Agent Sparring: Start Next Stage from Plan…` | For an accepted standalone stage with an associated plan: create the stage that follows it (by stage label) with the engine's own `sparring new-stage <id>`, after a confirmation naming the title, the proposed id and the plan section. The Overview switches to the new stage, the plan association follows it, and its fresh `brief.md` opens beside the plan section for you to fill in before **Run stage**. Also **Start next stage** in the Overview. |
 | `Agent Sparring: Continue Plan Automatically` | Build the execution manifest for the plan of the selected run and start (or resume) the engine's managed plan run against it: `sparring run-plan --manifest … [--adopt]` / `sparring resume-plan --manifest …`. The engine then sequences the stages itself. One confirmation before the first stage; none between stages. Also **Continue automatically** in the Overview. |
 | `Agent Sparring: Sibling Repositories for a Plan Stage…` | Declare which *other* repositories a plan stage's reviewed candidate spans, so acceptance pins and verifies the complete set instead of the primary commit alone. Pick the stage, pick a repository this window knows (or browse to one) and confirm the branch its candidate must be on; no commit is ever asked for. Stored in VS Code workspace state per plan and stage label, emitted into the execution manifest, and shown quietly in the Overview. Removing a declaration is the same command. |
+| `Agent Sparring: Stage Mode for a Plan Stage…` | Declare that a plan stage is a *review* of work rather than work: no implementation agent runs for it, and a fresh independent reviewer inspects the candidates the earlier stages accepted. Nothing is inferred from a stage's title or its brief's prose — this command is the only way to say it. Stored in VS Code workspace state per plan and stage label and emitted into the execution manifest as `mode`. Setting it back to *Implementation* removes the declaration. |
 | `Agent Sparring: Copy Review Context for Chat` | For a stage the reviewer handed back to you: put the whole review on the clipboard as plain Markdown — the stage and its goal, the routing state, the reviewer's summary and note, every human-gate check with its instruction and pass criteria verbatim, the concrete names the review refers to, the latest handoff claims, the reviewer's findings and the stage's plan section — so it can be pasted into ChatGPT/Claude, an issue or a message and asked about. No provider prompts, model reasoning, command output or activity log. Also **Copy context for chat** in the Overview, beside **Open detailed review**, with **Copy this check** under each outstanding check. |
 | `Agent Sparring: Choose sparring Executable…` | Pick the `sparring` CLI with a file dialog and store it as `agentSparring.executable`. |
 | `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / finalizing / future stages), the current stage as primary content (the stage as the plan names it — `Stage 3D — title`, with `6 of 8` as secondary metadata — a human state word with one explaining sentence, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), latest sparring result, small Stage Agent / Sparrer cards, Brief / Handoff / Sparring report / Diff / Plan / Log buttons, and quiet metadata (where the engine's own words live). Never auto-opens; updates in place. |
@@ -219,6 +220,42 @@ re-verifies every pin and refuses if one has moved. Declared and pinned
 repositories are listed quietly at the bottom of the Overview, each said only
 as far as the data goes — *declared in VS Code*, *recorded for this stage*, or
 *pinned by the engine* with the commit.
+
+**Review-only stages.** A plan's last stage is often not work: a fresh
+independent reviewer verifies the candidates the earlier stages accepted,
+checks every gate, and the activation decision is taken on that. Run through
+the ordinary lifecycle, such a stage gets an implementation agent with
+nothing to implement — one that opens a session, reads around, and sooner or
+later writes something to try an idea out, at which point the reviewer of the
+work is also its author.
+
+**Agent Sparring: Stage Mode for a Plan Stage…** says so instead: pick the
+stage, pick *Independent review (review only)*. Nothing is inferred — a stage
+titled "Independent final review and activation decision" runs the
+implementation lifecycle until someone declares otherwise, because which
+agent runs is not a thing to read off a heading. The declaration is workspace
+state per plan and stage label, exactly like a sibling repository, and it
+reaches the engine as `"mode": "independent_review"` in the execution
+manifest. The engine then runs that stage as one fresh reviewer over the
+accepted candidate set with no implementation turn at all, treats a defect it
+finds as a stop rather than as work to do, and completes the stage over the
+commit it reviewed instead of manufacturing one. Nothing is merged.
+
+Two consequences worth knowing before declaring one. A declared mode is part
+of what the engine digests to identify a recorded run, so declaring it
+mid-run changes that digest and the engine refuses to continue across the
+change — deliberately. And a stage that has *already run* under the other
+mode cannot simply be relabelled: the engine refuses to adopt an
+implementation session into a review meant to be independent of it, and names
+`sparring reset-stage`, which archives that attempt as history, verifies the
+repository is at the preceding accepted candidate, and restarts the stage with
+a fresh reviewer. Both refusals arrive in the terminal with the command to
+run.
+
+In the Overview, the reviewing actor card reads **Independent reviewer** for
+such a stage rather than *Review turn*, and its instructions are the captured
+`prompts/0001-reviewer-original.md` — which is how you check that the actor
+working right now really is a fresh reviewer.
 
 **Pause after each stage** (`manual`) keeps the per-stage checkpoints below
 unchanged, for when you want to look before every provider turn. In automatic

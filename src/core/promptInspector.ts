@@ -24,8 +24,18 @@
  * Pure: no vscode API, no filesystem access. The caller supplies the texts.
  */
 
-/** Roles, as the engine names them in the index. */
-export type CaptureRole = "stage" | "sparrer";
+/**
+ * Roles, as the engine names them in the index.
+ *
+ * `reviewer` is the independent reviewer of a review-only stage, and it is
+ * its own role rather than a `sparrer` because the two are not the same
+ * actor: a sparrer reviews one stage agent's work with that agent still
+ * behind it, and a reviewer reviews a candidate set that is already accepted
+ * with no implementation agent behind it at all. Showing one as the other
+ * would describe a pairing that does not exist for that stage — which is
+ * precisely the thing someone opens this view to check.
+ */
+export type CaptureRole = "stage" | "sparrer" | "reviewer";
 
 /** Where a section's content came from, as the engine recorded it. */
 export type SectionOrigin = "file" | "engine";
@@ -96,7 +106,7 @@ function toEntry(raw: unknown): CaptureEntry | undefined {
   }
   const value = raw as Record<string, unknown>;
   const role = value.role;
-  if (role !== "stage" && role !== "sparrer") {
+  if (role !== "stage" && role !== "sparrer" && role !== "reviewer") {
     return undefined;
   }
   if (typeof value.file !== "string" || typeof value.seq !== "number") {
@@ -162,7 +172,7 @@ export interface PromptViewSection {
 }
 
 export interface PromptView {
-  /** `Implementation turn`, `Review turn`, `Commit turn` — what this turn asks for. */
+  /** `Implementation turn`, `Review turn`, `Commit turn`, `Independent reviewer` — what this turn asks for. */
   turn: string;
   /** The short phrase after it: `first turn of this stage`, `correction after review`, … */
   detail: string;
@@ -191,6 +201,13 @@ const TURN_WORDS: Record<string, { turn: string; detail: string }> = {
   "sparrer:resume": { turn: "Review turn", detail: "re-review after a correction" },
   "sparrer:evidence_review": { turn: "Review turn", detail: "judging the evidence you recorded" },
   "sparrer:finalized_review": { turn: "Review turn", detail: "reviewing the committed candidate" },
+  // A review-only stage. Named after the actor rather than after the turn,
+  // because the fact worth seeing at a glance here is *who* is working: that
+  // the active actor is a fresh independent reviewer and not the stage agent
+  // this card would otherwise be showing.
+  "reviewer:original": { turn: "Independent reviewer", detail: "original review of the accepted candidate set" },
+  "reviewer:resume": { turn: "Independent reviewer", detail: "continuing the same review" },
+  "reviewer:evidence_review": { turn: "Independent reviewer", detail: "judging the evidence you recorded" },
 };
 
 function words(role: CaptureRole, turnKind: string): { turn: string; detail: string } {
@@ -198,8 +215,9 @@ function words(role: CaptureRole, turnKind: string): { turn: string; detail: str
   if (known) {
     return known;
   }
+  const turn = role === "stage" ? "Implementation turn" : role === "reviewer" ? "Independent reviewer" : "Review turn";
   return {
-    turn: role === "stage" ? "Implementation turn" : "Review turn",
+    turn,
     detail: turnKind ? `engine turn kind: ${turnKind}` : "turn kind not recorded",
   };
 }

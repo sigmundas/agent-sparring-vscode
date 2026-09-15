@@ -41,6 +41,7 @@ import { stageDisplayName } from "../core/presentation";
 import { stageActions, stageRunAction } from "../core/runner";
 import { planKey, planLabel, planRunId, type SparringSubcommand } from "../core/sparringCommand";
 import { manifestRepositories, relativeRepositoryPath, type DeclaredRepository } from "../core/stageRepositories";
+import { STAGE_MODE_LABELS, STAGE_MODES, type StageMode } from "../core/stageModes";
 import { withTemporaryFile } from "../core/tempFile";
 import type { SparringController } from "./controller";
 import type { EngineFailure, LaunchResult } from "./executionTracker";
@@ -69,6 +70,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.startNextStage", () => startNextStageCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.continueAutomatically", () => void performContinueAutomatically(controller, overview, { confirm: true })),
     vscode.commands.registerCommand("agentSparring.stageRepositories", () => stageRepositoriesCommand(controller)),
+    vscode.commands.registerCommand("agentSparring.stageMode", () => stageModeCommand(controller)),
     vscode.commands.registerCommand("agentSparring.copyReviewContext", () => overview.copyReviewContext()),
     vscode.commands.registerCommand("agentSparring.chooseExecutable", () => chooseExecutableCommand()),
     controller.onCommandNotFound((event) => void explainCommandNotFound(event.word)),
@@ -1529,6 +1531,7 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
     planName: path.basename(run.planPath),
     known: await knownStageIds(controller, run, markdown),
     repositories: manifestRepositories(controller.stageRepositories(run.planKey), run.location.repoRoot),
+    modes: controller.stageModes(run.planKey),
   });
   if (!built.ok) {
     void vscode.window.showWarningMessage(`Agent Sparring: the execution manifest for ${path.basename(run.planPath)} could not be rebuilt: ${built.problems[0]?.reason ?? "the plan changed."}`);
@@ -1591,6 +1594,7 @@ async function performContinueAutomatically(controller: SparringController, over
     planName: path.basename(planPath),
     known: await knownStageIds(controller, run, markdown),
     repositories: manifestRepositories(controller.stageRepositories(planKey(label)), location.repoRoot),
+    modes: controller.stageModes(planKey(label)),
   });
   if (!built.ok) {
     const detail = built.problems.map((problem) => `• ${problem.reason}`).join("\n");
@@ -2027,6 +2031,78 @@ async function stageRepositoriesCommand(controller: SparringController): Promise
     return;
   }
   await editStageRepositories(controller, run.location, key, label);
+}
+
+/**
+ * Declare what kind of stage a plan stage is: work, or a review of work.
+ *
+ * The engine will not infer this. A stage called "Independent final review
+ * and activation decision" runs the implementation lifecycle — a stage agent
+ * that writes code, with a sparrer behind it — unless something says
+ * otherwise, because which agent runs is not a thing to read off a heading.
+ * Saying otherwise is this command: the choice is recorded per plan and
+ * stage label and emitted into the execution manifest, and the engine then
+ * runs that stage as one fresh independent reviewer over the candidates the
+ * earlier stages already accepted, with no implementation turn at all.
+ *
+ * Nothing here writes engine state, and nothing here changes a stage that
+ * has already run: the engine refuses to continue a stage under a mode other
+ * than the one it ran under, and its `reset-stage` command is the supported
+ * way to restart one. This command is told so, and says so.
+ */
+async function stageModeCommand(controller: SparringController): Promise<void> {
+  const run = controller.currentSelection.selected;
+  if (!run) {
+    void vscode.window.showInformationMessage("Agent Sparring: select a run first.");
+    return;
+  }
+  const planPath = planDocumentFor(controller, run);
+  const key = await planKeyFor(controller, run);
+  if (!planPath || !key) {
+    void vscode.window.showInformationMessage("Agent Sparring: choose a plan for this stage first; a stage's mode is declared per plan stage.");
+    return;
+  }
+  const markdown = await readOptional(planPath);
+  if (markdown === undefined) {
+    void vscode.window.showWarningMessage(`Agent Sparring: the plan document ${path.basename(planPath)} could not be read.`);
+    return;
+  }
+  const entries = buildStageIndex(parsePlanHeadings(markdown)).filter((entry) => entry.label);
+  if (entries.length === 0) {
+    void vscode.window.showInformationMessage(`Agent Sparring: ${path.basename(planPath)} defines no labelled stages.`);
+    return;
+  }
+
+  const stage = await vscode.window.showQuickPick(
+    entries.map((entry) => ({
+      label: entry.display,
+      description: controller.stageModeFor(key, entry.label) === "independent_review" ? "review only" : "",
+      value: entry.label,
+    })),
+    { title: "Stage mode", placeHolder: "Which stage is a review of work rather than work?" },
+  );
+  if (!stage) {
+    return;
+  }
+
+  const current = controller.stageModeFor(key, stage.value);
+  const mode = await vscode.window.showQuickPick(
+    STAGE_MODES.map((candidate) => ({
+      label: `${candidate === current ? "$(check) " : "$(blank) "}${STAGE_MODE_LABELS[candidate].label}`,
+      detail: STAGE_MODE_LABELS[candidate].detail,
+      value: candidate as StageMode,
+    })),
+    { title: `Stage ${stage.value} — mode`, placeHolder: "What kind of stage is this?" },
+  );
+  if (!mode || mode.value === current) {
+    return;
+  }
+  await controller.declareStageMode(key, stage.value, mode.value);
+  void vscode.window.showInformationMessage(
+    mode.value === "independent_review"
+      ? `Agent Sparring: Stage ${stage.value} is now review-only. If its stage has already run under the other mode, the engine will refuse to continue it and tell you to run sparring reset-stage, which archives that attempt and restarts the stage with a fresh reviewer.`
+      : `Agent Sparring: Stage ${stage.value} runs the implementation lifecycle again.`,
+  );
 }
 
 async function pickStageLabel(controller: SparringController, key: string, entries: StageEntry[]): Promise<string | undefined> {

@@ -35,6 +35,7 @@ import { buildStageIndex, parsePlanHeadings, type PlanHeading, type StageEntry }
 import { slugify } from "./engineFormats";
 import { humanizeStageId } from "./presentation";
 import { STAGE_ID_RE } from "./nextStage";
+import type { StageMode } from "./stageModes";
 
 export const MANIFEST_VERSION = 1;
 
@@ -52,6 +53,14 @@ export interface ManifestStage {
   title: string;
   /** The exact `brief.md` content the engine will write. */
   brief: string;
+  /**
+   * What kind of stage this is (stageModes.ts). Emitted only for
+   * `independent_review`: `implementation` is the engine's default, so
+   * writing it would change no behaviour and would only make the file
+   * noisier. Never derived from the title or the brief — see stageModes.ts
+   * for why that line matters.
+   */
+  mode?: "independent_review";
   repositories?: ManifestRepository[];
 }
 
@@ -87,6 +96,13 @@ export interface ManifestInput {
   known?: KnownStage[];
   /** Sibling repositories a given plan label's stage reviews alongside the primary one. */
   repositories?: Record<string, ManifestRepository[]>;
+  /**
+   * Stages the user declared as review-only, keyed the same way
+   * (`modeLabelKey`). Absent labels run the implementation lifecycle, which
+   * is the engine's default and what every manifest written before modes
+   * existed means.
+   */
+  modes?: Record<string, StageMode>;
 }
 
 /** One stage the plan defines but that cannot be executed as written. */
@@ -174,11 +190,13 @@ export function buildManifest(input: ManifestInput): ManifestBuild {
       brief = rendered.brief;
     }
     const repositories = input.repositories?.[entry.label.toUpperCase()];
+    const mode = input.modes?.[entry.label.toUpperCase()];
     stages.push({
       stage_id: stageId,
       label: `Stage ${entry.label}`,
       title: entry.title ?? titleOf(entry, stageId),
       brief,
+      ...(mode === "independent_review" ? { mode } : {}),
       ...(repositories && repositories.length > 0 ? { repositories } : {}),
     });
   }
