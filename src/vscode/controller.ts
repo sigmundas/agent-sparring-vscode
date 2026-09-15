@@ -13,11 +13,13 @@ import { diagnoseDiscovery, renderDiagnostic, type DiscoveryDiagnostic } from ".
 import {
   DEFAULT_NESTED_SEARCH_DEPTH,
   activityPathFor,
+  canonicalPath,
   currentStageOf,
   discoverRuns,
   isNestedLocation,
   locateAll,
   runLabel,
+  samePath,
   selectRun,
   totalStagesOf,
   type Discovery,
@@ -28,8 +30,8 @@ import {
   type RunSnapshot,
   type SparringLocation,
 } from "../core/discovery";
-import { manifestFileName, readManifestStages, type ManifestStageIdentity } from "../core/manifest";
-import { resolveMemberships, type PlanMembership } from "../core/planMembership";
+import { bindManifest, manifestExpectationFor, manifestPathFor, type ManifestStageIdentity } from "../core/manifest";
+import { resolveMemberships, stageOwnership, type PlanMembership } from "../core/planMembership";
 import { deriveLiveness, type ExecutionRecord, type RunnerLiveness } from "../core/liveness";
 import { applyEvent, emptyLiveState, type LiveState } from "../core/liveState";
 import {
@@ -80,13 +82,28 @@ import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } 
 import { TerminalPool } from "./terminalPool";
 import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult } from "./executionTracker";
 import { MANIFEST_READ_LIMIT, readHead } from "./fileHead";
-import { ActiveRepositoryTracker } from "./activeRepository";
+import { ActiveRepositoryTracker, RealPaths } from "./activeRepository";
 
 const SELECTED_RUN_KEY = "agentSparring.selectedRunId";
 /** When that choice was made, so a managed run that advances afterwards can overtake it. */
 const SELECTED_AT_KEY = "agentSparring.selectedRunAtMs";
 /** The run last shown, whether chosen explicitly or automatically; restores across reloads. */
 const STICKY_RUN_KEY = "agentSparring.lastShownRunId";
+/**
+ * Which pin policy the stored selection was made under.
+ *
+ * An explicit selection used to mean "show this run", full stop; there was no
+ * repository context for it to survive. It now means "keep this run on screen
+ * even when this window is in another repository", which is a stronger and
+ * longer-lived promise than anyone made when they clicked a row in the old
+ * picker. Promoting an old selection to that silently would leave a window
+ * pinned to a foreign repository's run with no memory of having asked, so a
+ * selection stored before this key exists is demoted to the ordinary
+ * remembered run instead: it is still what the cockpit shows while the window
+ * is in its repository, and it lets go as soon as the window is not.
+ */
+const PIN_POLICY_KEY = "agentSparring.pinPolicy";
+const PIN_POLICY = "repository-scoped-pin-v1";
 const OUTPUT_CHANNEL_NAME = "Agent Sparring";
 /** How often the process table may be read for one run whose liveness nothing in this window watched. */
 const PROBE_COOLDOWN_MS = 15_000;
@@ -111,6 +128,8 @@ export class SparringController implements vscode.Disposable {
   private readonly terminals: TerminalPool;
   /** Which repository this window is in; automatic selection is confined to it. */
   private readonly activeRepository: ActiveRepositoryTracker;
+  /** Symlink resolution for repository roots, so two spellings of one directory are one repository. */
+  private readonly realPaths = new RealPaths();
   private reattached = false;
   /** When the process table was last read for a run id; see resolveUnwatchedRunner. */
   private readonly probed = new Map<string, number>();
@@ -196,6 +215,7 @@ export class SparringController implements vscode.Disposable {
       this.watch(folder);
     }
     this.statusBar.show();
+    await this.migratePinPolicy();
     await this.refresh();
     this.armPolling();
     if (!this.reattached) {
@@ -211,6 +231,30 @@ export class SparringController implements vscode.Disposable {
 
   private fileFolders(): vscode.WorkspaceFolder[] {
     return (vscode.workspace.workspaceFolders ?? []).filter((folder) => folder.uri.scheme === "file");
+  }
+
+  /**
+   * Demote a selection stored before pins meant what they now mean, and
+   * record which policy later selections were made under. See
+   * {@link PIN_POLICY_KEY}: nobody who clicked a row in the old picker asked
+   * for a run to stay on screen across repositories, so nobody is given one.
+   */
+  private async migratePinPolicy(): Promise<void> {
+    if (this.context.workspaceState.get<string>(PIN_POLICY_KEY) === PIN_POLICY) {
+      return;
+    }
+    const stored = this.context.workspaceState.get<string>(SELECTED_RUN_KEY);
+    if (stored) {
+      this.log(
+        `an explicit run selection was stored before pins survived a change of repository; it is kept as the remembered run rather than becoming a pin. ${FOLLOW_ACTIVE_LABEL} is how the cockpit follows this window, and Select repository / run is how to pin deliberately.`,
+      );
+      await this.context.workspaceState.update(SELECTED_RUN_KEY, undefined);
+      await this.context.workspaceState.update(SELECTED_AT_KEY, undefined);
+      if (!this.context.workspaceState.get<string>(STICKY_RUN_KEY)) {
+        await this.context.workspaceState.update(STICKY_RUN_KEY, stored);
+      }
+    }
+    await this.context.workspaceState.update(PIN_POLICY_KEY, PIN_POLICY);
   }
 
   /** Probe each workspace folder on its own (including nested projects); never merge folders into one root. */
@@ -248,7 +292,8 @@ export class SparringController implements vscode.Disposable {
       ...this.locateOptions(),
       preferredId: this.preference()?.id,
       stickyId: this.attachedRunId ?? this.context.workspaceState.get<string>(STICKY_RUN_KEY),
-      scope: this.repositoryScope(),
+      scope: await this.repositoryScope(),
+      gitAttached: this.activeRepository.attached,
       manifestStages: (run) => this.manifestStagesFor(run),
     });
     this.output.appendLine("");
@@ -340,7 +385,11 @@ export class SparringController implements vscode.Disposable {
     await this.relocate();
     this.discovery = await discoverRuns(this.locations);
     const sticky = this.attachedRunId ?? this.context.workspaceState.get<string>(STICKY_RUN_KEY);
-    this.selection = selectRun(this.discovery.runs, this.preference(), sticky, this.repositoryScope());
+    // Ownership first: whether a plan run has taken over from a pinned stage
+    // is a question about recorded membership, and answering it any other way
+    // is the guessing that made unrelated stages look like a plan's history.
+    const ownership = stageOwnership(await this.planMemberships());
+    this.selection = selectRun(this.discovery.runs, this.preference(), sticky, await this.repositoryScope(), ownership);
     if (this.selection.selected && this.selection.selected.id !== this.context.workspaceState.get<string>(STICKY_RUN_KEY)) {
       await this.context.workspaceState.update(STICKY_RUN_KEY, this.selection.selected.id);
     }
@@ -389,13 +438,47 @@ export class SparringController implements vscode.Disposable {
    * inactive, the folder may not be a repository at all, or nothing has
    * focused a repository yet. Scoping on a guess would hide runs; not
    * scoping only restores the behaviour from before following existed.
+   *
+   * Roots are aligned to the spellings this window's own discovered projects
+   * use (see {@link alignRoots}), because attribution is now strict: a run
+   * that cannot be attributed is not selected, so a `/tmp` versus
+   * `/private/tmp` mismatch would empty the cockpit rather than merely widen
+   * it.
    */
-  private repositoryScope(): RepositoryScope | undefined {
-    const repoRoot = this.activeRepository.activeRepoRoot;
-    if (!repoRoot) {
+  private async repositoryScope(): Promise<RepositoryScope | undefined> {
+    const active = this.activeRepository.activeRepoRoot;
+    if (!active) {
       return undefined;
     }
-    return { repoRoot, knownRoots: this.activeRepository.knownRepoRoots ?? [repoRoot] };
+    const known = this.activeRepository.knownRepoRoots ?? [active];
+    const aligned = await this.alignRoots([active, ...known]);
+    return { repoRoot: aligned[0], knownRoots: aligned };
+  }
+
+  /**
+   * The Git extension's repository roots, re-spelled the way this window's
+   * discovered projects spell the same directories.
+   *
+   * One spelling per root, so two entries never look like two repositories
+   * with the same name — which is what would happen if `/tmp/foo` and
+   * `/private/tmp/foo` were both kept and the context line then tried to
+   * disambiguate them.
+   */
+  private async alignRoots(roots: readonly string[]): Promise<string[]> {
+    const byRealPath = new Map<string, string>();
+    for (const location of this.locations) {
+      for (const dir of [location.repoRoot, location.projectDir]) {
+        byRealPath.set(canonicalPath(await this.realPaths.of(dir)), dir);
+      }
+    }
+    const out: string[] = [];
+    for (const root of roots) {
+      const aligned = byRealPath.get(canonicalPath(await this.realPaths.of(root))) ?? root;
+      if (!out.some((seen) => samePath(seen, aligned))) {
+        out.push(aligned);
+      }
+    }
+    return out;
   }
 
   get currentSelection(): RunSelection {
@@ -469,22 +552,36 @@ export class SparringController implements vscode.Disposable {
   }
 
   /**
-   * The stage identities of the manifest a managed run executes, cached by the
-   * file's modification time.
+   * The stage identities of the manifest a managed run executes — but only
+   * once that manifest has been bound to *this* run.
    *
-   * A manifest carries every stage's brief verbatim, so it is by far the
-   * largest thing the Overview reads, and both the Overview and the run picker
-   * now need it — the Overview to draw the journey, the picker and the
-   * Overview to know which plan run a standalone stage belongs to
-   * (planMembership.ts). Reading it once per change rather than once per
-   * render is what makes that affordable. The extension wrote the file itself
-   * and regenerates it deterministically, so its mtime is a sound key.
+   * The file lives in global storage, which is per-user and nothing else, so
+   * finding a file there is not evidence that it belongs to the run on screen.
+   * Two things make it authoritative, and both are required:
+   *
+   *  - its **path** is scoped to the project directory as well as the plan key
+   *    (`manifestFileName`), so two worktrees running `docs/plans/foo.md` no
+   *    longer share one file and cannot consume each other's;
+   *  - its **content** is validated against what the engine recorded in
+   *    `.sparring/plans/<key>.json` — the plan label it executes and its
+   *    current stage (`bindManifest`), which is what catches a manifest
+   *    regenerated into something this run does not execute.
+   *
+   * A manifest that fails either check yields `undefined`, and every caller
+   * degrades to "no recorded membership" — a standalone stage stays
+   * standalone, the journey is not drawn, and nothing claims an ownership it
+   * cannot show. The rejection is logged once per file version, because a
+   * silent degradation is the one thing worse than an honest one.
+   *
+   * Cached by the file's modification time: a manifest carries every stage's
+   * brief verbatim, so it is by far the largest thing the Overview reads, and
+   * the Overview, the run picker and selection all need it now.
    */
   async manifestStagesFor(run: RunSnapshot): Promise<ManifestStageIdentity[] | undefined> {
     if (run.kind !== "plan" || run.state.source !== "manifest") {
       return undefined;
     }
-    const file = path.join(this.manifestDirectoryPath, manifestFileName(run.planKey));
+    const file = manifestPathFor(this.manifestDirectoryPath, run);
     let mtimeMs: number;
     try {
       mtimeMs = (await fs.stat(file)).mtimeMs;
@@ -496,7 +593,11 @@ export class SparringController implements vscode.Disposable {
     if (cached && cached.mtimeMs === mtimeMs) {
       return cached.stages;
     }
-    const stages = readManifestStages(await readHead(file, MANIFEST_READ_LIMIT));
+    const bound = bindManifest(await readHead(file, MANIFEST_READ_LIMIT), manifestExpectationFor(run));
+    if (!bound.ok) {
+      this.log(`the execution manifest ${path.basename(file)} is not this run's: ${bound.detail}. Its stages are not used, and no stage is attributed to this plan run from it.`);
+    }
+    const stages = bound.ok ? bound.identity.stages : undefined;
     this.manifestCache.set(file, { mtimeMs, stages });
     return stages;
   }
@@ -828,9 +929,18 @@ export class SparringController implements vscode.Disposable {
     if (!this.tailer || this.polling) {
       return;
     }
+    const tailer = this.tailer;
     this.polling = true;
     try {
-      const result = await this.tailer.poll();
+      const result = await tailer.poll();
+      // Reading the log is I/O, and the selection can move while it is in
+      // flight — following the active repository makes that ordinary rather
+      // than rare. Events read from the run we have since left must not be
+      // folded into the run now on screen, which would show one run's
+      // provider activity under another run's name.
+      if (this.tailer !== tailer) {
+        return;
+      }
       if (result.reset) {
         this.live = emptyLiveState();
         this.logRenderer.reset();

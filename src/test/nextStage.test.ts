@@ -240,7 +240,7 @@ describe("new-stage is the engine's own lifecycle", () => {
     );
     assert.match(
       await fs.readFile(path.join(src, "vscode", "commands.ts"), "utf8"),
-      /async function writeManifestFile\(file: string, manifest: ExecutionManifest\): Promise<void> \{\n\s*await fs\.writeFile\(file, renderManifest\(carriedForward\(manifest, await readOptional\(file\)\)\), "utf8"\);/,
+      /async function writeManifestFile\(controller: SparringController, file: string, legacyName: string, manifest: ExecutionManifest\): Promise<void> \{[\s\S]*?await fs\.writeFile\(file, renderManifest\(carriedForward\(manifest, previous\)\), "utf8"\);\n\}/,
       "and every manifest write goes through the one helper that carries an unchanged manifest's provenance forward",
     );
     const temp = await fs.readFile(path.join(src, "core", "tempFile.ts"), "utf8");

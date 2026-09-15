@@ -13,7 +13,7 @@
  * meaningful event on the right); provider cards; recent events; metadata.
  */
 
-import { FOLLOW_ACTIVE_LABEL } from "./activeRepository";
+import { ACTIVE_CONTEXT_HEADLINE, FOLLOW_ACTIVE_LABEL, SELECT_RUN_LABEL } from "./activeRepository";
 import { CHECK_OUTCOMES, isCheckKey, type CheckItem, type CheckOutcome } from "./humanChecks";
 import { checkName, humanTask, splitPassCriteria } from "./humanTask";
 import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type TimelineItem, type WhatsNext } from "./overviewModel";
@@ -267,20 +267,21 @@ function renderBody(model: OverviewModel): string {
   if (model.kind === "empty") {
     // The title names the repository, so an empty screen cannot be mistaken
     // for the cockpit still looking at the repository just left behind.
-    return `<header class="top"><div><h1>Agent Sparring</h1><div class="run muted">${escapeHtml(model.title)}</div></div></header>
+    return `${renderRepositoryContext(model)}
+<header class="top"><div><h1>Agent Sparring</h1><div class="run muted">${escapeHtml(model.title)}</div></div></header>
 ${(model.emptyLines ?? []).map((line) => `<p class="muted">${escapeHtml(line)}</p>`).join("\n")}
-<div class="actions">${button("runPlan", "Run plan…")}${button("selectRun", "Select repository / run…")}${followButton(model)}${button("showLog", "Show log")}</div>
-${renderFollowing(model)}`;
+<div class="actions">${button("runPlan", "Run plan…")}${button("showLog", "Show log")}</div>`;
   }
   if (model.kind === "ambiguous") {
-    return `<header class="top"><h1>Agent Sparring</h1></header>
+    return `${renderRepositoryContext(model)}
+<header class="top"><h1>Agent Sparring</h1></header>
 <p>${escapeHtml(model.title)}:</p>
 <ul>${(model.choices ?? []).map((choice) => `<li>${escapeHtml(choice)}</li>`).join("")}</ul>
-<div class="actions">${button("selectRun", "Select repository / run…")}${followButton(model)}${button("showLog", "Show log")}</div>
-${renderFollowing(model)}`;
+<div class="actions">${button("showLog", "Show log")}</div>`;
   }
 
   const parts: string[] = [];
+  parts.push(renderRepositoryContext(model));
   parts.push(renderHeader(model));
   if (model.branchGuard) {
     parts.push(renderBranchGuard(model.branchGuard));
@@ -308,36 +309,51 @@ ${renderFollowing(model)}`;
   if (model.facts && model.facts.length > 0) {
     parts.push(`<dl class="facts">${model.facts.map((fact) => `<dt>${escapeHtml(fact.label)}</dt><dd>${escapeHtml(fact.value)}</dd>`).join("")}</dl>`);
   }
-  parts.push(renderFollowing(model));
   return parts.filter(Boolean).join("\n");
 }
 
 /**
- * Which repository the cockpit is in, and how to change that.
+ * Which repository Agent Sparring is in, at the top of the screen, before
+ * anything about the run.
  *
- * Normally a quiet footer line: following the active repository is the
- * expected state and needs no attention. A pin that is holding the cockpit in
- * a *different* repository from the one this window is in is the opposite —
- * it is the only reason the screen can disagree with the Source Control view,
- * so it is stated plainly and the way out is a button next to it rather than
- * a command someone has to know the name of.
+ * This is the contract made visible. VS Code's own repository selector in the
+ * status bar cannot be read by an extension, so what the cockpit resolved has
+ * to be stated rather than assumed — a person must never be able to think it
+ * silently followed a selector it cannot see. Two shapes:
+ *
+ *  - following: one line, `Following repository: <name>`;
+ *  - pinned: the pinned repository *and* the repository this window is in,
+ *    on separate lines, with Follow active repository next to them. Both names
+ *    appear even when they are the same, so the policy reads the same way
+ *    every time and a pin never hides where the window actually is.
+ *
+ * Agent Sparring's own chooser sits here too. Switching context must not
+ * depend on a VS Code gesture this extension cannot observe, so the way to do
+ * it is where the person already is rather than only in the Command Palette.
  */
-function renderFollowing(model: OverviewModel): string {
-  const following = model.following;
-  if (!following) {
+function renderRepositoryContext(model: OverviewModel): string {
+  const context = model.repositoryContext;
+  if (!context) {
     return "";
   }
-  const held = following.mode === "pinned" && following.release !== undefined;
-  const text = `${escapeHtml(following.text)}${following.release ? ` ${escapeHtml(following.release)}` : ""}`;
-  if (!held) {
-    return `<p class="muted following">${text}</p>`;
+  const pinned = context.mode === "pinned";
+  const lines = [contextLine(context.headline, context.repository, pinned)];
+  if (pinned && context.activeRepository) {
+    lines.push(contextLine(ACTIVE_CONTEXT_HEADLINE, context.activeRepository, false));
   }
-  return `<p class="muted following pinned">${icon("pin", "pin")}${text} ${button("followActiveRepository", FOLLOW_ACTIVE_LABEL, true, undefined, "link")}</p>`;
+  const controls = [
+    button("selectRun", SELECT_RUN_LABEL, true, "Pin an Agent Sparring repository or run explicitly", "quiet"),
+    pinned ? button("followActiveRepository", FOLLOW_ACTIVE_LABEL, true, context.explanation) : "",
+  ].join("");
+  return `<section class="repocontext${pinned ? " pinned" : ""}${context.away ? " away" : ""}" title="${escapeHtml(context.explanation)}">
+<div class="names">${lines.join("")}</div>
+<div class="actions">${controls}</div>
+</section>`;
 }
 
-/** Offered only when there is a pin to release; otherwise it would do nothing. */
-function followButton(model: OverviewModel): string {
-  return model.following?.mode === "pinned" ? button("followActiveRepository", FOLLOW_ACTIVE_LABEL) : "";
+function contextLine(headline: string, repository: string | undefined, pinned: boolean): string {
+  const name = repository ?? "not resolved";
+  return `<div class="line"><span class="headline">${pinned ? icon("pin", "pin") : ""}${escapeHtml(headline)}:</span><span class="name">${escapeHtml(name)}</span></div>`;
 }
 
 function renderHeader(model: OverviewModel): string {
@@ -1394,11 +1410,19 @@ button.quiet { background: transparent; color: var(--vscode-descriptionForegroun
 .facts { display: grid; grid-template-columns: max-content 1fr; gap: 1px 12px; margin: 0; padding-top: 8px; border-top: 1px solid var(--line); font-size: 0.82em; color: var(--vscode-descriptionForeground); }
 .facts dt { color: var(--vscode-descriptionForeground); }
 .facts dd { margin: 0; font-family: var(--vscode-editor-font-family); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.following { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 8px 0 0; font-size: 0.82em; }
-.following.pinned { color: var(--vscode-foreground); }
-.following .pin { flex: none; opacity: 0.8; }
-button.link { background: none; border: none; padding: 0; color: var(--vscode-textLink-foreground); text-decoration: underline; cursor: pointer; font: inherit; }
-button.link:hover { color: var(--vscode-textLink-activeForeground); }
+/* The repository context, above everything. Quiet while following; stated
+   plainly, with a left rule, while a pin is in force. */
+.repocontext { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 0 0 12px; padding-bottom: 8px; border-bottom: 1px solid var(--line); font-size: 0.86em; }
+.repocontext .names { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.repocontext .line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.repocontext .headline { display: inline-flex; align-items: center; gap: 4px; color: var(--vscode-descriptionForeground); }
+.repocontext .name { font-weight: 600; color: var(--vscode-foreground); overflow-wrap: anywhere; }
+.repocontext .actions { margin: 0; gap: 6px; }
+.repocontext.pinned { padding-left: 8px; border-left: 2px solid var(--vscode-textLink-foreground); }
+/* A pin holding the cockpit away from the repository this window is in is the
+   one state where the screen can disagree with the Source Control view. */
+.repocontext.away { border-left-color: var(--warn-border); }
+.repocontext .pin { flex: none; opacity: 0.85; }
 
 @media (max-width: 640px) {
   .columns { grid-template-columns: 1fr; }

@@ -25,6 +25,8 @@
  */
 
 import assert from "node:assert/strict";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 import { diagnoseDiscovery } from "../core/diagnose";
 import { discoverRuns, selectRun, type PlanRunSnapshot, type RunSnapshot, type StandaloneStageSnapshot } from "../core/discovery";
@@ -354,15 +356,42 @@ describe("a standalone stage no managed run claims", () => {
     assert.equal(model.continueAutomatically?.kind, "adopt", "this is the one place a stage can become a managed run");
   });
 
-  it("gets no back button when the plan run's manifest cannot be read and that run has finished", async () => {
-    // supersedingPlanRun is the manifest-free fallback, and it can only see an
-    // *open* run. Without either source nothing is claimed — which is honest:
-    // the extension does not know that this stage was part of that run.
-    const { runs, historical, members } = await project("complete", false);
-    assert.equal(planMemberships(runs, members).size, 0);
-    const { model } = overview(runs, historical, members);
-    assert.equal(model.followPlan, undefined);
-    assert.equal(model.runKind, RUN_KIND.standaloneStage);
+  it("gets no back button when the plan run's manifest cannot be read, whether that run is finished or live", async () => {
+    // Without the manifest nothing is claimed — which is honest: the extension
+    // does not know that this stage was part of that run. There is no fallback
+    // to "some plan run in this project is open", because that is not a record
+    // of anything.
+    for (const status of ["complete", "running"] as const) {
+      const { runs, historical, members } = await project(status, false);
+      assert.equal(planMemberships(runs, members).size, 0, `${status}: nothing claims the stage`);
+      const { model } = overview(runs, historical, members);
+      assert.equal(model.followPlan, undefined, `${status}: no dead button`);
+      assert.equal(model.runKind, RUN_KIND.standaloneStage, `${status}: and it reads as its own work`);
+    }
+  });
+
+  /**
+   * The blocking finding: historical-stage membership must come from recorded
+   * execution membership, and the fallbacks that could turn an unrelated stage
+   * into "Historical stage" are gone. The panel is where the last one lived.
+   */
+  it("the panel resolves the owning run from membership alone, with no fallback", async () => {
+    const panel = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "overview", "overviewPanel.ts"), "utf8");
+    const body = /private async managedPlanRun[\s\S]*?\n {2}}\n/.exec(panel)?.[0] ?? "";
+    assert.ok(body, "managedPlanRun exists");
+    assert.match(body, /planMemberships\(\)\)\.get\(run\.id\)/, "membership is the source");
+    assert.match(body, /if \(!membership\) \{\s*return undefined;/, "and no membership means no owning run");
+    assert.ok(!/supersedingPlanRun/.test(panel), "'some open plan run has advanced' is not membership and is no longer consulted here");
+  });
+
+  it("membership itself consults only recorded execution, never a stage-id prefix", async () => {
+    const source = await fs.readFile(path.join(__dirname, "..", "..", "src", "core", "planMembership.ts"), "utf8");
+    const claims = /function claims\([\s\S]*?\n}\n/.exec(source)?.[0] ?? "";
+    assert.ok(claims, "claims exists");
+    assert.match(claims, /manifestStages\?\.some/, "the validated manifest");
+    assert.match(claims, /currentStage\.stageId === stageId/, "the run's own recorded current stage");
+    assert.match(claims, /state\.source === "markdown" && candidate\.run\.stages\.some/, "and, for a markdown run only, the stage list the engine parses");
+    assert.ok(!/startsWith/.test(claims), "a stage id that merely looks like this plan's is not a record of anything");
   });
 });
 

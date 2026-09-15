@@ -18,7 +18,7 @@
  * tooltips and the footer.
  */
 
-import { describeFollowing, emptyStateLines, emptyStateTitle, type FollowingView } from "./activeRepository";
+import { describeRepositoryContext, emptyStateLines, emptyStateTitle, type RepositoryContextView } from "./activeRepository";
 import { parseBriefGoal, parseBriefOpening } from "./brief";
 import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
@@ -523,13 +523,17 @@ export interface OverviewModel {
   /** For ambiguous: the candidate labels. */
   choices?: string[];
   /**
-   * Which repository the cockpit is in and whether it is following the active
-   * one or held by an explicit pin. Always present, because "which repository
-   * am I actually looking at" is the question this whole screen answers, and
-   * leaving it implicit is what let a completed run in another repository sit
-   * here looking current.
+   * Which repository the cockpit is in, and whether it got there by following
+   * this window or by an explicit pin.
+   *
+   * Always present, and rendered at the *top* of the screen rather than in a
+   * footer, because "which repository am I actually looking at" is the
+   * question this whole screen answers. It is also the only place the contract
+   * is stated: VS Code's own repository selector cannot be read by an
+   * extension, so a person must be able to see what Agent Sparring resolved
+   * instead of assuming it followed that selector.
    */
-  following?: FollowingView;
+  repositoryContext?: RepositoryContextView;
   /** For empty: the sentences under the title (see activeRepository.emptyStateLines). */
   emptyLines?: string[];
   /** Plan journey: only for managed plan runs with a readable plan document. */
@@ -582,17 +586,17 @@ export function buildOverviewModel(
   nowMs: number = Date.now(),
   execution?: ExecutionRecord,
 ): OverviewModel {
-  const following = describeFollowing(selection);
+  const repositoryContext = describeRepositoryContext(selection);
   if (!selection.selected) {
     if (selection.ambiguous.length > 0) {
       return {
         kind: "ambiguous",
         title: "Several runs look active",
         choices: selection.ambiguous.map((run) => `${run.location.folderName}: ${runLabel(run)}`),
-        following,
+        repositoryContext,
       };
     }
-    return { kind: "empty", title: emptyStateTitle(selection), emptyLines: emptyStateLines(selection), following };
+    return { kind: "empty", title: emptyStateTitle(selection), emptyLines: emptyStateLines(selection), repositoryContext };
   }
   const run = selection.selected;
   const stage = currentStageOf(run);
@@ -611,7 +615,7 @@ export function buildOverviewModel(
   const model: OverviewModel = {
     kind: "run",
     title: run.kind === "plan" ? runLabel(run) : stageDisplayName(stage),
-    following,
+    repositoryContext,
     stageAgent: actorCard("stage", stage, live, halted, nowMs, uncertain, artifacts.capturedPrompts),
     sparrer: actorCard("sparrer", stage, live, halted, nowMs, uncertain, artifacts.capturedPrompts),
     actions: {

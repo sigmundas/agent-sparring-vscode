@@ -8,7 +8,7 @@
 import * as crypto from "node:crypto";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, supersedingPlanRun, type PlanRunSnapshot, type RunSnapshot } from "../../core/discovery";
+import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, type PlanRunSnapshot, type RunSnapshot } from "../../core/discovery";
 import { parseStageState, type StageStatus } from "../../core/engineFormats";
 import { planRunDisplayName } from "../../core/planMembership";
 import {
@@ -328,25 +328,33 @@ export class OverviewPanelManager implements vscode.Disposable {
    * adopted it and has since advanced past it, whether that run is still going
    * or is complete.
    *
-   * Two sources, in this order. Membership (`planMembership.ts`) reads the
-   * execution manifest the extension wrote for the run and answers the
-   * identity question outright: this stage id is that run's Stage 3D. It is
-   * the one that holds for a *finished* run, which is the case that produced
-   * the reported confusion — a complete plan whose historical stages still
-   * offered Continue plan automatically. `supersedingPlanRun` is kept as the
-   * fallback for a run whose manifest cannot be read (another machine, cleared
-   * global storage): it can only see an open run, but it needs no manifest.
+   * One source, and it is recorded execution: membership (`planMembership.ts`),
+   * which reads the execution manifest the extension wrote for that run —
+   * bound to the run and validated against its recorded state before it counts
+   * — or the run's own recorded stage list. It answers the identity question
+   * outright: this stage id is that run's Stage 3D. It holds for a *finished*
+   * run, which is the case that produced the reported confusion: a complete
+   * plan whose historical stages still offered Continue plan automatically.
    *
-   * Nothing is guessed from plan titles or paths: without one of these two, a
-   * standalone stage stays standalone and no dead "Back to plan run" appears.
+   * There is deliberately **no fallback**. "Some open plan run in this project
+   * has advanced" used to stand in for membership, and it is not membership at
+   * all: it turned a stage that plan had never executed into a "Historical
+   * stage", withdrew that stage's own actions in favour of a run that did not
+   * own it, and offered "Back to plan run" as the way out. Without recorded
+   * membership a standalone stage stays standalone, and no dead button
+   * appears.
    */
   private async managedPlanRun(run: RunSnapshot): Promise<ManagedPlanRun | undefined> {
     if (run.kind !== "stage") {
       return undefined;
     }
-    const runs = this.controller.currentDiscovery.runs;
     const membership = (await this.controller.planMemberships()).get(run.id);
-    const plan = runs.find((candidate): candidate is PlanRunSnapshot => candidate.kind === "plan" && candidate.id === membership?.planRunId) ?? supersedingPlanRun(run, runs);
+    if (!membership) {
+      return undefined;
+    }
+    const plan = this.controller.currentDiscovery.runs.find(
+      (candidate): candidate is PlanRunSnapshot => candidate.kind === "plan" && candidate.id === membership.planRunId,
+    );
     if (!plan) {
       return undefined;
     }
@@ -357,8 +365,8 @@ export class OverviewPanelManager implements vscode.Disposable {
       stageId: plan.currentStage.stageId,
       stageLabel: stages?.find((stage) => stage.stageId === plan.currentStage.stageId)?.label,
       status: plan.state.status,
-      memberLabel: membership?.stageLabel,
-      memberTitle: membership?.stageTitle,
+      memberLabel: membership.stageLabel,
+      memberTitle: membership.stageTitle,
     };
   }
 

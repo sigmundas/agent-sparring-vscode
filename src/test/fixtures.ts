@@ -7,8 +7,10 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { SparringLocation } from "../core/discovery";
+import type { PlanRunSnapshot, RunSnapshot, SparringLocation, StageOwnership } from "../core/discovery";
 import type { ActivityEvent } from "../core/engineFormats";
+import { bindManifest, manifestExpectationFor, manifestPathFor, type ManifestStageIdentity } from "../core/manifest";
+import { resolveMemberships, stageOwnership, type PlanMembership } from "../core/planMembership";
 
 /** Real values produced by the engine for `docs/plans/foo.md` (see plan.py: plan_key). */
 export const FOO_PLAN_LABEL = "docs/plans/foo.md";
@@ -198,4 +200,68 @@ export function normalUi(html: string): string {
     .replace(/title="[^"]*"/g, "")
     .replace(/<dl class="facts">[\s\S]*?<\/dl>/g, "")
     .replace(/<details class="tech">[\s\S]*?<\/details>/g, "");
+}
+
+/**
+ * The execution manifests the extension keeps in global storage, as tests
+ * need them.
+ *
+ * Files are written to, and read from, the same paths the extension uses
+ * (`manifestPathFor`) and are accepted only through the same binding rules
+ * (`bindManifest`). A test therefore cannot accept a manifest the extension
+ * itself would refuse, which is the whole point: these files decide which
+ * historical stage belongs to which plan run.
+ */
+export class ManifestStore {
+  private constructor(readonly dir: string) {}
+
+  static async create(): Promise<ManifestStore> {
+    return new ManifestStore(await fs.mkdtemp(path.join(os.tmpdir(), "agent-sparring-manifests-")));
+  }
+
+  /** The manifest of `run`, written where the extension would write it. */
+  async write(run: PlanRunSnapshot, stages: readonly ManifestStageIdentity[], overrides: Record<string, unknown> = {}): Promise<string> {
+    return this.writeAt(manifestPathFor(this.dir, run), {
+      version: 1,
+      plan_label: run.state.plan,
+      source_digest: "sha256:" + "0".repeat(64),
+      stages: stages.map((stage) => ({ stage_id: stage.stageId, label: stage.label, title: stage.title, brief: `# ${stage.title}\n` })),
+      ...overrides,
+    });
+  }
+
+  /** A manifest at an arbitrary path — for the legacy, unscoped name, and for files that must be refused. */
+  async writeAt(file: string, payload: unknown): Promise<string> {
+    await fs.writeFile(file, JSON.stringify(payload, null, 2) + "\n");
+    return file;
+  }
+
+  fileFor(run: PlanRunSnapshot): string {
+    return manifestPathFor(this.dir, run);
+  }
+
+  /** The reader the controller passes to `resolveMemberships`, with the same validation. */
+  readonly stagesOf = async (run: PlanRunSnapshot): Promise<ManifestStageIdentity[] | undefined> => {
+    if (run.state.source !== "manifest") {
+      return undefined;
+    }
+    let text: string | undefined;
+    try {
+      text = await fs.readFile(manifestPathFor(this.dir, run), "utf8");
+    } catch {
+      return undefined;
+    }
+    const bound = bindManifest(text, manifestExpectationFor(run));
+    return bound.ok ? bound.identity.stages : undefined;
+  };
+}
+
+/** Recorded membership for a discovery, resolved exactly as the extension resolves it. */
+export async function membershipsOf(runs: readonly RunSnapshot[], store: ManifestStore): Promise<Map<string, PlanMembership>> {
+  return resolveMemberships(runs, store.stagesOf);
+}
+
+/** …and the ownership edges `selectRun` takes. */
+export async function ownershipOf(runs: readonly RunSnapshot[], store: ManifestStore): Promise<StageOwnership> {
+  return stageOwnership(await membershipsOf(runs, store));
 }

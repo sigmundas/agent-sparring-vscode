@@ -25,6 +25,30 @@
  * a run whose manifest is unreadable simply has no members — there is no
  * fallback that invents one.
  *
+ * ### What counts as recorded, and what does not
+ *
+ * Exactly three things establish membership, and all three are recorded
+ * execution, not inference:
+ *
+ *  1. the run's **execution manifest**, validated against the run it is
+ *     claimed to belong to (controller.manifestStagesFor / manifest.ts) — the
+ *     answer for a `source: "manifest"` run, and the one that holds after the
+ *     run has finished;
+ *  2. the run's own recorded **current stage** (`state.json`);
+ *  3. for a `source: "markdown"` run only, the **plan document's stage list**,
+ *     because that list *is* what the engine executes for such a run: it
+ *     parses the same headings into the same ids.
+ *
+ * What used to count and no longer does is a **stage-id prefix**. A stage id
+ * beginning `<plan key>-stage-` merely looks like something that plan run
+ * might have created; the engine records nothing to say that it did. Acting on
+ * it turned unrelated stages into "Historical stage", hid their own actions
+ * behind a plan run that had never executed them, and — on a plan that had
+ * merely advanced — offered "Back to plan run" as the way out of a stage that
+ * run did not own. The prefix is still used by `discoverStandaloneStages` for
+ * the opposite, conservative purpose: keeping such a stage out of the
+ * standalone list entirely.
+ *
  * Unlike `supersedingPlanRun` (discovery.ts), which answers "has an *open*
  * managed run advanced past this stage, so the cockpit should follow it",
  * membership is a statement about identity and holds for a finished run too.
@@ -34,7 +58,7 @@
  * No dependency on the vscode API.
  */
 
-import { isOpenRun, type PlanRunSnapshot, type RunSnapshot, type StandaloneStageSnapshot } from "./discovery";
+import { isOpenRun, type PlanRunSnapshot, type RunSnapshot, type StageOwnership, type StandaloneStageSnapshot } from "./discovery";
 import type { PlanRunState } from "./engineFormats";
 import type { ManifestStageIdentity } from "./manifest";
 
@@ -80,13 +104,9 @@ function fileName(label: string): string {
  * The managed plan run this standalone stage is a stage of, or undefined when
  * no discovered run claims it.
  *
- * Only runs of the same project are considered, and a stage is claimed by a
- * run when the run's manifest lists its id, when the run's own parsed stage
- * list names it, or when its id carries that run's plan key prefix (the two
- * latter cases are what discovery already excludes, and are kept here so the
- * question is answered the same way whatever the plan document looks like).
- * Should two runs both claim it, an open one wins, then the most recently
- * written.
+ * Only runs of the same project are considered, and only recorded execution
+ * claims a stage — see {@link claims}. Should two runs both claim it, an open
+ * one wins, then the most recently written.
  */
 export function planMembershipFor(stage: StandaloneStageSnapshot, plans: readonly PlanRunMembers[]): PlanMembership | undefined {
   const owners = plans
@@ -112,14 +132,22 @@ export function planMembershipFor(stage: StandaloneStageSnapshot, plans: readonl
   };
 }
 
+/**
+ * Whether this plan run recorded that stage as one of its own. Three sources,
+ * all of them recorded execution; see the module header for what was removed
+ * and why.
+ */
 function claims(candidate: PlanRunMembers, stageId: string): boolean {
   if (candidate.manifestStages?.some((entry) => entry.stageId === stageId)) {
     return true;
   }
-  if (candidate.run.stages.some((entry) => entry.stageId === stageId) || candidate.run.currentStage.stageId === stageId) {
+  if (candidate.run.currentStage.stageId === stageId) {
     return true;
   }
-  return stageId.startsWith(`${candidate.run.planKey}-stage-`);
+  // The plan document's stage list is the engine's own execution order for a
+  // markdown run, and means nothing for a manifest run — there the engine
+  // executes the manifest, and these ids are not the ones it used.
+  return candidate.run.state.source === "markdown" && candidate.run.stages.some((entry) => entry.stageId === stageId);
 }
 
 /** Membership of every standalone stage among `runs`, keyed by run id; runs with no owner are absent. */
@@ -150,4 +178,14 @@ export async function resolveMemberships(
   const plans = runs.filter((run): run is PlanRunSnapshot => run.kind === "plan");
   const members = await Promise.all(plans.map(async (run) => ({ run, manifestStages: await manifestStages(run) })));
   return planMemberships(runs, members);
+}
+
+/**
+ * The same answer reduced to identity: which plan run owns each standalone
+ * stage. `selectRun` needs the edge and none of the display fields, and taking
+ * it from here is what keeps "has a plan run taken over from this stage?" and
+ * "whose stage is this?" from ever being answered differently.
+ */
+export function stageOwnership(memberships: ReadonlyMap<string, PlanMembership>): StageOwnership {
+  return new Map([...memberships].map(([runId, membership]) => [runId, membership.planRunId]));
 }

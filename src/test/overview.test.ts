@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { describeRepositoryContext } from "../core/activeRepository";
 import { discoverRuns, selectRun, type RunSelection } from "../core/discovery";
 import { foldEvents } from "../core/liveState";
 import { renderOverviewHtml } from "../core/overviewHtml";
@@ -337,9 +338,21 @@ describe("overview HTML", () => {
     assert.ok(!html.includes("Last activity"));
   });
 
-  it("ambiguous model lists the choices and offers selection", () => {
-    const html = renderOverviewHtml({ kind: "ambiguous", title: "Several runs look active", choices: ["a.md", "<b>.md"] }, "n", "c");
+  it("ambiguous model lists the choices, names the repository and offers selection", () => {
+    // Every model buildOverviewModel produces carries a repository context,
+    // and it is what puts Agent Sparring's own chooser on the screen.
+    const html = renderOverviewHtml(
+      {
+        kind: "ambiguous",
+        title: "Several runs look active",
+        choices: ["a.md", "<b>.md"],
+        repositoryContext: describeRepositoryContext({ ambiguous: [], scope: { repoRoot: "/code/beta", name: "beta" } }),
+      },
+      "n",
+      "c",
+    );
     assert.match(html, /<li>&lt;b&gt;.md<\/li>/);
     assert.match(html, /data-action="selectRun"/);
+    assert.ok(html.includes('Following repository:</span><span class="name">beta'));
   });
 });

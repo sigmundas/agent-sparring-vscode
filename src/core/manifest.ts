@@ -30,6 +30,7 @@
  */
 
 import * as crypto from "node:crypto";
+import * as path from "node:path";
 import { renderNextStageBrief, type NextStageProposal } from "./nextStage";
 import { buildStageIndex, parsePlanHeadings, type PlanHeading, type StageEntry } from "./planAssociation";
 import { slugify } from "./engineFormats";
@@ -352,6 +353,106 @@ export interface ManifestStageIdentity {
   title: string;
 }
 
+/** A manifest read back from disk, with the fields that say *whose* it is. */
+export interface ManifestIdentity {
+  /** `plan_label`: the repo-relative plan path this manifest executes. */
+  planLabel: string;
+  /** `source_digest`: provenance of the plan text it was built from. */
+  sourceDigest: string;
+  stages: ManifestStageIdentity[];
+}
+
+/**
+ * What a manifest must match before it may describe a run's stages.
+ *
+ * A manifest is only ever *written* by this extension, into global storage,
+ * and global storage is per-user, not per-worktree or per-machine-state. So a
+ * file being there is not evidence that it belongs to the run being displayed;
+ * it has to say so. Two independent checks, both against what the **engine**
+ * recorded in `.sparring/plans/<key>.json`:
+ *
+ *  - the plan label must be the one the run records as executing, so a
+ *    manifest for another plan can never be read as this one's stage list;
+ *  - the run's recorded current stage must be one of the manifest's stages,
+ *    which is what catches a manifest that has since been regenerated into
+ *    something the run does not execute. A complete run passes it as readily
+ *    as a live one, because its current stage is its last.
+ *
+ * Neither check can distinguish two worktrees that run the same plan path —
+ * their recorded state is identical by construction. That is why the file name
+ * is scoped to the project as well (see {@link manifestFileName}): the
+ * validation says the manifest describes this *plan run*, and the path says it
+ * belongs to this *worktree*.
+ */
+export interface ManifestExpectation {
+  /** The plan label the run records (`PlanRunState.plan`). */
+  planLabel: string;
+  /** The stage the run records itself as being at (`PlanRunState.currentStage`). */
+  currentStageId: string;
+}
+
+/** Why a manifest on disk was not accepted as a run's stage list; for the log and the diagnostic. */
+export type ManifestRejection = "unreadable" | "plan-label" | "current-stage";
+
+export type ManifestBinding = { ok: true; identity: ManifestIdentity } | { ok: false; reason: ManifestRejection; detail: string };
+
+/**
+ * Read a manifest and bind it to the run it is claimed to describe, or say
+ * why it cannot be. Never returns a partial answer: an unbound manifest
+ * yields nothing, and the caller degrades to "no recorded membership" rather
+ * than to a guess.
+ */
+export function bindManifest(text: string | undefined, expect: ManifestExpectation): ManifestBinding {
+  const identity = readManifestIdentity(text);
+  if (!identity) {
+    return { ok: false, reason: "unreadable", detail: "not a version 1 execution manifest with a complete stage list" };
+  }
+  if (identity.planLabel !== expect.planLabel) {
+    return { ok: false, reason: "plan-label", detail: `it executes ${identity.planLabel}, while the run records ${expect.planLabel}` };
+  }
+  if (!identity.stages.some((stage) => stage.stageId === expect.currentStageId)) {
+    return { ok: false, reason: "current-stage", detail: `it does not contain the run's recorded current stage ${expect.currentStageId}` };
+  }
+  return { ok: true, identity };
+}
+
+/**
+ * Where a plan run's manifest lives. One place this is computed, so the
+ * writer, the reader and the tests cannot drift into different files.
+ */
+export function manifestPathFor(directory: string, run: { planKey: string; location: { projectDir: string } }): string {
+  return path.join(directory, manifestFileName(run.planKey, run.location.projectDir));
+}
+
+/** What a manifest must match to be that run's: taken from the engine's own recorded state. */
+export function manifestExpectationFor(run: { state: { plan: string; currentStage: string } }): ManifestExpectation {
+  return { planLabel: run.state.plan, currentStageId: run.state.currentStage };
+}
+
+/** A manifest as it is on disk, with its identity fields; `undefined` when it is absent or not one. */
+export function readManifestIdentity(text: string | undefined): ManifestIdentity | undefined {
+  if (!text) {
+    return undefined;
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (!raw || typeof raw !== "object") {
+    return undefined;
+  }
+  const payload = raw as Record<string, unknown>;
+  const planLabel = typeof payload["plan_label"] === "string" ? payload["plan_label"] : undefined;
+  const sourceDigest = typeof payload["source_digest"] === "string" ? payload["source_digest"] : undefined;
+  const stages = readManifestStages(text);
+  if (planLabel === undefined || sourceDigest === undefined || !stages) {
+    return undefined;
+  }
+  return { planLabel, sourceDigest, stages };
+}
+
 /**
  * Read back the stages of a manifest this extension wrote, for display.
  *
@@ -400,7 +501,43 @@ export function readManifestStages(text: string | undefined): ManifestStageIdent
   return out;
 }
 
-/** A stable file name for one plan's manifest, so regenerating it overwrites in place. */
-export function manifestFileName(planKey: string): string {
+/**
+ * A stable file name for one plan run's manifest, so regenerating it
+ * overwrites in place.
+ *
+ * Scoped to the project directory as well as the plan, because a plan key is
+ * a hash of the plan's **repo-relative** path: two worktrees of the same
+ * repository — the ordinary way to run two stages of the same plan side by
+ * side — produce the same key for `docs/plans/foo.md`, and used to share one
+ * file in global storage. Whichever window wrote last decided what the other
+ * one believed its stages were, and the Overview would then attribute one
+ * worktree's historical stages to the other worktree's run.
+ *
+ * The project directory is the same thing `runIdFor` uses to make a run
+ * identity unique, so the manifest and the run it belongs to are now scoped
+ * the same way. See {@link legacyManifestFileName} for how a run started
+ * before this keeps its provenance.
+ */
+export function manifestFileName(planKey: string, projectDir: string): string {
+  return `${planKey}-${projectDigest(projectDir)}.manifest.json`;
+}
+
+/**
+ * The name manifests had before they were scoped to a project: shared by every
+ * worktree with the same plan path.
+ *
+ * It is never written any more and never read as authority. It is read for one
+ * thing only: `source_digest` provenance when a run that started against the
+ * old file writes its first scoped one (see `carriedForward`). Without that,
+ * the rebuilt manifest would take a fresh hash of the plan text, the engine's
+ * run identity would change, and a run in flight would be refused — the exact
+ * failure that lost a submission before.
+ */
+export function legacyManifestFileName(planKey: string): string {
   return `${planKey}.manifest.json`;
+}
+
+/** First 8 hex digits of SHA-256 of the resolved project directory; short enough to keep the file name readable. */
+function projectDigest(projectDir: string): string {
+  return crypto.createHash("sha256").update(path.resolve(projectDir), "utf8").digest("hex").slice(0, 8);
 }

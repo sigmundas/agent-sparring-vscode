@@ -18,6 +18,7 @@ import * as crypto from "node:crypto";
 import * as os from "node:os";
 import type { DiscoveryDiagnostic } from "../core/diagnose";
 import { discoverRuns, selectRun } from "../core/discovery";
+import { manifestFileName } from "../core/manifest";
 import { isCopyPromptMessage, isHumanCheckMessage, isHumanFeedbackMessage, isOpenPromptSourceMessage, renderOverviewHtml } from "../core/overviewHtml";
 import { withHumanCheck, type HumanCheckDrafts } from "../core/humanChecks";
 import type { ExecutionRecord, LivenessState, RunnerLiveness } from "../core/liveness";
@@ -768,14 +769,20 @@ async function advancementAssertions(reportedRepo: string): Promise<void> {
   await fs.writeFile(planState, JSON.stringify({ current_stage: stage4, current_stage_index: 6, expected_branch: "feature/reported-statistics", plan: GATE_PLAN_LABEL, plan_digest: "0".repeat(64), source: "manifest", status: "running" }));
   // The manifest this managed run executes, as the extension wrote it when
   // the plan was adopted: it is what gives Stage 4 its plan identity.
+  //
+  // Written under the name the extension itself uses, which is scoped to this
+  // project as well as to the plan key, and carrying the fields a manifest is
+  // bound by: the plan label it executes, and a stage list containing the
+  // run's recorded current stage.
   const manifests = (await vscode.commands.executeCommand("agentSparring._test.manifestDirectory")) as string;
   await fs.mkdir(manifests, { recursive: true });
+  const manifestFile = path.join(manifests, manifestFileName(GATE_PLAN_KEY, reportedRepo));
   await fs.writeFile(
-    path.join(manifests, `${GATE_PLAN_KEY}.manifest.json`),
+    manifestFile,
     JSON.stringify({
       version: 1,
-      plan: GATE_PLAN_LABEL,
-      plan_digest: "0".repeat(64),
+      plan_label: GATE_PLAN_LABEL,
+      source_digest: `sha256:${"0".repeat(64)}`,
       stages: [
         { stage_id: GATE_STAGE, label: "Stage 3D", title: "Snapshot v2 and attachment/export/import transport", brief: "The transport." },
         { stage_id: stage4, label: "Stage 4", title: "Editor and UI inspection and guarded editing", brief: "The editor." },
@@ -805,14 +812,63 @@ async function advancementAssertions(reportedRepo: string): Promise<void> {
   assert.equal(history.continueAutomatically, undefined, "adopting again is not offered");
   assert.equal(history.whatsNext?.kind, "next-created", "nor creating a stage the engine already created");
 
+  // Withholding the button is not enough: the command itself must refuse.
+  // "Continue plan automatically" is reachable from the Command Palette and
+  // from a keybinding, and what it would do to a stage this run already
+  // executed is create or adopt a *second* plan run over the same work.
+  const refused = (await vscode.commands.executeCommand("agentSparring._test.continueAutomatically")) as { ok: boolean; reason?: string; message?: string };
+  assert.equal(refused.ok, false, "the command path refuses, not just the screen");
+  assert.equal(refused.reason, "owned", `refused because the stage is owned, got ${String(refused.reason)}`);
+  assert.match(refused.message ?? "", /Stage 3D/, `and it names the stage and its run, got ${String(refused.message)}`);
+
+  // No second plan run was created or adopted: the project still has exactly
+  // the one the engine recorded.
+  const afterRefusal = (await vscode.commands.executeCommand("agentSparring.diagnoseDiscovery")) as DiscoveryDiagnostic;
+  assert.deepEqual(
+    afterRefusal.runs.filter((run) => run.kind === "plan").map((run) => run.id),
+    [before.runs.find((run) => run.id.endsWith(`plan:${GATE_PLAN_KEY}`))?.id ?? `${reportedRepo}|plan:${GATE_PLAN_KEY}`].filter(Boolean),
+    "exactly one plan run, the recorded one",
+  );
+
+  // A manifest that no longer describes the run is not half-believed: the
+  // stage goes back to standing on its own rather than being attributed to a
+  // run that cannot be shown to have executed it.
+  await fs.writeFile(
+    manifestFile,
+    JSON.stringify({
+      version: 1,
+      plan_label: GATE_PLAN_LABEL,
+      source_digest: `sha256:${"0".repeat(64)}`,
+      stages: [{ stage_id: "stage-9-rewritten", label: "Stage 9", title: "Rewritten", brief: "x" }],
+    }),
+  );
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  await vscode.commands.executeCommand("agentSparring._test.chooseRun", stageRunId);
+  const unbound = await model();
+  assert.equal(unbound.runKind, "Standalone stage", `an unbound manifest attributes nothing, got ${String(unbound.runKind)}`);
+  assert.equal(unbound.followPlan, undefined, "and there is no dead Back to plan run");
+
   // And that button switches to it.
+  await fs.writeFile(
+    manifestFile,
+    JSON.stringify({
+      version: 1,
+      plan_label: GATE_PLAN_LABEL,
+      source_digest: `sha256:${"0".repeat(64)}`,
+      stages: [
+        { stage_id: GATE_STAGE, label: "Stage 3D", title: "Snapshot v2 and attachment/export/import transport", brief: "The transport." },
+        { stage_id: stage4, label: "Stage 4", title: "Editor and UI inspection and guarded editing", brief: "The editor." },
+      ],
+    }),
+  );
+  await vscode.commands.executeCommand("agentSparring.refresh");
   await vscode.commands.executeCommand("agentSparring._test.associatePlan", undefined);
   await vscode.commands.executeCommand("agentSparring._test.chooseRun", stageRunId);
   await vscode.commands.executeCommand("agentSparring._test.overviewAction", "openPlanRun");
   const followed = await model();
   assert.equal(followed.runKind, "Plan run");
   assert.equal(followed.stageId, stage4);
-  console.log("integration: after the managed run advanced, the Overview follows it to Stage 4; the finished stage stays reachable as history");
+  console.log("integration: after the managed run advanced, the Overview follows it to Stage 4; the finished stage stays reachable as history, and adopting it a second time is refused in the command path");
 }
 
 // ---------------------------------------------------------------- one reusable terminal per project

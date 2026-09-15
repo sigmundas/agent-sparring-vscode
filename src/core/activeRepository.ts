@@ -1,46 +1,61 @@
 /**
- * Which repository this VS Code window is *in*, folded from the signals the
- * public API actually offers.
+ * Which repository Agent Sparring is in, and how that is decided.
  *
- * VS Code has the concept internally — `ISCMViewService.activeRepository` is
- * `pinned ?? latestChangedOf(activeEditorRepository, scmFocusedRepository)`,
- * and the lower-left repository selector is the status bar entry
- * `status.scm.provider`, whose command `scm.setActiveProvider` calls
- * `pinActiveRepository`. None of that is public: `vscode.scm` exposes only
- * `createSourceControl`, and core publishes the active repository solely as
- * the context keys `scmActiveRepositoryName` / `scmActiveRepositoryBranchName`,
- * which an extension can test in a `when` clause but cannot read as values.
+ * ### The contract, stated plainly
  *
- * What *is* public, and stable, is the built-in Git extension's API version 1:
+ * ```
+ * Agent Sparring repository context =
+ *     the explicitly pinned Agent Sparring repository/run, if one is pinned
+ *     otherwise the repository of the active editor / Source Control focus
+ * ```
  *
- *  - `Repository.ui.selected` / `Repository.ui.onDidChange` — fed by core from
- *    `scmViewService.onDidFocusRepository`, so it tracks which repository is
- *    focused in the Source Control view. Exactly one repository is selected at
- *    a time; the previous one is set back to false.
- *  - `API.getRepository(uri)`, plus `vscode.window.onDidChangeActiveTextEditor`
- *    — the repository owning the document you are looking at.
+ * That is the whole rule, and it is the rule the UI states out loud. It is
+ * deliberately *not* "whatever VS Code's lower-left repository selector says":
  *
- * Those are the same two inputs core folds together, so this module folds them
- * the same way: the most recently changed one wins. The one input we cannot
- * see is the user's explicit *pin* from the lower-left selector, which reaches
- * no extension at all. Agent Sparring therefore offers its own explicit pin
- * (see discovery.selectRun's `preferred`) and says which repository it has
- * resolved, so a disagreement is visible and correctable rather than silent.
+ *  - `vscode.scm` exposes only `createSourceControl`. There is no public
+ *    `activeRepository`.
+ *  - The lower-left selector is core's own status bar entry; its command
+ *    `scm.setActiveProvider` calls `pinActiveRepository` on an internal
+ *    service. No extension is told, and none can ask.
+ *  - Core publishes the answer solely as the context keys
+ *    `scmActiveRepositoryName` / `scmActiveRepositoryBranchName`, which a
+ *    `when` clause can test but an extension cannot read as a value.
  *
- * The wording for all of this lives here too, so the status bar, the Run
- * Overview and the run picker can never disagree about which repository the
- * cockpit is in or whether it is following or pinned.
+ * Emulating it would mean reaching into private commands or internals, so the
+ * cockpit does not claim to follow it. What it follows instead is the two
+ * public signals the built-in Git extension's API version 1 does offer:
+ *
+ *  - `Repository.ui.selected` / `Repository.ui.onDidChange` — which repository
+ *    the Source Control view has focused;
+ *  - `API.getRepository(uri)` plus `window.onDidChangeActiveTextEditor` — the
+ *    repository owning the document you are looking at.
+ *
+ * The most recently *observed* of those two wins, and Agent Sparring's own pin
+ * overrides both. Because the two can disagree with the lower-left selector,
+ * the repository the cockpit resolved is named at the top of the Overview and
+ * in the status bar tooltip rather than left implicit: a person must never be
+ * able to think the cockpit silently followed a selector it cannot see.
+ *
+ * ### A re-read is not an event
+ *
+ * {@link ActiveRepositoryFold} separates *observations* (an editor became
+ * active; the Source Control view moved its focus) from *resolution* (which
+ * repository root an observation names). Only an observation carries a
+ * timestamp. Re-reading the Git extension — because a repository opened or
+ * closed, or because the extension only just became available — re-resolves
+ * the recorded observations and never stamps a new one. Without that
+ * separation, an unrelated repository opening could hand the lead back to an
+ * editor the user had already navigated away from.
  *
  * No dependency on the vscode API.
  */
 
-import * as path from "node:path";
-import type { RunSelection, RunSnapshot } from "./discovery";
+import { canonicalPath, isInsidePath, samePath, type RunSelection, type RunSnapshot } from "./discovery";
 
 export interface ActiveRepositorySignal {
   /** Absolute repository/worktree root, exactly as the Git extension reports it. */
   rootPath: string;
-  /** When this signal last changed (epoch ms). */
+  /** When this signal was last *observed* (epoch ms). Never advanced by a re-read. */
   atMs: number;
 }
 
@@ -58,7 +73,8 @@ export interface ActiveRepositoryState {
 export const NO_ACTIVE_REPOSITORY: ActiveRepositoryState = {};
 
 /**
- * The repository the window is in: whichever signal changed most recently.
+ * The repository the window is in: whichever signal was observed most
+ * recently.
  *
  * A tie goes to the Source Control view's focus, because focusing a
  * repository there is a deliberate statement about which repository you mean,
@@ -114,10 +130,50 @@ export function withEditorRepository(state: ActiveRepositoryState, rootPath: str
   return { ...state, editor: { rootPath, atMs } };
 }
 
+/**
+ * Re-resolve the Source Control focus without treating the re-read as a new
+ * statement: whatever moment the focus was observed at is kept.
+ *
+ * `seedAtMs` is used only when there is nothing recorded yet — the case where
+ * the Git extension has only just become able to answer at all, so the moment
+ * we learned the focus is the only moment there is.
+ */
+export function withResolvedFocusedRepository(state: ActiveRepositoryState, rootPath: string | undefined, seedAtMs: number): ActiveRepositoryState {
+  if (rootPath === undefined) {
+    return state.focused === undefined ? state : { ...state, focused: undefined };
+  }
+  const atMs = state.focused?.atMs ?? seedAtMs;
+  if (state.focused && state.focused.atMs === atMs && samePath(state.focused.rootPath, rootPath)) {
+    return state;
+  }
+  return { ...state, focused: { rootPath, atMs } };
+}
+
+/**
+ * Re-resolve the active editor to a repository without inventing a selection
+ * event. `seedAtMs` is the moment that editor was observed to become active,
+ * which is genuinely known even when the Git extension could not yet say
+ * which repository it belonged to.
+ *
+ * This is the fix for: editor in A, then Source Control focus on B, then an
+ * unrelated repository C opens — the re-read caused by C used to re-stamp A
+ * and jump the cockpit back to it.
+ */
+export function withResolvedEditorRepository(state: ActiveRepositoryState, rootPath: string | undefined, seedAtMs: number): ActiveRepositoryState {
+  if (rootPath === undefined) {
+    return state;
+  }
+  const atMs = state.editor?.atMs ?? seedAtMs;
+  if (state.editor && state.editor.atMs === atMs && samePath(state.editor.rootPath, rootPath)) {
+    return state;
+  }
+  return { ...state, editor: { rootPath, atMs } };
+}
+
 /** Whether this repository is already the answer, in which case no signal about it is news. */
 function isActive(state: ActiveRepositoryState, rootPath: string): boolean {
   const current = activeRepositoryRoot(state);
-  return current !== undefined && path.resolve(current) === path.resolve(rootPath);
+  return current !== undefined && samePath(current, rootPath);
 }
 
 /**
@@ -130,59 +186,269 @@ export function withKnownRepositories(state: ActiveRepositoryState, roots: reado
   if (roots === undefined) {
     return state;
   }
-  const open = new Set(roots.map((root) => path.resolve(root)));
-  const keep = (signal: ActiveRepositorySignal | undefined) => (signal && open.has(path.resolve(signal.rootPath)) ? signal : undefined);
+  const open = new Set(roots.map((root) => canonicalPath(root)));
+  const keep = (signal: ActiveRepositorySignal | undefined) => (signal && open.has(canonicalPath(signal.rootPath)) ? signal : undefined);
   const next: ActiveRepositoryState = { focused: keep(state.focused), editor: keep(state.editor) };
   return next.focused === state.focused && next.editor === state.editor ? state : next;
 }
 
 // ---------------------------------------------------------------------------
-// wording: following, pinned, and the honest empty state
+// the fold: observations in, one repository out
 // ---------------------------------------------------------------------------
 
-/** The one name for going back to automatic selection, wherever it is offered. */
-export const FOLLOW_ACTIVE_LABEL = "Follow the active repository";
-
-export interface FollowingView {
-  /**
-   * `following` — automatic selection, confined to the repository this window
-   * is in; `pinned` — the user chose one run explicitly and it is kept even
-   * when the window moves to another repository; `unscoped` — no repository
-   * could be resolved (the Git extension told us nothing), so every discovered
-   * run is a candidate, which is the behaviour from before following existed.
-   */
-  mode: "following" | "pinned" | "unscoped";
-  /** One line for a footer or tooltip. */
-  text: string;
-  /** Present only when the pin is holding the cockpit away from the active repository. */
-  release?: string;
+/** One repository as the Git extension's API version 1 reports it, reduced to what the fold needs. */
+export interface GitRepositoryView {
+  /** Absolute repository/worktree root (`Repository.rootUri.fsPath`). */
+  rootPath: string;
+  /** `Repository.ui.selected` — focused in the Source Control view. */
+  selected: boolean;
 }
 
 /**
- * How the cockpit is currently scoped, said plainly.
+ * The built-in Git extension, as far as this fold is concerned.
+ *
+ * `repositories()` returning `undefined` means the extension has answered
+ * nothing at all — it is not installed, not active yet, or offers no API
+ * version 1 — which is a different thing from an active extension with no
+ * repository open (an empty array). The distinction is what keeps a window
+ * that started before the Git extension from being permanently unscoped.
+ */
+export interface GitSource {
+  repositories(): readonly GitRepositoryView[] | undefined;
+  /**
+   * The Git extension's own answer for which repository owns a path
+   * (`API.getRepository`), or `undefined` when it declines. It knows about
+   * submodules and worktrees, so it is asked before the containment fallback
+   * below.
+   */
+  repositoryOf(fsPath: string): string | undefined;
+}
+
+/**
+ * Folds the two public signals into one repository, keeping observations and
+ * re-reads strictly apart.
+ *
+ * Every method returns the repository root the fold now resolves to, so the
+ * adapter can decide whether anything changed without a second read.
+ */
+export class ActiveRepositoryFold {
+  private state: ActiveRepositoryState = NO_ACTIVE_REPOSITORY;
+  /**
+   * The document in the active editor, and when it became active. Held as the
+   * *path* rather than as a resolved repository so it can be re-resolved once
+   * the Git extension is able to answer, without claiming the editor became
+   * active at that later moment.
+   */
+  private editorDocument: { fsPath: string; atMs: number } | undefined;
+
+  constructor(
+    private readonly git: GitSource,
+    /** When this window's tracker started; the seed for a signal with no observable moment of its own. */
+    private readonly startedAtMs: number,
+  ) {}
+
+  /** The repository this window is in, or `undefined` when no signal names one. */
+  get activeRepoRoot(): string | undefined {
+    return activeRepositoryRoot(this.state);
+  }
+
+  /** Every repository root the Git extension has open; `undefined` when it has told us nothing. */
+  get knownRepoRoots(): string[] | undefined {
+    return this.git.repositories()?.map((repository) => repository.rootPath);
+  }
+
+  /**
+   * A real `onDidChangeActiveTextEditor`. `fsPath` is `undefined` for an
+   * editor with no file on disk, which is recorded as "nothing new to say"
+   * rather than as leaving the repository.
+   */
+  editorActivated(fsPath: string | undefined, atMs: number): string | undefined {
+    if (fsPath === undefined) {
+      // An editor with no file on disk — a Settings tab, the Output panel, an
+      // untitled buffer, or no editor at all — is not a statement about
+      // repositories, so the previously observed document keeps its moment.
+      // Re-stamping it here would let opening the log hand the lead back to an
+      // editor the Source Control view has since moved away from.
+      this.reresolve();
+      return this.activeRepoRoot;
+    }
+    this.editorDocument = { fsPath, atMs };
+    this.reresolve();
+    this.state = withEditorRepository(this.state, this.editorRoot(), atMs);
+    return this.activeRepoRoot;
+  }
+
+  /**
+   * A real `Repository.ui.onDidChange`: the Source Control view moved its
+   * focus, which is a deliberate statement and is stamped now.
+   */
+  focusChanged(atMs: number): string | undefined {
+    this.reresolve();
+    this.state = withFocusedRepository(this.state, this.focusedRoot(), atMs);
+    return this.activeRepoRoot;
+  }
+
+  /**
+   * A re-read: a repository opened or closed, or the Git extension only just
+   * became available. Resolves the recorded observations again and stamps
+   * nothing.
+   */
+  resync(): string | undefined {
+    this.reresolve();
+    return this.activeRepoRoot;
+  }
+
+  /**
+   * Seed the editor that was already open when this window's tracker started.
+   * Its moment is the tracker's own start, which is the earliest honest claim
+   * that can be made about it.
+   */
+  seedActiveEditor(fsPath: string | undefined): string | undefined {
+    if (fsPath !== undefined && this.editorDocument === undefined) {
+      this.editorDocument = { fsPath, atMs: this.startedAtMs };
+    }
+    return this.resync();
+  }
+
+  private reresolve(): void {
+    this.state = withKnownRepositories(this.state, this.knownRepoRoots);
+    this.state = withResolvedFocusedRepository(this.state, this.focusedRoot(), this.startedAtMs);
+    this.state = withResolvedEditorRepository(this.state, this.editorRoot(), this.editorDocument?.atMs ?? this.startedAtMs);
+  }
+
+  private focusedRoot(): string | undefined {
+    return this.git.repositories()?.find((repository) => repository.selected)?.rootPath;
+  }
+
+  private editorRoot(): string | undefined {
+    const fsPath = this.editorDocument?.fsPath;
+    if (fsPath === undefined) {
+      return undefined;
+    }
+    return repositoryOfPath(this.git, fsPath);
+  }
+}
+
+/**
+ * Which repository owns a path.
+ *
+ * The Git extension is asked first, because it is its own authority and knows
+ * about submodules and worktrees. The containment fallback exists for the
+ * cases it declines: there the *deepest* open root containing the path wins,
+ * so a worktree checked out inside its parent repository is not mistaken for
+ * the parent.
+ */
+export function repositoryOfPath(git: GitSource, fsPath: string): string | undefined {
+  const owner = git.repositoryOf(fsPath);
+  if (owner) {
+    return owner;
+  }
+  return (git.repositories() ?? [])
+    .map((repository) => repository.rootPath)
+    .filter((root) => samePath(root, fsPath) || isInsidePath(fsPath, root))
+    .sort((a, b) => canonicalPath(b).length - canonicalPath(a).length)[0];
+}
+
+// ---------------------------------------------------------------------------
+// wording: the contract, said out loud
+// ---------------------------------------------------------------------------
+
+/** The one name for going back to automatic selection, wherever it is offered. */
+export const FOLLOW_ACTIVE_LABEL = "Follow active repository";
+/** The one name for Agent Sparring's own repository/run chooser. */
+export const SELECT_RUN_LABEL = "Select repository / run…";
+
+/** The headline above the repository name, one per mode. */
+export const CONTEXT_HEADLINE = {
+  following: "Following repository",
+  pinned: "Viewing pinned run from",
+  unscoped: "Repository context",
+} as const;
+
+/** The second line, shown whenever a pin is in force so the pin can never hide where the window actually is. */
+export const ACTIVE_CONTEXT_HEADLINE = "Active repository context";
+
+/**
+ * How the cockpit is scoped right now, as the Overview and the status bar
+ * both state it.
+ *
+ * `mode` is the contract in one word: `pinned` — an explicit Agent Sparring
+ * selection is in force; `following` — the repository of the active editor /
+ * Source Control focus; `unscoped` — neither could be resolved, so every
+ * discovered run is a candidate, which is the behaviour from before following
+ * existed.
+ */
+export interface RepositoryContextView {
+  mode: "following" | "pinned" | "unscoped";
+  /** `Following repository` / `Viewing pinned run from` / `Repository context`. */
+  headline: string;
+  /** The repository named under that headline; absent only when nothing could be resolved. */
+  repository?: string;
+  /**
+   * The repository the *window* is in, named whenever a pin is in force —
+   * including when the pin is in that same repository, so the policy reads
+   * the same way every time.
+   */
+  activeRepository?: string;
+  /** Present when a pin is holding the cockpit away from the active repository. */
+  away?: boolean;
+  /** One line for a tooltip or the status bar. */
+  text: string;
+  /** The label of the control that releases a pin; present only when there is a pin to release. */
+  release?: string;
+  /** How the context was decided, for the details layer. Never the only place a fact appears. */
+  explanation: string;
+}
+
+const FOLLOWING_EXPLANATION =
+  "Agent Sparring follows the repository of the active editor or the Source Control view's focus. VS Code's own repository selector in the status bar is not readable by extensions, so it is not what this follows; use Select repository / run to choose explicitly.";
+const PINNED_EXPLANATION = `This run was pinned through Select repository / run, and a pin is kept even when the window moves to another repository so that history stays open while you work elsewhere. ${FOLLOW_ACTIVE_LABEL} releases it.`;
+const UNSCOPED_EXPLANATION =
+  "No repository could be resolved: the built-in Git extension has opened none, or has not answered yet. Nothing is scoped away, so every discovered run is a candidate.";
+
+/**
+ * The repository context of a selection, said the same way everywhere.
  *
  * A pin is only called out as holding the cockpit *away* from somewhere when
  * it actually is: pinning a run in the repository you are already in is not a
  * conflict, and claiming otherwise would put a warning on the screen that
  * nothing is wrong with.
  */
-export function describeFollowing(selection: RunSelection): FollowingView {
+export function describeRepositoryContext(selection: RunSelection): RepositoryContextView {
   const scope = selection.scope;
   if (selection.pinned && selection.selected) {
     const pinnedTo = selection.selected.location.folderName;
-    if (!scope || path.resolve(selection.selected.location.repoRoot) === scope.repoRoot) {
-      return { mode: "pinned", text: `Pinned to this run in ${pinnedTo}.`, release: `${FOLLOW_ACTIVE_LABEL} instead.` };
-    }
+    const away = Boolean(scope) && !samePath(selection.selected.location.repoRoot, scope?.repoRoot ?? "");
     return {
       mode: "pinned",
-      text: `Pinned to a run in ${pinnedTo}, while this window is in ${scope.name}.`,
-      release: `${FOLLOW_ACTIVE_LABEL} to follow ${scope.name} again.`,
+      headline: CONTEXT_HEADLINE.pinned,
+      repository: pinnedTo,
+      activeRepository: scope?.name,
+      ...(away ? { away: true } : {}),
+      text: away
+        ? `Pinned to a run in ${pinnedTo}, while this window is in ${scope?.name}.`
+        : scope
+          ? `Pinned to this run in ${pinnedTo}.`
+          : `Pinned to a run in ${pinnedTo}; no active repository could be resolved.`,
+      release: FOLLOW_ACTIVE_LABEL,
+      explanation: PINNED_EXPLANATION,
     };
   }
   if (scope) {
-    return { mode: "following", text: `Following the active repository: ${scope.name}.` };
+    return {
+      mode: "following",
+      headline: CONTEXT_HEADLINE.following,
+      repository: scope.name,
+      text: `Following the active repository: ${scope.name}.`,
+      explanation: FOLLOWING_EXPLANATION,
+    };
   }
-  return { mode: "unscoped", text: "No active repository resolved; every discovered run is a candidate." };
+  return {
+    mode: "unscoped",
+    headline: CONTEXT_HEADLINE.unscoped,
+    text: "No active repository resolved; every discovered run is a candidate.",
+    explanation: UNSCOPED_EXPLANATION,
+  };
 }
 
 /**
@@ -210,6 +476,10 @@ export function emptyStateLines(selection: RunSelection): string[] {
   if (elsewhere) {
     lines.push(elsewhere);
   }
+  const unattributed = describeUnattributed(selection.unattributed ?? []);
+  if (unattributed) {
+    lines.push(unattributed);
+  }
   return lines;
 }
 
@@ -222,10 +492,31 @@ export function describeElsewhere(runs: readonly RunSnapshot[]): string | undefi
   if (runs.length === 0) {
     return undefined;
   }
+  return `Agent Sparring has also discovered ${countByRepository(runs)}. Select repository / run pins one of those to inspect it.`;
+}
+
+/**
+ * Runs that no repository the Git extension has opened owns.
+ *
+ * They are never selected automatically — attributing them to the active
+ * repository would be a guess, and a guess is exactly what produces "Following
+ * the active repository: B" above a run from A. They stay in the picker, and
+ * the empty state says they are there.
+ */
+export function describeUnattributed(runs: readonly RunSnapshot[]): string | undefined {
+  if (runs.length === 0) {
+    return undefined;
+  }
+  return `Agent Sparring has also discovered ${countByRepository(runs)} that could not be attributed to any repository the Git extension has opened; nothing is selected from those automatically. Select repository / run reaches them.`;
+}
+
+function countByRepository(runs: readonly RunSnapshot[]): string {
   const byRepository = new Map<string, number>();
   for (const run of runs) {
     byRepository.set(run.location.folderName, (byRepository.get(run.location.folderName) ?? 0) + 1);
   }
-  const parts = [...byRepository.entries()].sort((a, b) => a[0].localeCompare(b[0])).map(([name, count]) => `${count} in ${name}`);
-  return `Agent Sparring has also discovered ${parts.join(", ")}. Select Repository / Run pins one of those to inspect it.`;
+  return [...byRepository.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([name, count]) => `${count} in ${name}`)
+    .join(", ");
 }

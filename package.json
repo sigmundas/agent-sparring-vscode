@@ -57,7 +57,7 @@
       },
       {
         "command": "agentSparring.followActiveRepository",
-        "title": "Follow the Active Repository",
+        "title": "Follow Active Repository",
         "category": "Agent Sparring"
       },
       {

@@ -33,7 +33,7 @@ import {
 } from "./discovery";
 import { EngineFormatError, parsePlanRunState, parseStageState } from "./engineFormats";
 import type { ManifestStageIdentity } from "./manifest";
-import { resolveMemberships } from "./planMembership";
+import { resolveMemberships, stageOwnership } from "./planMembership";
 import { buildRunPickGroups } from "./runPick";
 
 export interface DiagnosticFolder {
@@ -91,8 +91,12 @@ export interface DiscoveryDiagnostic {
   stickyId?: string;
   /** The repository automatic selection was confined to, and the roots it was attributed against. */
   scope?: { repoRoot: string; name: string; knownRoots: string[] };
-  /** Runs that exist in other repositories, so "no run here" can be told from "no run anywhere". */
+  /** Whether the built-in Git extension's API is attached; without it nothing is scoped. */
+  gitAttached?: boolean;
+  /** Runs positively attributed to another repository, so "no run here" can be told from "no run anywhere". */
   elsewhereIds?: string[];
+  /** Runs no known repository root owns; never candidates for automatic selection, always in the picker. */
+  unattributedIds?: string[];
   /**
    * What "Select Repository / Run" would list, in order, one string per row:
    * `<group> | <label> — <description> — <detail>`. The group is included
@@ -111,6 +115,8 @@ export interface DiagnoseOptions extends LocateOptions {
   stickyId?: string;
   /** What the window is following; see core/activeRepository.ts. */
   scope?: RepositoryScope;
+  /** Whether the Git extension's API was attached when the report was taken. */
+  gitAttached?: boolean;
   /**
    * The stage identities of a managed run's execution manifest, when the
    * caller can read them (the extension's cached reader). Supplying it is what
@@ -146,8 +152,8 @@ export async function diagnoseDiscovery(folders: DiagnosticFolder[], options: Di
       location.runIds = discovery.runs.filter((run) => run.location.sparringDir === location.sparringDir).map((run) => run.id);
     }
   }
-  const selection = selectRun(discovery.runs, options.preferredId, options.stickyId, options.scope);
   const memberships = options.manifestStages ? await resolveMemberships(discovery.runs, options.manifestStages) : undefined;
+  const selection = selectRun(discovery.runs, options.preferredId, options.stickyId, options.scope, memberships ? stageOwnership(memberships) : undefined);
   const report: DiscoveryDiagnostic = {
     folders: folderReports,
     problems: discovery.problems,
@@ -157,7 +163,9 @@ export async function diagnoseDiscovery(folders: DiagnosticFolder[], options: Di
     ...(options.scope && selection.scope
       ? { scope: { repoRoot: selection.scope.repoRoot, name: selection.scope.name, knownRoots: [...(options.scope.knownRoots ?? [])] } }
       : {}),
+    ...(options.gitAttached === undefined ? {} : { gitAttached: options.gitAttached }),
     ...(selection.elsewhere ? { elsewhereIds: selection.elsewhere.map((run) => run.id) } : {}),
+    ...(selection.unattributed ? { unattributedIds: selection.unattributed.map((run) => run.id) } : {}),
     pickLabels: buildRunPickGroups(discovery.runs, { selectedId: selection.selected?.id, memberships }).flatMap((group) =>
       group.items.map((item) => `${group.title} | ${item.label} — ${item.description} — ${item.detail}`),
     ),
@@ -240,8 +248,15 @@ function explainNoSelection(report: DiscoveryDiagnostic): string {
   if (report.ambiguousIds.length > 0) {
     return `${report.ambiguousIds.length} runs look active and neither the explicit nor the remembered selection names one of them; a choice is required`;
   }
-  if (report.scope && report.elsewhereIds && report.elsewhereIds.length === report.runs.length && report.runs.length > 0) {
-    return `no recorded run in ${report.scope.name}, the repository this window is in; ${report.elsewhereIds.length} run(s) exist in other repositories and can be pinned through Select Repository / Run`;
+  if (report.scope && report.runs.length > 0) {
+    const out = (report.elsewhereIds?.length ?? 0) + (report.unattributedIds?.length ?? 0);
+    if (out === report.runs.length) {
+      const parts = [
+        report.elsewhereIds?.length ? `${report.elsewhereIds.length} in other repositories` : "",
+        report.unattributedIds?.length ? `${report.unattributedIds.length} attributable to no repository the Git extension has opened` : "",
+      ].filter(Boolean);
+      return `no recorded run in ${report.scope.name}, the repository this window is in; ${parts.join(" and ")}, all reachable through Select repository / run`;
+    }
   }
   if (report.runs.length > 0) {
     return "runs exist but none was selected (unexpected; see the selection rule)";
@@ -324,12 +339,16 @@ export function renderDiagnostic(report: DiscoveryDiagnostic): string[] {
   for (const run of report.runs) {
     lines.push(`  ${run.kind} ${run.label} (${run.open ? "open" : "terminal"}) id ${run.id}`);
   }
+  lines.push(`Git extension API: ${report.gitAttached === undefined ? "not reported" : report.gitAttached ? "attached" : "not attached; nothing is scoped to a repository"}`);
   lines.push(`active repository: ${report.scope ? `${report.scope.name} (${report.scope.repoRoot})` : "none resolved; selection is not confined to a repository"}`);
   if (report.scope) {
     lines.push(`  repository roots runs were attributed against: ${report.scope.knownRoots.length === 0 ? "none" : report.scope.knownRoots.join(", ")}`);
   }
   if (report.elsewhereIds && report.elsewhereIds.length > 0) {
     lines.push(`  runs in other repositories (not candidates for automatic selection): ${report.elsewhereIds.join(", ")}`);
+  }
+  if (report.unattributedIds && report.unattributedIds.length > 0) {
+    lines.push(`  runs no known repository root owns (not candidates for automatic selection; reachable through the picker): ${report.unattributedIds.join(", ")}`);
   }
   lines.push(`explicit selection (pin): ${report.preferredId ?? "none"}`);
   lines.push(`remembered selection: ${report.stickyId ?? "none"}`);

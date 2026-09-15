@@ -13,7 +13,7 @@
  * No dependency on the vscode API.
  */
 
-import { describeFollowing, emptyStateLines, emptyStateTitle } from "./activeRepository";
+import { describeRepositoryContext, emptyStateLines, emptyStateTitle } from "./activeRepository";
 import { currentStageOf, runLabel, totalStagesOf, type RunSelection, type RunSnapshot } from "./discovery";
 import type { RunnerLiveness } from "./liveness";
 import { providerDisplayName, type LiveState } from "./liveState";
@@ -63,8 +63,8 @@ export function deriveStatus(selection: RunSelection, live: LiveState | undefine
   const presentation = presentRunStage(run, live);
   const tooltipLines: string[] = [runLabel(run)];
   tooltipLines.push(`Repository: ${run.location.folderName}`);
-  const following = describeFollowing(selection);
-  tooltipLines.push(following.release ? `${following.text} ${following.release}` : following.text);
+  const context = describeRepositoryContext(selection);
+  tooltipLines.push(context.release ? `${context.text} — ${context.release} to go back to automatic selection.` : context.text);
   tooltipLines.push(run.kind === "plan" ? `Stage ${stagePosition(run)} — ${name}` : name);
   tooltipLines.push(`Stage id: ${stage.stageId}`);
   tooltipLines.push(`Stage state: ${presentation.label}`);

@@ -47,10 +47,10 @@ navigates.
 | `Agent Sparring: Choose sparring Executable…` | Pick the `sparring` CLI with a file dialog and store it as `agentSparring.executable`. |
 | `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / finalizing / future stages), the current stage as primary content (the stage as the plan names it — `Stage 3D — title`, with `6 of 8` as secondary metadata — a human state word with one explaining sentence, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), latest sparring result, small Stage Agent / Sparrer cards, Brief / Handoff / Sparring report / Diff / Plan document / Log buttons, and quiet metadata (where the engine's own words live). Never auto-opens; updates in place. |
 | `Agent Sparring: Show Log` | Focus the Output Channel. |
-| `Agent Sparring: Follow the Active Repository` | Release the pin and go back to automatic selection in whichever repository this window is in. Also the first group of Select Repository / Run, and a **Follow the active repository** control in the Overview whenever a pin is holding it elsewhere. |
+| `Agent Sparring: Follow Active Repository` | Release the pin and go back to automatic selection in whichever repository this window is in. Also the last group of Select Repository / Run, and a **Follow active repository** control at the top of the Overview whenever a pin is in force. |
 | `Agent Sparring: Select Run` | Choose explicitly when several runs look active; the choice *pins* that run, so it is kept even when the window moves to another repository, and the Overview says so. The choice is remembered per workspace. The list is grouped — *Plan runs* first, then *Standalone / historical stages* — and each row is labelled by what a person calls it (the plan document's title, the plan's own `Stage 3D — …` name for a stage), with the repository and the raw stage id in the detail line. |
 | `Agent Sparring: Rediscover State` | Re-scan `.sparring` from disk. |
-| `Agent Sparring: Diagnose Discovery` | Trace discovery for every workspace folder into the Output Channel: scheme, path, the `.sparring` probed, nested projects, stage/plan files and whether they parsed (lifecycle status only), runs produced, the active repository and the roots runs were attributed against, the runs in other repositories that automatic selection therefore did not consider, what Select Repository / Run would list (group, label, description and the raw stage id), and why nothing is selected. Never logs file contents. |
+| `Agent Sparring: Diagnose Discovery` | Trace discovery for every workspace folder into the Output Channel: scheme, path, the `.sparring` probed, nested projects, stage/plan files and whether they parsed (lifecycle status only), runs produced, whether the built-in Git extension's API is attached, the active repository and the roots runs were attributed against, the runs in other repositories — and the runs no known root owns — that automatic selection therefore did not consider, what Select Repository / Run would list (group, label, description and the raw stage id), and why nothing is selected. Never logs file contents. |
 
 ## Settings
 
@@ -408,12 +408,24 @@ The Overview then follows the managed run to its current stage. Every "a
 runner is already alive" message offers **Show running plan** too, rather
 than leaving you on a screen whose buttons cannot work.
 
-### Following the active repository, and pinning a run
+### The repository context: following, and pinning
 
-A VS Code window is often several repositories. The cockpit follows the one
-you are in: move to another repository and the run from the previous one is
-dropped rather than left on screen looking current. If the repository you have
-moved to has no `.sparring` run, you get
+A VS Code window is often several repositories, so the cockpit states which
+one it is in — at the **top of the Overview**, before anything about the run:
+
+> Following repository: **sporely-py-inaturalist-republish-media**
+
+The contract is exactly this, and nothing else:
+
+```
+Agent Sparring repository context =
+    the explicitly pinned Agent Sparring repository/run, if one is pinned
+    otherwise the repository of the active editor / Source Control focus
+```
+
+Move to another repository and the run from the previous one is dropped
+rather than left on screen looking current. If the repository you have moved
+to has no `.sparring` run, you get
 
 > **No Agent Sparring run for sporely-py-inaturalist-republish-media**
 > This repository has no .sparring plan run or stage on disk. Nothing has been
@@ -423,50 +435,73 @@ and, when work exists elsewhere, a line naming where: *Agent Sparring has also
 discovered 1 in sporely-py-reported-statistics.* Nothing is started, adopted
 or created on your behalf.
 
-Picking a row in **Select Repository / Run** *pins* it. A pin is kept even
-when the window moves to another repository — that is what makes inspecting a
-finished run in another checkout possible — and the Overview says so, in the
-footer, with the way out beside it:
+**Pinning.** Picking a row in **Select repository / run…** *pins* it. A pin is
+kept even when the window moves to another repository — that is what makes
+inspecting a finished run in another checkout possible — and both repositories
+are then named at the top, with the way out beside them:
 
-> 📌 Pinned to a run in sporely-py-reported-statistics, while this window is in
-> sporely-py-inaturalist-republish-media. **Follow the active repository** to
-> follow sporely-py-inaturalist-republish-media again.
+> 📌 Viewing pinned run from: **sporely-py-reported-statistics**
+> Active repository context: **sporely-py-inaturalist-republish-media**
+> \[ Select repository / run… ] \[ Follow active repository ]
 
-The same choice is the first group of the picker, and there is also
-`Agent Sparring: Follow the Active Repository`. When nothing is pinned the
-footer just reads *Following the active repository: beta.*
+Both lines appear whenever a pin is in force, including when the pin is in the
+repository you are already in, so the policy reads the same way every time.
+**Select repository / run…** is on every Overview screen — with a run, without
+one, and while several look active — and `Agent Sparring: Follow Active
+Repository` is in the Command Palette. Switching context never depends on a
+gesture this extension cannot observe.
 
-**What "the repository this window is in" is derived from.** VS Code has no
-public API for its active Git repository. Core's own notion is
-`pinned ?? latestChangedOf(activeEditorRepository, scmFocusedRepository)`, and
-the lower-left repository selector is a status bar entry whose command
-(`scm.setActiveProvider`) sets that *pin* — which reaches no extension and is
-published only as `when`-clause context keys an extension cannot read. So this
-extension folds the two signals core folds underneath that pin, both from the
-built-in Git extension's stable API version 1:
+A selection stored by a version of this extension from before pins survived a
+change of repository is **not** silently promoted to one: on first start it is
+demoted to the ordinary remembered run, which still shows while the window is
+in its repository and lets go as soon as it is not.
+
+**What "the repository of the active editor / Source Control focus" means, and
+what it deliberately does not.** VS Code's lower-left repository selector
+cannot be read through any public extension API: `vscode.scm` exposes only
+`createSourceControl`, the selector's command (`scm.setActiveProvider`) sets an
+internal pin no extension is told about, and core publishes the answer solely
+as `when`-clause context keys an extension cannot read as values. Emulating it
+would mean reaching into private commands or internals, so **Agent Sparring
+does not claim to follow it.** What it follows is the two public signals the
+built-in Git extension's stable API version 1 does offer:
 
 - `Repository.ui.selected` / `Repository.ui.onDidChange` — which repository the
   Source Control view has focused;
 - `API.getRepository(uri)` with `window.onDidChangeActiveTextEditor` — which
   repository owns the document you are looking at.
 
-Whichever changed most recently wins. An editor that belongs to no repository
-(a Settings tab, the Output panel) says nothing rather than emptying the
-answer. No private command is intercepted and no context key is read.
+Whichever was observed most recently wins. An editor that belongs to no
+repository (a Settings tab, the Output panel) says nothing rather than
+emptying the answer, and a *re-read* — caused by a repository opening or
+closing, or by the Git extension only just becoming available — re-resolves
+what was already observed without counting as a new selection. No private
+command is intercepted and no context key is read.
 
 The consequence worth knowing: **using the lower-left selector alone is not
 visible to this extension.** Opening a file in the repository you switched to
-is, as is focusing it in the Source Control view — and if the cockpit ever
-disagrees with the Source Control view, the footer names the repository it
-resolved and **Select Repository / Run** overrides it.
+is, as is focusing it in the Source Control view — and the resolved repository
+is named at the top of the Overview precisely so a disagreement is visible
+rather than silent. **Select repository / run…** overrides it.
 
-Repositories are told apart by **root path only**, never by branch name.
-Two worktrees of the same repository are two repositories, and a worktree
-checked out inside its parent belongs to itself: a run is attributed to the
-*deepest* repository root that contains it. A `.sparring` project that no
-known repository root owns — a folder that is not a git repository, or one the
-Git extension has not opened — stays visible rather than being scoped away,
-because a run that cannot be attributed cannot be excluded either.
+If the built-in Git extension is disabled, not installed, or has not activated
+yet, nothing is scoped at all and every discovered run is a candidate, exactly
+as before following existed. Agent Sparring can activate before the Git
+extension does; it then awaits that extension's activation and retries from
+every later editor or Source Control signal, so following starts working
+without a reload. `Agent Sparring: Diagnose Discovery` reports whether the API
+is attached.
+
+**Attribution is strict.** Repositories are told apart by **root path only**,
+never by branch name; two worktrees of the same repository are two
+repositories, a worktree checked out inside its parent belongs to itself (a
+run is attributed to the *deepest* repository root that contains it), and two
+roots with the same directory name are qualified by their parent
+(`worktrees/republish-media`). A run that **no** known repository root owns — a
+`.sparring` project in a folder that is not a git repository, or one the Git
+extension has not opened — is never selected automatically, because showing it
+under the words *Following the active repository: B* would be a claim that it
+is B's. It stays in **Select repository / run…**, and the empty state names it.
 
 ### Plan run, historical stage, plan document
 
@@ -478,11 +513,26 @@ Three things, and the UI keeps them apart:
 | **Historical stage** | one finished stage of a plan run — good for inspecting its brief, handoff, review, diff and log | the *Standalone / historical stages* group |
 | **Plan document** | the Markdown specification | **Plan document** / **Open plan section**, which open an editor and change nothing about which run is selected |
 
-A stage is known to belong to a plan run when the **execution manifest that
-run executes** lists its id. That is why a stage of a plan whose document the
-engine's `## Stage <n>` parser refuses — one carrying `## Stage 3D handoff —
-…` records — is still named `Stage 3D` and still knows where it came from,
-and why nothing is claimed when no recorded run lists it.
+A stage is known to belong to a plan run only through **recorded execution**:
+the execution manifest that run executes lists its id, or the run's own
+recorded current stage is it, or — for a run started from a Markdown plan — the
+plan document's stage list, which is what the engine itself executes for such
+a run. That is why a stage of a plan whose document the engine's
+`## Stage <n>` parser refuses — one carrying `## Stage 3D handoff — …`
+records — is still named `Stage 3D` and still knows where it came from, and
+why nothing is claimed when no recorded run lists it. A stage id that merely
+*looks* like one of a plan's, and a plan run that merely happens to be open in
+the same project, are not records of anything and claim nothing.
+
+A manifest is only believed once it is bound to the run it is claimed to
+describe. It lives in the extension's global storage, which is per-user and
+nothing else, so its file name is scoped to the run's project directory as
+well as to the plan — two worktrees running `docs/plans/foo.md` no longer share
+one file — and its contents are checked against what the engine recorded: the
+plan label it executes, and the presence of the run's current stage. A
+manifest that fails either check, or that is missing, attributes nothing; the
+stage keeps its own screen rather than being handed to a run that cannot be
+shown to have executed it.
 
 Such a stage reads *Historical stage*, is named as its own run
 names it, and offers **Back to plan run** as its primary action; that button
@@ -491,6 +541,10 @@ is withheld there: **Continue plan automatically** is not offered (whether
 that run is still going or complete — adopting stages a managed run already
 owns could only be refused, or start a second run over finished work), and
 neither is **Start next stage** for a stage the engine has already created.
+The refusal is in the command, not only in the screen: invoking
+`Agent Sparring: Continue Plan Automatically` from the Command Palette or a
+keybinding on a stage an existing plan run owns is refused with that run
+named, and offers **Back to plan run**.
 
 ### Runner lifecycle
 

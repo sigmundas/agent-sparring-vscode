@@ -286,7 +286,8 @@ describe("a stage is called what the plan calls it", () => {
     const reader = /async manifestStagesFor[\s\S]*?\n {2}}\n/.exec(controller)?.[0] ?? "";
     assert.ok(reader, "manifestStagesFor exists");
     assert.match(reader, /run\.state\.source !== "manifest"/, "only a manifest run has one");
-    assert.match(reader, /manifestFileName\(run\.planKey\)/);
+    assert.match(reader, /manifestPathFor\(this\.manifestDirectoryPath, run\)/, "the file is the one scoped to this run's own project");
+    assert.match(reader, /bindManifest\([\s\S]*?manifestExpectationFor\(run\)\)/, "and it is bound to the run before any of it is believed");
     assert.match(reader, /mtimeMs/, "and it is cached by the file's modification time, not re-read per render");
   });
 });

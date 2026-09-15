@@ -11,7 +11,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { acceptStage, type AcceptStageResult } from "../core/acceptance";
 import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, readGitBranch, type ExecutableProblem } from "../core/cli";
-import { adoptionGaps, buildManifest, carriedForward, manifestFileName, renderManifest, type ExecutionManifest, type KnownStage } from "../core/manifest";
+import { adoptionGaps, buildManifest, carriedForward, legacyManifestFileName, manifestFileName, renderManifest, type ExecutionManifest, type KnownStage } from "../core/manifest";
 import {
   BRIEF_FILENAME,
   HANDOFF_FILENAME,
@@ -27,7 +27,7 @@ import {
   type StageSnapshot,
   type StandaloneStageSnapshot,
 } from "../core/discovery";
-import { FOLLOW_ACTIVE_LABEL, describeFollowing } from "../core/activeRepository";
+import { FOLLOW_ACTIVE_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
 import { parseHandoffBranch, parsePlanStages } from "../core/engineFormats";
 import { appendHumanEvidence, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
@@ -193,16 +193,16 @@ async function selectRunCommand(controller: SparringController): Promise<void> {
   // back is the same list, so the two modes are named next to each other
   // rather than one of them being a command you have to already know about.
   const selection = controller.currentSelection;
-  const following = describeFollowing(selection);
-  items.push({ label: "Following", kind: vscode.QuickPickItemKind.Separator });
+  const context = describeRepositoryContext(selection);
+  items.push({ label: "REPOSITORY CONTEXT", kind: vscode.QuickPickItemKind.Separator });
   items.push({
-    label: `${following.mode === "pinned" ? "" : "$(check) "}$(sync) ${FOLLOW_ACTIVE_LABEL}`,
+    label: `${context.mode === "pinned" ? "" : "$(check) "}$(sync) ${FOLLOW_ACTIVE_LABEL}`,
     description: selection.scope ? `automatic selection in ${selection.scope.name}` : "automatic selection; no active repository resolved",
-    detail: following.mode === "pinned" ? "Releases the pin below." : "Already following; every row above pins instead.",
+    detail: context.mode === "pinned" ? "Releases the pin above." : "Already following; every row above pins instead.",
     run: undefined,
   });
   const picked = await vscode.window.showQuickPick(items, {
-    placeHolder: `Pin a run, or follow the active repository. ${following.text}`,
+    placeHolder: `Pin a run, or follow the active repository. ${context.text}`,
   });
   if (!picked) {
     return;
@@ -1548,9 +1548,49 @@ async function performStartNextStage(controller: SparringController, overview: O
  * engine's run identity includes `source_digest`, so rebuilding it from an
  * edited plan document — even one where only a handoff record changed — would
  * otherwise end the recorded run.
+ *
+ * `legacyName` is the pre-scoping file name for the same plan key, read for
+ * provenance only when the scoped file does not exist yet. A run started
+ * before manifests were scoped to their project would otherwise take a fresh
+ * `source_digest` on its very next continuation and be refused by the engine
+ * mid-flight. It is never read as authority and never written.
  */
-async function writeManifestFile(file: string, manifest: ExecutionManifest): Promise<void> {
-  await fs.writeFile(file, renderManifest(carriedForward(manifest, await readOptional(file))), "utf8");
+async function writeManifestFile(controller: SparringController, file: string, legacyName: string, manifest: ExecutionManifest): Promise<void> {
+  let previous = await readOptional(file);
+  if (previous === undefined) {
+    previous = await readOptional(path.join(controller.manifestDirectoryPath, legacyName));
+    if (previous !== undefined) {
+      controller.log(`carrying the execution manifest provenance of ${legacyName} forward into ${path.basename(file)}, which is scoped to this worktree.`);
+    }
+  }
+  await fs.writeFile(file, renderManifest(carriedForward(manifest, previous)), "utf8");
+}
+
+/**
+ * The managed plan run that already owns this stage, when one does.
+ *
+ * Recorded membership only (planMembership.ts): the run's validated execution
+ * manifest, or its own recorded stage list. A plan run merely being open in
+ * the same project is not ownership and must not block anything, so nothing
+ * here falls back to that.
+ */
+async function ownedByPlanRun(
+  controller: SparringController,
+  run: RunSnapshot,
+): Promise<{ runId: string; planName: string; status: string; stage: string } | undefined> {
+  if (run.kind !== "stage") {
+    return undefined;
+  }
+  const membership = (await controller.planMemberships()).get(run.id);
+  if (!membership) {
+    return undefined;
+  }
+  return {
+    runId: membership.planRunId,
+    planName: membership.planName,
+    status: membership.planStatus,
+    stage: membership.stageLabel ? `${membership.stageLabel} (${run.stage.stageId})` : `This stage (${run.stage.stageId})`,
+  };
 }
 
 async function planInvocationFor(controller: SparringController, run: PlanRunSnapshot): Promise<{ planPath: string } | { manifest: string } | undefined> {
@@ -1575,8 +1615,8 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
     return undefined;
   }
   try {
-    const file = path.join(await controller.manifestDirectory(), manifestFileName(run.planKey));
-    await writeManifestFile(file, built.manifest);
+    const file = path.join(await controller.manifestDirectory(), manifestFileName(run.planKey, run.location.projectDir));
+    await writeManifestFile(controller, file, legacyManifestFileName(run.planKey), built.manifest);
     return { manifest: file };
   } catch (error) {
     void vscode.window.showErrorMessage(`Agent Sparring: could not write the execution manifest: ${(error as Error).message}. Nothing was started.`);
@@ -1588,7 +1628,7 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
 
 export type ContinueAutomaticallyOutcome =
   | { ok: true; runId: string; manifest: string; kind: "run-plan" | "resume-plan"; adopt: boolean; stages: number }
-  | { ok: false; reason: "no-plan" | "unreadable" | "manifest" | "preflight" | "branch" | "complete" | "running" | "cancelled" | "write"; message?: string };
+  | { ok: false; reason: "no-plan" | "unreadable" | "manifest" | "preflight" | "branch" | "complete" | "running" | "cancelled" | "write" | "owned"; message?: string };
 
 /**
  * Hand the whole plan to the engine and let it run until it needs a human.
@@ -1611,6 +1651,26 @@ async function performContinueAutomatically(controller: SparringController, over
   const run = controller.currentSelection.selected;
   if (!run) {
     return { ok: false, reason: "no-plan" };
+  }
+  // Ownership is enforced here, in the command, and not only by withholding
+  // the button in the Overview. This path is reachable from the Command
+  // Palette and from a keybinding, and what it would do to a stage a managed
+  // run already executed is create or adopt a *second* plan run over work that
+  // run owns — the duplicate-run failure that started this. The refusal is the
+  // same whichever route arrives.
+  const owner = await ownedByPlanRun(controller, run);
+  if (owner) {
+    void vscode.window.showInformationMessage(
+      `Agent Sparring: ${owner.stage} is a stage of the managed plan run ${owner.planName} (${owner.status}). Continue that run instead of starting a second one over the same work.`,
+      "Back to plan run",
+    ).then(async (choice) => {
+      if (choice === "Back to plan run") {
+        await controller.chooseRun(controller.currentDiscovery.runs.find((candidate) => candidate.id === owner.runId));
+        await overview.update();
+      }
+    });
+    controller.log(`Continue automatically: refused — ${owner.stage} is already owned by the managed plan run ${owner.planName} (${owner.status}).`);
+    return { ok: false, reason: "owned", message: `${owner.stage} belongs to ${owner.planName}` };
   }
   const location = run.location;
   const planPath = planDocumentFor(controller, run);
@@ -1719,8 +1779,8 @@ async function performContinueAutomatically(controller: SparringController, over
 
   let manifestPath: string;
   try {
-    manifestPath = path.join(await controller.manifestDirectory(), manifestFileName(planKey(label)));
-    await writeManifestFile(manifestPath, built.manifest);
+    manifestPath = path.join(await controller.manifestDirectory(), manifestFileName(planKey(label), location.projectDir));
+    await writeManifestFile(controller, manifestPath, legacyManifestFileName(planKey(label)), built.manifest);
   } catch (error) {
     void vscode.window.showErrorMessage(`Agent Sparring: could not write the execution manifest: ${(error as Error).message}. Nothing was started.`);
     return { ok: false, reason: "write", message: (error as Error).message };

@@ -10,7 +10,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { adoptionGaps, buildManifest, manifestFileName, renderManifest, sourceDigest, type KnownStage } from "../core/manifest";
+import { adoptionGaps, bindManifest, buildManifest, legacyManifestFileName, manifestFileName, renderManifest, sourceDigest, type KnownStage } from "../core/manifest";
 
 const PLAN_LABEL = "docs/plans/active/reported-statistics.md";
 const PLAN_NAME = "reported-statistics.md";
@@ -306,8 +306,23 @@ describe("building an execution manifest from a human plan", () => {
     assert.deepEqual(adoptionGaps(built.manifest, new Set(built.manifest.stages.map((stage) => stage.stage_id))), [], "a fully existing sequence has no hole");
   });
 
-  it("names the manifest file after the plan key, so regenerating overwrites in place", () => {
-    assert.equal(manifestFileName("reported-statistics-3f9a2c1b"), "reported-statistics-3f9a2c1b.manifest.json");
+  it("names the manifest file after the plan key *and* the project, so regenerating overwrites in place", () => {
+    const name = manifestFileName("reported-statistics-3f9a2c1b", "/code/sporely-py-reported-statistics");
+    assert.match(name, /^reported-statistics-3f9a2c1b-[0-9a-f]{8}\.manifest\.json$/);
+    assert.equal(name, manifestFileName("reported-statistics-3f9a2c1b", "/code/sporely-py-reported-statistics"), "same run, same file");
+    assert.equal(legacyManifestFileName("reported-statistics-3f9a2c1b"), "reported-statistics-3f9a2c1b.manifest.json");
+  });
+
+  it("gives two worktrees running the same plan path two different manifests", () => {
+    // The plan key is a hash of the *repo-relative* plan path, so two
+    // worktrees of one repository produce the same key for docs/plans/foo.md.
+    // They used to share one file in global storage, and whichever window
+    // wrote last decided what the other believed its stages were.
+    const key = "reported-statistics-3f9a2c1b";
+    assert.notEqual(
+      manifestFileName(key, "/code/sporely-py-reported-statistics"),
+      manifestFileName(key, "/code/worktrees/sporely-py-reported-statistics"),
+    );
   });
 
   it("carries no status, position, verdict or session: it is input, not a second workflow engine", () => {
@@ -324,5 +339,60 @@ describe("building an execution manifest from a human plan", () => {
     for (const forbidden of ["status", "current_stage", "accepted", "session", "candidate_sha\": \"", "digest\": \"sha256:0"]) {
       assert.ok(!text.includes(`"${forbidden}"`), `no ${forbidden} field`);
     }
+  });
+});
+
+/**
+ * A manifest lives in global storage, which is per-user and nothing else. It
+ * being there is not evidence that it belongs to the run on screen, so before
+ * it may define that run's stages — and therefore which historical stages
+ * belong to it — it has to be bound to the run's own recorded state.
+ */
+describe("binding a manifest to the run it is claimed to describe", () => {
+  const STAGES = [
+    { stage_id: "stage-3d-transport", label: "Stage 3D", title: "Transport" },
+    { stage_id: "stage-4-editor", label: "Stage 4", title: "Editor" },
+  ];
+  const manifest = (overrides: Record<string, unknown> = {}) =>
+    JSON.stringify({ version: 1, plan_label: "docs/plans/reported-statistics.md", source_digest: "sha256:abc", stages: STAGES, ...overrides });
+  const expect = { planLabel: "docs/plans/reported-statistics.md", currentStageId: "stage-4-editor" };
+
+  it("accepts the run's own manifest and hands back its stage identities", () => {
+    const bound = bindManifest(manifest(), expect);
+    assert.ok(bound.ok);
+    assert.deepEqual(
+      bound.identity.stages.map((stage) => stage.label),
+      ["Stage 3D", "Stage 4"],
+    );
+    assert.equal(bound.identity.planLabel, "docs/plans/reported-statistics.md");
+  });
+
+  it("refuses a manifest that executes a different plan", () => {
+    const bound = bindManifest(manifest({ plan_label: "docs/plans/something-else.md" }), expect);
+    assert.equal(bound.ok, false);
+    assert.equal(bound.ok === false && bound.reason, "plan-label");
+  });
+
+  it("refuses a manifest that has been regenerated into something this run does not execute", () => {
+    // The plan was rewritten and the stage ids changed under a run that is
+    // still recorded as being at stage-4-editor. Redefining that run's stage
+    // membership from it would move historical stages between runs.
+    const regenerated = manifest({ stages: [{ stage_id: "stage-5-something-new", label: "Stage 5", title: "New" }] });
+    const bound = bindManifest(regenerated, expect);
+    assert.equal(bound.ok, false);
+    assert.equal(bound.ok === false && bound.reason, "current-stage");
+  });
+
+  it("refuses an absent or unreadable manifest rather than guessing at one", () => {
+    for (const text of [undefined, "", "not json", JSON.stringify({ version: 2, plan_label: "x", source_digest: "y", stages: STAGES })]) {
+      const bound = bindManifest(text, expect);
+      assert.equal(bound.ok, false, `refused: ${String(text).slice(0, 20)}`);
+      assert.equal(bound.ok === false && bound.reason, "unreadable");
+    }
+  });
+
+  it("a complete run keeps its stages: its recorded current stage is its last one", () => {
+    const bound = bindManifest(manifest(), { planLabel: "docs/plans/reported-statistics.md", currentStageId: "stage-4-editor" });
+    assert.ok(bound.ok, "completion is a status, and a manifest carries no status at all");
   });
 });
