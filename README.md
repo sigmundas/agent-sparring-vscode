@@ -410,7 +410,7 @@ Three things, and the UI keeps them apart:
 | | What it is | How to get to it |
 | --- | --- | --- |
 | **Plan run** | the whole job: the engine sequences its stages, records where it is, and the Overview draws the timeline | the *Plan runs* group of Select Repository / Run; **Back to plan run** from one of its stages |
-| **Historical standalone stage** | one finished stage of a plan run, rediscovered on its own — good for inspecting its brief, handoff, review, diff and log | the *Standalone / historical stages* group |
+| **Historical stage** | one finished stage of a plan run — good for inspecting its brief, handoff, review, diff and log | the *Standalone / historical stages* group |
 | **Plan document** | the Markdown specification | **Plan document** / **Open plan section**, which open an editor and change nothing about which run is selected |
 
 A stage is known to belong to a plan run when the **execution manifest that
@@ -419,7 +419,7 @@ engine's `## Stage <n>` parser refuses — one carrying `## Stage 3D handoff —
 …` records — is still named `Stage 3D` and still knows where it came from,
 and why nothing is claimed when no recorded run lists it.
 
-Such a stage reads *Historical standalone stage*, is named as its own run
+Such a stage reads *Historical stage*, is named as its own run
 names it, and offers **Back to plan run** as its primary action; that button
 changes the selected run, so the timeline comes back. What the plan run owns
 is withheld there: **Continue plan automatically** is not offered (whether

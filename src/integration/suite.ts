@@ -798,7 +798,7 @@ async function advancementAssertions(reportedRepo: string): Promise<void> {
   const planFile = path.join(reportedRepo, "plans", "reported-statistics.md");
   assert.equal(await vscode.commands.executeCommand("agentSparring._test.associatePlan", planFile), planFile);
   const history = await model();
-  assert.equal(history.runKind, "Historical standalone stage", "a deliberate visit is respected, and reads as history");
+  assert.equal(history.runKind, "Historical stage", "a deliberate visit is respected, and reads as history");
   assert.match(history.followPlan?.text ?? "", /now at Stage 4/, "and it names the run that has taken over");
   assert.equal(history.followPlan?.label, "Back to plan run");
   assert.match(history.stageHeading ?? "", /^Stage 3D — Snapshot v2/, "the stage is named as its own plan run names it");

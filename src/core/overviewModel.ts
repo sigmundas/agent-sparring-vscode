@@ -484,7 +484,7 @@ export interface OverviewModel {
   /** Reviewer hand-back to the human; present only for NEEDS_YOU / ESCALATE with no turn in progress. */
   actionRequired?: ActionRequired;
   title: string;
-  /** `Plan run`, `Historical standalone stage` or `Standalone stage`; see runKindWord. */
+  /** `Plan run`, `Historical stage` or `Standalone stage`; see RUN_KIND. */
   runKind?: string;
   status?: RunStatus;
   /** The last meaningful event, also while a turn is active. */
@@ -1063,14 +1063,22 @@ function continueAutomatically(
 /**
  * What kind of thing is on screen, in the plainest words there are.
  *
- * Three kinds, never two: the whole job, one old stage of a job, and one
- * stage that was only ever run on its own. The middle one used to be
- * indistinguishable from the first — same layout, same pill, no timeline —
- * which is how a complete plan run looked like it had lost its stages.
+ * The vocabulary is the mental model and nothing else: a **plan run** is the
+ * whole job, a **historical stage** is one old stage to inspect, and a **plan
+ * document** is the specification. "Standalone" is the extension's own reason
+ * for a stage record existing on its own, and a label is not the place for
+ * it — the person reading the pill wants to know what they are looking at,
+ * not why the harness has a separate record for it.
+ *
+ * Three kinds, never two: the middle one used to be indistinguishable from
+ * the first — same layout, same pill, no timeline — which is how a complete
+ * plan run looked like it had lost its stages. The third is the odd case, a
+ * stage no plan run claims, and there the word earns its place: it is why
+ * that screen may still offer to adopt the stage into a managed run.
  */
 export const RUN_KIND = {
   plan: "Plan run",
-  historicalStage: "Historical standalone stage",
+  historicalStage: "Historical stage",
   standaloneStage: "Standalone stage",
 } as const;
 

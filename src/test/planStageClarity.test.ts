@@ -300,7 +300,8 @@ describe("a historical stage of a managed plan run", () => {
     assert.match(model.followPlan?.detail ?? "", /does not open the plan document/);
 
     // The pill is toned down, and the button is the primary action.
-    assert.match(html, /<span class="hpill history" title="One finished stage[^"]*">Historical standalone stage<\/span>/);
+    assert.match(html, /<span class="hpill history" title="One finished stage[^"]*">Historical stage<\/span>/);
+    assert.ok(!html.includes("standalone"), "the label does not explain why the harness keeps a separate record for this stage");
     assert.match(html, /<button type="button" class="primary" data-action="openPlanRun"[^>]*>Back to plan run<\/button>/);
   });
 
