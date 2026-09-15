@@ -8,6 +8,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { ActivityTailer } from "../core/activityTailer";
+import { FOLLOW_ACTIVE_LABEL } from "../core/activeRepository";
 import { diagnoseDiscovery, renderDiagnostic, type DiscoveryDiagnostic } from "../core/diagnose";
 import {
   DEFAULT_NESTED_SEARCH_DEPTH,
@@ -22,6 +23,7 @@ import {
   type Discovery,
   type LocateOptions,
   type RunPreference,
+  type RepositoryScope,
   type RunSelection,
   type RunSnapshot,
   type SparringLocation,
@@ -78,6 +80,7 @@ import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } 
 import { TerminalPool } from "./terminalPool";
 import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult } from "./executionTracker";
 import { MANIFEST_READ_LIMIT, readHead } from "./fileHead";
+import { ActiveRepositoryTracker } from "./activeRepository";
 
 const SELECTED_RUN_KEY = "agentSparring.selectedRunId";
 /** When that choice was made, so a managed run that advances afterwards can overtake it. */
@@ -106,6 +109,8 @@ export class SparringController implements vscode.Disposable {
   private readonly commands: SparringCommandRunner;
   /** The integrated terminals this extension owns: one per project, reused. */
   private readonly terminals: TerminalPool;
+  /** Which repository this window is in; automatic selection is confined to it. */
+  private readonly activeRepository: ActiveRepositoryTracker;
   private reattached = false;
   /** When the process table was last read for a run id; see resolveUnwatchedRunner. */
   private readonly probed = new Map<string, number>();
@@ -144,6 +149,10 @@ export class SparringController implements vscode.Disposable {
     this.onCommandNotFound = this.tracker.onCommandNotFound;
     this.onEngineFailed = this.tracker.onEngineFailed;
     this.commands = new SparringCommandRunner((message) => this.log(message), this.terminals);
+    // Moving to another repository re-decides which run the cockpit follows,
+    // so it is a rediscovery like any other authoritative change.
+    this.activeRepository = new ActiveRepositoryTracker((message) => this.log(message));
+    this.disposables.push(this.activeRepository, this.activeRepository.onDidChange(() => this.scheduleRefresh()));
     this.disposables.push(
       this.tracker,
       this.commands,
@@ -239,6 +248,7 @@ export class SparringController implements vscode.Disposable {
       ...this.locateOptions(),
       preferredId: this.preference()?.id,
       stickyId: this.attachedRunId ?? this.context.workspaceState.get<string>(STICKY_RUN_KEY),
+      scope: this.repositoryScope(),
       manifestStages: (run) => this.manifestStagesFor(run),
     });
     this.output.appendLine("");
@@ -330,7 +340,7 @@ export class SparringController implements vscode.Disposable {
     await this.relocate();
     this.discovery = await discoverRuns(this.locations);
     const sticky = this.attachedRunId ?? this.context.workspaceState.get<string>(STICKY_RUN_KEY);
-    this.selection = selectRun(this.discovery.runs, this.preference(), sticky);
+    this.selection = selectRun(this.discovery.runs, this.preference(), sticky, this.repositoryScope());
     if (this.selection.selected && this.selection.selected.id !== this.context.workspaceState.get<string>(STICKY_RUN_KEY)) {
       await this.context.workspaceState.update(STICKY_RUN_KEY, this.selection.selected.id);
     }
@@ -371,8 +381,30 @@ export class SparringController implements vscode.Disposable {
     }
   }
 
+  /**
+   * The repository automatic selection is confined to, or `undefined` when
+   * this window is in no repository it can name.
+   *
+   * `undefined` is deliberately permissive: the Git extension may be
+   * inactive, the folder may not be a repository at all, or nothing has
+   * focused a repository yet. Scoping on a guess would hide runs; not
+   * scoping only restores the behaviour from before following existed.
+   */
+  private repositoryScope(): RepositoryScope | undefined {
+    const repoRoot = this.activeRepository.activeRepoRoot;
+    if (!repoRoot) {
+      return undefined;
+    }
+    return { repoRoot, knownRoots: this.activeRepository.knownRepoRoots ?? [repoRoot] };
+  }
+
   get currentSelection(): RunSelection {
     return this.selection;
+  }
+
+  /** The repository this window is in (integration tests and the diagnostic). */
+  get activeRepositoryRoot(): string | undefined {
+    return this.activeRepository.activeRepoRoot;
   }
 
   get currentDiscovery(): Discovery {
@@ -732,7 +764,24 @@ export class SparringController implements vscode.Disposable {
   async chooseRun(run: RunSnapshot | undefined): Promise<void> {
     await this.context.workspaceState.update(SELECTED_RUN_KEY, run?.id);
     await this.context.workspaceState.update(SELECTED_AT_KEY, run ? Date.now() : undefined);
+    if (run) {
+      this.log(`pinned to ${run.location.folderName} · ${runLabel(run)}; it stays on screen even in another repository. ${FOLLOW_ACTIVE_LABEL} to go back to automatic selection.`);
+    }
     await this.refresh();
+  }
+
+  /**
+   * Release the pin and go back to automatic selection in whichever
+   * repository this window is in.
+   *
+   * This is the named way out of a pin, offered in the Overview and the run
+   * picker, because a pin is otherwise indistinguishable from the cockpit
+   * simply disagreeing with the Source Control view.
+   */
+  async followActiveRepository(): Promise<void> {
+    const root = this.activeRepository.activeRepoRoot;
+    this.log(root ? `following the active repository again: ${path.basename(root)}` : "following the active repository again; this window is in no repository the Git extension has opened");
+    await this.chooseRun(undefined);
   }
 
   private async attachToSelected(): Promise<void> {

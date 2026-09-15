@@ -18,6 +18,7 @@
  * tooltips and the footer.
  */
 
+import { describeFollowing, emptyStateLines, emptyStateTitle, type FollowingView } from "./activeRepository";
 import { parseBriefGoal, parseBriefOpening } from "./brief";
 import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
@@ -521,6 +522,16 @@ export interface OverviewModel {
   liveness?: { state: LivenessState; source: RunnerLiveness["source"]; detail: string };
   /** For ambiguous: the candidate labels. */
   choices?: string[];
+  /**
+   * Which repository the cockpit is in and whether it is following the active
+   * one or held by an explicit pin. Always present, because "which repository
+   * am I actually looking at" is the question this whole screen answers, and
+   * leaving it implicit is what let a completed run in another repository sit
+   * here looking current.
+   */
+  following?: FollowingView;
+  /** For empty: the sentences under the title (see activeRepository.emptyStateLines). */
+  emptyLines?: string[];
   /** Plan journey: only for managed plan runs with a readable plan document. */
   timeline?: TimelineItem[];
   timelineNote?: string;
@@ -571,11 +582,17 @@ export function buildOverviewModel(
   nowMs: number = Date.now(),
   execution?: ExecutionRecord,
 ): OverviewModel {
+  const following = describeFollowing(selection);
   if (!selection.selected) {
     if (selection.ambiguous.length > 0) {
-      return { kind: "ambiguous", title: "Several runs look active", choices: selection.ambiguous.map((run) => `${run.location.folderName}: ${runLabel(run)}`) };
+      return {
+        kind: "ambiguous",
+        title: "Several runs look active",
+        choices: selection.ambiguous.map((run) => `${run.location.folderName}: ${runLabel(run)}`),
+        following,
+      };
     }
-    return { kind: "empty", title: "No active run" };
+    return { kind: "empty", title: emptyStateTitle(selection), emptyLines: emptyStateLines(selection), following };
   }
   const run = selection.selected;
   const stage = currentStageOf(run);
@@ -594,6 +611,7 @@ export function buildOverviewModel(
   const model: OverviewModel = {
     kind: "run",
     title: run.kind === "plan" ? runLabel(run) : stageDisplayName(stage),
+    following,
     stageAgent: actorCard("stage", stage, live, halted, nowMs, uncertain, artifacts.capturedPrompts),
     sparrer: actorCard("sparrer", stage, live, halted, nowMs, uncertain, artifacts.capturedPrompts),
     actions: {

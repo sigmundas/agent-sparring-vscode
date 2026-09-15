@@ -13,6 +13,7 @@
  * No dependency on the vscode API.
  */
 
+import { describeFollowing, emptyStateLines, emptyStateTitle } from "./activeRepository";
 import { currentStageOf, runLabel, totalStagesOf, type RunSelection, type RunSnapshot } from "./discovery";
 import type { RunnerLiveness } from "./liveness";
 import { providerDisplayName, type LiveState } from "./liveState";
@@ -30,6 +31,8 @@ const PREFIX = "Agent Sparring";
 /** After this long without any telemetry, a "working" claim is flagged as quiet. */
 export const QUIET_AFTER_MS = 10 * 60 * 1000;
 const STANDALONE_NAME_MAX = 28;
+/** The status bar is narrow; the full repository name is in the tooltip. */
+const REPOSITORY_NAME_MAX = 44;
 
 /**
  * `live` must be the presented fold (see liveness.deriveLiveness) and
@@ -46,7 +49,12 @@ export function deriveStatus(selection: RunSelection, live: LiveState | undefine
         severity: "warning",
       };
     }
-    return { text: `$(circle-outline) ${PREFIX}: No active run`, tooltip: "No recorded plan run or stage in this workspace.", severity: "none" };
+    const title = emptyStateTitle(selection);
+    return {
+      text: `$(circle-outline) ${PREFIX}: ${selection.scope ? `No run for ${truncateLabel(selection.scope.name, REPOSITORY_NAME_MAX)}` : "No active run"}`,
+      tooltip: [title, ...emptyStateLines(selection)].join("\n"),
+      severity: "none",
+    };
   }
 
   const run = selection.selected;
@@ -55,6 +63,8 @@ export function deriveStatus(selection: RunSelection, live: LiveState | undefine
   const presentation = presentRunStage(run, live);
   const tooltipLines: string[] = [runLabel(run)];
   tooltipLines.push(`Repository: ${run.location.folderName}`);
+  const following = describeFollowing(selection);
+  tooltipLines.push(following.release ? `${following.text} ${following.release}` : following.text);
   tooltipLines.push(run.kind === "plan" ? `Stage ${stagePosition(run)} — ${name}` : name);
   tooltipLines.push(`Stage id: ${stage.stageId}`);
   tooltipLines.push(`Stage state: ${presentation.label}`);

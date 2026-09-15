@@ -27,6 +27,7 @@ import {
   selectRun,
   type LocateOptions,
   type PlanRunSnapshot,
+  type RepositoryScope,
   type RunSnapshot,
   type SparringLocation,
 } from "./discovery";
@@ -88,6 +89,10 @@ export interface DiscoveryDiagnostic {
   runs: { id: string; kind: string; label: string; open: boolean }[];
   preferredId?: string;
   stickyId?: string;
+  /** The repository automatic selection was confined to, and the roots it was attributed against. */
+  scope?: { repoRoot: string; name: string; knownRoots: string[] };
+  /** Runs that exist in other repositories, so "no run here" can be told from "no run anywhere". */
+  elsewhereIds?: string[];
   /**
    * What "Select Repository / Run" would list, in order, one string per row:
    * `<group> | <label> — <description> — <detail>`. The group is included
@@ -104,6 +109,8 @@ export interface DiscoveryDiagnostic {
 export interface DiagnoseOptions extends LocateOptions {
   preferredId?: string;
   stickyId?: string;
+  /** What the window is following; see core/activeRepository.ts. */
+  scope?: RepositoryScope;
   /**
    * The stage identities of a managed run's execution manifest, when the
    * caller can read them (the extension's cached reader). Supplying it is what
@@ -139,7 +146,7 @@ export async function diagnoseDiscovery(folders: DiagnosticFolder[], options: Di
       location.runIds = discovery.runs.filter((run) => run.location.sparringDir === location.sparringDir).map((run) => run.id);
     }
   }
-  const selection = selectRun(discovery.runs, options.preferredId, options.stickyId);
+  const selection = selectRun(discovery.runs, options.preferredId, options.stickyId, options.scope);
   const memberships = options.manifestStages ? await resolveMemberships(discovery.runs, options.manifestStages) : undefined;
   const report: DiscoveryDiagnostic = {
     folders: folderReports,
@@ -147,6 +154,10 @@ export async function diagnoseDiscovery(folders: DiagnosticFolder[], options: Di
     runs: discovery.runs.map((run) => ({ id: run.id, kind: run.kind, label: runLabel(run), open: isOpen(run) })),
     preferredId: options.preferredId,
     stickyId: options.stickyId,
+    ...(options.scope && selection.scope
+      ? { scope: { repoRoot: selection.scope.repoRoot, name: selection.scope.name, knownRoots: [...(options.scope.knownRoots ?? [])] } }
+      : {}),
+    ...(selection.elsewhere ? { elsewhereIds: selection.elsewhere.map((run) => run.id) } : {}),
     pickLabels: buildRunPickGroups(discovery.runs, { selectedId: selection.selected?.id, memberships }).flatMap((group) =>
       group.items.map((item) => `${group.title} | ${item.label} — ${item.description} — ${item.detail}`),
     ),
@@ -229,6 +240,9 @@ function explainNoSelection(report: DiscoveryDiagnostic): string {
   if (report.ambiguousIds.length > 0) {
     return `${report.ambiguousIds.length} runs look active and neither the explicit nor the remembered selection names one of them; a choice is required`;
   }
+  if (report.scope && report.elsewhereIds && report.elsewhereIds.length === report.runs.length && report.runs.length > 0) {
+    return `no recorded run in ${report.scope.name}, the repository this window is in; ${report.elsewhereIds.length} run(s) exist in other repositories and can be pinned through Select Repository / Run`;
+  }
   if (report.runs.length > 0) {
     return "runs exist but none was selected (unexpected; see the selection rule)";
   }
@@ -310,7 +324,14 @@ export function renderDiagnostic(report: DiscoveryDiagnostic): string[] {
   for (const run of report.runs) {
     lines.push(`  ${run.kind} ${run.label} (${run.open ? "open" : "terminal"}) id ${run.id}`);
   }
-  lines.push(`explicit selection: ${report.preferredId ?? "none"}`);
+  lines.push(`active repository: ${report.scope ? `${report.scope.name} (${report.scope.repoRoot})` : "none resolved; selection is not confined to a repository"}`);
+  if (report.scope) {
+    lines.push(`  repository roots runs were attributed against: ${report.scope.knownRoots.length === 0 ? "none" : report.scope.knownRoots.join(", ")}`);
+  }
+  if (report.elsewhereIds && report.elsewhereIds.length > 0) {
+    lines.push(`  runs in other repositories (not candidates for automatic selection): ${report.elsewhereIds.join(", ")}`);
+  }
+  lines.push(`explicit selection (pin): ${report.preferredId ?? "none"}`);
   lines.push(`remembered selection: ${report.stickyId ?? "none"}`);
   lines.push(`Select Repository / Run would list ${report.pickLabels.length} item(s):`);
   for (const label of report.pickLabels) {

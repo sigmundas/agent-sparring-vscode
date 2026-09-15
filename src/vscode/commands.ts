@@ -27,6 +27,7 @@ import {
   type StageSnapshot,
   type StandaloneStageSnapshot,
 } from "../core/discovery";
+import { FOLLOW_ACTIVE_LABEL, describeFollowing } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
 import { parseHandoffBranch, parsePlanStages } from "../core/engineFormats";
 import { appendHumanEvidence, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
@@ -57,6 +58,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.showLog", () => controller.showLog()),
     vscode.commands.registerCommand("agentSparring.refresh", () => controller.refresh()),
     vscode.commands.registerCommand("agentSparring.selectRun", () => selectRunCommand(controller)),
+    vscode.commands.registerCommand("agentSparring.followActiveRepository", () => controller.followActiveRepository()),
     vscode.commands.registerCommand("agentSparring.diagnoseDiscovery", () => controller.diagnoseDiscovery()),
     vscode.commands.registerCommand("agentSparring.openOverview", () => openOverviewCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.runPlan", () => runPlanCommand(controller, overview)),
@@ -186,10 +188,21 @@ async function selectRunCommand(controller: SparringController): Promise<void> {
       items.push({ label: item.label, description: item.description, detail: item.detail, run: item.run });
     }
   }
-  items.push({ label: "Selection", kind: vscode.QuickPickItemKind.Separator });
-  items.push({ label: "$(sync) Automatic selection", description: "clear the explicit choice", run: undefined });
+  // Picking a row *pins* it: it is kept even when this window moves to
+  // another repository, which is the point of opening history there. The way
+  // back is the same list, so the two modes are named next to each other
+  // rather than one of them being a command you have to already know about.
+  const selection = controller.currentSelection;
+  const following = describeFollowing(selection);
+  items.push({ label: "Following", kind: vscode.QuickPickItemKind.Separator });
+  items.push({
+    label: `${following.mode === "pinned" ? "" : "$(check) "}$(sync) ${FOLLOW_ACTIVE_LABEL}`,
+    description: selection.scope ? `automatic selection in ${selection.scope.name}` : "automatic selection; no active repository resolved",
+    detail: following.mode === "pinned" ? "Releases the pin below." : "Already following; every row above pins instead.",
+    run: undefined,
+  });
   const picked = await vscode.window.showQuickPick(items, {
-    placeHolder: "Which run should Agent Sparring follow? A plan run is the whole job and its timeline; a standalone stage is one stage on its own.",
+    placeHolder: `Pin a run, or follow the active repository. ${following.text}`,
   });
   if (!picked) {
     return;
@@ -291,6 +304,10 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       return;
     case "selectRun":
       await selectRunCommand(controller);
+      await overview.update();
+      return;
+    case "followActiveRepository":
+      await controller.followActiveRepository();
       await overview.update();
       return;
     case "runPlan":

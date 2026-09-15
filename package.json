@@ -56,6 +56,11 @@
         "category": "Agent Sparring"
       },
       {
+        "command": "agentSparring.followActiveRepository",
+        "title": "Follow the Active Repository",
+        "category": "Agent Sparring"
+      },
+      {
         "command": "agentSparring.refresh",
         "title": "Rediscover State",
         "category": "Agent Sparring"

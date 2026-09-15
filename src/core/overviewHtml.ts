@@ -13,6 +13,7 @@
  * meaningful event on the right); provider cards; recent events; metadata.
  */
 
+import { FOLLOW_ACTIVE_LABEL } from "./activeRepository";
 import { CHECK_OUTCOMES, isCheckKey, type CheckItem, type CheckOutcome } from "./humanChecks";
 import { checkName, humanTask, splitPassCriteria } from "./humanTask";
 import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type TimelineItem, type WhatsNext } from "./overviewModel";
@@ -29,6 +30,7 @@ export type OverviewAction =
   | "openDiff"
   | "showLog"
   | "selectRun"
+  | "followActiveRepository"
   | "runPlan"
   | "resumePlan"
   | "runStage"
@@ -187,6 +189,7 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "openDiff",
   "showLog",
   "selectRun",
+  "followActiveRepository",
   "runPlan",
   "resumePlan",
   "runStage",
@@ -251,6 +254,7 @@ const ICON: Record<string, string> = {
   arrow: '<path d="M3 8h9M8.5 4.5L12 8l-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>',
   pause: '<path d="M5.5 4.5v7M10.5 4.5v7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>',
   lock: '<rect x="3.5" y="7" width="9" height="7" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5.5 7V5a2.5 2.5 0 015 0v2" fill="none" stroke="currentColor" stroke-width="1.4"/>',
+  pin: '<path d="M6 1.5h4l-.6 4 2.1 2.4H4.5L6.6 5.5z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 7.9v6.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>',
 };
 
 function icon(name: keyof typeof ICON, cls = ""): string {
@@ -261,15 +265,19 @@ function icon(name: keyof typeof ICON, cls = ""): string {
 
 function renderBody(model: OverviewModel): string {
   if (model.kind === "empty") {
-    return `<header class="top"><h1>Agent Sparring</h1></header>
-<p class="muted">No recorded plan run or stage in this workspace.</p>
-<div class="actions">${button("runPlan", "Run plan…")}${button("showLog", "Show log")}</div>`;
+    // The title names the repository, so an empty screen cannot be mistaken
+    // for the cockpit still looking at the repository just left behind.
+    return `<header class="top"><div><h1>Agent Sparring</h1><div class="run muted">${escapeHtml(model.title)}</div></div></header>
+${(model.emptyLines ?? []).map((line) => `<p class="muted">${escapeHtml(line)}</p>`).join("\n")}
+<div class="actions">${button("runPlan", "Run plan…")}${button("selectRun", "Select repository / run…")}${followButton(model)}${button("showLog", "Show log")}</div>
+${renderFollowing(model)}`;
   }
   if (model.kind === "ambiguous") {
     return `<header class="top"><h1>Agent Sparring</h1></header>
 <p>${escapeHtml(model.title)}:</p>
 <ul>${(model.choices ?? []).map((choice) => `<li>${escapeHtml(choice)}</li>`).join("")}</ul>
-<div class="actions">${button("selectRun", "Select run…")}${button("showLog", "Show log")}</div>`;
+<div class="actions">${button("selectRun", "Select repository / run…")}${followButton(model)}${button("showLog", "Show log")}</div>
+${renderFollowing(model)}`;
   }
 
   const parts: string[] = [];
@@ -300,7 +308,36 @@ function renderBody(model: OverviewModel): string {
   if (model.facts && model.facts.length > 0) {
     parts.push(`<dl class="facts">${model.facts.map((fact) => `<dt>${escapeHtml(fact.label)}</dt><dd>${escapeHtml(fact.value)}</dd>`).join("")}</dl>`);
   }
-  return parts.join("\n");
+  parts.push(renderFollowing(model));
+  return parts.filter(Boolean).join("\n");
+}
+
+/**
+ * Which repository the cockpit is in, and how to change that.
+ *
+ * Normally a quiet footer line: following the active repository is the
+ * expected state and needs no attention. A pin that is holding the cockpit in
+ * a *different* repository from the one this window is in is the opposite —
+ * it is the only reason the screen can disagree with the Source Control view,
+ * so it is stated plainly and the way out is a button next to it rather than
+ * a command someone has to know the name of.
+ */
+function renderFollowing(model: OverviewModel): string {
+  const following = model.following;
+  if (!following) {
+    return "";
+  }
+  const held = following.mode === "pinned" && following.release !== undefined;
+  const text = `${escapeHtml(following.text)}${following.release ? ` ${escapeHtml(following.release)}` : ""}`;
+  if (!held) {
+    return `<p class="muted following">${text}</p>`;
+  }
+  return `<p class="muted following pinned">${icon("pin", "pin")}${text} ${button("followActiveRepository", FOLLOW_ACTIVE_LABEL, true, undefined, "link")}</p>`;
+}
+
+/** Offered only when there is a pin to release; otherwise it would do nothing. */
+function followButton(model: OverviewModel): string {
+  return model.following?.mode === "pinned" ? button("followActiveRepository", FOLLOW_ACTIVE_LABEL) : "";
 }
 
 function renderHeader(model: OverviewModel): string {
@@ -1357,6 +1394,11 @@ button.quiet { background: transparent; color: var(--vscode-descriptionForegroun
 .facts { display: grid; grid-template-columns: max-content 1fr; gap: 1px 12px; margin: 0; padding-top: 8px; border-top: 1px solid var(--line); font-size: 0.82em; color: var(--vscode-descriptionForeground); }
 .facts dt { color: var(--vscode-descriptionForeground); }
 .facts dd { margin: 0; font-family: var(--vscode-editor-font-family); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.following { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 8px 0 0; font-size: 0.82em; }
+.following.pinned { color: var(--vscode-foreground); }
+.following .pin { flex: none; opacity: 0.8; }
+button.link { background: none; border: none; padding: 0; color: var(--vscode-textLink-foreground); text-decoration: underline; cursor: pointer; font: inherit; }
+button.link:hover { color: var(--vscode-textLink-activeForeground); }
 
 @media (max-width: 640px) {
   .columns { grid-template-columns: 1fr; }

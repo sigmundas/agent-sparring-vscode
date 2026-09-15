@@ -467,6 +467,93 @@ export interface RunSelection {
   selected?: RunSnapshot;
   /** Non-empty when several runs look active and none was explicitly chosen. */
   ambiguous: RunSnapshot[];
+  /**
+   * The repository automatic selection was confined to, when the window is
+   * following one (see {@link RepositoryScope}). Present whether or not a run
+   * was found there, because "no run in this repository" is only an honest
+   * thing to say if we can name the repository.
+   */
+  scope?: RepositoryScopeView;
+  /** True when `selected` is the user's explicit pin rather than automatic selection. */
+  pinned?: boolean;
+  /**
+   * Discovered runs in other repositories. Never selected automatically, and
+   * never hidden from the picker: they are why the empty state can say how
+   * much work exists elsewhere instead of implying there is none.
+   */
+  elsewhere?: RunSnapshot[];
+}
+
+/**
+ * Confine automatic selection to one repository: the one this window is
+ * currently in (see core/activeRepository.ts).
+ *
+ * `knownRoots` is every repository root the window can see, and it matters:
+ * a run is attributed to the *deepest* known root that contains it, so a
+ * nested checkout or a worktree living inside a parent repository belongs to
+ * itself rather than to its container. Repository roots only — a branch name
+ * never identifies a repository, and two worktrees of the same repository are
+ * two repositories here.
+ */
+export interface RepositoryScope {
+  /** Absolute root of the repository the window is following. */
+  repoRoot: string;
+  /** Every repository root the window can see, including `repoRoot`. */
+  knownRoots?: readonly string[];
+}
+
+export interface RepositoryScopeView {
+  /** Absolute, resolved root. */
+  repoRoot: string;
+  /** What to call it: the root directory's own name. */
+  name: string;
+}
+
+/** What a person calls a repository: its root directory's name. Never a branch, never a path. */
+export function repositoryDisplayName(repoRoot: string): string {
+  return path.basename(path.resolve(repoRoot)) || path.resolve(repoRoot);
+}
+
+/**
+ * Which of `roots` owns this project: the deepest one containing it, or
+ * `undefined` when none does.
+ *
+ * Deepest wins because repository roots nest — a worktree checked out under
+ * its parent repository, a monorepo package that is its own checkout. Matching
+ * shallowest-first would hand every nested project to the container and make
+ * two unrelated repositories look like one.
+ */
+export function repositoryOwning(location: SparringLocation, roots: readonly string[]): string | undefined {
+  return roots
+    .filter((root) => containsProject(location, root))
+    .sort((a, b) => path.resolve(b).length - path.resolve(a).length)[0];
+}
+
+function containsProject(location: SparringLocation, root: string): boolean {
+  const resolved = path.resolve(root);
+  for (const dir of [location.repoRoot, location.projectDir]) {
+    if (path.resolve(dir) === resolved || isInsidePath(dir, resolved)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The runs belonging to one repository.
+ *
+ * A run that no known root owns is **kept**: it could not be attributed, so
+ * scoping must not hide it. That is what keeps a `.sparring` project in a
+ * folder that is not a git repository — or one the Git extension has not
+ * opened — visible instead of silently unreachable.
+ */
+export function runsInRepository(runs: readonly RunSnapshot[], repoRoot: string, knownRoots: readonly string[] = []): RunSnapshot[] {
+  const target = path.resolve(repoRoot);
+  const roots = [...new Set([repoRoot, ...knownRoots].map((root) => path.resolve(root)))];
+  return runs.filter((run) => {
+    const owner = repositoryOwning(run.location, roots);
+    return owner === undefined || path.resolve(owner) === target;
+  });
 }
 
 export function isOpenRun(run: RunSnapshot): boolean {
@@ -515,10 +602,21 @@ export function supersedingPlanRun(run: RunSnapshot, runs: readonly RunSnapshot[
 
 /**
  * Deterministic selection:
+ *  0. when a `scope` is given, automatic selection only ever considers runs in
+ *     that repository, and every run elsewhere is reported as `elsewhere`. A
+ *     run in another repository is never shown, not even the one shown a
+ *     moment ago: the remembered (`stickyId`) run is only a candidate while it
+ *     is in scope, so switching repository drops the previous repository's run
+ *     rather than leaving it on screen. Switching back finds it again, because
+ *     the memory was kept, only ignored;
  *  1. an explicitly preferred run (by id) that still exists wins, even when
- *     it has become terminal (complete / accepted) — unless a managed plan
- *     run in the same project has advanced past it since it was chosen, in
- *     which case the cockpit follows the plan (`supersedingPlanRun`);
+ *     it has become terminal (complete / accepted), and **regardless of
+ *     scope** — pinning a run is how someone asks to inspect history in
+ *     another repository, so following the active repository must not undo it.
+ *     The selection says so (`pinned`), and the Overview offers the way back.
+ *     The one exception is unchanged: a managed plan run in the same project
+ *     that has advanced past it since it was chosen takes over
+ *     (`supersedingPlanRun`);
  *  2. exactly one open plan run (status running/paused) is selected;
  *  3. several open plan runs: the remembered (`stickyId`) one if it is among
  *     them, otherwise ambiguous and nothing is selected;
@@ -530,14 +628,29 @@ export function supersedingPlanRun(run: RunSnapshot, runs: readonly RunSnapshot[
  * `stickyId` is what the caller last showed; it is a tie-breaker and a
  * fallback, never a reason to ignore a newly started open run.
  */
-export function selectRun(runs: RunSnapshot[], preferred?: string | RunPreference, stickyId?: string): RunSelection {
+export function selectRun(runs: RunSnapshot[], preferred?: string | RunPreference, stickyId?: string, scope?: RepositoryScope): RunSelection {
+  const view: RepositoryScopeView | undefined = scope
+    ? { repoRoot: path.resolve(scope.repoRoot), name: repositoryDisplayName(scope.repoRoot) }
+    : undefined;
+  const inScope = scope ? runsInRepository(runs, scope.repoRoot, scope.knownRoots ?? []) : runs;
+  const elsewhere = scope ? runs.filter((run) => !inScope.includes(run)) : [];
+  const decorate = (selection: RunSelection): RunSelection => ({
+    ...selection,
+    ...(view ? { scope: view } : {}),
+    ...(elsewhere.length > 0 ? { elsewhere } : {}),
+  });
+
   const pick = typeof preferred === "string" ? { id: preferred } : preferred;
   if (pick) {
     const chosen = runs.find((run) => run.id === pick.id);
     if (chosen && !supersedingPlanRun(chosen, runs, pick.atMs ?? 0)) {
-      return { selected: chosen, ambiguous: [] };
+      return decorate({ selected: chosen, ambiguous: [], pinned: true });
     }
   }
+  return decorate(selectAutomatically(inScope, stickyId));
+}
+
+function selectAutomatically(runs: RunSnapshot[], stickyId?: string): RunSelection {
   const sticky = stickyId ? runs.find((run) => run.id === stickyId) : undefined;
 
   const openPlans = runs.filter((run): run is PlanRunSnapshot => run.kind === "plan" && isOpenRun(run));
