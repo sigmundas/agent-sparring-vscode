@@ -21,7 +21,6 @@ import {
   currentStageOf,
   isInsidePath,
   runIdFor,
-  supersedingPlanRun,
   type PlanRunSnapshot,
   type RunSnapshot,
   type SparringLocation,
@@ -36,7 +35,7 @@ import type { OverviewAction } from "../core/overviewHtml";
 import { createStage, proposeNextStage, renderNextStageBrief, type NewStageResult } from "../core/nextStage";
 import { buildStageIndex, locateStage, parsePlanHeadings, sectionSummary, type HeadingRef, type PlanHeading, type StageEntry } from "../core/planAssociation";
 import { stageMatchRows, type StageMatchRow, type StageToMatch } from "../core/stageMatches";
-import { buildRunPickItems, describeRun } from "../core/runPick";
+import { buildRunPickGroups, describeRun } from "../core/runPick";
 import { stageDisplayName } from "../core/presentation";
 import { stageActions, stageRunAction } from "../core/runner";
 import { planKey, planLabel, planRunId, type SparringSubcommand } from "../core/sparringCommand";
@@ -175,9 +174,23 @@ async function selectRunCommand(controller: SparringController): Promise<void> {
     }
     return;
   }
-  const items: RunItem[] = buildRunPickItems(runs, controller.currentSelection.selected?.id);
+  // Grouped, because the two kinds answer different questions: a plan run is
+  // the whole job with its timeline, a standalone stage is one old stage to
+  // inspect. They used to sit in one dense list, which is how a completed
+  // plan's own history came to look like the thing to pick.
+  const groups = buildRunPickGroups(runs, { selectedId: controller.currentSelection.selected?.id, memberships: await controller.planMemberships() });
+  const items: RunItem[] = [];
+  for (const group of groups) {
+    items.push({ label: group.title, kind: vscode.QuickPickItemKind.Separator });
+    for (const item of group.items) {
+      items.push({ label: item.label, description: item.description, detail: item.detail, run: item.run });
+    }
+  }
+  items.push({ label: "Selection", kind: vscode.QuickPickItemKind.Separator });
   items.push({ label: "$(sync) Automatic selection", description: "clear the explicit choice", run: undefined });
-  const picked = await vscode.window.showQuickPick(items, { placeHolder: "Which repository / run should Agent Sparring follow?" });
+  const picked = await vscode.window.showQuickPick(items, {
+    placeHolder: "Which run should Agent Sparring follow? A plan run is the whole job and its timeline; a standalone stage is one stage on its own.",
+  });
   if (!picked) {
     return;
   }
@@ -345,11 +358,18 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
         await overview.update();
       }
       return;
-    case "showRunningPlan": {
-      // The stage on screen is history; its project's managed run is live.
-      const plan = run ? supersedingPlanRun(run, controller.currentDiscovery.runs) : undefined;
+    case "openPlanRun": {
+      // The stage on screen is one stage of a managed plan run: select that
+      // run, so the Overview shows the whole job and its timeline. This is the
+      // one action here that changes the selection; it opens no document.
+      //
+      // The run is taken from the model the button was rendered from, so what
+      // is selected is exactly what the screen named — and it works for a
+      // complete run as well as a live one.
+      const model = await overview.buildModel();
+      const plan = model.followPlan ? controller.currentDiscovery.runs.find((candidate) => candidate.id === model.followPlan?.runId) : undefined;
       if (!plan) {
-        void vscode.window.showInformationMessage("Agent Sparring: no managed plan run is in progress for this project any more.");
+        void vscode.window.showInformationMessage("Agent Sparring: the managed plan run for this stage is no longer discoverable.");
         await overview.update();
         return;
       }
@@ -2210,8 +2230,8 @@ async function addStageRepository(controller: SparringController, location: Spar
  */
 async function explainNextStageProblem(controller: SparringController, overview: OverviewPanelManager, run: StandaloneStageSnapshot, planPath: string, message: string, line: number | undefined): Promise<void> {
   controller.log(`Start next stage: nothing created — ${message}`);
-  const choice = await vscode.window.showWarningMessage(`Agent Sparring: ${message}`, "Open in plan", "Change match…");
-  if (choice === "Open in plan") {
+  const choice = await vscode.window.showWarningMessage(`Agent Sparring: ${message}`, "Open plan section", "Change match…");
+  if (choice === "Open plan section") {
     await openDocument(planPath, `the plan document ${path.basename(planPath)} is missing.`, overview.documentColumn, line);
   } else if (choice === "Change match…") {
     if (controller.currentSelection.selected?.id === run.id) {

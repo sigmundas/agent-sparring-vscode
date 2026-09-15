@@ -22,6 +22,7 @@ import {
   type SparringOutcome,
   type StageState,
 } from "./engineFormats";
+import { planTitle } from "./planAssociation";
 
 export const SPARRING_DIRNAME = ".sparring";
 export const PLANS_DIRNAME = "plans";
@@ -89,6 +90,14 @@ export interface PlanRunSnapshot {
   state: PlanRunState;
   /** Absolute path of the plan document, resolved from the recorded label. */
   planPath: string;
+  /**
+   * The plan document's own `# ` title, when it has one. What a person calls
+   * the job — "Reported statistics and explicit range semantics" — as opposed
+   * to `state.plan`, which is the repo-relative file path the engine records.
+   * Read from the same document as `planStages`, and available even when the
+   * engine-shaped stage parser refuses it.
+   */
+  planDocumentTitle?: string;
   /** Parsed headings, or undefined if the plan is unreadable/malformed. */
   planStages?: PlanStageHeading[];
   planError?: string;
@@ -326,14 +335,25 @@ async function snapshotPlanRun(location: SparringLocation, statePath: string): P
 
   let planStages: PlanStageHeading[] | undefined;
   let planError: string | undefined;
+  let planText: string | undefined;
   try {
-    planStages = parsePlanStages(await fs.readFile(planPath, "utf8"), planKey);
-    if (planStages.length === 0) {
-      planStages = undefined;
-      planError = "plan declares no stages";
-    }
+    planText = await fs.readFile(planPath, "utf8");
   } catch (error) {
     planError = (error as Error).message;
+  }
+  if (planText !== undefined) {
+    // The document's own title is kept whatever the engine-shaped stage parser
+    // makes of the rest of it: a plan that carries handoff records is refused
+    // as a stage list and still has a name a person recognises.
+    try {
+      planStages = parsePlanStages(planText, planKey);
+      if (planStages.length === 0) {
+        planStages = undefined;
+        planError = "plan declares no stages";
+      }
+    } catch (error) {
+      planError = (error as Error).message;
+    }
   }
 
   const stagesRoot = path.join(location.sparringDir, STAGES_DIRNAME);
@@ -363,6 +383,7 @@ async function snapshotPlanRun(location: SparringLocation, statePath: string): P
     stateMtimeMs: stat.mtimeMs,
     state,
     planPath,
+    planDocumentTitle: planText === undefined ? undefined : planTitle(planText),
     planStages,
     planError,
     stages,

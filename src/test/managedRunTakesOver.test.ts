@@ -141,7 +141,7 @@ describe("a managed run that advances past the stage it adopted", () => {
       brief: false,
       plan: false,
       associatedPlan: { path: PLAN_LABEL, exists: true, text: PLAN, manualMatch: { label: "3D", title: "Snapshot v2 and attachment/export/import transport" } },
-      activePlanRun: { runId: plan.id, planName: "reported-statistics.md", stageId: STAGE_4, stageLabel: "Stage 4", status: "running" },
+      managedPlanRun: { runId: plan.id, planName: "reported-statistics.md", stageId: STAGE_4, stageLabel: "Stage 4", status: "running" },
       existingStageIds: [STAGE_3D, STAGE_4],
     });
     assert.equal(taken.continueAutomatically, undefined, "adopting a second time is not offered while the managed run is live");
@@ -149,6 +149,6 @@ describe("a managed run that advances past the stage it adopted", () => {
     assert.match(taken.whatsNext?.text ?? "", /already exists/);
     assert.equal(taken.followPlan?.runId, plan.id);
     assert.match(taken.followPlan?.text ?? "", /managed plan run, now at Stage 4/);
-    assert.equal(taken.followPlan?.label, "Show running plan");
+    assert.equal(taken.followPlan?.label, "Back to plan run");
   });
 });

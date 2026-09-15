@@ -273,13 +273,21 @@ describe("a stage is called what the plan calls it", () => {
     assert.equal(readManifestStages(JSON.stringify({ version: 1, stages: [{ stage_id: "s", title: "t" }] })), undefined, "a stage without a label is a half-read journey");
   });
 
-  it("the Overview panel reads that file for the run it is showing", async () => {
-    const source = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "overview", "overviewPanel.ts"), "utf8");
-    const body = /private async manifestStages[\s\S]*?\n {2}}\n/.exec(source)?.[0] ?? "";
+  it("the Overview panel reads that file for the run it is showing, through the one cached reader", async () => {
+    const panel = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "overview", "overviewPanel.ts"), "utf8");
+    const body = /private async manifestStages[\s\S]*?\n {2}}\n/.exec(panel)?.[0] ?? "";
     assert.ok(body, "manifestStages exists");
-    assert.match(body, /run\.state\.source !== "manifest"/, "only a manifest run has one");
-    assert.match(body, /manifestFileName\(run\.planKey\)/);
+    assert.match(body, /this\.controller\.manifestStagesFor\(run\)/, "the identities come from the controller's cached read");
     assert.match(body, /recordedStatus\(path\.join\(run\.location\.sparringDir, STAGES_DIRNAME, stage\.stageId, STATE_FILENAME\)\)/, "each status is the stage's own state.json");
+
+    // The controller owns that read because the run picker needs it too (plan
+    // membership), and a manifest is the largest file either surface touches.
+    const controller = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "controller.ts"), "utf8");
+    const reader = /async manifestStagesFor[\s\S]*?\n {2}}\n/.exec(controller)?.[0] ?? "";
+    assert.ok(reader, "manifestStagesFor exists");
+    assert.match(reader, /run\.state\.source !== "manifest"/, "only a manifest run has one");
+    assert.match(reader, /manifestFileName\(run\.planKey\)/);
+    assert.match(reader, /mtimeMs/, "and it is cached by the file's modification time, not re-read per render");
   });
 });
 

@@ -119,11 +119,13 @@ async function discoveryAssertions(report: DiscoveryDiagnostic, fixtureRoot: str
   assert.equal(report.runs.length, 7);
   for (const stage of STAGES) {
     assert.ok(
-      report.pickLabels.some((label) => label.includes(`sporely-py-reported-statistics: ${stage}`)),
-      `Select Repository / Run lists ${stage}`,
+      // The label is the stage's readable name; the raw id stays in the detail,
+      // which the diagnostic includes precisely so it can be grepped for.
+      report.pickLabels.some((label) => label.startsWith("STANDALONE / HISTORICAL STAGES | ") && label.endsWith(`sporely-py-reported-statistics · ${stage}`)),
+      `Select Repository / Run lists ${stage} under the standalone group`,
     );
   }
-  assert.ok(report.pickLabels.some((label) => label.includes("nested-repo: stage-nested-only")));
+  assert.ok(report.pickLabels.some((label) => label.endsWith("nested-repo · stage-nested-only")));
   // Five open stages in two repositories: ambiguous, never guessed, and the report says so.
   assert.equal(report.ambiguousIds.length, 5);
   assert.equal(report.selectedId, undefined);
@@ -796,16 +798,17 @@ async function advancementAssertions(reportedRepo: string): Promise<void> {
   const planFile = path.join(reportedRepo, "plans", "reported-statistics.md");
   assert.equal(await vscode.commands.executeCommand("agentSparring._test.associatePlan", planFile), planFile);
   const history = await model();
-  assert.equal(history.runKind, "Standalone stage", "a deliberate visit is respected");
+  assert.equal(history.runKind, "Historical standalone stage", "a deliberate visit is respected, and reads as history");
   assert.match(history.followPlan?.text ?? "", /now at Stage 4/, "and it names the run that has taken over");
-  assert.equal(history.followPlan?.label, "Show running plan");
+  assert.equal(history.followPlan?.label, "Back to plan run");
+  assert.match(history.stageHeading ?? "", /^Stage 3D — Snapshot v2/, "the stage is named as its own plan run names it");
   assert.equal(history.continueAutomatically, undefined, "adopting again is not offered");
   assert.equal(history.whatsNext?.kind, "next-created", "nor creating a stage the engine already created");
 
   // And that button switches to it.
   await vscode.commands.executeCommand("agentSparring._test.associatePlan", undefined);
   await vscode.commands.executeCommand("agentSparring._test.chooseRun", stageRunId);
-  await vscode.commands.executeCommand("agentSparring._test.overviewAction", "showRunningPlan");
+  await vscode.commands.executeCommand("agentSparring._test.overviewAction", "openPlanRun");
   const followed = await model();
   assert.equal(followed.runKind, "Plan run");
   assert.equal(followed.stageId, stage4);

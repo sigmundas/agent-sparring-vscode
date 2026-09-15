@@ -6,12 +6,11 @@
  */
 
 import * as crypto from "node:crypto";
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, supersedingPlanRun, type RunSnapshot } from "../../core/discovery";
+import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, supersedingPlanRun, type PlanRunSnapshot, type RunSnapshot } from "../../core/discovery";
 import { parseStageState, type StageStatus } from "../../core/engineFormats";
-import { manifestFileName, readManifestStages } from "../../core/manifest";
+import { planRunDisplayName } from "../../core/planMembership";
 import {
   isActionMessage,
   isCopyMessage,
@@ -28,7 +27,7 @@ import {
   type OverviewAction,
 } from "../../core/overviewHtml";
 import { PROMPTS_DIRNAME, PROMPT_INDEX_FILENAME, latestCapture, parseCaptureIndex } from "../../core/promptInspector";
-import { buildOverviewModel, type ActivePlanRun, type CapturedPrompt, type ManifestStageView, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
+import { buildOverviewModel, type CapturedPrompt, type ManagedPlanRun, type ManifestStageView, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
 import { checkCopyText, reviewCopyText, type ReviewCopySource } from "../../core/reviewCopy";
 import { locateStage, parsePlanHeadings, type HeadingRef } from "../../core/planAssociation";
 import { planKey, planLabel } from "../../core/sparringCommand";
@@ -36,6 +35,7 @@ import type { DeclaredRepository } from "../../core/stageRepositories";
 import { documentViewColumn } from "../../core/viewColumn";
 import type { SparringController } from "../controller";
 import { gitContext } from "../git";
+import { readHead as readFileHead } from "../fileHead";
 
 const VIEW_TYPE = "agentSparring.overview";
 
@@ -229,7 +229,7 @@ export class OverviewPanelManager implements vscode.Disposable {
         continuation: planContinuation(),
         siblingRepositories: this.siblingRepositories(run, run.kind === "plan" ? planText : associatedText, briefText, association?.match),
         manifestStages: await this.manifestStages(run),
-        activePlanRun: await this.activePlanRun(run),
+        managedPlanRun: await this.managedPlanRun(run),
         existingStageIds: this.existingStageIds(run),
       };
     }
@@ -324,25 +324,41 @@ export class OverviewPanelManager implements vscode.Disposable {
   }
 
   /**
-   * The managed plan run in progress in this project while a standalone
-   * stage is on screen — the run that adopted this stage and has advanced
-   * past it. Selection already follows such a run on its own
-   * (`supersedingPlanRun`); this is for the case where the user is looking
-   * at the finished stage deliberately, so the screen can say where the work
-   * is instead of offering to sequence a stage the engine owns.
+   * The managed plan run this standalone stage is a stage of — the run that
+   * adopted it and has since advanced past it, whether that run is still going
+   * or is complete.
+   *
+   * Two sources, in this order. Membership (`planMembership.ts`) reads the
+   * execution manifest the extension wrote for the run and answers the
+   * identity question outright: this stage id is that run's Stage 3D. It is
+   * the one that holds for a *finished* run, which is the case that produced
+   * the reported confusion — a complete plan whose historical stages still
+   * offered Continue plan automatically. `supersedingPlanRun` is kept as the
+   * fallback for a run whose manifest cannot be read (another machine, cleared
+   * global storage): it can only see an open run, but it needs no manifest.
+   *
+   * Nothing is guessed from plan titles or paths: without one of these two, a
+   * standalone stage stays standalone and no dead "Back to plan run" appears.
    */
-  private async activePlanRun(run: RunSnapshot): Promise<ActivePlanRun | undefined> {
-    const plan = supersedingPlanRun(run, this.controller.currentDiscovery.runs);
+  private async managedPlanRun(run: RunSnapshot): Promise<ManagedPlanRun | undefined> {
+    if (run.kind !== "stage") {
+      return undefined;
+    }
+    const runs = this.controller.currentDiscovery.runs;
+    const membership = (await this.controller.planMemberships()).get(run.id);
+    const plan = runs.find((candidate): candidate is PlanRunSnapshot => candidate.kind === "plan" && candidate.id === membership?.planRunId) ?? supersedingPlanRun(run, runs);
     if (!plan) {
       return undefined;
     }
-    const stages = await this.manifestStages(plan);
+    const stages = await this.controller.manifestStagesFor(plan);
     return {
       runId: plan.id,
-      planName: planLabel(plan.planPath, plan.location.repoRoot),
+      planName: planRunDisplayName(plan),
       stageId: plan.currentStage.stageId,
       stageLabel: stages?.find((stage) => stage.stageId === plan.currentStage.stageId)?.label,
       status: plan.state.status,
+      memberLabel: membership?.stageLabel,
+      memberTitle: membership?.stageTitle,
     };
   }
 
@@ -409,11 +425,7 @@ export class OverviewPanelManager implements vscode.Disposable {
    * `state.json` — nothing here is inferred from the manifest's order.
    */
   private async manifestStages(run: RunSnapshot): Promise<ManifestStageView[] | undefined> {
-    if (run.kind !== "plan" || run.state.source !== "manifest") {
-      return undefined;
-    }
-    const file = path.join(this.controller.manifestDirectoryPath, manifestFileName(run.planKey));
-    const stages = readManifestStages(await readHead(file, MANIFEST_READ_LIMIT));
+    const stages = await this.controller.manifestStagesFor(run);
     if (!stages) {
       return undefined;
     }
@@ -463,9 +475,6 @@ const NOTES_READ_LIMIT = 256 * 1024;
 const SPARRING_READ_LIMIT = 256 * 1024;
 /** A plan document is read for its headings and one opening paragraph only; never past this many bytes. */
 const PLAN_READ_LIMIT = 512 * 1024;
-/** A manifest carries every stage's brief verbatim, so it is the largest of them; only its stage identities are read. */
-const MANIFEST_READ_LIMIT = 4 * 1024 * 1024;
-
 /**
  * A captured prompt is bounded by what the engine assembles — brief,
  * PROJECT.md, sparring.md, handoff.md and the engine's own framing — so a
@@ -492,19 +501,9 @@ async function recordedStatus(stateFile: string): Promise<StageStatus | undefine
 /** state.json is a handful of fields; never read past this many bytes. */
 const STATE_READ_LIMIT = 64 * 1024;
 
-/** The beginning of a text file, or undefined when it does not exist / cannot be read. */
-async function readHead(file: string, limit = BRIEF_READ_LIMIT): Promise<string | undefined> {
-  let handle: fs.FileHandle | undefined;
-  try {
-    handle = await fs.open(file, "r");
-    const buffer = Buffer.alloc(limit);
-    const { bytesRead } = await handle.read(buffer, 0, limit, 0);
-    return buffer.subarray(0, bytesRead).toString("utf8");
-  } catch {
-    return undefined;
-  } finally {
-    await handle?.close();
-  }
+/** The beginning of a text file; a brief-sized cap by default (see fileHead.ts). */
+function readHead(file: string, limit = BRIEF_READ_LIMIT): Promise<string | undefined> {
+  return readFileHead(file, limit);
 }
 
 /**

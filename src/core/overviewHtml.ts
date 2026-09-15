@@ -15,7 +15,7 @@
 
 import { CHECK_OUTCOMES, isCheckKey, type CheckItem, type CheckOutcome } from "./humanChecks";
 import { checkName, humanTask, splitPassCriteria } from "./humanTask";
-import { TIMELINE_STATE_WORD, type ActionRequired, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type TimelineItem, type WhatsNext } from "./overviewModel";
+import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { MatchSource } from "./planAssociation";
 import type { PromptView, PromptViewSection } from "./promptInspector";
 import type { StageRunAction } from "./runner";
@@ -39,7 +39,7 @@ export type OverviewAction =
   | "clearMatch"
   | "startNextStage"
   | "continueAutomatically"
-  | "showRunningPlan"
+  | "openPlanRun"
   | "stopRunner"
   | "openPlanSection"
   | "submitForReview"
@@ -197,7 +197,7 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "clearMatch",
   "startNextStage",
   "continueAutomatically",
-  "showRunningPlan",
+  "openPlanRun",
   "stopRunner",
   "openPlanSection",
   "submitForReview",
@@ -306,7 +306,16 @@ function renderBody(model: OverviewModel): string {
 function renderHeader(model: OverviewModel): string {
   const pills: string[] = [];
   if (model.runKind) {
-    pills.push(`<span class="hpill" title="${escapeHtml(model.title)}">${escapeHtml(model.runKind)}</span>`);
+    // The kind pill is the first thing read, and the three kinds must not look
+    // alike: a historical stage is toned down and says, in the pill itself,
+    // that the whole job lives elsewhere.
+    const historical = model.runKind === RUN_KIND.historicalStage;
+    const explain = historical
+      ? "One finished stage of a managed plan run, shown on its own. Back to plan run shows the whole job and its timeline."
+      : model.runKind === RUN_KIND.plan
+        ? "The whole job: the engine sequences its stages and records where it is."
+        : "A stage that was run on its own; no managed plan run claims it.";
+    pills.push(`<span class="hpill${historical ? " history" : ""}" title="${escapeHtml(explain)}">${escapeHtml(model.runKind)}</span>`);
   }
   if (model.stageLabel) {
     // What a person calls this stage. Where it sits in the run is secondary
@@ -387,7 +396,7 @@ function renderActionRequired(model: OverviewModel, panel: ActionRequired): stri
   // be able to see that there is somewhere for it to go.
   buttons.push(button("sendFeedbackForReview", panel.feedback.send.label, panel.feedback.send.enabled, panel.feedback.send.detail));
   if (panel.planSection) {
-    buttons.push(button("openPlanSection", "Open plan section", true, `Open ${model.planName ?? "the plan"} at this stage's section`));
+    buttons.push(button("openPlanSection", "Open plan section", true, `Open the document ${model.planName ?? "the plan"} at this stage's section`));
   }
   buttons.push(button("openSparring", "Open detailed review", panel.review, "Open sparring.md — the reviewer's full findings, in their own words"));
   // Asking someone else what a check means is a normal step, and it should not
@@ -705,7 +714,7 @@ function renderStageCard(model: OverviewModel): string {
   // While the Action required panel is up it carries the offer instead, so
   // the same button is never in two places.
   if (model.followPlan) {
-    buttons.push(button("showRunningPlan", model.followPlan.label, true, model.followPlan.detail, "primary"));
+    buttons.push(button("openPlanRun", model.followPlan.label, true, model.followPlan.detail, "primary"));
   }
   const auto = model.actionRequired ? undefined : model.continueAutomatically;
   if (auto && !handedOver) {
@@ -738,7 +747,7 @@ function renderStageCard(model: OverviewModel): string {
       buttons.push(button("openDiff", actions.diff.label, true, actions.diff.detail));
     }
     if (actions.plan) {
-      buttons.push(button("openPlan", "Plan", true, model.plan ? `${model.plan.name} — ${model.plan.note}` : "Open the plan document"));
+      buttons.push(button("openPlan", "Plan document", true, model.plan ? `Open the Markdown document ${model.plan.name} — ${model.plan.note}` : "Open the plan document"));
     } else if (actions.choosePlan && !accepted) {
       buttons.push(button("associatePlan", "Choose plan…", true, CHOOSE_PLAN_TITLE));
     }
@@ -866,7 +875,13 @@ function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
   const hints = next.hints && next.hints.length > 0 ? `<p class="muted">The brief lists later work that is in this plan: ${next.hints.map((hint) => `<span class="next">${escapeHtml(hint)}</span>`).join(", ")}.</p>` : "";
   const buttons: string[] = [];
   const planName = plan?.name ?? "the plan";
-  const openNext = (label: string, cls = "") => button(plan?.next?.line ? "openNextStage" : "openPlan", label, true, plan?.next?.line ? `Open ${planName} at ${plan.next.display}` : `Open ${planName}`, cls);
+  // Opening Markdown, and nothing else. The label says "document" or
+  // "section" precisely so it can never be read as switching the cockpit to
+  // the plan *run* — that is Back to plan run, and it is a different act.
+  const openNext = (cls = "") =>
+    plan?.next?.line
+      ? button("openNextStage", "Open plan section", true, `Open the document ${planName} at ${plan.next.display}`, cls)
+      : button("openPlan", "Open plan document", true, `Open the document ${planName}`, cls);
   // In automatic mode the rest of the plan goes to the engine in one step;
   // the per-stage operation stays as the quieter alternative.
   const auto = model.continueAutomatically;
@@ -880,7 +895,7 @@ function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
         buttons.push(button("resumePlan", model.planAction.label, true, model.planAction.detail, auto ? "" : "primary"));
       }
       if (model.actions?.plan) {
-        buttons.push(openNext("Open in plan"));
+        buttons.push(openNext());
       }
       break;
     case "next-stage":
@@ -893,29 +908,29 @@ function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
           auto ? "quiet" : "primary",
         ),
       );
-      buttons.push(openNext("Open in plan"));
+      buttons.push(openNext());
       buttons.push(button("matchStage", "Change match…", true, MATCH_TITLE, "quiet"));
       break;
     case "next-created":
       if (model.followPlan) {
-        buttons.push(button("showRunningPlan", model.followPlan.label, true, model.followPlan.detail, "primary"));
+        buttons.push(button("openPlanRun", model.followPlan.label, true, model.followPlan.detail, "primary"));
       }
-      buttons.push(openNext("Open in plan", model.followPlan ? "" : "primary"));
+      buttons.push(openNext(model.followPlan ? "" : "primary"));
       break;
     case "next-unclear":
-      buttons.push(openNext("Open in plan", "primary"));
+      buttons.push(openNext("primary"));
       buttons.push(button("matchStage", "Change match…", true, MATCH_TITLE, "quiet"));
       break;
     case "last-stage":
     case "no-labels":
-      buttons.push(button("openPlan", "Open plan", true, `Open ${planName}`));
+      buttons.push(button("openPlan", "Open plan document", true, `Open the document ${planName}`));
       buttons.push(button("matchStage", "Change match…", true, MATCH_TITLE, "quiet"));
       break;
     case "match":
       if (model.actions?.matchStage) {
         buttons.push(button("matchStage", "Match this stage…", true, MATCH_TITLE, "primary"));
       }
-      buttons.push(button("openPlan", "Open plan", true, `Open ${planName}`));
+      buttons.push(button("openPlan", "Open plan document", true, `Open the document ${planName}`));
       buttons.push(button("associatePlan", "Change plan…", true, "Choose another plan file or remove the association", "quiet"));
       break;
     case "missing-plan":
@@ -1098,6 +1113,8 @@ h1 { font-size: 1.35em; font-weight: 600; margin: 0; }
    theme, and the warning tone is carried by its border and its dot. */
 .hpill.warn { color: var(--vscode-foreground); border-color: var(--warn-border); background: var(--warn-surface); font-weight: 600; }
 .hpill.warn .icon { color: var(--warn); }
+/* A historical stage is not the live thing: dashed, quiet, unmistakably a record. */
+.hpill.history { color: var(--vscode-descriptionForeground); border-style: dashed; background: none; }
 
 .run .plan { font-family: var(--vscode-font-family); font-weight: 600; color: var(--vscode-foreground); }
 .run .sep { margin: 0 6px; }

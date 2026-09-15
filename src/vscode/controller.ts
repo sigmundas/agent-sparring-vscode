@@ -4,6 +4,7 @@
  * `../core`; this file only adapts it to the vscode API.
  */
 
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { ActivityTailer } from "../core/activityTailer";
@@ -25,6 +26,8 @@ import {
   type RunSnapshot,
   type SparringLocation,
 } from "../core/discovery";
+import { manifestFileName, readManifestStages, type ManifestStageIdentity } from "../core/manifest";
+import { resolveMemberships, type PlanMembership } from "../core/planMembership";
 import { deriveLiveness, type ExecutionRecord, type RunnerLiveness } from "../core/liveness";
 import { applyEvent, emptyLiveState, type LiveState } from "../core/liveState";
 import {
@@ -74,6 +77,7 @@ import { deriveStatus } from "../core/status";
 import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
 import { TerminalPool } from "./terminalPool";
 import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult } from "./executionTracker";
+import { MANIFEST_READ_LIMIT, readHead } from "./fileHead";
 
 const SELECTED_RUN_KEY = "agentSparring.selectedRunId";
 /** When that choice was made, so a managed run that advances afterwards can overtake it. */
@@ -107,6 +111,8 @@ export class SparringController implements vscode.Disposable {
   private readonly probed = new Map<string, number>();
   /** Run ids whose Accept stage operation from this window is still in flight. */
   private readonly accepting = new Set<string>();
+  /** Manifest stage identities by file, keyed by the file's mtime; see manifestStagesFor. */
+  private readonly manifestCache = new Map<string, { mtimeMs: number; stages: ManifestStageIdentity[] | undefined }>();
 
   private readonly changeEmitter = new vscode.EventEmitter<void>();
   /** Fires after every re-render: selection, authoritative state or live activity changed. */
@@ -233,6 +239,7 @@ export class SparringController implements vscode.Disposable {
       ...this.locateOptions(),
       preferredId: this.preference()?.id,
       stickyId: this.attachedRunId ?? this.context.workspaceState.get<string>(STICKY_RUN_KEY),
+      manifestStages: (run) => this.manifestStagesFor(run),
     });
     this.output.appendLine("");
     this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} ---- Diagnose Discovery (extension ${String(this.context.extension.packageJSON.version)}) ----`);
@@ -427,6 +434,50 @@ export class SparringController implements vscode.Disposable {
   async manifestDirectory(): Promise<string> {
     await vscode.workspace.fs.createDirectory(vscode.Uri.file(this.manifestDirectoryPath));
     return this.manifestDirectoryPath;
+  }
+
+  /**
+   * The stage identities of the manifest a managed run executes, cached by the
+   * file's modification time.
+   *
+   * A manifest carries every stage's brief verbatim, so it is by far the
+   * largest thing the Overview reads, and both the Overview and the run picker
+   * now need it — the Overview to draw the journey, the picker and the
+   * Overview to know which plan run a standalone stage belongs to
+   * (planMembership.ts). Reading it once per change rather than once per
+   * render is what makes that affordable. The extension wrote the file itself
+   * and regenerates it deterministically, so its mtime is a sound key.
+   */
+  async manifestStagesFor(run: RunSnapshot): Promise<ManifestStageIdentity[] | undefined> {
+    if (run.kind !== "plan" || run.state.source !== "manifest") {
+      return undefined;
+    }
+    const file = path.join(this.manifestDirectoryPath, manifestFileName(run.planKey));
+    let mtimeMs: number;
+    try {
+      mtimeMs = (await fs.stat(file)).mtimeMs;
+    } catch {
+      this.manifestCache.delete(file);
+      return undefined;
+    }
+    const cached = this.manifestCache.get(file);
+    if (cached && cached.mtimeMs === mtimeMs) {
+      return cached.stages;
+    }
+    const stages = readManifestStages(await readHead(file, MANIFEST_READ_LIMIT));
+    this.manifestCache.set(file, { mtimeMs, stages });
+    return stages;
+  }
+
+  /**
+   * Which managed plan run each standalone stage of the discovery belongs to.
+   *
+   * One answer for the whole window, so the Overview's wording, the run
+   * picker's grouping and the diagnostic can never disagree about whether a
+   * stage is history of a plan run or work of its own.
+   */
+  planMemberships(): Promise<Map<string, PlanMembership>> {
+    return resolveMemberships(this.discovery.runs, (run) => this.manifestStagesFor(run));
   }
 
   // ---------------------------------------------------------------- acceptance in flight

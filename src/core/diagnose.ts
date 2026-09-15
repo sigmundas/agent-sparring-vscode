@@ -26,11 +26,14 @@ import {
   runLabel,
   selectRun,
   type LocateOptions,
+  type PlanRunSnapshot,
   type RunSnapshot,
   type SparringLocation,
 } from "./discovery";
 import { EngineFormatError, parsePlanRunState, parseStageState } from "./engineFormats";
-import { buildRunPickItems } from "./runPick";
+import type { ManifestStageIdentity } from "./manifest";
+import { resolveMemberships } from "./planMembership";
+import { buildRunPickGroups } from "./runPick";
 
 export interface DiagnosticFolder {
   index: number;
@@ -85,7 +88,12 @@ export interface DiscoveryDiagnostic {
   runs: { id: string; kind: string; label: string; open: boolean }[];
   preferredId?: string;
   stickyId?: string;
-  /** What "Select Repository / Run" would list, in order. */
+  /**
+   * What "Select Repository / Run" would list, in order, one string per row:
+   * `<group> | <label> — <description> — <detail>`. The group is included
+   * because the picker separates plan runs from standalone stages, and the
+   * detail because a diagnostic is exactly where the raw stage id belongs.
+   */
   pickLabels: string[];
   selectedId?: string;
   ambiguousIds: string[];
@@ -96,6 +104,14 @@ export interface DiscoveryDiagnostic {
 export interface DiagnoseOptions extends LocateOptions {
   preferredId?: string;
   stickyId?: string;
+  /**
+   * The stage identities of a managed run's execution manifest, when the
+   * caller can read them (the extension's cached reader). Supplying it is what
+   * lets the report say which plan run each standalone stage belongs to —
+   * exactly the question this diagnostic exists to answer — and without it the
+   * rows are still grouped, just not annotated.
+   */
+  manifestStages?: (run: PlanRunSnapshot) => Promise<readonly ManifestStageIdentity[] | undefined>;
 }
 
 export async function diagnoseDiscovery(folders: DiagnosticFolder[], options: DiagnoseOptions = {}): Promise<DiscoveryDiagnostic> {
@@ -124,13 +140,16 @@ export async function diagnoseDiscovery(folders: DiagnosticFolder[], options: Di
     }
   }
   const selection = selectRun(discovery.runs, options.preferredId, options.stickyId);
+  const memberships = options.manifestStages ? await resolveMemberships(discovery.runs, options.manifestStages) : undefined;
   const report: DiscoveryDiagnostic = {
     folders: folderReports,
     problems: discovery.problems,
     runs: discovery.runs.map((run) => ({ id: run.id, kind: run.kind, label: runLabel(run), open: isOpen(run) })),
     preferredId: options.preferredId,
     stickyId: options.stickyId,
-    pickLabels: buildRunPickItems(discovery.runs, selection.selected?.id).map((item) => `${item.label} — ${item.description}`),
+    pickLabels: buildRunPickGroups(discovery.runs, { selectedId: selection.selected?.id, memberships }).flatMap((group) =>
+      group.items.map((item) => `${group.title} | ${item.label} — ${item.description} — ${item.detail}`),
+    ),
     selectedId: selection.selected?.id,
     ambiguousIds: selection.ambiguous.map((run) => run.id),
   };

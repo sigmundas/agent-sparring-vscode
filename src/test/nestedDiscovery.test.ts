@@ -61,10 +61,13 @@ describe("reported-statistics multi-root shape (sibling workspace folders)", () 
     const items = buildRunPickItems(discovery.runs, selection.selected?.id);
     assert.deepEqual(
       items.map((item) => item.label),
-      [`$(check) ${STAGES[2]}`, STAGES[1], STAGES[0]].map((label) => label),
-      "Select Repository / Run lists every stage, open first, then newest",
+      ["$(check) Reported statistics typed parser", "Reported statistics local schema barrier", "Reported statistics contract"],
+      "Select Repository / Run lists every stage by its readable name, open first, then newest",
     );
-    assert.ok(items.every((item) => item.detail.startsWith("sporely-py-reported-statistics · ")));
+    assert.ok(
+      items.every((item, at) => item.detail === `sporely-py-reported-statistics · ${[STAGES[2], STAGES[1], STAGES[0]][at]}`),
+      "the repository and the raw stage id stay in the detail line, where an identifier belongs",
+    );
   });
 
   it("all stages accepted: still recorded, the newest is selected as the terminal fallback", async () => {

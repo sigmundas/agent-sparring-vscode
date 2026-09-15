@@ -318,7 +318,7 @@ describe("overview HTML", () => {
     assert.match(html, /<ol class="journey"><li class="step accepted" title="Stage 1 — Contract \(Accepted\) · 1 of 3"><span class="node"><svg class="icon " [^>]*>.*?<\/svg><\/span><span class="num">1<\/span><span class="name">Contract<\/span><span class="state"><svg[^>]*>.*?<\/svg>Accepted<\/span><\/li>/);
     assert.match(html, /<li class="step paused current" [^>]*>.*?<span class="name">Schema &amp; API<\/span><span class="state">Paused<\/span><\/li>/);
     assert.match(html, /<li class="step future" [^>]*><span class="node">3<\/span>.*?<span class="state">Pending<\/span><\/li>/);
-    assert.match(html, /<span class="hpill" title="docs\/plans\/foo.md">Plan run<\/span><span class="hpill">Stage 2 \/ 3<\/span><span class="hpill warn"><svg[^>]*>.*?<\/svg>Needs you<\/span>/);
+    assert.match(html, /<span class="hpill" title="The whole job[^"]*">Plan run<\/span><span class="hpill">Stage 2 \/ 3<\/span><span class="hpill warn"><svg[^>]*>.*?<\/svg>Needs you<\/span>/);
     assert.match(html, /<h2 [^>]*><svg class="icon accent needs_you"[^>]*>.*?<\/svg>Stage 2 — Schema &amp; API<\/h2>/);
     assert.ok(!/<span class="status needs_you"/.test(html), "the card does not repeat the header pill's Needs you");
     assert.equal((html.match(/<div class="card actor">/g) ?? []).length, 2);

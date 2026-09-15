@@ -36,7 +36,7 @@ navigates.
 | `Agent Sparring: Resume Plan` | Pick a paused/running plan run, optionally record human evidence, launch `resume-plan`. The branch is *not* asked for: the run recorded `expected_branch` when it started and the engine refuses any other, so the checked-out branch is used when it matches and the mismatch is explained when it does not. |
 | `Agent Sparring: Run / Resume Stage` | For the selected standalone stage (or after picking one), launch `sparring run-loop <stage> --repo-root <project> --expected-branch <current branch>` in a terminal. The branch comes from the Git repository owning the project (built-in Git API, then `.git/HEAD`); a detached HEAD is refused, never guessed. Also offered as **Run stage** / **Resume stage** in the Overview. |
 | `Agent Sparring: Accept Stage` | For a stage whose independent review passed (**Review complete**): one action that runs the engine's `freeze-candidate` and, only if that succeeds, `accept-candidate` for the selected stage, project and current branch. Refusals are translated (uncommitted changes, not pushed, wrong branch, code changed after the review); the engine's own output goes to the Output Channel. Also offered as **Accept stage** in the Overview. |
-| `Agent Sparring: Choose Plan for Stage…` | Associate a Markdown plan file (any location, ordinary file picker) with the selected standalone stage. Stored in VS Code workspace state per repository + stage id, never in engine state; gives the Overview a **Plan** button, this stage's place in the document and, once accepted, **What's next**. Change or remove it the same way. |
+| `Agent Sparring: Choose Plan for Stage…` | Associate a Markdown plan file (any location, ordinary file picker) with the selected standalone stage. Stored in VS Code workspace state per repository + stage id, never in engine state; gives the Overview a **Plan document** button, this stage's place in the document and, once accepted, **What's next**. Change or remove it the same way. |
 | `Agent Sparring: Match Stage to Plan Section…` | When the Overview cannot tell which stage of the associated plan the selected stage is, pick it from the plan's stages (also **Match this stage…** / **Change match…** in the Overview). It remaps **only the stage on screen**, and the dialog is titled with that stage's name so it cannot be mistaken for another. Stored with the association in VS Code workspace state, never in engine state. |
 | `Agent Sparring: Review Stage Matches…` | The plan-level view: every stage this project has and which section of the plan it resolves to, with the ones nothing could place — and any two stages claiming the same section — first. Pick one to say which section *it* is. Use this to fix a historical stage; **Change match…** would remap the current one instead. When nothing needs placing the list says so — *All stages are matched. Select one only if you want to change it.* — and fixing the last unplaced stage closes it rather than reopening. Also **All stage matches…** in the Overview. |
 | `Agent Sparring: Start Next Stage from Plan…` | For an accepted standalone stage with an associated plan: create the stage that follows it (by stage label) with the engine's own `sparring new-stage <id>`, after a confirmation naming the title, the proposed id and the plan section. The Overview switches to the new stage, the plan association follows it, and its fresh `brief.md` opens beside the plan section for you to fill in before **Run stage**. Also **Start next stage** in the Overview. |
@@ -45,11 +45,11 @@ navigates.
 | `Agent Sparring: Stage Mode for a Plan Stage…` | Declare that a plan stage is a *review* of work rather than work: no implementation agent runs for it, and a fresh independent reviewer inspects the candidates the earlier stages accepted. Nothing is inferred from a stage's title or its brief's prose — this command is the only way to say it. Stored in VS Code workspace state per plan and stage label and emitted into the execution manifest as `mode`. Setting it back to *Implementation* removes the declaration. |
 | `Agent Sparring: Copy Review Context for Chat` | For a stage the reviewer handed back to you: put the whole review on the clipboard as plain Markdown — the stage and its goal, the routing state, the reviewer's summary and note, every human-gate check with its instruction and pass criteria verbatim, the concrete names the review refers to, the latest handoff claims, the reviewer's findings and the stage's plan section — so it can be pasted into ChatGPT/Claude, an issue or a message and asked about. No provider prompts, model reasoning, command output or activity log. Also **Copy context for chat** in the Overview, beside **Open detailed review**, with **Copy this check** under each outstanding check. |
 | `Agent Sparring: Choose sparring Executable…` | Pick the `sparring` CLI with a file dialog and store it as `agentSparring.executable`. |
-| `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / finalizing / future stages), the current stage as primary content (the stage as the plan names it — `Stage 3D — title`, with `6 of 8` as secondary metadata — a human state word with one explaining sentence, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), latest sparring result, small Stage Agent / Sparrer cards, Brief / Handoff / Sparring report / Diff / Plan / Log buttons, and quiet metadata (where the engine's own words live). Never auto-opens; updates in place. |
+| `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / finalizing / future stages), the current stage as primary content (the stage as the plan names it — `Stage 3D — title`, with `6 of 8` as secondary metadata — a human state word with one explaining sentence, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), latest sparring result, small Stage Agent / Sparrer cards, Brief / Handoff / Sparring report / Diff / Plan document / Log buttons, and quiet metadata (where the engine's own words live). Never auto-opens; updates in place. |
 | `Agent Sparring: Show Log` | Focus the Output Channel. |
-| `Agent Sparring: Select Run` | Choose explicitly when several runs look active; the choice is remembered per workspace. |
+| `Agent Sparring: Select Run` | Choose explicitly when several runs look active; the choice is remembered per workspace. The list is grouped — *Plan runs* first, then *Standalone / historical stages* — and each row is labelled by what a person calls it (the plan document's title, the plan's own `Stage 3D — …` name for a stage), with the repository and the raw stage id in the detail line. |
 | `Agent Sparring: Rediscover State` | Re-scan `.sparring` from disk. |
-| `Agent Sparring: Diagnose Discovery` | Trace discovery for every workspace folder into the Output Channel: scheme, path, the `.sparring` probed, nested projects, stage/plan files and whether they parsed (lifecycle status only), runs produced, what Select Repository / Run would list, and why nothing is selected. Never logs file contents. |
+| `Agent Sparring: Diagnose Discovery` | Trace discovery for every workspace folder into the Output Channel: scheme, path, the `.sparring` probed, nested projects, stage/plan files and whether they parsed (lifecycle status only), runs produced, what Select Repository / Run would list (group, label, description and the raw stage id), and why nothing is selected. Never logs file contents. |
 
 ## Settings
 
@@ -264,15 +264,15 @@ mode those actions are still there, just no longer the obvious path.
 ## Plans: managed runs and associated files
 
 - A **managed plan run** is the engine's `.sparring/plans/<key>.json`. It is
-  authoritative: the Overview shows the journey, **Plan** opens the recorded
-  document, and after the current stage is accepted **Continue plan** calls
+  authoritative: the Overview shows the journey, **Plan document** opens the
+  recorded Markdown, and after the current stage is accepted **Continue plan** calls
   `sparring resume-plan`, which advances past the accepted stage and starts
   the next one (paused runs get **Resume plan**).
 - A **standalone stage** has no machine-readable plan. **Choose plan…** lets
   you pick any Markdown file (no directory convention is assumed). The
   association is VS Code workspace state keyed by repository + stage id;
-  the engine never sees it. The Overview then shows **Plan** and this
-  stage's place in the document. Because the engine has no operation that
+  the engine never sees it. The Overview then shows **Plan document** and
+  this stage's place in the document. Because the engine has no operation that
   starts a standalone stage from a plan, nothing here offers to; the next
   section is information you read, not a button that runs something.
 
@@ -314,12 +314,12 @@ line and a **What's next** block:
 
 | Situation | What's next shows |
 | --- | --- |
-| Managed plan run, a stage follows | the engine's next stage, its opening paragraph from the plan, **Continue plan** (`resume-plan`), **Open in plan** |
+| Managed plan run, a stage follows | the engine's next stage, its opening paragraph from the plan, **Continue plan** (`resume-plan`), **Open plan section** |
 | Managed plan run, last stage | *No stage follows this one in the plan.* and **Continue plan** |
-| Standalone stage, plan linked and matched, next stage defined | `Stage 3C — title`, its opening paragraph, **Start next stage**, **Open in plan**, **Change match…** |
-| Standalone stage, next stage ambiguous or only mentioned historically | the label and why it cannot be started; **Open in plan** |
-| Standalone stage, no later label / plan without labels | *No later stage is defined in …* / the plan has no "Stage …" labels; **Open plan** |
-| Standalone stage, plan linked but not matched | *The plan is linked, but Agent Sparring doesn't yet know where this stage belongs in it.* **Match this stage…**, **Open plan**; plan stages the brief lists as later work are shown as a hint |
+| Standalone stage, plan linked and matched, next stage defined | `Stage 3C — title`, its opening paragraph, **Start next stage**, **Open plan section**, **Change match…** |
+| Standalone stage, next stage ambiguous or only mentioned historically | the label and why it cannot be started; **Open plan section** |
+| Standalone stage, no later label / plan without labels | *No later stage is defined in …* / the plan has no "Stage …" labels; **Open plan document** |
+| Standalone stage, plan linked but not matched | *The plan is linked, but Agent Sparring doesn't yet know where this stage belongs in it.* **Match this stage…**, **Open plan document**; plan stages the brief lists as later work are shown as a hint |
 | Standalone stage, no plan | *This stage has been accepted. Choose a plan to see what comes next.* **Choose plan…** |
 
 **Start next stage** (the per-stage path) proposes `stage-<label>-<slug>`
@@ -399,14 +399,33 @@ In order:
 A choice stops holding when a managed plan run of the same project has
 **advanced past** the finished stage you had chosen — which is what happens
 when a stage you adopted is accepted and the engine moves to the next one.
-The Overview then follows the managed run to its current stage. The stage it
-came from stays discoverable as history, and opening it deliberately is
-respected (the plan has not advanced since you opened it); that screen then
-says which run has taken over, offers **Show running plan**, and withholds
-what the live run already owns — Continue plan automatically, and Start next
-stage for a stage the engine has already created. Every "a runner is already
-alive" message offers **Show running plan** too, rather than leaving you on a
-screen whose buttons cannot work.
+The Overview then follows the managed run to its current stage. Every "a
+runner is already alive" message offers **Show running plan** too, rather
+than leaving you on a screen whose buttons cannot work.
+
+### Plan run, historical stage, plan document
+
+Three things, and the UI keeps them apart:
+
+| | What it is | How to get to it |
+| --- | --- | --- |
+| **Plan run** | the whole job: the engine sequences its stages, records where it is, and the Overview draws the timeline | the *Plan runs* group of Select Repository / Run; **Back to plan run** from one of its stages |
+| **Historical standalone stage** | one finished stage of a plan run, rediscovered on its own — good for inspecting its brief, handoff, review, diff and log | the *Standalone / historical stages* group |
+| **Plan document** | the Markdown specification | **Plan document** / **Open plan section**, which open an editor and change nothing about which run is selected |
+
+A stage is known to belong to a plan run when the **execution manifest that
+run executes** lists its id. That is why a stage of a plan whose document the
+engine's `## Stage <n>` parser refuses — one carrying `## Stage 3D handoff —
+…` records — is still named `Stage 3D` and still knows where it came from,
+and why nothing is claimed when no recorded run lists it.
+
+Such a stage reads *Historical standalone stage*, is named as its own run
+names it, and offers **Back to plan run** as its primary action; that button
+changes the selected run, so the timeline comes back. What the plan run owns
+is withheld there: **Continue plan automatically** is not offered (whether
+that run is still going or complete — adopting stages a managed run already
+owns could only be refused, or start a second run over finished work), and
+neither is **Start next stage** for a stage the engine has already created.
 
 ### Runner lifecycle
 

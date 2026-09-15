@@ -221,13 +221,13 @@ export interface OverviewArtifacts {
    */
   manifestStages?: ManifestStageView[];
   /**
-   * The managed plan run that is live in this project while a *standalone*
-   * stage is being shown — the stage a managed run adopted and has since
-   * advanced past. Everything that would sequence this stage by hand is the
-   * live run's business now, so those offers are withdrawn and the Overview
-   * points at it instead.
+   * The managed plan run this *standalone* stage belongs to — the run that
+   * adopted it and has since advanced past it, whether that run is still
+   * going or has finished. Everything that would sequence this stage by hand
+   * is that run's business, so those offers are withdrawn and the Overview
+   * offers the way back to the run instead.
    */
-  activePlanRun?: ActivePlanRun;
+  managedPlanRun?: ManagedPlanRun;
   /**
    * Stage ids the engine has already created in this project. Start next
    * stage is not offered for one of them: `sparring new-stage` refuses an
@@ -236,8 +236,8 @@ export interface OverviewArtifacts {
   existingStageIds?: readonly string[];
 }
 
-/** A managed plan run in the same project as the standalone stage on screen. */
-export interface ActivePlanRun {
+/** The managed plan run the standalone stage on screen is a stage of. */
+export interface ManagedPlanRun {
   runId: string;
   /** The plan's display name, as the run list shows it. */
   planName: string;
@@ -245,8 +245,12 @@ export interface ActivePlanRun {
   stageId: string;
   /** Its plan identity when the manifest gives one (`Stage 4`). */
   stageLabel?: string;
-  /** The engine's recorded status of the run (`running`, `paused`, …). */
+  /** The engine's recorded status of the run (`running`, `paused`, `complete`). */
   status: string;
+  /** The plan's own name for the stage on screen (`Stage 3D`), when the manifest gives one. */
+  memberLabel?: string;
+  /** The plan's own title for the stage on screen, when the manifest gives one. */
+  memberTitle?: string;
 }
 
 export type PlanContinuation = "automatic" | "manual";
@@ -480,7 +484,7 @@ export interface OverviewModel {
   /** Reviewer hand-back to the human; present only for NEEDS_YOU / ESCALATE with no turn in progress. */
   actionRequired?: ActionRequired;
   title: string;
-  /** `Plan run` or `Standalone stage`. */
+  /** `Plan run`, `Historical standalone stage` or `Standalone stage`; see runKindWord. */
   runKind?: string;
   status?: RunStatus;
   /** The last meaningful event, also while a turn is active. */
@@ -498,8 +502,9 @@ export interface OverviewModel {
    */
   continueAutomatically?: { label: string; detail: string; primary: boolean; kind: "adopt" | "continue" };
   /**
-   * This standalone stage's project has a managed plan run in progress: what
-   * it is at, and the one action that makes sense here — switch to it.
+   * This standalone stage is a stage of a managed plan run: what that run is,
+   * and the one action that makes sense here — Back to plan run, which changes
+   * the cockpit's selection to that run. Never a document action.
    */
   followPlan?: { runId: string; label: string; text: string; detail: string };
   /** An Accept stage operation from this window is in flight. */
@@ -605,7 +610,7 @@ export function buildOverviewModel(
     goal: goal(artifacts, plan),
     activity: activityLine(live, halted, nowMs, uncertain),
     history: history(live),
-    runKind: run.kind === "plan" ? "Plan run" : "Standalone stage",
+    runKind: runKindWord(run, artifacts),
     status: fresh ? { label: "Ready to start", tone: "info" } : runStatus(run, presentation, liveness),
     liveness: { state: liveness.state, source: liveness.source, detail: liveness.detail },
     plan,
@@ -657,9 +662,15 @@ export function buildOverviewModel(
     // A standalone stage that is matched to a plan section is called what the
     // plan calls it as well; its engine id stays in the tooltip and the
     // footer. `3c cloud schema rpc and sync transport` is a slug read aloud.
+    //
+    // A stage of a managed plan run is named by that run's own manifest, which
+    // is the same authority the plan run's screen uses — so the two screens
+    // call the stage the same thing, and only the run kind differs.
     const matched = plan?.source === "associated" ? plan : undefined;
-    model.stageHeading = matched?.current ?? stageDisplayName(stage);
-    model.stageLabel = matched?.currentLabel ? `Stage ${matched.currentLabel}` : undefined;
+    const managed = artifacts.managedPlanRun;
+    const fromRun = managed?.memberLabel && managed.memberTitle ? `${managed.memberLabel} — ${managed.memberTitle}` : undefined;
+    model.stageHeading = matched?.current ?? fromRun ?? stageDisplayName(stage);
+    model.stageLabel = matched?.currentLabel ? `Stage ${matched.currentLabel}` : managed?.memberLabel;
   }
   model.stageId = stage.stageId;
   if (!stage.exists) {
@@ -690,9 +701,12 @@ export function buildOverviewModel(
   model.continueAutomatically = continueAutomatically(run, plan, artifacts, model, liveness);
   model.followPlan = followPlan(run, artifacts);
   if (model.followPlan) {
-    // The managed run owns the sequencing of this project now. Adopting it a
+    // A managed run owns the sequencing of these stages. Adopting them a
     // second time, or creating a stage it has already created, are both
-    // refusals waiting to happen; the way forward is that run's own screen.
+    // refusals waiting to happen — and when that run is *complete*, offering
+    // to continue the plan from one of its finished stages is worse than
+    // useless, because it would start a second run over work that is done.
+    // The way forward, or back, is that run's own screen.
     delete model.continueAutomatically;
   }
   model.actionRequired = actionRequired(run, presentation, outcome, plan, artifacts, model, branchGuard, liveness);
@@ -1047,24 +1061,59 @@ function continueAutomatically(
 }
 
 /**
- * A standalone stage screen while a managed plan run of the same project is
- * in progress. That happens after a stage is adopted and the managed run
+ * What kind of thing is on screen, in the plainest words there are.
+ *
+ * Three kinds, never two: the whole job, one old stage of a job, and one
+ * stage that was only ever run on its own. The middle one used to be
+ * indistinguishable from the first — same layout, same pill, no timeline —
+ * which is how a complete plan run looked like it had lost its stages.
+ */
+export const RUN_KIND = {
+  plan: "Plan run",
+  historicalStage: "Historical standalone stage",
+  standaloneStage: "Standalone stage",
+} as const;
+
+export function runKindWord(run: RunSnapshot, artifacts: OverviewArtifacts): string {
+  if (run.kind === "plan") {
+    return RUN_KIND.plan;
+  }
+  return artifacts.managedPlanRun ? RUN_KIND.historicalStage : RUN_KIND.standaloneStage;
+}
+
+/**
+ * A standalone stage screen for a stage that belongs to a managed plan run of
+ * the same project. That happens after a stage is adopted and the managed run
  * advances: the stage it left behind is an accepted stage of its own again,
  * and everything this screen would offer to sequence it by hand — Continue
- * plan automatically, Start next stage — belongs to the live run. Say where
- * the work actually is, and offer the way there.
+ * plan automatically, Start next stage — belongs to that run. Say where the
+ * work actually is, and offer the one way back.
+ *
+ * It holds for a run that has *finished* too, which is the case that caused
+ * the reported confusion: a complete plan's stages were still being offered
+ * for adoption into a new managed run, and the only route back to the
+ * timeline was the run picker.
+ *
+ * `label` is deliberately not about opening a document: it changes which run
+ * the cockpit follows. Open plan document / Open plan section are the actions
+ * that open Markdown, and the two must never sound alike.
  */
 function followPlan(run: RunSnapshot, artifacts: OverviewArtifacts): OverviewModel["followPlan"] {
-  const active = artifacts.activePlanRun;
-  if (run.kind !== "stage" || !active) {
+  const managed = artifacts.managedPlanRun;
+  if (run.kind !== "stage" || !managed) {
     return undefined;
   }
-  const at = active.stageLabel ? `${active.stageLabel} (${active.stageId})` : active.stageId;
+  const at = managed.stageLabel ? `${managed.stageLabel} (${managed.stageId})` : managed.stageId;
+  const mine = managed.memberLabel ? `${managed.memberLabel} is one of its stages` : "This stage is one of its stages";
+  const text =
+    managed.status === "complete"
+      ? `${managed.planName} is the managed plan run this stage belongs to, and the engine has completed it. ${mine}; this screen shows only that one stage.`
+      : `${managed.planName} is being run by the engine as a managed plan run, now at ${at}. ${mine}, and this screen shows only that one.`;
   return {
-    runId: active.runId,
-    label: "Show running plan",
-    text: `${active.planName} is being run by the engine as a managed plan run, now at ${at}. This stage is part of that run's history.`,
-    detail: `Follow the managed run of ${active.planName} (${active.status}, currently ${at}) instead of this finished stage`,
+    runId: managed.runId,
+    label: "Back to plan run",
+    text,
+    detail: `Follow the managed plan run of ${managed.planName} (${managed.status}, currently ${at}) instead of this single stage. This changes what the Overview shows; it does not open the plan document.`,
   };
 }
 
@@ -1512,8 +1561,10 @@ function whatsNext(run: RunSnapshot, plan: PlanContext | undefined, artifacts: O
       kind: "next-created",
       heading: next.display,
       summary: next.summary,
-      text: artifacts.activePlanRun
-        ? `${next.display} already exists (${created}); the managed plan run is sequencing it.`
+      text: artifacts.managedPlanRun
+        ? artifacts.managedPlanRun.status === "complete"
+          ? `${next.display} already exists (${created}); the managed plan run that created it is complete.`
+          : `${next.display} already exists (${created}); the managed plan run is sequencing it.`
         : `${next.display} already exists as ${created}, so there is nothing to create. Select that stage to work on it.`,
     };
   }
