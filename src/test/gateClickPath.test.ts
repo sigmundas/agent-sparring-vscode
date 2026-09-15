@@ -33,6 +33,7 @@ import { deriveVerification, isCheckKey, withHumanCheck, type CheckOutcome, type
 import { isActionMessage, isHumanCheckMessage, renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel, type ManifestStageView, type OverviewArtifacts, type OverviewModel } from "../core/overviewModel";
 import { Workspace } from "./fixtures";
+import { elementFrom, FakeElement, FakeTextArea, runWebviewScript } from "./webviewShim";
 
 const NOW = Date.parse("2026-09-14T20:00:00.000Z");
 const STAGE_3D = "stage-3d-snapshot-v2-and-attachment-export-import-transport";
@@ -51,112 +52,39 @@ const MANIFEST: ManifestStageView[] = [
   { stageId: STAGE_3D, label: "Stage 3D", title: "Snapshot v2 and attachment/export/import transport", status: "working" },
 ];
 
-function sparringWithGate(): string {
-  const gate = { category: "DEVICE_MANUAL_CHECK", title: "Confirm the supported pre-activation desktop reads snapshot-v2 feeds safely", checks: [{ id: CHECK_ID, instruction: INSTRUCTION, pass_criteria: PASS_CRITERIA, source: null }] };
+/** A second check, for the cases where what matters is one check's draft not disturbing another's. */
+const SECOND_ID = "attachment-export-import-round-trip";
+const SECOND_INSTRUCTION = "Export a snapshot with two attachments and import it into a second profile.";
+const SECOND_PASS_CRITERIA = "Pass if both attachments open after the import.";
+
+function sparringWithGate(checks = 1): string {
+  const all = [
+    { id: CHECK_ID, instruction: INSTRUCTION, pass_criteria: PASS_CRITERIA, source: null },
+    { id: SECOND_ID, instruction: SECOND_INSTRUCTION, pass_criteria: SECOND_PASS_CRITERIA, source: null },
+  ].slice(0, checks);
+  const gate = { category: "DEVICE_MANUAL_CHECK", title: "Confirm the supported pre-activation desktop reads snapshot-v2 feeds safely", checks: all };
   return ["# Sparring: stage 3d", "", "## Routing outcome", "", "- Action: `NEEDS_YOU`", "- Summary: One compatibility check is the sole acceptance blocker.", "- Needs-you reason: DEVICE/MANUAL CHECK -- a pre-activation desktop against a v2 feed.", "", "## NEEDS YOU", "", HUMAN_GATE_MARKER, "", "```json", JSON.stringify(gate, null, 2), "```", ""].join("\n");
 }
 
 // ---------------------------------------------------------------- a DOM the shipped script can run against
 
-interface Posted {
-  type: string;
-  [field: string]: unknown;
-}
-
-/** Just enough of an element for the shipped listener: attributes, `closest`, `disabled`, and a value. */
-class FakeElement {
-  readonly attributes: Record<string, string>;
-  disabled = false;
-  value = "";
-  constructor(
-    readonly tag: string,
-    attributes: Record<string, string>,
-    readonly parent?: FakeElement,
-  ) {
-    this.attributes = attributes;
-  }
-  getAttribute(name: string): string | null {
-    return this.attributes[name] ?? null;
-  }
-  hasAttribute(name: string): boolean {
-    return name in this.attributes;
-  }
-  /** `button[data-check][data-outcome]` and friends: a tag plus required attributes, walked up the parents. */
-  closest(selector: string): FakeElement | null {
-    const [, tag, rest] = /^([a-z]+)((?:\[[^\]]+\])*)$/.exec(selector) ?? [];
-    const wanted = [...(rest ?? "").matchAll(/\[([^\]]+)\]/g)].map((match) => match[1]);
-    const matches = (node: FakeElement): boolean => node.tag === tag && wanted.every((attribute) => node.hasAttribute(attribute));
-    if (matches(this)) {
-      return this;
-    }
-    return this.parent?.closest(selector) ?? null;
-  }
-}
-
-class FakeTextArea extends FakeElement {}
-
-/** The document as the shipped script uses it: three delegated listeners on one root. */
-class FakeDocument {
-  private readonly listeners = new Map<string, ((event: { target: unknown }) => void)[]>();
-  addEventListener(type: string, listener: (event: { target: unknown }) => void): void {
-    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
-  }
-  dispatch(type: string, target: unknown): void {
-    for (const listener of this.listeners.get(type) ?? []) {
-      listener({ target });
-    }
-  }
-}
-
-/**
- * Run the script the document actually ships, and return the DOM it bound
- * itself to plus everything it posts. Nothing here is a re-implementation:
- * the listener under test is the string inside the rendered `<script>`.
- */
-function runWebviewScript(html: string): { document: FakeDocument; posted: Posted[] } {
-  const script = /<script nonce="n">([\s\S]*?)<\/script>/.exec(html)?.[1];
-  assert.ok(script, "the document ships a script");
-  const document = new FakeDocument();
-  const posted: Posted[] = [];
-  const timers: ReturnType<typeof setTimeout>[] = [];
-  const run = new Function("document", "acquireVsCodeApi", "Element", "HTMLTextAreaElement", "setTimeout", "clearTimeout", script);
-  run(
-    document,
-    () => ({ postMessage: (message: Posted) => posted.push(message) }),
-    FakeElement,
-    FakeTextArea,
-    (fn: () => void) => {
-      const timer = setTimeout(fn, 0);
-      timers.push(timer);
-      return timer;
-    },
-    (timer: ReturnType<typeof setTimeout>) => clearTimeout(timer),
-  );
-  return { document, posted };
-}
-
 /** The Pass / Fail / Can't test button for a check, built from the markup the renderer emitted. */
 function outcomeButton(html: string, key: string, outcome: CheckOutcome): FakeElement {
-  const markup = new RegExp(`<button[^>]*data-check="${key}" data-outcome="${outcome}"[^>]*>`).exec(html)?.[0];
-  assert.ok(markup, `the document has a ${outcome} control for ${key}`);
-  const attributes: Record<string, string> = {};
-  for (const [, name, value] of markup.matchAll(/([a-z-]+)="([^"]*)"/g)) {
-    attributes[name] = value;
-  }
-  assert.ok("data-check" in attributes && "data-outcome" in attributes, "the attributes the listener selects on");
-  return new FakeElement("button", attributes);
+  const button = elementFrom(html, "button", new RegExp(`<button[^>]*data-check="${key}" data-outcome="${outcome}"[^>]*>`), `a ${outcome} control for ${key}`);
+  assert.ok(button.hasAttribute("data-check") && button.hasAttribute("data-outcome"), "the attributes the listener selects on");
+  return button;
 }
 
 // ---------------------------------------------------------------- the run
 
-async function managedGate() {
+async function managedGate(checks = 1) {
   const ws = await Workspace.create();
   const planPath = path.join(ws.root, ...PLAN_LABEL.split("/"));
   await fs.mkdir(path.dirname(planPath), { recursive: true });
   await fs.writeFile(planPath, PLAN);
   await ws.writePlanRun(PLAN_KEY, { plan: PLAN_LABEL, status: "paused", current_stage_index: 1, current_stage: STAGE_3D, expected_branch: "feature/x", source: "manifest" });
   await ws.writeStage("stage-1-contract", { status: "accepted" });
-  await ws.writeStage(STAGE_3D, { status: "working", implementation_session_id: "impl", sparring_session_id: "spar" }, { "sparring.md": sparringWithGate() });
+  await ws.writeStage(STAGE_3D, { status: "working", implementation_session_id: "impl", sparring_session_id: "spar" }, { "sparring.md": sparringWithGate(checks) });
   const selection = selectRun((await discoverRuns([ws.location])).runs);
   const runId = selection.selected!.id;
   assert.ok(runId.endsWith(RUN_ID_SUFFIX));
@@ -270,6 +198,114 @@ describe("clicking Pass on a structured gate", () => {
     assert.ok(handler, "recordHumanCheck exists");
     assert.match(handler, /this\.controller\.setHumanCheck\(run\.id, message\.key/);
     assert.ok(!/launch|buildRun|Terminal|submitForReview/.test(handler), "no engine invocation on a draft");
+  });
+});
+
+/**
+ * The reported defect, on the path it actually happened on.
+ *
+ * Recording *Can't test* on one check, typing a note under it, then clicking
+ * *Pass* on another check reset the first check to no outcome at all — and
+ * only when it had a note. Nothing about it was visible when it happened,
+ * because a note is stored without re-rendering: the page kept showing Can't
+ * test selected until the next click rebuilt the document from state that no
+ * longer said so.
+ *
+ * The cause was the merge, not the wire. A note message carries no outcome,
+ * and the host filled the missing field in as `outcome: undefined` before
+ * merging, so spreading the change over the stored record overwrote the
+ * outcome with nothing. The mirror image lost the note: an outcome click
+ * carries no note, and the same fill-in blanked it.
+ *
+ * So `undefined` in a change now means "this field was not part of this
+ * message" everywhere, and the two controls of one check can no longer erase
+ * each other's work.
+ */
+describe("a note and an outcome are recorded independently", () => {
+  it("typing a note keeps the outcome that was already recorded — the reported bug", async () => {
+    const { runId, view } = await managedGate(2);
+    let drafts: HumanCheckDrafts = {};
+
+    // Can't test on check 1, through the shipped script.
+    const first = view(drafts);
+    const blocked = runWebviewScript(first.html);
+    blocked.document.dispatch("click", outcomeButton(first.html, CHECK_ID, "blocked"));
+    assert.ok(isHumanCheckMessage(blocked.posted[0]));
+    drafts = withHumanCheck(drafts, runId, CHECK_ID, { outcome: blocked.posted[0].outcome as CheckOutcome, note: blocked.posted[0].note as string | undefined });
+
+    // A note under it, from the same real textarea. The message carries a
+    // note and no outcome, exactly as the shipped listener sends it.
+    const withOutcome = view(drafts);
+    const typing = runWebviewScript(withOutcome.html);
+    const area = elementFrom(withOutcome.html, "textarea", new RegExp(`<textarea class="note" data-check="${CHECK_ID}"[^>]*>`), "the note field of check 1");
+    area.value = "No pre-activation device available this week.";
+    typing.document.dispatch("focusout", area);
+    const note = typing.posted[0];
+    assert.deepEqual({ ...note }, { type: "humanCheck", key: CHECK_ID, note: "No pre-activation device available this week." });
+    // The host fills in the field the message did not carry, which is what
+    // made this a data-loss bug rather than a missing feature.
+    drafts = withHumanCheck(drafts, runId, note.key as string, { outcome: note.outcome as CheckOutcome | undefined, note: note.note as string });
+
+    assert.deepEqual(drafts[runId][CHECK_ID], { outcome: "blocked", note: "No pre-activation device available this week." }, "the note is added; the outcome stays");
+
+    // Pass on check 2 — the click that rebuilt the page and revealed the loss.
+    const second = view(drafts);
+    const passing = runWebviewScript(second.html);
+    passing.document.dispatch("click", outcomeButton(second.html, SECOND_ID, "pass"));
+    const pass = passing.posted[0];
+    drafts = withHumanCheck(drafts, runId, pass.key as string, { outcome: pass.outcome as CheckOutcome, note: pass.note as string | undefined });
+
+    const after = view(drafts);
+    const panel = after.model.actionRequired!;
+    assert.deepEqual(
+      panel.required.map((item) => [item.key, item.record?.outcome, item.record?.note]),
+      [
+        [CHECK_ID, "blocked", "No pre-activation device available this week."],
+        [SECOND_ID, "pass", undefined],
+      ],
+      "check 1 still says Can't test, with its note; check 2 says Pass",
+    );
+    assert.equal(panel.progress, "1 / 2 verified · 1 blocked");
+    assert.equal(panel.submit.enabled, true, "both checks have a result, so the evidence can go back");
+    assert.match(after.html, new RegExp(`class="choice blocked on" data-check="${CHECK_ID}" data-outcome="blocked" aria-pressed="true"`), "and the selection is still visible");
+    assert.match(after.html, />No pre-activation device available this week\.<\/textarea>/);
+  });
+
+  it("clicking an outcome keeps the note that was already typed — the same bug, mirrored", async () => {
+    const { runId, view } = await managedGate(2);
+    let drafts: HumanCheckDrafts = {};
+
+    const start = view(drafts);
+    const typing = runWebviewScript(start.html);
+    const area = elementFrom(start.html, "textarea", new RegExp(`<textarea class="note" data-check="${CHECK_ID}"[^>]*>`), "the note field of check 1");
+    area.value = "Ran it on the 2026.4 build; the placeholder does not flash.";
+    typing.document.dispatch("focusout", area);
+    drafts = withHumanCheck(drafts, runId, CHECK_ID, { outcome: undefined, note: typing.posted[0].note as string });
+
+    const noted = view(drafts);
+    const clicking = runWebviewScript(noted.html);
+    clicking.document.dispatch("click", outcomeButton(noted.html, CHECK_ID, "pass"));
+    drafts = withHumanCheck(drafts, runId, CHECK_ID, { outcome: clicking.posted[0].outcome as CheckOutcome, note: clicking.posted[0].note as string | undefined });
+
+    assert.deepEqual(drafts[runId][CHECK_ID], { outcome: "pass", note: "Ran it on the 2026.4 build; the placeholder does not flash." }, "the evidence someone typed survives recording the result it belongs to");
+    const after = view(drafts);
+    assert.equal(after.model.actionRequired?.required[0].record?.note, "Ran it on the 2026.4 build; the placeholder does not flash.");
+    assert.match(after.html, />Ran it on the 2026.4 build; the placeholder does not flash\.<\/textarea>/);
+  });
+
+  it("changing the outcome three times never touches the note, and emptying the field clears only the note", async () => {
+    const runId = "run|a";
+    let drafts = withHumanCheck(undefined, runId, CHECK_ID, { note: "Two clients agree." });
+    for (const outcome of ["pass", "fail", "blocked"] as const) {
+      drafts = withHumanCheck(drafts, runId, CHECK_ID, { outcome, note: undefined });
+      assert.equal(drafts[runId][CHECK_ID].note, "Two clients agree.", `still there after ${outcome}`);
+      assert.equal(drafts[runId][CHECK_ID].outcome, outcome);
+    }
+    // Emptying the textarea is a note of "", not an absent note: that is how a
+    // person withdraws what they wrote, and it must not withdraw the result.
+    drafts = withHumanCheck(drafts, runId, CHECK_ID, { outcome: undefined, note: "" });
+    assert.deepEqual(drafts[runId][CHECK_ID], { outcome: "blocked" });
+    assert.deepEqual(withHumanCheck(drafts, runId, CHECK_ID, { note: "   " })[runId][CHECK_ID], { outcome: "blocked" }, "whitespace is no note either");
   });
 });
 

@@ -235,8 +235,13 @@ describe("new-stage is the engine's own lifecycle", () => {
     const commandWrites = (await fs.readFile(path.join(src, "vscode", "commands.ts"), "utf8")).match(/\bfs\.writeFile\([^\n]*/g) ?? [];
     assert.deepEqual(
       commandWrites.map((call) => /\(([^,]+),/.exec(call)?.[1]),
-      ["notesPath", "file", "manifestPath"],
-      "the only workspace file the extension writes is the stage's notes.md (the engine's own '## Human evidence' append, which the engine then reads live); the other two are execution manifests, written to the extension's own global storage and never into a repository",
+      ["notesPath", "file"],
+      "the only workspace file the extension writes is the stage's notes.md (the engine's own '## Human evidence' append, which the engine then reads live); the other is the execution manifest, written by one helper into the extension's own global storage and never into a repository",
+    );
+    assert.match(
+      await fs.readFile(path.join(src, "vscode", "commands.ts"), "utf8"),
+      /async function writeManifestFile\(file: string, manifest: ExecutionManifest\): Promise<void> \{\n\s*await fs\.writeFile\(file, renderManifest\(carriedForward\(manifest, await readOptional\(file\)\)\), "utf8"\);/,
+      "and every manifest write goes through the one helper that carries an unchanged manifest's provenance forward",
     );
     const temp = await fs.readFile(path.join(src, "core", "tempFile.ts"), "utf8");
     assert.match(temp, /mkdtemp\(path\.join\(os\.tmpdir\(\)/, "the temporary file lives under the OS temporary directory");

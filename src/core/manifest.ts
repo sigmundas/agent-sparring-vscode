@@ -19,8 +19,12 @@
  * invocation, and the engine refuses to continue a recorded run whose
  * manifest digest changed. So the same plan, matches and stage ids must
  * always produce byte-identical JSON — hence the fixed key order and the
- * two-space indent here, and `source_digest` over the plan text so an
- * *edited* plan does change it.
+ * two-space indent here.
+ *
+ * `source_digest` is a hash of the plan text, and because the engine folds it
+ * into that identity it is carried forward across rebuilds whenever the
+ * manifest still executes the same thing — see {@link carriedForward}.
+ * Without that, appending a handoff record to the plan document ends the run.
  *
  * No dependency on the vscode API.
  */
@@ -253,6 +257,63 @@ export function adoptionGaps(manifest: ExecutionManifest, existing: ReadonlySet<
 /** SHA-256 of the plan document exactly as it was read; opaque provenance for the engine. */
 export function sourceDigest(markdown: string): string {
   return `sha256:${crypto.createHash("sha256").update(markdown, "utf8").digest("hex")}`;
+}
+
+/**
+ * Keep the provenance of an unchanged manifest, so editing the plan's *prose*
+ * does not end a run.
+ *
+ * The engine folds `source_digest` into the manifest digest that identifies a
+ * recorded run (manifest.py: `manifest_digest`), and refuses to continue when
+ * that digest changes. `source_digest` is the hash of the whole plan
+ * document — every byte, including the historical `## Stage 3D handoff — …`
+ * records this very file deliberately excludes from execution, and the
+ * narrative sections the engine's own `plan_digest` docstring says do not
+ * count ("Prose outside the stage sections does not count").
+ *
+ * The consequence was a real managed run refused mid-flight: two handoff
+ * records were appended to the plan and a status paragraph was updated, not
+ * one executable stage changed, and `resume-plan --evidence` answered *the
+ * executable content of … has changed since this run started* — discarding
+ * the submission that carried five human check results.
+ *
+ * So provenance is carried forward: when the manifest that would be written
+ * executes exactly what the manifest on disk executes — same version, same
+ * plan label, same stages in the same order with the same ids, labels, titles,
+ * briefs and repositories — it keeps that file's `source_digest` instead of
+ * taking a fresh hash of the plan text. The run's identity then tracks what it
+ * runs, which is what the guard is for.
+ *
+ * Protection is unchanged in the other direction: any difference in what
+ * would execute — a reworded stage section that becomes a different brief, a
+ * retitled stage, a new or reordered stage, a changed sibling repository —
+ * takes the new digest and the engine refuses, exactly as before.
+ */
+export function carriedForward(next: ExecutionManifest, existing: string | undefined): ExecutionManifest {
+  const previous = readManifest(existing);
+  if (!previous || !executesTheSame(previous, next)) {
+    return next;
+  }
+  return { ...next, source_digest: previous.source_digest };
+}
+
+/** True when two manifests would run the same thing; `source_digest` is provenance and is not compared. */
+function executesTheSame(a: ExecutionManifest, b: ExecutionManifest): boolean {
+  return a.version === b.version && a.plan_label === b.plan_label && JSON.stringify(a.stages) === JSON.stringify(b.stages);
+}
+
+/** A manifest file as it is on disk, or undefined when it is absent or not one. */
+function readManifest(text: string | undefined): ExecutionManifest | undefined {
+  if (!text?.trim()) {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(text) as ExecutionManifest;
+    const usable = typeof parsed?.version === "number" && typeof parsed.plan_label === "string" && typeof parsed.source_digest === "string" && Array.isArray(parsed.stages);
+    return usable ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

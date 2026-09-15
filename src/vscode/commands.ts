@@ -11,7 +11,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { acceptStage, type AcceptStageResult } from "../core/acceptance";
 import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, readGitBranch, type ExecutableProblem } from "../core/cli";
-import { adoptionGaps, buildManifest, manifestFileName, renderManifest, type ExecutionManifest, type KnownStage } from "../core/manifest";
+import { adoptionGaps, buildManifest, carriedForward, manifestFileName, renderManifest, type ExecutionManifest, type KnownStage } from "../core/manifest";
 import {
   BRIEF_FILENAME,
   HANDOFF_FILENAME,
@@ -28,8 +28,9 @@ import {
   type StageSnapshot,
   type StandaloneStageSnapshot,
 } from "../core/discovery";
+import { decideExpectedBranch } from "../core/expectedBranch";
 import { parseHandoffBranch, parsePlanStages } from "../core/engineFormats";
-import { appendHumanEvidence, renderHumanEvidence, submittableChecks } from "../core/humanChecks";
+import { appendHumanEvidence, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
 import { blocksLaunch } from "../core/liveness";
 import type { OverviewAction } from "../core/overviewHtml";
 import { createStage, proposeNextStage, renderNextStageBrief, type NewStageResult } from "../core/nextStage";
@@ -68,6 +69,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.startNextStage", () => startNextStageCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.continueAutomatically", () => void performContinueAutomatically(controller, overview, { confirm: true })),
     vscode.commands.registerCommand("agentSparring.stageRepositories", () => stageRepositoriesCommand(controller)),
+    vscode.commands.registerCommand("agentSparring.copyReviewContext", () => overview.copyReviewContext()),
     vscode.commands.registerCommand("agentSparring.chooseExecutable", () => chooseExecutableCommand()),
     controller.onCommandNotFound((event) => void explainCommandNotFound(event.word)),
     controller.onEngineFailed((event) => void explainEngineFailure(controller, event)),
@@ -133,6 +135,14 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
       }
       await controller.setHumanCheck(run.id, key, { outcome, note });
       return controller.humanChecks(run.id)[key];
+    }),
+    vscode.commands.registerCommand("agentSparring._test.recordHumanFeedback", async (text: string) => {
+      const run = controller.currentSelection.selected;
+      if (!run) {
+        return undefined;
+      }
+      await controller.setHumanFeedback(run.id, text);
+      return controller.humanFeedback(run.id);
     }),
     vscode.commands.registerCommand("agentSparring._test.manifestDirectory", () => controller.manifestDirectoryPath),
     vscode.commands.registerCommand("agentSparring._test.lastEngineFailure", () => lastEngineFailure),
@@ -321,6 +331,17 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
     }
     case "submitForReview":
       await submitForReviewCommand(controller, overview);
+      return;
+    case "sendFeedbackForReview":
+      await sendFeedbackForReviewCommand(controller, overview);
+      return;
+    case "dismissSubmissionFailure":
+      if (run) {
+        // Only the report goes. The drafts it was reporting about are the
+        // user's work and are never touched from here.
+        await controller.dismissSubmission(run.id);
+        await overview.update();
+      }
       return;
     case "showRunningPlan": {
       // The stage on screen is history; its project's managed run is live.
@@ -585,35 +606,145 @@ async function submitForReviewCommand(controller: SparringController, overview: 
   if (choice !== "Submit for review") {
     return;
   }
+  const sent = await askReviewerAgain(controller, run, entry, `Submit for review: ${count} manual verification result(s)`);
+  if (sent.launched) {
+    // Handed over, not recorded. The drafts stay exactly as they are until
+    // this execution exits 0; see controller.resolveSubmissions.
+    await controller.beginSubmission({
+      runId: run.id,
+      channel: "checks",
+      executionId: sent.executionId,
+      startedAtMs: Date.now(),
+      entry,
+      results: count,
+      stageId: run.kind === "plan" ? run.currentStage.stageId : run.stage.stageId,
+    });
+  }
+  await overview.update();
+}
+
+/**
+ * Freeform human feedback, sent to the *reviewer* against the unchanged
+ * candidate.
+ *
+ * This is the other half of the human gate, and it deliberately routes the
+ * same way as a check result rather than more directly. A person who finds a
+ * reproducible crash on the way to check 1 has something the workflow needs,
+ * but what they have is *evidence*, not a verdict and not an implementation
+ * order: whether it means SEND_BACK, the same checks again, revised checks or
+ * nothing at all is the reviewer's call, made against its own acceptance
+ * rules. Handing the prose straight to the stage agent would skip that call
+ * and let a sentence typed in a text box act as a routing decision.
+ *
+ * So: the text is recorded verbatim under `## Human evidence`, in its own
+ * `### Additional human feedback` block, and the reviewer is asked to rule
+ * again — `resume-plan --evidence` inside a managed run, `run-sparring` for a
+ * standalone stage. No check is marked, nothing is accepted, and the outstanding
+ * checks stay outstanding. The draft is cleared only once the engine has
+ * actually been launched.
+ */
+async function sendFeedbackForReviewCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
+  const run = controller.currentSelection.selected;
+  if (!run) {
+    return;
+  }
+  const model = await overview.buildModel();
+  const panel = model.actionRequired;
+  if (!panel) {
+    void vscode.window.showInformationMessage("Agent Sparring: this stage is not waiting for you right now.");
+    return;
+  }
+  if (model.branchGuard) {
+    await explainWrongBranch(model.branchGuard);
+    return;
+  }
+  if (!panel.feedback.send.enabled) {
+    void vscode.window.showInformationMessage(`Agent Sparring: ${panel.feedback.send.detail}`);
+    return;
+  }
+  const entry = renderHumanFeedback(panel.feedback.draft ?? "", new Date());
+  if (!entry) {
+    void vscode.window.showInformationMessage("Agent Sparring: type what you found in 'Additional findings or instructions' first.");
+    return;
+  }
+  const outstanding = panel.required.filter((item) => !item.record?.outcome).length;
+  const stay =
+    outstanding === 0
+      ? "No check result is recorded or changed by this."
+      : `The ${outstanding === 1 ? "one check" : `${outstanding} checks`} still without a result stay that way: nothing is marked Pass, Fail or Can't test.`;
+  const detail = [
+    `This text goes to the reviewer as human evidence against the unchanged candidate, and the reviewer rules again. ${stay}`,
+    "",
+    entry,
+  ].join("\n");
+  const choice = await vscode.window.showInformationMessage("Send this feedback to the reviewer?", { modal: true, detail }, "Send feedback for review");
+  if (choice !== "Send feedback for review") {
+    return;
+  }
+  const sent = await askReviewerAgain(controller, run, entry, "Send feedback for review: freeform human feedback");
+  if (sent.launched) {
+    await controller.beginSubmission({
+      runId: run.id,
+      channel: "feedback",
+      executionId: sent.executionId,
+      startedAtMs: Date.now(),
+      entry,
+      results: 0,
+      stageId: run.kind === "plan" ? run.currentStage.stageId : run.stage.stageId,
+    });
+  }
+  await overview.update();
+}
+
+/**
+ * Record `entry` as human evidence and ask the reviewer to rule again — the
+ * one path both submission buttons take, so that "the reviewer looks at the
+ * unchanged candidate" means the same command, on the same branch, with the
+ * same failure reporting, whichever button was pressed.
+ *
+ *  - managed plan run → the engine's own `resume-plan --evidence`, which
+ *    records the evidence and continues the plan at this same stage. The plan
+ *    loop is the engine's orchestration and is not bypassed here.
+ *  - standalone stage → the entry is written into the stage's notes.md, then
+ *    `sparring run-sparring <stage>` resumes the recorded sparring session
+ *    against the unchanged candidate. `run-loop` would start the stage agent
+ *    with nothing to implement; Resume stage stays the separate action for
+ *    actual implementation work.
+ *
+ * The launch result names the execution whose *exit code* decides the
+ * submission, so the caller can record a submission in flight and keep the
+ * drafts until the engine has actually recorded the evidence. Launching is
+ * not submitting. Nothing is frozen or accepted either way.
+ */
+type Handover = { launched: false } | { launched: true; executionId: string };
+
+async function askReviewerAgain(controller: SparringController, run: RunSnapshot, entry: string, logPrefix: string): Promise<Handover> {
   if (run.kind === "plan") {
-    const expectedBranch = await askBranch(run.location, run.state.expectedBranch);
+    const expectedBranch = await resolveExpectedBranch(run.location, run.state.expectedBranch);
     if (!expectedBranch) {
-      return;
+      return { launched: false };
     }
     const input = await planInvocationFor(controller, run);
     if (!input) {
-      return;
+      return { launched: false };
     }
     const args = buildResumePlanArgs({ ...input, repoRoot: run.location.repoRoot, expectedBranch, sparringDir: run.location.sparringDir, evidence: entry });
-    controller.log(`Submit for review: ${count} manual verification result(s) passed to resume-plan --evidence for ${run.currentStage.stageId}`);
-    await launch(controller, run.location, args, "resume-plan", run.planPath, "manifest" in input ? input.manifest : undefined);
-    await controller.clearHumanChecks(run.id);
-    await overview.update();
-    return;
+    controller.log(`${logPrefix} passed to resume-plan --evidence for ${run.currentStage.stageId}`);
+    const result = await launch(controller, run.location, args, "resume-plan", run.planPath, "manifest" in input ? input.manifest : undefined);
+    return result.ok ? { launched: true, executionId: result.record.id } : { launched: false };
   }
   const expectedBranch = await currentBranch(run.location.repoRoot);
   if (!expectedBranch) {
     void vscode.window.showErrorMessage(
       `Agent Sparring: no Git branch is checked out in ${run.location.folderName} (detached HEAD or not a repository). Check out the stage's branch, then submit again.`,
     );
-    return;
+    return { launched: false };
   }
   if (!(await recordEvidence(controller, run, entry))) {
-    return;
+    return { launched: false };
   }
-  await controller.clearHumanChecks(run.id);
   const args = buildRunSparringArgs({ stageId: run.stage.stageId, repoRoot: run.location.repoRoot, expectedBranch, sparringDir: run.location.sparringDir });
-  controller.log(`Submit for review: sparring run-sparring ${run.stage.stageId} (branch ${expectedBranch}); the stage agent is not started`);
+  controller.log(`${logPrefix}: sparring run-sparring ${run.stage.stageId} (branch ${expectedBranch}); the stage agent is not started`);
   const result = await controller.launch({
     configured: configuredExecutable(),
     args,
@@ -625,7 +756,7 @@ async function submitForReviewCommand(controller: SparringController, overview: 
     reveal: false,
   });
   await explainLaunch(result);
-  await overview.update();
+  return result.ok ? { launched: true, executionId: result.record.id } : { launched: false };
 }
 
 /**
@@ -650,10 +781,10 @@ async function recordEvidence(controller: SparringController, run: StandaloneSta
 }
 
 /** Nothing is launched from the wrong branch; the recorded branch is named so the fix is obvious. */
-async function explainWrongBranch(guard: { expected: string; actual?: string }): Promise<void> {
+async function explainWrongBranch(guard: { expected: string; actual?: string }, subject = "this stage belongs to"): Promise<void> {
   const where = guard.actual ? `the repository is on ${guard.actual}` : "no branch is checked out";
   void vscode.window.showWarningMessage(
-    `Agent Sparring: this stage belongs to ${guard.expected}, but ${where}. Switch branches first; the engine refuses a run on another branch.`,
+    `Agent Sparring: ${subject} ${guard.expected}, but ${where}. Switch branches first; the engine refuses a run on another branch.`,
   );
 }
 
@@ -993,14 +1124,36 @@ async function looksLikePlan(file: string): Promise<boolean> {
   return ((await planStageCount(file)) ?? 0) > 0;
 }
 
-async function askBranch(location: SparringLocation, recorded?: string): Promise<string | undefined> {
-  const detected = recorded ?? (await currentBranch(location.repoRoot));
+/**
+ * The branch to pass as `--expected-branch`.
+ *
+ * A managed run recorded one when it started, and the engine refuses to
+ * resume on any other, so there is nothing here for a person to decide: if
+ * the repository is on that branch it is used silently. If it is not, the
+ * mismatch is the only useful thing to say, and it is said — asking for a
+ * value the engine will reject is not a choice, it is the same failure one
+ * step later. Only a plan with no recorded branch is a real question.
+ *
+ * Returns undefined when the caller should stop: either the person
+ * cancelled, or the mismatch has already been explained to them.
+ */
+async function resolveExpectedBranch(location: SparringLocation, recorded?: string): Promise<string | undefined> {
+  const decision = decideExpectedBranch(recorded, await currentBranch(location.repoRoot));
+  if (decision.kind === "use") {
+    return decision.branch;
+  }
+  if (decision.kind === "ask") {
+    return askBranch(decision.suggestion);
+  }
+  await explainWrongBranch(decision, "this plan run was started for");
+  return undefined;
+}
+
+async function askBranch(suggestion?: string): Promise<string | undefined> {
   const value = await vscode.window.showInputBox({
     title: "Agent Sparring: expected branch",
-    prompt: recorded
-      ? "The branch this plan run was started for (the engine refuses any other)."
-      : "The feature branch every stage of this plan must modify (passed as --expected-branch).",
-    value: detected ?? "",
+    prompt: "The feature branch every stage of this plan must modify (passed as --expected-branch).",
+    value: suggestion ?? "",
     ignoreFocusOut: true,
     validateInput: (text) => (text.trim() ? undefined : "A branch name is required."),
   });
@@ -1086,7 +1239,8 @@ async function chooseExecutableCommand(): Promise<void> {
   void vscode.window.showInformationMessage(`Agent Sparring: agentSparring.executable set to ${file} (${target === vscode.ConfigurationTarget.Workspace ? "workspace" : "user"} settings).`);
 }
 
-async function launch(controller: SparringController, location: SparringLocation, args: string[], kind: SparringSubcommand, planPath: string, manifest?: string): Promise<void> {
+/** Returns the launch result, for callers that must not discard a draft the engine never received. */
+async function launch(controller: SparringController, location: SparringLocation, args: string[], kind: SparringSubcommand, planPath: string, manifest?: string): Promise<LaunchResult> {
   // The command runs inside the user's normal integrated terminal through
   // shell integration, so the user sees the engine's own output and the
   // terminal follows VS Code's normal persistence; the run id is the one the
@@ -1095,6 +1249,7 @@ async function launch(controller: SparringController, location: SparringLocation
   // here builds a command line or starts a process of its own.
   const result = await controller.launch({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: kind, runId: planRunId(location, planPath), kind, planPath, manifest, reveal: true });
   await explainLaunch(result);
+  return result;
 }
 
 async function runPlanCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
@@ -1106,7 +1261,7 @@ async function runPlanCommand(controller: SparringController, overview: Overview
   if (!planPath) {
     return;
   }
-  const expectedBranch = await askBranch(location);
+  const expectedBranch = await resolveExpectedBranch(location);
   if (!expectedBranch) {
     return;
   }
@@ -1165,7 +1320,7 @@ async function resumePlanCommand(controller: SparringController, preselected?: P
       return;
     }
   }
-  const expectedBranch = await askBranch(run.location, run.state.expectedBranch);
+  const expectedBranch = await resolveExpectedBranch(run.location, run.state.expectedBranch);
   if (!expectedBranch) {
     return;
   }
@@ -1348,6 +1503,17 @@ async function performStartNextStage(controller: SparringController, overview: O
  * digest — and its path is passed. Undefined when the manifest could not be
  * produced, in which case the caller must not launch.
  */
+/**
+ * Write the manifest, keeping the provenance of the one already there when
+ * the new one executes the same thing (manifest.ts: `carriedForward`). The
+ * engine's run identity includes `source_digest`, so rebuilding it from an
+ * edited plan document — even one where only a handoff record changed — would
+ * otherwise end the recorded run.
+ */
+async function writeManifestFile(file: string, manifest: ExecutionManifest): Promise<void> {
+  await fs.writeFile(file, renderManifest(carriedForward(manifest, await readOptional(file))), "utf8");
+}
+
 async function planInvocationFor(controller: SparringController, run: PlanRunSnapshot): Promise<{ planPath: string } | { manifest: string } | undefined> {
   if (run.state.source !== "manifest") {
     return { planPath: run.planPath };
@@ -1370,7 +1536,7 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
   }
   try {
     const file = path.join(await controller.manifestDirectory(), manifestFileName(run.planKey));
-    await fs.writeFile(file, renderManifest(built.manifest), "utf8");
+    await writeManifestFile(file, built.manifest);
     return { manifest: file };
   } catch (error) {
     void vscode.window.showErrorMessage(`Agent Sparring: could not write the execution manifest: ${(error as Error).message}. Nothing was started.`);
@@ -1452,12 +1618,24 @@ async function performContinueAutomatically(controller: SparringController, over
     return { ok: false, reason: "running" };
   }
 
-  const expectedBranch = managed ? await askBranch(location, managed.state.expectedBranch) : await currentBranch(location.repoRoot);
-  if (!expectedBranch) {
-    void vscode.window.showErrorMessage(
-      `Agent Sparring: no Git branch is checked out in ${location.folderName} (detached HEAD or not a repository). Check out the plan's branch, then start again.`,
-    );
-    return { ok: false, reason: "branch" };
+  // A managed run's branch is already recorded and already enforced by the
+  // engine, so it is resolved, not asked for; a fresh run takes the branch
+  // the repository is actually on. Either way no picker appears.
+  let expectedBranch: string | undefined;
+  if (managed) {
+    expectedBranch = await resolveExpectedBranch(location, managed.state.expectedBranch);
+    if (!expectedBranch) {
+      // resolveExpectedBranch already named the mismatch.
+      return { ok: false, reason: "branch" };
+    }
+  } else {
+    expectedBranch = await currentBranch(location.repoRoot);
+    if (!expectedBranch) {
+      void vscode.window.showErrorMessage(
+        `Agent Sparring: no Git branch is checked out in ${location.folderName} (detached HEAD or not a repository). Check out the plan's branch, then start again.`,
+      );
+      return { ok: false, reason: "branch" };
+    }
   }
 
   const kind: "run-plan" | "resume-plan" = managed ? "resume-plan" : "run-plan";
@@ -1501,7 +1679,7 @@ async function performContinueAutomatically(controller: SparringController, over
   let manifestPath: string;
   try {
     manifestPath = path.join(await controller.manifestDirectory(), manifestFileName(planKey(label)));
-    await fs.writeFile(manifestPath, renderManifest(built.manifest), "utf8");
+    await writeManifestFile(manifestPath, built.manifest);
   } catch (error) {
     void vscode.window.showErrorMessage(`Agent Sparring: could not write the execution manifest: ${(error as Error).message}. Nothing was started.`);
     return { ok: false, reason: "write", message: (error as Error).message };

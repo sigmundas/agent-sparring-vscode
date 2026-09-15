@@ -14,9 +14,10 @@
  */
 
 import { CHECK_OUTCOMES, isCheckKey, type CheckItem, type CheckOutcome } from "./humanChecks";
-import { humanTask, splitPassCriteria } from "./humanTask";
+import { checkName, humanTask, splitPassCriteria } from "./humanTask";
 import { TIMELINE_STATE_WORD, type ActionRequired, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { MatchSource } from "./planAssociation";
+import type { PromptView, PromptViewSection } from "./promptInspector";
 import type { StageRunAction } from "./runner";
 
 export type OverviewAction =
@@ -41,7 +42,9 @@ export type OverviewAction =
   | "showRunningPlan"
   | "stopRunner"
   | "openPlanSection"
-  | "submitForReview";
+  | "submitForReview"
+  | "sendFeedbackForReview"
+  | "dismissSubmissionFailure";
 
 /** A Pass / Fail / Can't test click or a note edit on one manual check, posted by the webview as it happens. */
 export interface HumanCheckMessage {
@@ -51,10 +54,87 @@ export interface HumanCheckMessage {
   note?: string;
 }
 
+/**
+ * The freeform findings field, posted as it is typed.
+ *
+ * It carries no key on purpose: there is one such field per review, and it
+ * belongs to no check. A message that arrived with a check key would be a
+ * check note, which is a different thing entirely — so the two never share a
+ * payload shape and cannot be confused for one another on either side of the
+ * wire. Empty text is valid: clearing the field clears the draft.
+ */
+export interface HumanFeedbackMessage {
+  type: "humanFeedback";
+  text: string;
+}
+
 /** An action button click, posted by the webview. */
 export interface ActionMessage {
   type: "action";
   action: OverviewAction;
+}
+
+/**
+ * A "copy for chat" click: the whole review, or one check of it.
+ *
+ * It is not an {@link ActionMessage} because a check-scoped copy carries the
+ * check's key, and an action carries nothing — widening the action payload so
+ * that one button could smuggle a key through it is how a guard stops guarding
+ * anything. The key's shape is the one definition {@link isCheckKey} owns, the
+ * same as for a Pass / Fail / Can't test click.
+ */
+export interface CopyMessage {
+  type: "copy";
+  scope: "review" | "check";
+  /** The check to copy; present (and required) for scope `check`. */
+  key?: string;
+}
+
+export function isCopyMessage(message: unknown): message is CopyMessage {
+  const record = asRecord(message);
+  if (!record || record["type"] !== "copy") {
+    return false;
+  }
+  if (record["scope"] === "review") {
+    return record["key"] === undefined || record["key"] === null;
+  }
+  return record["scope"] === "check" && isCheckKey(record["key"]);
+}
+
+export interface OpenPromptSourceMessage {
+  type: "openPromptSource";
+  /** A path relative to the project's `.sparring` directory, as the engine recorded it. */
+  source: string;
+}
+
+/**
+ * A request to open the file one prompt section came from.
+ *
+ * The path is a webview message, so it is untrusted: it must be relative,
+ * must not climb, and must not be absolute. The host resolves it against
+ * the run's own sparring directory, and these checks are what stop a
+ * crafted message from naming somewhere else entirely.
+ */
+export function isOpenPromptSourceMessage(message: unknown): message is OpenPromptSourceMessage {
+  const record = asRecord(message);
+  if (!record || record["type"] !== "openPromptSource" || typeof record["source"] !== "string") {
+    return false;
+  }
+  const source = record["source"] as string;
+  if (!source || source.length > 512 || source.startsWith("/") || source.startsWith("\\") || /^[A-Za-z]:/.test(source)) {
+    return false;
+  }
+  return !source.split(/[\\/]/).some((part) => part === ".." || part === "");
+}
+
+export interface CopyPromptMessage {
+  type: "copyPrompt";
+  role: "stage" | "sparrer";
+}
+
+export function isCopyPromptMessage(message: unknown): message is CopyPromptMessage {
+  const record = asRecord(message);
+  return record !== undefined && record["type"] === "copyPrompt" && (record["role"] === "stage" || record["role"] === "sparrer");
 }
 
 /**
@@ -84,6 +164,11 @@ export function isHumanCheckMessage(message: unknown): message is HumanCheckMess
   const outcomeOk = outcome === undefined || outcome === null || (CHECK_OUTCOMES as readonly string[]).includes(String(outcome));
   const noteOk = note === undefined || note === null || (typeof note === "string" && note.length <= NOTE_MAX_LENGTH);
   return outcomeOk && noteOk && (outcome != null || note != null);
+}
+
+export function isHumanFeedbackMessage(message: unknown): message is HumanFeedbackMessage {
+  const record = asRecord(message);
+  return record !== undefined && record["type"] === "humanFeedback" && typeof record["text"] === "string" && (record["text"] as string).length <= NOTE_MAX_LENGTH;
 }
 
 /** A note is free text a person typed; long enough for evidence, bounded so a message cannot be a payload. */
@@ -116,6 +201,8 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "stopRunner",
   "openPlanSection",
   "submitForReview",
+  "sendFeedbackForReview",
+  "dismissSubmissionFailure",
 ];
 
 const ACTIONS: ReadonlySet<string> = new Set<string>(OVERVIEW_ACTIONS);
@@ -291,13 +378,29 @@ function renderActionRequired(model: OverviewModel, panel: ActionRequired): stri
   // lives. Without one it is the only compact statement there is.
   const note = !gate && panel.reviewerNote ? `<p class="reason"><span class="tag reviewer">Reviewer note</span> ${escapeHtml(panel.reviewerNote)}</p>` : "";
   const failure = panel.reviewFailure ? `<p class="failure">${icon("warn", "escalate")}${escapeHtml(panel.reviewFailure)}</p>` : "";
+  const submission = renderSubmissionState(panel);
   const body = gate ? renderGateChecks(panel) : renderDerivedChecks(panel);
   const buttons: string[] = [];
   buttons.push(button("submitForReview", panel.submit.label, panel.submit.enabled, panel.submit.detail, "primary"));
+  // The second submission path, beside the first: the two are alternatives,
+  // and a person who found a blocking bug instead of a check result has to
+  // be able to see that there is somewhere for it to go.
+  buttons.push(button("sendFeedbackForReview", panel.feedback.send.label, panel.feedback.send.enabled, panel.feedback.send.detail));
   if (panel.planSection) {
     buttons.push(button("openPlanSection", "Open plan section", true, `Open ${model.planName ?? "the plan"} at this stage's section`));
   }
   buttons.push(button("openSparring", "Open detailed review", panel.review, "Open sparring.md — the reviewer's full findings, in their own words"));
+  // Asking someone else what a check means is a normal step, and it should not
+  // start with reassembling four files by hand. The copy is Markdown, so it
+  // pastes into a chat assistant, an issue or a message unchanged.
+  buttons.push(
+    copyButton(
+      "review",
+      undefined,
+      "Copy context for chat",
+      "Copy this whole review as Markdown — the stage, the goal, the routing state, every check's instruction and pass criteria verbatim, the handoff claims, the reviewer's findings and the plan section. No prompts, reasoning, command output or activity log.",
+    ),
+  );
   // Offered here, at a gate, because adopting does not touch the gate: the
   // engine keeps this pause and the next human action is unchanged. It is
   // the only route from a standalone stage into a managed run, so it must be
@@ -317,10 +420,73 @@ function renderActionRequired(model: OverviewModel, panel: ActionRequired): stri
   }
   return `<section class="card action ${panel.kind}${panel.ready ? " ready" : ""}${gate ? " gate" : ""}">
 <div class="actionhead"><h2>${icon(panel.ready && panel.kind === "needs_you" ? "check" : "warn", panel.ready && panel.kind === "needs_you" ? "ready" : panel.kind)}${escapeHtml(panel.headline)}</h2>${summary}${note}${failure}</div>
+${submission}
 ${body}
+${renderFeedbackField(panel)}
 ${renderTechnical(panel)}
 <div class="actions">${buttons.join("")}</div>
 </section>`;
+}
+
+/**
+ * The freeform field, under the structured checks and visibly not one of
+ * them: its own heading, its own helper sentence, no Pass / Fail / Can't test
+ * beside it, and no place in the progress count.
+ *
+ * It is always present, not revealed by a disclosure, because the observation
+ * it exists for — the crash on the way to the first check — arrives before
+ * the person has any reason to go looking for a place to put it.
+ */
+function renderFeedbackField(panel: ActionRequired): string {
+  const draft = panel.feedback.draft ?? "";
+  const previous =
+    panel.feedback.submitted.length > 0
+      ? `<details class="prev"><summary>Feedback already sent (${panel.feedback.submitted.length})</summary>${panel.feedback.submitted.map((entry) => `<pre class="sent">${escapeHtml(entry)}</pre>`).join("")}</details>`
+      : "";
+  return `<div class="feedback">
+<h4>${escapeHtml(FEEDBACK_HEADING)}</h4>
+<p class="muted small helper">${escapeHtml(FEEDBACK_HELPER)}</p>
+<textarea class="freeform" data-feedback="review" rows="3" placeholder="${escapeHtml(FEEDBACK_PLACEHOLDER)}">${escapeHtml(draft)}</textarea>
+${previous}
+</div>`;
+}
+
+export const FEEDBACK_HEADING = "Additional findings or instructions";
+
+/**
+ * Two sentences, and the second one is the important half: without it the
+ * field reads as a comment box for the check above, which is precisely the
+ * conflation the whole channel exists to undo.
+ */
+export const FEEDBACK_HELPER =
+  "Report a blocking bug, unexpected behavior, design feedback, or other information that does not belong to a check above. This field is independent of Pass / Fail / Can't test.";
+
+const FEEDBACK_PLACEHOLDER = "What you found, and how to reproduce it if it is a bug";
+
+/**
+ * Where a submission stands, when one is in flight or has failed.
+ *
+ * A failed submission leads with what was preserved, before the reason and
+ * before the engine's own words: the person has just watched five recorded
+ * check results seem to vanish, and the first thing on the page has to answer
+ * that. The engine's output follows verbatim, because it is the only thing
+ * that says what to fix.
+ */
+function renderSubmissionState(panel: ActionRequired): string {
+  if (panel.submitting) {
+    return `<p class="submitting" title="${escapeHtml(panel.submitting.detail)}">${icon("dot", "accent")}${escapeHtml(panel.submitting.label)}</p>`;
+  }
+  const failed = panel.submissionFailure;
+  if (!failed) {
+    return "";
+  }
+  const error = failed.error ? `<pre class="engineerror">${escapeHtml(failed.error)}</pre>` : "";
+  return `<div class="subfail">
+<p class="preserved">${icon("warn", "escalate")}${escapeHtml(failed.preserved)}</p>
+<p class="muted small">${escapeHtml(failed.reason)} ${escapeHtml(failed.what)}</p>
+${error}
+<div class="actions">${button("dismissSubmissionFailure", "Dismiss", true, "Hide this report. Nothing you entered is changed by dismissing it.", "quiet small")}</div>
+</div>`;
 }
 
 /**
@@ -334,7 +500,10 @@ function renderGateChecks(panel: ActionRequired): string {
   // Two or more checks: say how far along the evidence is. One check has no
   // progress worth reporting — the controls under it are the whole story.
   const progress = total > 1 && panel.progress ? `<p class="muted small progress">${escapeHtml(panel.progress)}</p>` : "";
-  const required = panel.required.length > 0 ? `<ol class="checklist gate">${panel.required.map(renderTask).join("")}</ol>` : `<p class="muted">Every check the reviewer asked for has a recorded result.</p>`;
+  const required =
+    panel.required.length > 0
+      ? `<ol class="checklist gate">${panel.required.map((item, index) => renderTask(item, index + 1, total)).join("")}</ol>`
+      : `<p class="muted">Every check the reviewer asked for has a recorded result.</p>`;
   return `<div class="checks">${title}${progress}${required}${renderPreviousEvidence(panel)}</div>`;
 }
 
@@ -366,7 +535,7 @@ function renderDerivedChecks(panel: ActionRequired): string {
     parts.push(`<div class="part"><h4>Evidence already recorded</h4><ol class="checklist recorded">${panel.recorded.map(renderRecorded).join("")}</ol></div>`);
   }
   parts.push(
-    `<div class="part"><h4>Still required</h4>${panel.required.length > 0 ? `<ol class="checklist">${panel.required.map(renderRequired).join("")}</ol>` : `<p class="muted small">Every check has recorded evidence.</p>`}</div>`,
+    `<div class="part"><h4>Still required</h4>${panel.required.length > 0 ? `<ol class="checklist">${panel.required.map((item, index) => renderRequired(item, index + 1, total)).join("")}</ol>` : `<p class="muted small">Every check has recorded evidence.</p>`}</div>`,
   );
   return `<div class="checks"><h3>${icon("check", "accent")}Manual verification ${progress}</h3>${parts.join("")}</div>`;
 }
@@ -386,15 +555,45 @@ function renderTechnical(panel: ActionRequired): string {
  * three results and a note. Nothing is shortened — a check is a test, and a
  * test loses its meaning one clause at a time.
  */
-function renderTask(item: CheckItem): string {
+function renderTask(item: CheckItem, position: number, total: number): string {
   const task = humanTask(item);
   const steps = task.steps.length > 1 ? `<ol class="steps">${task.steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol>` : `<p class="instruction">${escapeHtml(task.steps[0] ?? item.text)}</p>`;
   const passIf = task.passIf ? `<p class="passif"><span class="lead">Pass if:</span> ${escapeHtml(task.passIf)}</p>` : "";
+  // Where the reviewer said the full test is defined. It is part of doing the
+  // check, not of explaining the harness, so it belongs in the primary layer —
+  // and it is a concrete name, which is the whole point of it.
+  const source = item.source ? `<p class="muted small source"><span class="lead">Defined in:</span> ${escapeHtml(item.source)}</p>` : "";
   return `<li class="check task${item.record?.outcome ? ` ${item.record.outcome}` : ""}">
-<div class="checkbody">${steps}${passIf}</div>
+<div class="checkbody">${steps}${passIf}${source}</div>
 ${renderRecordControls(item)}
+${renderCheckMeta(item, position, total)}
 </li>`;
 }
+
+/**
+ * The quiet row under a check: what the check is called, and the copy action
+ * for it.
+ *
+ * The name is shown only when there is more than one check, because that is
+ * the case where the alternative is a collective phrase — "both of them", "the
+ * other one" — and the reviewer's stable id is the concrete name that ends the
+ * ambiguity. With a single check the panel headline has already said which
+ * check this is, and an id there would be noise.
+ */
+function renderCheckMeta(item: CheckItem, position: number, total: number): string {
+  const name = checkName(item, position);
+  const label = total > 1 && name.named ? `<span class="checkid muted small" title="${escapeHtml(NAME_TITLE)}">${escapeHtml(name.name)}</span>` : "";
+  const copy = copyButton(
+    "check",
+    item.key,
+    "Copy this check",
+    `Copy ${name.named ? `check ${name.name}` : `this check (${name.description})`} as Markdown: the stage it belongs to, its instruction and its pass criteria verbatim, ready to paste into a chat and ask what it means or how to perform it`,
+    "quiet small",
+  );
+  return `<div class="checkmeta">${label}${copy}</div>`;
+}
+
+const NAME_TITLE = "The reviewer's own stable id for this check; it is what a recorded result is matched by";
 
 /** Pass / Fail / Can't test, plus the optional note; the same controls wherever a check is shown. */
 function renderRecordControls(item: CheckItem): string {
@@ -419,18 +618,9 @@ const OUTCOME_TITLES: Record<CheckOutcome, string> = {
   blocked: "You could not perform the check (recorded as Blocked, the engine's own word for it)",
 };
 
-/** `DEVICE_MANUAL_CHECK` → `Device manual check`; the engine's own category, just made readable. */
-export function categoryWord(category: string | undefined): string {
-  if (!category) {
-    return "Human gate";
-  }
-  const words = category.toLowerCase().replace(/_/g, " ").trim();
-  return words ? words.charAt(0).toUpperCase() + words.slice(1) : "Human gate";
-}
-
 function originTag(item: CheckItem): string {
   if (item.origin === "gate") {
-    return `<span class="tag reviewer" title="${escapeHtml(`The reviewer's own check, id ${item.key}`)}">Reviewer</span>`;
+    return `<span class="tag reviewer" title="${escapeHtml(item.gateId ? `The reviewer's own check, id ${item.gateId}` : "The reviewer's own check")}">Reviewer</span>`;
   }
   return item.origin === "plan" ? `<span class="tag plan" title="${escapeHtml(item.line ? `Plan line ${item.line}` : "From the plan")}">Plan</span>` : `<span class="tag reviewer" title="From the sparring report, not the plan">Reviewer</span>`;
 }
@@ -451,11 +641,12 @@ function renderRecorded(item: CheckItem): string {
 }
 
 /** ○ text with the reviewer's pass criteria, then the three results and a note (legacy derived path). */
-function renderRequired(item: CheckItem): string {
+function renderRequired(item: CheckItem, position: number, total: number): string {
   const outcome = item.record?.outcome;
   return `<li class="check${outcome ? ` ${outcome}` : ""}">
 <div class="checkrow"><span class="mark">○</span><div class="checkbody"><p class="criterion">${escapeHtml(item.text)} ${originTag(item)}</p>${checkDetail(item)}</div></div>
 ${renderRecordControls(item)}
+${renderCheckMeta(item, position, total)}
 </li>`;
 }
 
@@ -751,14 +942,78 @@ function renderActor(card: ActorCard): string {
   // time since the observed start, not a claim that work is happening now.
   const word = busy && card.uncertain ? `${card.activity}?` : card.activity;
   const span = busy && card.uncertain ? (card.duration ? ` <span class="muted">(turn observed ${escapeHtml(card.duration)} ago)</span>` : "") : duration;
-  return `<div class="card actor">
-<span class="avatar ${who}">${escapeHtml(card.provider.charAt(0).toUpperCase())}</span>
-<div>
+  const identity = `<span class="avatar ${who}">${escapeHtml(card.provider.charAt(0).toUpperCase())}</span>
+<div class="who">
 <div><span class="provider ${who}">${escapeHtml(card.provider)}</span> <span class="muted">(${escapeHtml(card.role)})</span></div>
 <div class="activity ${card.activity.toLowerCase()}${busy && card.uncertain ? " uncertain" : ""}">${icon("dot", "dot")}${escapeHtml(word)}${busy ? span : ""}${uncertain}${quiet}</div>
 <div class="session muted">${session}</div>
-</div>
 </div>`;
+  // No captured prompt means the engine has not run a turn for this actor
+  // since prompt capture existed. An ordinary state, so the card simply
+  // stays a card rather than offering a disclosure that would open on
+  // nothing.
+  if (!card.prompt) {
+    return `<div class="card actor">${identity}</div>`;
+  }
+  const role = card.role === "Stage agent" ? "stage" : "sparrer";
+  return `<details class="card actor" data-role="${role}">
+<summary>${identity}<span class="showinstr">Show instructions</span></summary>
+${renderInstructions(card.prompt, role)}
+</details>`;
+}
+
+/**
+ * What this actor was told, from the engine's captured prompt.
+ *
+ * Role and turn kind come first, deliberately: they are usually enough to
+ * see that a stage is running the wrong kind of turn — a review stage being
+ * driven as an implementation turn, say — without reading a word of the
+ * prompt body.
+ *
+ * Everything below is escaped text laid out by section. Nothing renders the
+ * Markdown: the structure a reader needs is the section headings and where
+ * each one came from, both of which the engine recorded, and escaping first
+ * is what keeps arbitrary plan prose from reaching this webview as markup.
+ */
+function renderInstructions(prompt: PromptView, role: string): string {
+  const recency = prompt.live
+    ? `<span class="turnchip live">This turn</span>`
+    : `<span class="turnchip">Last turn</span>`;
+  const branch = prompt.branch ? ` <span class="muted">· branch <code>${escapeHtml(prompt.branch)}</code></span>` : "";
+  const head = `<div class="turnline">${recency}<strong>${escapeHtml(prompt.turn)}</strong> <span class="muted">· ${escapeHtml(prompt.detail)}</span>${branch}</div>`;
+
+  const body = prompt.sectionsUnavailable
+    ? `<p class="note">${escapeHtml(prompt.sectionsUnavailable)}</p>`
+    : prompt.sections.map(renderPromptSection).join("");
+
+  const exact = `<details class="promptsec exact"><summary><span class="sechead">View exact generated prompt</span><span class="secsrc muted">${prompt.exact.length.toLocaleString("en-US")} characters, as sent</span></summary><pre class="prompttext">${escapeHtml(prompt.exact)}</pre></details>`;
+  const copy = `<div class="actions"><button class="quiet" data-copyprompt="${role}">Copy prompt</button></div>`;
+  return `<div class="instructions">${head}${body}${exact}${copy}</div>`;
+}
+
+/**
+ * One section: its heading, where it came from, and its text.
+ *
+ * A file-sourced section names the file and offers to open it; an
+ * engine-authored one says so instead of being left to look like part of
+ * the plan. Large sections start collapsed so that PROJECT.md, which is
+ * routinely the longest thing in the prompt, does not bury the rest.
+ */
+function renderPromptSection(section: PromptViewSection): string {
+  const open = section.text.length <= PROMPT_SECTION_OPEN_MAX ? " open" : "";
+  const source = section.source
+    ? `<button class="linkish" data-openprompt="${escapeHtml(section.source)}" title="${escapeHtml(section.source)}">${escapeHtml(basename(section.source))}</button>`
+    : `<span class="secsrc muted">Agent Sparring</span>`;
+  const heading = section.heading || "(unnamed section)";
+  return `<details class="promptsec"${open}><summary><span class="sechead">${escapeHtml(heading)}</span>${source}</summary><pre class="prompttext">${escapeHtml(section.text)}</pre></details>`;
+}
+
+/** Sections at or below this many characters start expanded. */
+const PROMPT_SECTION_OPEN_MAX = 2000;
+
+function basename(source: string): string {
+  const parts = source.split("/");
+  return parts[parts.length - 1] || source;
 }
 
 function whoClass(name: string): string {
@@ -780,6 +1035,17 @@ function button(action: OverviewAction, label: string, enabled = true, title?: s
   const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
   const classAttr = cls ? ` class="${cls}"` : "";
   return `<button type="button"${classAttr} data-action="${action}"${titleAttr}${enabled ? "" : " disabled"}>${escapeHtml(label)}</button>`;
+}
+
+/**
+ * A copy-for-chat control. It carries `data-copy` rather than `data-action`
+ * because it is the one button kind that acts on a *named part* of the page,
+ * and the check's key travels with the click; see {@link CopyMessage}.
+ */
+function copyButton(scope: CopyMessage["scope"], key: string | undefined, label: string, title: string, cls = ""): string {
+  const classAttr = cls ? ` class="${cls}"` : "";
+  const keyAttr = key === undefined ? "" : ` data-check="${escapeHtml(key)}"`;
+  return `<button type="button"${classAttr} data-copy="${scope}"${keyAttr} title="${escapeHtml(title)}">${escapeHtml(label)}</button>`;
 }
 
 export type { HistoryEntry };
@@ -890,6 +1156,22 @@ textarea.note { flex: 1 1 240px; min-height: 26px; padding: 4px 8px; font-family
 textarea.note:focus { outline: 1px solid var(--vscode-focusBorder); }
 .action > .actions { margin-top: 12px; align-items: center; }
 
+/* A submission in flight, and one that failed with everything preserved. */
+.submitting { display: flex; align-items: center; margin: 8px 0 0; font-weight: 600; color: var(--info); }
+.subfail { margin: 10px 0 0; padding: 8px 10px; border-left: 3px solid var(--bad); background: var(--vscode-textBlockQuote-background); }
+.subfail .preserved { display: flex; align-items: flex-start; margin: 0; font-weight: 600; }
+.subfail p.muted { margin: 4px 0 0; }
+.subfail .actions { margin-top: 8px; }
+pre.engineerror { margin: 6px 0 0; padding: 6px 8px; max-height: 9em; overflow: auto; background: var(--vscode-editor-background); border: 1px solid var(--line); border-radius: 4px; font-family: var(--vscode-editor-font-family); font-size: 0.88em; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* The freeform channel: beside the checks, never inside one of them. */
+.feedback { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.feedback h4 { margin: 0 0 2px; }
+.feedback .helper { margin: 0 0 6px; }
+textarea.freeform { display: block; width: 100%; box-sizing: border-box; min-height: 58px; padding: 6px 8px; font-family: inherit; font-size: 0.92em; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--line)); border-radius: 6px; resize: vertical; }
+textarea.freeform:focus { outline: 1px solid var(--vscode-focusBorder); }
+pre.sent { margin: 6px 0 0; padding: 6px 10px; border-left: 2px solid var(--line); background: var(--vscode-textBlockQuote-background); font-family: var(--vscode-editor-font-family); font-size: 0.92em; white-space: pre-wrap; overflow-wrap: anywhere; }
+
 /* One structured gate: the requirement, the steps, the pass line. */
 .action.gate .checks { margin-top: 10px; padding-top: 10px; }
 .gatetitle { font-size: 1.05em; font-weight: 600; margin: 0 0 6px; }
@@ -902,6 +1184,12 @@ textarea.note:focus { outline: 1px solid var(--vscode-focusBorder); }
 .passif { margin: 0 0 2px; }
 .passif .lead { font-weight: 600; color: var(--vscode-descriptionForeground); }
 .checklist.gate .record { margin-left: 0; margin-top: 10px; }
+.source { margin: 4px 0 0; }
+/* What the check is called, and the one action that acts on it alone. */
+.checkmeta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 6px 0 0 28px; }
+.checklist.gate .checkmeta { margin-left: 0; }
+.checkid { font-family: var(--vscode-editor-font-family); }
+button.small { padding: 2px 8px; font-size: 0.85em; }
 
 /* The demoted layers: technical details, previous evidence, other actions. */
 details.tech, details.prev { margin-top: 10px; font-size: 0.92em; }
@@ -1002,6 +1290,32 @@ p { margin: 0 0 4px; line-height: 1.45; }
 .activity.working .icon.dot, .activity.sparring .icon.dot { color: var(--good); }
 .session { font-family: var(--vscode-editor-font-family); font-size: 0.85em; }
 
+/* An actor card that carries a captured prompt is a disclosure. Opening it
+   spans the full width of the grid, so the prompt is read at the width of
+   the rest of the UI instead of in a half-width column. */
+details.actor { display: block; padding: 0; }
+details.actor > summary { display: flex; gap: 12px; align-items: flex-start; padding: 10px 12px; line-height: 1.45; cursor: pointer; list-style: none; }
+details.actor > summary::-webkit-details-marker { display: none; }
+details.actor > summary .who { flex: 1 1 auto; min-width: 0; }
+details.actor[open] { grid-column: 1 / -1; }
+.showinstr { flex: none; align-self: center; font-size: 0.85em; color: var(--vscode-textLink-foreground); }
+details.actor[open] .showinstr::after { content: ' ▾'; }
+details.actor:not([open]) .showinstr::after { content: ' ▸'; }
+
+.instructions { padding: 0 12px 12px; border-top: 1px solid var(--line); }
+.turnline { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 0; font-size: 1.02em; }
+.turnchip { flex: none; padding: 1px 8px; border: 1px solid var(--line); border-radius: 10px; font-size: 0.8em; color: var(--vscode-descriptionForeground); }
+.turnchip.live { border-color: var(--good); color: var(--good); font-weight: 600; }
+.promptsec { border: 1px solid var(--line); border-radius: 6px; margin: 0 0 6px; background: var(--vscode-editor-background); }
+.promptsec > summary { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding: 6px 10px; cursor: pointer; }
+.sechead { font-weight: 600; }
+.secsrc { font-size: 0.85em; }
+.prompttext { margin: 0; padding: 8px 10px; border-top: 1px solid var(--line); font-family: var(--vscode-editor-font-family); font-size: 0.88em; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 22em; overflow-y: auto; }
+.promptsec.exact { margin-top: 10px; }
+.linkish { padding: 0; border: none; background: none; color: var(--vscode-textLink-foreground); font-size: 0.85em; cursor: pointer; }
+.linkish:hover { text-decoration: underline; background: none; }
+.note { margin: 6px 0; font-size: 0.9em; color: var(--vscode-descriptionForeground); }
+
 .history { margin: 0 0 10px; }
 .history ol { list-style: none; margin: 0; padding: 0; font-size: 0.9em; color: var(--vscode-descriptionForeground); }
 .history li { display: grid; grid-template-columns: max-content max-content 1fr; gap: 0 10px; line-height: 1.55; }
@@ -1044,29 +1358,65 @@ const SCRIPT = `
       vscode.postMessage({ type: 'humanCheck', key: choice.getAttribute('data-check'), outcome: choice.getAttribute('data-outcome') });
       return;
     }
+    var copy = element ? element.closest('button[data-copy]') : null;
+    if (copy && !copy.disabled) {
+      var scope = copy.getAttribute('data-copy');
+      var forCheck = copy.getAttribute('data-check');
+      vscode.postMessage(forCheck === null ? { type: 'copy', scope: scope } : { type: 'copy', scope: scope, key: forCheck });
+      return;
+    }
+    var openSource = element ? element.closest('button[data-openprompt]') : null;
+    if (openSource && !openSource.disabled) {
+      // Defensive: this button sits inside a <summary>, and a <summary>'s
+      // activation toggles the section it heads. Chromium already declines
+      // to toggle when the click lands on an interactive descendant, so
+      // removing this changes nothing today (the integration test passes
+      // either way) -- but the correct behaviour then depends on the
+      // element staying a <button>, which is not a thing this file should
+      // have to remember.
+      event.preventDefault();
+      vscode.postMessage({ type: 'openPromptSource', source: openSource.getAttribute('data-openprompt') });
+      return;
+    }
+    var copyPrompt = element ? element.closest('button[data-copyprompt]') : null;
+    if (copyPrompt && !copyPrompt.disabled) {
+      vscode.postMessage({ type: 'copyPrompt', role: copyPrompt.getAttribute('data-copyprompt') });
+      return;
+    }
     var target = element ? element.closest('button[data-action]') : null;
     if (!target || target.disabled) { return; }
     vscode.postMessage({ type: 'action', action: target.getAttribute('data-action') });
   });
-  // Notes are saved as they are typed (debounced) and on blur, so a re-render
-  // of the page never loses them; the extension stores them as drafts.
+  // Every text field is saved as it is typed (debounced) and on blur, so a
+  // re-render of the page never loses what was typed; the extension stores it
+  // as a draft. A check note carries the check's key; the freeform findings
+  // field carries no key and is posted as its own message type.
   var timers = {};
-  function saveNote(area) {
-    var key = area.getAttribute('data-check');
-    vscode.postMessage({ type: 'humanCheck', key: key, note: area.value });
+  function tracked(area) {
+    return area instanceof HTMLTextAreaElement && (area.hasAttribute('data-check') || area.hasAttribute('data-feedback'));
+  }
+  function timerKey(area) {
+    return area.hasAttribute('data-feedback') ? 'feedback:' + area.getAttribute('data-feedback') : 'check:' + area.getAttribute('data-check');
+  }
+  function save(area) {
+    if (area.hasAttribute('data-feedback')) {
+      vscode.postMessage({ type: 'humanFeedback', text: area.value });
+      return;
+    }
+    vscode.postMessage({ type: 'humanCheck', key: area.getAttribute('data-check'), note: area.value });
   }
   document.addEventListener('input', function (event) {
     var area = event.target;
-    if (!(area instanceof HTMLTextAreaElement) || !area.hasAttribute('data-check')) { return; }
-    var key = area.getAttribute('data-check');
+    if (!tracked(area)) { return; }
+    var key = timerKey(area);
     clearTimeout(timers[key]);
-    timers[key] = setTimeout(function () { saveNote(area); }, 400);
+    timers[key] = setTimeout(function () { save(area); }, 400);
   });
   document.addEventListener('focusout', function (event) {
     var area = event.target;
-    if (!(area instanceof HTMLTextAreaElement) || !area.hasAttribute('data-check')) { return; }
-    clearTimeout(timers[area.getAttribute('data-check')]);
-    saveNote(area);
+    if (!tracked(area)) { return; }
+    clearTimeout(timers[timerKey(area)]);
+    save(area);
   });
 })();
 `;

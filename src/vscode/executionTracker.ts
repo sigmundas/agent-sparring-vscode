@@ -192,6 +192,38 @@ export class ExecutionTracker implements vscode.Disposable {
     return best;
   }
 
+  /**
+   * One execution by its own id, whatever state it is in.
+   *
+   * A submission is tied to the execution it launched, not to its run: a run
+   * may have started something else since, and only *this* execution's exit
+   * code may decide whether the evidence was recorded. Restored ended
+   * launches are tracked too, so this still answers after a window reload.
+   */
+  recordById(executionId: string): ExecutionRecord | undefined {
+    for (const { record } of this.tracked.values()) {
+      if (record.id === executionId) {
+        return record;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * What one execution printed, when this window watched it. Undefined when
+   * the execution is not known here or nothing was collected (a reattached
+   * launch from before a reload has no output to give).
+   */
+  async outputOf(executionId: string): Promise<string | undefined> {
+    for (const item of this.tracked.values()) {
+      if (item.record.id === executionId) {
+        const output = (await item.output)?.trim();
+        return output ? output : undefined;
+      }
+    }
+    return undefined;
+  }
+
   /** What a window reload would find in workspaceState, reduced to run id and state. */
   persisted(): { runId: string; state: "running" | "ended" }[] {
     return this.context.workspaceState

@@ -17,6 +17,10 @@
  * a shortened instruction is a different test, and no summariser here can
  * know which clause is the one that matters.
  *
+ * The same module also owns how a check is *named*, for the places where the
+ * alternative is a collective phrase ("both rollout switches") when the
+ * reviewer's own concrete names are sitting right there.
+ *
  * Deterministic and pure: no model call, no vscode API.
  */
 
@@ -76,4 +80,60 @@ export function splitPassCriteria(criteria: string | undefined): { passIf?: stri
 
 function capitalize(text: string): string {
   return text ? text.charAt(0).toUpperCase() + text.slice(1) : text;
+}
+
+/** `DEVICE_MANUAL_CHECK` → `Device manual check`; the engine's own category, just made readable. */
+export function categoryWord(category: string | undefined): string {
+  if (!category) {
+    return "Human gate";
+  }
+  const words = category.toLowerCase().replace(/_/g, " ").trim();
+  return words ? capitalize(words) : "Human gate";
+}
+
+/**
+ * How a check is referred to *by name*.
+ *
+ * A gate check has a name the reviewer chose and the engine keeps stable
+ * across turns — its id — and that is the thing to say when the alternative
+ * is a vague collective ("both rollout switches", "all 2 remaining checks").
+ * A derived check has no such name, only its position, so it gets one;
+ * inventing a name for it would be inventing data.
+ *
+ * `description` is the short human sentence that goes with the name: the
+ * instruction's first sentence, so the name is never shown bare.
+ */
+export interface CheckName {
+  /** The reviewer's stable id when there is one; `Check 2` otherwise. */
+  name: string;
+  /** True when `name` is the reviewer's own id rather than a position. */
+  named: boolean;
+  description: string;
+}
+
+/**
+ * Only `gateId` counts as a name: a gate check whose id the panel could not
+ * round-trip is keyed by a hash of its instruction, and presenting that hash
+ * as "the reviewer's id" would be stating something the gate does not say.
+ */
+export function checkName(check: { text: string; gateId?: string }, position: number): CheckName {
+  const named = Boolean(check.gateId);
+  return { name: check.gateId ?? `Check ${position}`, named, description: sentences(check.text)[0] ?? check.text };
+}
+
+/**
+ * The names of several checks, for a sentence that would otherwise say "all
+ * N of them": `a, b and c`. Undefined when the checks carry no reviewer-given
+ * names, or when there are too many for a sentence to stay readable — then the
+ * count really is the honest short form.
+ */
+export const NAMES_IN_A_SENTENCE_MAX = 4;
+
+export function checkNameList(checks: { text: string; gateId?: string }[]): string | undefined {
+  const names = checks.map((check, index) => checkName(check, index + 1)).filter((entry) => entry.named);
+  if (names.length === 0 || names.length !== checks.length || names.length > NAMES_IN_A_SENTENCE_MAX) {
+    return undefined;
+  }
+  const words = names.map((entry) => entry.name);
+  return words.length === 1 ? words[0] : `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}`;
 }

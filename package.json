@@ -102,6 +102,11 @@
         "category": "Agent Sparring"
       },
       {
+        "command": "agentSparring.copyReviewContext",
+        "title": "Copy Review Context for Chat",
+        "category": "Agent Sparring"
+      },
+      {
         "command": "agentSparring.chooseExecutable",
         "title": "Choose sparring Executable…",
         "category": "Agent Sparring"

@@ -1,0 +1,130 @@
+/**
+ * A submission of human evidence, from the click until the engine has
+ * actually recorded it.
+ *
+ * **Launching is not submitting.** The first version of this cleared the
+ * drafted check results as soon as the launcher reported that it had started
+ * a command, which is the one thing about a submission that is never in
+ * doubt. Everything that can actually go wrong happens afterwards: the engine
+ * refuses the branch, refuses the plan digest, cannot read the manifest, the
+ * provider fails, someone presses Ctrl-C, the terminal is closed. Every one
+ * of those left the person who had just performed five manual checks looking
+ * at an empty form.
+ *
+ * So a submission is a recorded fact with three states, and only one of them
+ * may discard anything:
+ *
+ *  - **pending** — the engine was launched and has not ended. The drafts stay
+ *    exactly as they are, and the panel says `Submitting…` rather than
+ *    offering the button again.
+ *  - **recorded** — the execution ended with exit code 0. The engine has the
+ *    evidence; now, and only now, the drafts are cleared.
+ *  - **failed** — anything else, including no exit code at all. The drafts
+ *    stay, byte for byte, and the panel says so above the engine's own error.
+ *
+ * The record also keeps the submitted entry verbatim. That is deliberate
+ * redundancy: it is the same text the drafts still hold, and it is what makes
+ * a failure recoverable even if the drafts are later cleared by something
+ * else — the thing that was missing when a real Stage 4 submission was lost.
+ *
+ * Kept in workspace state, so a window reload mid-submission resolves against
+ * the recorded execution instead of waiting forever.
+ *
+ * No dependency on the vscode API.
+ */
+
+/** Which of the two channels was submitted; each owns its own drafts. */
+export type SubmissionChannel = "checks" | "feedback";
+
+export interface SubmissionFailure {
+  atMs: number;
+  /** Undefined when the execution ended with no exit code at all (Ctrl-C, a signal, the terminal closed). */
+  exitCode?: number;
+  /** The engine's own last words, when it printed any. Never paraphrased. */
+  output?: string;
+  /** One sentence naming what happened, in this extension's vocabulary. */
+  reason: string;
+}
+
+export interface SubmissionRecord {
+  runId: string;
+  channel: SubmissionChannel;
+  /** The execution whose exit code decides this submission. */
+  executionId: string;
+  startedAtMs: number;
+  /** Exactly what was handed to the engine as `--evidence`. */
+  entry: string;
+  /** How many structured check results the entry carried (0 for a feedback-only submission). */
+  results: number;
+  /** The stage the evidence belongs to, for the log and for a report. */
+  stageId?: string;
+  /** Set once the execution ended without succeeding; absent while pending. */
+  failure?: SubmissionFailure;
+}
+
+/** workspaceState entry: run id → its latest submission. */
+export type Submissions = Record<string, SubmissionRecord>;
+
+export const SUBMISSIONS_KEY = "agentSparring.submissions";
+
+/**
+ * Where a submission stands. `pending` is the answer whenever anything is
+ * unknown — an execution that cannot be found, one still running, one whose
+ * liveness this platform could not establish — because the cost of guessing
+ * wrong is a person's recorded work, and the cost of waiting is a label.
+ */
+export type SubmissionState = "pending" | "recorded" | "failed";
+
+export function submissionState(execution: { state: "running" | "unknown" | "ended"; exitCode?: number } | undefined): SubmissionState {
+  if (!execution || execution.state !== "ended") {
+    return "pending";
+  }
+  return execution.exitCode === 0 ? "recorded" : "failed";
+}
+
+/** Exit codes that mean a person or a signal stopped it, not that the engine judged anything. */
+const INTERRUPTED_EXITS = new Set([130, 143]);
+
+/**
+ * What to say about a failed submission. The exit code is reported as itself;
+ * nothing here infers a cause from it, because the engine's own output is
+ * carried alongside and says what actually happened.
+ */
+export function submissionFailureReason(exitCode: number | undefined): string {
+  if (exitCode === undefined) {
+    return "The submission was interrupted before the engine finished (Ctrl-C, a signal, or the terminal was closed).";
+  }
+  if (INTERRUPTED_EXITS.has(exitCode)) {
+    return `The submission was interrupted (exit ${exitCode}) before the engine recorded the evidence.`;
+  }
+  return `The engine exited with code ${exitCode} without recording the evidence.`;
+}
+
+/** The sentence a failed submission leads with. The reassurance comes first: it is the answer to what the person is about to fear. */
+export const SUBMISSION_PRESERVED = "Submission failed — your check results and feedback were preserved.";
+
+export function submissionFor(submissions: Submissions | undefined, runId: string): SubmissionRecord | undefined {
+  const record = submissions?.[runId];
+  if (!record || typeof record !== "object" || typeof record.entry !== "string" || (record.channel !== "checks" && record.channel !== "feedback")) {
+    return undefined;
+  }
+  return record;
+}
+
+export function withSubmission(submissions: Submissions | undefined, record: SubmissionRecord): Submissions {
+  return { ...(submissions ?? {}), [record.runId]: record };
+}
+
+export function withSubmissionFailure(submissions: Submissions | undefined, runId: string, failure: SubmissionFailure): Submissions {
+  const record = submissionFor(submissions, runId);
+  if (!record) {
+    return { ...(submissions ?? {}) };
+  }
+  return { ...submissions, [runId]: { ...record, failure } };
+}
+
+export function withoutSubmission(submissions: Submissions | undefined, runId: string): Submissions {
+  const next: Submissions = { ...(submissions ?? {}) };
+  delete next[runId];
+  return next;
+}

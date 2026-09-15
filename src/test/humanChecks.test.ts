@@ -294,9 +294,14 @@ describe("recorded outcomes (drafts) and the ## Human evidence entry", () => {
     drafts = withHumanCheck(drafts, "run|a", "k2", { outcome: "blocked" });
     assert.deepEqual(humanChecksFor(drafts, "run|a"), { k1: { outcome: "pass", note: "Seen on both clients." }, k2: { outcome: "blocked", note: undefined } });
     drafts = withHumanCheck(drafts, "run|a", "k1", { note: "   " });
-    assert.deepEqual(humanChecksFor(drafts, "run|a").k1, { outcome: "pass", note: undefined });
+    assert.deepEqual(humanChecksFor(drafts, "run|a").k1, { outcome: "pass", note: undefined }, "an empty note is withdrawn; the outcome it was written under is not");
+    // A field the change does not carry is a field the message did not carry:
+    // the two controls of one check report separately and must not erase each
+    // other. Clearing a whole run's drafts is what withoutHumanChecks is for.
     drafts = withHumanCheck(drafts, "run|a", "k2", { outcome: undefined });
-    assert.equal(humanChecksFor(drafts, "run|a").k2, undefined);
+    assert.deepEqual(humanChecksFor(drafts, "run|a").k2, { outcome: "blocked", note: undefined }, "an absent outcome changes nothing");
+    drafts = withHumanCheck(drafts, "run|a", "k2", { note: "Second client unavailable." });
+    assert.deepEqual(humanChecksFor(drafts, "run|a").k2, { outcome: "blocked", note: "Second client unavailable." });
     assert.deepEqual(humanChecksFor(withoutHumanChecks(drafts, "run|a"), "run|a"), {});
     assert.deepEqual(humanChecksFor(undefined, "run|a"), {});
   });

@@ -18,10 +18,10 @@ import * as crypto from "node:crypto";
 import * as os from "node:os";
 import type { DiscoveryDiagnostic } from "../core/diagnose";
 import { discoverRuns, selectRun } from "../core/discovery";
-import { isHumanCheckMessage, renderOverviewHtml } from "../core/overviewHtml";
+import { isCopyPromptMessage, isHumanCheckMessage, isHumanFeedbackMessage, isOpenPromptSourceMessage, renderOverviewHtml } from "../core/overviewHtml";
 import { withHumanCheck, type HumanCheckDrafts } from "../core/humanChecks";
 import type { ExecutionRecord, LivenessState, RunnerLiveness } from "../core/liveness";
-import { buildOverviewModel, type ManifestStageView, type OverviewArtifacts } from "../core/overviewModel";
+import { buildOverviewModel, type CapturedPrompt, type ManifestStageView, type OverviewArtifacts } from "../core/overviewModel";
 
 const STAGES = ["stage-reported-statistics-contract", "stage-reported-statistics-local-schema-barrier", "stage-reported-statistics-typed-parser", "stage-review-complete", "stage-review-complete-dirty", "stage-stale-turn"];
 
@@ -67,6 +67,7 @@ export async function run(): Promise<void> {
     ["accept", () => acceptStageAssertions(report, reportedRepo)],
     ["plan", () => planAssociationAssertions(report, reportedRepo, fixtureRoot)],
     ["gate", () => gateClickAssertions()],
+    ["prompt", () => promptInspectorAssertions()],
     ["evidence", () => evidenceLaunchAssertions(reportedRepo, fixtureRoot)],
     ["advance", () => advancementAssertions(reportedRepo)],
     ["terminals", () => terminalReuseAssertions(report, reportedRepo)],
@@ -478,8 +479,8 @@ const GATE_PLAN_LABEL = "plans/reported-statistics.md";
 const GATE_CHECK_ID = "pre-activation-desktop-v2-feed";
 
 /**
- * The one thing a rendered snapshot cannot show: that clicking Pass does
- * anything.
+ * The one thing a rendered snapshot cannot show: that clicking Pass — or
+ * typing a finding into the freeform field — does anything.
  *
  * A real Chromium webview inside this real VS Code renders the document the
  * Overview renders, its own shipped script binds the click listener, a real
@@ -490,8 +491,9 @@ const GATE_CHECK_ID = "pre-activation-desktop-v2-feed";
  *
  * The panel this uses is the test's own: the extension's Overview cannot be
  * clicked from here, and its handler is one line (`isHumanCheckMessage(m) →
- * recordHumanCheck`) covered by the unit tests. Everything else on the wire
- * is the shipped code, running where it really runs.
+ * recordHumanCheck`, `isHumanFeedbackMessage(m) → recordHumanFeedback`)
+ * covered by the unit tests. Everything else on the wire is the shipped code,
+ * running where it really runs.
  */
 async function gateClickAssertions(): Promise<void> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "agent-sparring-gate-"));
@@ -517,8 +519,8 @@ async function gateClickAssertions(): Promise<void> {
   const selection = selectRun((await discoverRuns([location])).runs);
   const runId = selection.selected?.id;
   assert.ok(runId, "the managed plan run is discovered");
-  const view = (drafts: HumanCheckDrafts) => {
-    const artifacts: OverviewArtifacts = { handoff: false, sparring: true, brief: false, plan: false, git: { branch: "feature/x" }, humanChecks: drafts[runId] ?? {}, manifestStages };
+  const view = (drafts: HumanCheckDrafts, feedback?: string) => {
+    const artifacts: OverviewArtifacts = { handoff: false, sparring: true, brief: false, plan: false, git: { branch: "feature/x" }, humanChecks: drafts[runId] ?? {}, humanFeedback: feedback, manifestStages };
     return buildOverviewModel(selection, undefined, artifacts, Date.now());
   };
 
@@ -556,6 +558,150 @@ async function gateClickAssertions(): Promise<void> {
     const html = renderOverviewHtml(after, nonce, panel.webview.cspSource);
     assert.match(html, new RegExp(`class="choice pass on" data-check="${GATE_CHECK_ID}"`), "Pass is visibly selected on the next render");
     assert.match(html, /data-action="submitForReview" title="[^"]*">Submit result and continue</, "and Submit result and continue is enabled");
+
+    // The other half of the gate, on the same real wire: a multi-line
+    // finding that belongs to no check. Typed into the real textarea, posted
+    // by the shipped listener, and it must arrive byte for byte — a
+    // reproduction path whose newlines are lost is not a reproduction path.
+    const feedback = ["App crashes while entering the reference workflow:", "Observation → Add reference → Cancel → crash.", "", "It's reproducible; I can't reach the editor to run the check above."].join("\n");
+    const feedbackNonce = crypto.randomBytes(16).toString("base64");
+    const gotFeedback = new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("no feedback message arrived from the webview within 15s")), 15_000);
+      panel.webview.onDidReceiveMessage((message: Record<string, unknown>) => {
+        if (message?.["type"] === "humanFeedback") {
+          clearTimeout(timer);
+          resolve(message);
+        }
+      });
+    });
+    const typer = `<script nonce="${feedbackNonce}">var f = document.querySelector('textarea[data-feedback]'); f.value = ${JSON.stringify(feedback)}; f.dispatchEvent(new Event('focusout', { bubbles: true }));</script>`;
+    panel.webview.html = renderOverviewHtml(after, feedbackNonce, panel.webview.cspSource).replace("</body>", `${typer}</body>`);
+    const feedbackMessage = await gotFeedback;
+
+    assert.deepEqual(feedbackMessage, { type: "humanFeedback", text: feedback }, "every line of it crossed the wire, and it carries no check key");
+    assert.ok(isHumanFeedbackMessage(feedbackMessage), "the host accepts it as feedback");
+    assert.ok(!isHumanCheckMessage(feedbackMessage), "and can never file it as a check result");
+
+    // And with it in the box, the freeform action is offered while all of the
+    // reviewer's checks are still unanswered.
+    const withFeedback = view({}, feedbackMessage.text as string);
+    assert.equal(withFeedback.actionRequired?.feedback.draft, feedback);
+    assert.equal(withFeedback.actionRequired?.feedback.send.enabled, true);
+    assert.equal(withFeedback.actionRequired?.progress, "0 / 1 verified", "and it claims nothing about the check");
+    assert.equal(withFeedback.actionRequired?.submit.enabled, false);
+  } finally {
+    panel.dispose();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------- the prompt inspector's controls, in a real browser
+
+/**
+ * The prompt inspector's two controls both sit inside a `<summary>`, whose
+ * activation toggles the section it heads. So "open the file this section
+ * came from" could post exactly the right message and still be useless,
+ * because the section it was clicked in collapses at the same moment. The
+ * unit test's DOM shim cannot say anything about that: it has no
+ * `<details>` behaviour at all.
+ *
+ * Here a real Chromium webview renders the real document, a real `click()`
+ * on the real button reaches the shipped listener, and the probe reports
+ * whether the enclosing `<details>` stayed put.
+ *
+ * What this does *not* isolate: removing the listener's `preventDefault`
+ * leaves these assertions passing, because Chromium already declines to
+ * toggle a `<summary>` when the click lands on an interactive descendant.
+ * The guard is defensive, and what is verified here is the behaviour a
+ * person sees — the control acts and the section it is in stays open —
+ * which would still catch the control being rendered as something other
+ * than a button, or moved somewhere the listener does not reach.
+ */
+async function promptInspectorAssertions(): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "agent-sparring-prompt-"));
+  const stage = "stage-5-independent-final-review-and-activation-decision";
+  const stages = path.join(root, ".sparring", "stages");
+  await fs.mkdir(path.join(stages, stage), { recursive: true });
+  await fs.writeFile(path.join(stages, stage, "state.json"), JSON.stringify({ status: "working", base_sha: null, candidate_sha: null, implementation_session_id: "impl", sparring_session_id: null }));
+
+  const brief = "## Stage brief\n\nA fresh top-level reviewer verifies frozen candidate SHAs.";
+  const scope = "## Scope reminder\n\nStay within this stage's bounded goal above.";
+  const text = `${brief}\n\n${scope}\n`;
+  const source = `stages/${stage}/brief.md`;
+  const capturedPrompts: CapturedPrompt[] = [
+    {
+      entry: {
+        seq: 1,
+        ts: new Date().toISOString(),
+        role: "stage",
+        stageId: stage,
+        turnKind: "original",
+        resumed: false,
+        expectedBranch: "feature/x",
+        file: "0001-stage-original.md",
+        chars: text.length,
+        sections: [
+          { heading: "Stage brief", origin: "file", source, start: 0, end: brief.length },
+          { heading: "Scope reminder", origin: "engine", start: brief.length + 2, end: text.length - 1 },
+        ],
+      },
+      text,
+    },
+  ];
+
+  const location = { sparringDir: path.join(root, ".sparring"), projectDir: root, repoRoot: root, workspaceFolder: root, folderName: path.basename(root) };
+  const selection = selectRun((await discoverRuns([location])).runs);
+  assert.ok(selection.selected, "the standalone stage is discovered");
+  const artifacts: OverviewArtifacts = { handoff: false, sparring: false, brief: false, plan: false, capturedPrompts };
+  const model = buildOverviewModel(selection, undefined, artifacts, Date.now());
+  assert.equal(model.stageAgent?.prompt?.turn, "Implementation turn");
+
+  const nonce = crypto.randomBytes(16).toString("base64");
+  const panel = vscode.window.createWebviewPanel("agentSparring.promptClickTest", "prompt click", { viewColumn: vscode.ViewColumn.Active, preserveFocus: true }, { enableScripts: true, localResourceRoots: [] });
+  try {
+    const posted: Record<string, unknown>[] = [];
+    const probed = new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("no probe arrived from the webview within 15s")), 15_000);
+      panel.webview.onDidReceiveMessage((message: Record<string, unknown>) => {
+        posted.push(message);
+        if (message?.["type"] === "promptProbe") {
+          clearTimeout(timer);
+          resolve(message);
+        }
+      });
+    });
+    // `acquireVsCodeApi` may only be called once per webview, and the shipped
+    // script calls it. So the probe borrows the same handle rather than
+    // asking for a second one.
+    const shipped = `<script nonce="${nonce}">`;
+    const preamble = `<script nonce="${nonce}">var __api; var __acquire = acquireVsCodeApi; acquireVsCodeApi = function () { __api = __acquire(); return __api; };</script>`;
+    const probe = `<script nonce="${nonce}">
+      var card = document.querySelector('details.actor');
+      var section = document.querySelector('details.promptsec');
+      card.open = true;
+      section.open = true;
+      var openBefore = section.open;
+      document.querySelector('button[data-openprompt]').click();
+      var afterOpenSource = section.open;
+      document.querySelector('button[data-copyprompt]').click();
+      __api.postMessage({ type: 'promptProbe', openBefore: openBefore, afterOpenSource: afterOpenSource, cardStillOpen: card.open });
+    </script>`;
+    panel.webview.html = renderOverviewHtml(model, nonce, panel.webview.cspSource).replace(shipped, `${preamble}${shipped}`).replace("</body>", `${probe}</body>`);
+    const report = await probed;
+
+    assert.equal(report["openBefore"], true);
+    assert.equal(report["afterOpenSource"], true, "opening a section's source must not collapse the section it was clicked in");
+    assert.equal(report["cardStillOpen"], true, "nor the actor card around it");
+
+    const open = posted.find((message) => message["type"] === "openPromptSource");
+    assert.ok(open, "the shipped listener posted the open-source message from a real click");
+    assert.deepEqual(open, { type: "openPromptSource", source }, "carrying the path the engine recorded");
+    assert.ok(isOpenPromptSourceMessage(open), "and the host accepts it");
+
+    const copy = posted.find((message) => message["type"] === "copyPrompt");
+    assert.ok(copy, "and the copy button posted too");
+    assert.deepEqual(copy, { type: "copyPrompt", role: "stage" });
+    assert.ok(isCopyPromptMessage(copy), "which the host also accepts");
   } finally {
     panel.dispose();
     await fs.rm(root, { recursive: true, force: true });

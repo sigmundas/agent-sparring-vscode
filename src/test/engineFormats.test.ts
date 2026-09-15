@@ -134,9 +134,18 @@ describe("plan stage headings", () => {
 });
 
 describe("sparring.md routing outcome", () => {
-  it("reads action, summary and reason", () => {
+  it("reads action, summary, reason and the reviewer's findings", () => {
     const outcome = parseSparringOutcome(sparringMarkdown("NEEDS_YOU", "Confirm on device", "device_manual_check"));
-    assert.deepEqual(outcome, { action: "NEEDS_YOU", summary: "Confirm on device", needsYouReason: "device_manual_check", deferred: undefined, humanGate: undefined });
+    assert.deepEqual(outcome, {
+      action: "NEEDS_YOU",
+      summary: "Confirm on device",
+      needsYouReason: "device_manual_check",
+      deferred: undefined,
+      // The `## Finding / discussion` body: the reviewer's own findings, never
+      // shown in the status bar, quoted whole by the copy-for-chat surface.
+      findings: "Long findings that must never reach the status bar.",
+      humanGate: undefined,
+    });
   });
 
   it("returns undefined for the untouched template", () => {

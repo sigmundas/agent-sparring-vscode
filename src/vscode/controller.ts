@@ -27,7 +27,30 @@ import {
 } from "../core/discovery";
 import { deriveLiveness, type ExecutionRecord, type RunnerLiveness } from "../core/liveness";
 import { applyEvent, emptyLiveState, type LiveState } from "../core/liveState";
-import { HUMAN_CHECKS_KEY, humanChecksFor, withHumanCheck, withoutHumanChecks, type CheckRecord, type HumanCheckDrafts } from "../core/humanChecks";
+import {
+  HUMAN_CHECKS_KEY,
+  HUMAN_FEEDBACK_KEY,
+  humanChecksFor,
+  humanFeedbackFor,
+  withHumanCheck,
+  withHumanFeedback,
+  withoutHumanChecks,
+  withoutHumanFeedback,
+  type CheckRecord,
+  type HumanCheckDrafts,
+  type HumanFeedbackDrafts,
+} from "../core/humanChecks";
+import {
+  SUBMISSIONS_KEY,
+  submissionFailureReason,
+  submissionFor,
+  submissionState,
+  withSubmission,
+  withSubmissionFailure,
+  withoutSubmission,
+  type SubmissionRecord,
+  type Submissions,
+} from "../core/submission";
 import { LogRenderer } from "../core/logFormat";
 import { PLAN_ASSOCIATIONS_KEY, planAssociationFor, withAssociation, withManualMatch, type HeadingRef, type PlanAssociation, type PlanAssociations } from "../core/planAssociation";
 import {
@@ -113,7 +136,16 @@ export class SparringController implements vscode.Disposable {
       this.terminals,
       // A runner ending may have left new authoritative files behind; a
       // start or liveness change only needs re-rendering.
-      this.tracker.onDidChange((change) => (change === "ended" ? void this.refresh() : this.render())),
+      // A runner ending is also the moment a submission is decided: its exit
+      // code is what says whether the evidence was recorded or the drafts must
+      // be kept. A start or liveness change only needs re-rendering.
+      this.tracker.onDidChange((change) => {
+        if (change === "ended") {
+          void this.resolveSubmissions().then(() => this.refresh());
+        } else {
+          this.render();
+        }
+      }),
     );
 
     this.disposables.push(
@@ -147,7 +179,10 @@ export class SparringController implements vscode.Disposable {
       // Launches recorded before a reload: liveness is re-established from
       // terminals and processes, never from the telemetry just replayed.
       this.reattached = true;
-      void this.tracker.reattach();
+      // Then any submission that was in flight when the window went away is
+      // decided by what its own execution turned out to do, so a reload can
+      // neither strand it as "Submitting…" nor discard its drafts.
+      void this.tracker.reattach().then(() => this.resolveSubmissions());
     }
   }
 
@@ -474,6 +509,94 @@ export class SparringController implements vscode.Disposable {
 
   async clearHumanChecks(runId: string): Promise<void> {
     await this.context.workspaceState.update(HUMAN_CHECKS_KEY, withoutHumanChecks(this.context.workspaceState.get<HumanCheckDrafts>(HUMAN_CHECKS_KEY), runId));
+    this.render();
+  }
+
+  /**
+   * The freeform findings a person has typed for a run and not sent yet.
+   *
+   * Stored like the check drafts and for the same reason — a rerender, a
+   * details disclosure or a window reload must not lose a reproduction path
+   * someone just wrote out — but stored apart from them, because it is not a
+   * result for any check and nothing may ever read it as one.
+   */
+  humanFeedback(runId: string | undefined): string | undefined {
+    return runId === undefined ? undefined : humanFeedbackFor(this.context.workspaceState.get<HumanFeedbackDrafts>(HUMAN_FEEDBACK_KEY), runId);
+  }
+
+  /** Replace the draft with what the field now holds. `notify` false keeps the Overview from re-rendering mid-keystroke. */
+  async setHumanFeedback(runId: string, text: string, notify = false): Promise<void> {
+    const next = withHumanFeedback(this.context.workspaceState.get<HumanFeedbackDrafts>(HUMAN_FEEDBACK_KEY), runId, text);
+    await this.context.workspaceState.update(HUMAN_FEEDBACK_KEY, next);
+    if (notify) {
+      this.render();
+    }
+  }
+
+  /** Only a submission the engine actually recorded clears it; see {@link resolveSubmission}. */
+  async clearHumanFeedback(runId: string): Promise<void> {
+    await this.context.workspaceState.update(HUMAN_FEEDBACK_KEY, withoutHumanFeedback(this.context.workspaceState.get<HumanFeedbackDrafts>(HUMAN_FEEDBACK_KEY), runId));
+    this.render();
+  }
+
+  // ---------------------------------------------------------------- submissions (drafts survive until the engine records them)
+
+  /** The submission in flight or last failed for a run; undefined once the engine has recorded one. */
+  submissionFor(runId: string | undefined): SubmissionRecord | undefined {
+    return runId === undefined ? undefined : submissionFor(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), runId);
+  }
+
+  /**
+   * Record that evidence has been handed to the engine. The drafts are *not*
+   * cleared here: this is the beginning of a submission, and only the exit
+   * code of `record.executionId` says whether it became one.
+   */
+  async beginSubmission(record: SubmissionRecord): Promise<void> {
+    await this.context.workspaceState.update(SUBMISSIONS_KEY, withSubmission(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), record));
+    this.log(`Submission: ${record.results > 0 ? `${record.results} check result(s)` : "freeform feedback"} handed to the engine for ${record.stageId ?? record.runId}; the drafts are kept until it exits 0`);
+    this.render();
+  }
+
+  /**
+   * Resolve every pending submission against the execution it launched.
+   *
+   * Called whenever an execution ends and once after a window reload (where
+   * the recorded launch carries the exit code observed before the reload), so
+   * a submission is never left pending by a reload and never resolved by
+   * anything other than its own execution's exit code.
+   */
+  async resolveSubmissions(): Promise<void> {
+    const submissions = this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY);
+    for (const runId of Object.keys(submissions ?? {})) {
+      const record = submissionFor(submissions, runId);
+      if (!record || record.failure) {
+        continue; // already reported; the drafts are kept and the panel says so
+      }
+      const execution = this.tracker.recordById(record.executionId);
+      const state = submissionState(execution);
+      if (state === "pending") {
+        continue;
+      }
+      if (state === "recorded") {
+        await this.context.workspaceState.update(SUBMISSIONS_KEY, withoutSubmission(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), runId));
+        if (record.channel === "checks") {
+          await this.clearHumanChecks(runId);
+        } else {
+          await this.clearHumanFeedback(runId);
+        }
+        this.log(`Submission: the engine exited 0 for ${record.stageId ?? runId}; the evidence is recorded and the drafts are cleared`);
+        continue;
+      }
+      const failure = { atMs: Date.now(), exitCode: execution?.exitCode, output: await this.tracker.outputOf(record.executionId), reason: submissionFailureReason(execution?.exitCode) };
+      await this.context.workspaceState.update(SUBMISSIONS_KEY, withSubmissionFailure(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), runId, failure));
+      this.log(`Submission: ${failure.reason} Every drafted result and note for ${record.stageId ?? runId} is kept exactly as it was.`);
+      this.render();
+    }
+  }
+
+  /** Dismiss a failed submission's report. The drafts are untouched: they are the user's, not the report's. */
+  async dismissSubmission(runId: string): Promise<void> {
+    await this.context.workspaceState.update(SUBMISSIONS_KEY, withoutSubmission(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), runId));
     this.render();
   }
 

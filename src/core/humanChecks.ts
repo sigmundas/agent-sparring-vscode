@@ -44,6 +44,13 @@
  *    are rendered as prose under `## Human evidence` and the reviewer is
  *    asked to rule again. Nothing here marks anything READY or accepted.
  *
+ * Beside all of that, and independent of it, there is **freeform feedback**:
+ * what the human found that is not a result for any requested check — a
+ * crash on the way to the feature, a wording or design problem, a reason the
+ * checks cannot be performed yet. It has its own draft, its own
+ * `### Additional human feedback` sub-heading under `## Human evidence`, and
+ * it never becomes an outcome or moves `N / M verified`.
+ *
  * No dependency on the vscode API.
  */
 
@@ -374,11 +381,34 @@ export function humanChecksFor(drafts: HumanCheckDrafts | undefined, runId: stri
   return out;
 }
 
-/** Record (merge) one check's outcome and/or note; an empty record removes the draft. */
+/**
+ * Record one check's outcome and/or note, merging with what is already
+ * drafted for it; an empty record removes the draft.
+ *
+ * **`undefined` means "not part of this change", never "clear it".** The two
+ * controls of a check report separately — a Pass / Fail / Can't test click
+ * carries an outcome and no note, a keystroke in the note field carries a
+ * note and no outcome — and the caller fills the absent half in as
+ * `undefined`. Spreading that over the stored record used to overwrite the
+ * other control's work: typing a note under a Can't test silently reset it to
+ * no outcome, and clicking an outcome silently discarded the note someone had
+ * just written as their evidence. Neither was visible when it happened,
+ * because a note is stored without re-rendering the page.
+ *
+ * A note is therefore withdrawn by recording an empty one (which is what
+ * emptying the textarea sends), and an outcome is replaced by recording
+ * another; nothing here clears a field by omission.
+ */
 export function withHumanCheck(drafts: HumanCheckDrafts | undefined, runId: string, key: string, change: CheckRecord): HumanCheckDrafts {
   const next: HumanCheckDrafts = { ...(drafts ?? {}) };
   const forRun = { ...humanChecksFor(drafts, runId) };
-  const merged: CheckRecord = { ...forRun[key], ...change };
+  const merged: CheckRecord = { ...forRun[key] };
+  if (change.outcome !== undefined) {
+    merged.outcome = change.outcome;
+  }
+  if (change.note !== undefined) {
+    merged.note = change.note;
+  }
   if (merged.note !== undefined && !merged.note.trim()) {
     delete merged.note;
   }
@@ -401,9 +431,73 @@ export function withoutHumanChecks(drafts: HumanCheckDrafts | undefined, runId: 
   return next;
 }
 
+// ---------------------------------------------------------------- freeform human feedback (drafts)
+
+/**
+ * What a person found that is *not* one of the reviewer's checks.
+ *
+ * The structured controls force every observation into one of the checks the
+ * reviewer predefined, and a real verification session does not stay inside
+ * that list: a stage-4 check can be interrupted by a reproducible crash on
+ * the way to the feature, by a table that still says "Typical min/max" when
+ * the parser knows the values are P5/P95, or by a design decision the human
+ * wants revisited before spending time on the five requested checks. None of
+ * those is a Pass, a Fail or a Can't test of anything the reviewer asked for.
+ *
+ * So freeform feedback is a separate channel, stored separately, rendered
+ * separately and recorded separately — never a fourth outcome word, never a
+ * check, and it never moves `N / M verified`. It is evidence *for the
+ * reviewer's routing decision*: the reviewer reads it against the unchanged
+ * candidate and decides whether it means SEND_BACK, the same checks again,
+ * revised checks, or (only if its own acceptance rules already allow it)
+ * READY. It is not an instruction to the implementing agent.
+ *
+ * One draft per run, because it is one text box; it lives in workspace state
+ * beside the check drafts so it survives a rerender, a details disclosure and
+ * a window reload, and it is cleared only by a submission that actually
+ * launched.
+ */
+export type HumanFeedbackDrafts = Record<string, string>;
+
+export const HUMAN_FEEDBACK_KEY = "agentSparring.humanFeedback";
+
+/** The unsubmitted feedback for a run; undefined when there is none (whitespace is none). */
+export function humanFeedbackFor(drafts: HumanFeedbackDrafts | undefined, runId: string): string | undefined {
+  const value = drafts?.[runId];
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+/** Store the text as typed (trailing spaces and blank lines included); empty text removes the draft. */
+export function withHumanFeedback(drafts: HumanFeedbackDrafts | undefined, runId: string, text: string): HumanFeedbackDrafts {
+  const next: HumanFeedbackDrafts = { ...(drafts ?? {}) };
+  if (text.trim()) {
+    next[runId] = text;
+  } else {
+    delete next[runId];
+  }
+  return next;
+}
+
+export function withoutHumanFeedback(drafts: HumanFeedbackDrafts | undefined, runId: string): HumanFeedbackDrafts {
+  const next: HumanFeedbackDrafts = { ...(drafts ?? {}) };
+  delete next[runId];
+  return next;
+}
+
 // ---------------------------------------------------------------- recorded evidence (notes.md ## Human evidence)
 
 export const HUMAN_EVIDENCE_HEADING = "## Human evidence";
+
+/**
+ * The sub-heading freeform feedback is recorded under, inside
+ * `## Human evidence`. It is a `###` so the engine's own section keeps its
+ * one heading, and so that everything under it can be told apart from a
+ * check result by structure rather than by reading the prose.
+ */
+export const HUMAN_FEEDBACK_HEADING = "### Additional human feedback";
+
+const FEEDBACK_HEADING_RE = /^additional human feedback\b/i;
+const SUB_HEADING_RE = /^#{3,6}\s+(\S.*?)\s*$/;
 
 /** One entry of `## Human evidence`: a list item (with continuation lines) or a paragraph. */
 export interface EvidenceEntry {
@@ -416,6 +510,13 @@ export interface EvidenceEntry {
   checkId?: string;
   /** The entry says something is still pending / not claimed; it is not evidence of completion. */
   negative: boolean;
+  /**
+   * The entry sits under `### Additional human feedback`: it is freeform
+   * feedback a human sent, so it is never evidence *for a check* — not even
+   * when its words happen to overlap one. That is the whole point of
+   * recording it under its own sub-heading.
+   */
+  feedback: boolean;
 }
 
 /** Wording by which a human entry says a check is *not* done; such an entry never counts as completion evidence. */
@@ -441,10 +542,12 @@ export function parseHumanEvidence(notes: string | undefined): EvidenceEntry[] {
   const entries: EvidenceEntry[] = [];
   let current: string[] = [];
   let currentIsBullet = false;
+  let inFeedback = false;
   const flush = () => {
     const text = current.join(" ").replace(/\s+/g, " ").trim();
     // A structured result line is its bullet's first line; the indented note beneath does not change what it names.
     const structured = currentIsBullet && current.length > 0 ? STRUCTURED_RE.exec(current[0].trim()) : null;
+    const feedback = inFeedback;
     current = [];
     if (!text) {
       return;
@@ -455,6 +558,7 @@ export function parseHumanEvidence(notes: string | undefined): EvidenceEntry[] {
       checkText: structured ? structured[2] : undefined,
       checkId: structured ? structured[3] : undefined,
       negative: NEGATIVE_RE.test(text),
+      feedback,
     });
   };
   let inFence = false;
@@ -469,6 +573,14 @@ export function parseHumanEvidence(notes: string | undefined): EvidenceEntry[] {
     }
     if (/^#{1,2}\s/.test(line)) {
       break;
+    }
+    const sub = SUB_HEADING_RE.exec(line);
+    if (sub) {
+      // A sub-heading is a boundary, not content: it ends the entry above it
+      // and decides whether what follows is feedback or a check result.
+      flush();
+      inFeedback = FEEDBACK_HEADING_RE.test(sub[1]);
+      continue;
     }
     if (!line.trim()) {
       flush();
@@ -488,6 +600,57 @@ export function parseHumanEvidence(notes: string | undefined): EvidenceEntry[] {
   }
   flush();
   return entries;
+}
+
+/**
+ * The `### Additional human feedback` blocks of `## Human evidence`,
+ * verbatim and in the order they were recorded.
+ *
+ * Verbatim, and one block per submission, because this is a person's own
+ * report of something the workflow did not ask about: a reproduction path
+ * loses its meaning when its lines are joined, and a second submission is a
+ * second observation rather than a correction of the first. What is dropped
+ * is only the heading line itself.
+ */
+export function parseHumanFeedback(notes: string | undefined): string[] {
+  if (!notes) {
+    return [];
+  }
+  const lines = notes.split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === HUMAN_EVIDENCE_HEADING);
+  if (start < 0) {
+    return [];
+  }
+  const blocks: string[] = [];
+  let current: string[] | undefined;
+  let inFence = false;
+  const flush = () => {
+    const text = current?.join("\n").trim();
+    if (text) {
+      blocks.push(text);
+    }
+    current = undefined;
+  };
+  for (let index = start + 1; index < lines.length; index++) {
+    const line = lines[index];
+    if (FENCE_RE.test(line)) {
+      inFence = !inFence;
+    }
+    if (!inFence && /^#{1,2}\s/.test(line)) {
+      break;
+    }
+    const sub = !inFence ? SUB_HEADING_RE.exec(line) : null;
+    if (sub) {
+      flush();
+      if (FEEDBACK_HEADING_RE.test(sub[1])) {
+        current = [];
+      }
+      continue;
+    }
+    current?.push(line);
+  }
+  flush();
+  return blocks;
 }
 
 /** Shared significant words needed before a prose entry counts as evidence for a check (stricter than reviewer matching). */
@@ -514,17 +677,21 @@ export interface RecordedEvidence {
  * recorded before the reviewer supplied structured gates still counts.
  */
 export function recordedEvidenceFor(check: { text: string; key?: string; origin?: CheckOrigin }, entries: EvidenceEntry[]): RecordedEvidence | undefined {
+  // Freeform feedback is not a result for anything, however much of a check's
+  // wording it repeats: a person reporting that they cannot perform a check
+  // must never turn that check green.
+  const candidates = entries.filter((entry) => !entry.feedback);
   if (check.origin === "gate" && check.key) {
-    const byId = entries.filter((entry) => entry.checkId === check.key).pop();
+    const byId = candidates.filter((entry) => entry.checkId === check.key).pop();
     if (byId) {
       return { excerpt: excerpt(byId.text), outcome: byId.outcome, how: "id" };
     }
   }
-  const exact = entries.filter((entry) => entry.checkText !== undefined && normalise(entry.checkText) === normalise(check.text)).pop();
+  const exact = candidates.filter((entry) => entry.checkText !== undefined && normalise(entry.checkText) === normalise(check.text)).pop();
   if (exact) {
     return { excerpt: excerpt(exact.text), outcome: exact.outcome, how: "exact" };
   }
-  const prose = entries.filter((entry) => entry.checkText === undefined && !entry.negative);
+  const prose = candidates.filter((entry) => entry.checkText === undefined && !entry.negative);
   const at = matchReviewerRequest(prose, check.text, EVIDENCE_MATCH_MIN_OVERLAP);
   return at === undefined ? undefined : { excerpt: excerpt(prose[at].text), how: "prose" };
 }
@@ -544,6 +711,14 @@ export interface CheckItem {
   key: string;
   text: string;
   origin: CheckOrigin;
+  /**
+   * The reviewer's own stable id, when the gate gave one this panel can
+   * round-trip; `key` is then equal to it. Absent for a derived check, and for
+   * a gate check whose id had to fall back to a hash — so anything that shows
+   * a check *by name* can tell the reviewer's id from a key we invented, and
+   * never presents the second as the first.
+   */
+  gateId?: string;
   /** The reviewer's own pass/fail criteria; gate checks only. */
   passCriteria?: string;
   /** Where the full test is defined, as the reviewer named it; gate checks only. */
@@ -626,17 +801,21 @@ export function deriveVerification(plan: PlanChecks, outcome: SparringOutcome | 
  * stable id.
  */
 function gateItems(gate: HumanGate): CheckItem[] {
-  return gate.checks.map((check) => ({
+  return gate.checks.map((check) => {
     // The reviewer's id, unless it is a shape the panel cannot round-trip —
     // then the instruction's own hash, so the control still works and the
     // result is matched by its wording instead. A check whose button does
     // nothing is worse than one whose result is matched less precisely.
-    key: isCheckKey(check.id) ? check.id : checkKey(check.instruction),
-    text: check.instruction,
-    origin: "gate" as const,
-    passCriteria: check.passCriteria,
-    source: check.source,
-  }));
+    const usable = isCheckKey(check.id);
+    return {
+      key: usable ? check.id : checkKey(check.instruction),
+      gateId: usable ? check.id : undefined,
+      text: check.instruction,
+      origin: "gate" as const,
+      passCriteria: check.passCriteria,
+      source: check.source,
+    };
+  });
 }
 
 function derivedItems(plan: PlanChecks, outcome: SparringOutcome | undefined): CheckItem[] {
@@ -703,6 +882,25 @@ export function renderHumanEvidence(checks: RecordedCheck[], date: Date, planNam
     }
   }
   return lines.join("\n");
+}
+
+/**
+ * The `## Human evidence` entry for freeform feedback: the sub-heading that
+ * marks it as *not* a check result, a dated lead-in in the same shape the
+ * check results use, and then the person's text exactly as they typed it.
+ *
+ * Nothing is added, reworded or classified. The reviewer is the one who
+ * decides what the text means for routing, and any summarising here would be
+ * this extension deciding that instead — from the one place that has no
+ * evidence to decide it with.
+ */
+export function renderHumanFeedback(text: string, date: Date): string | undefined {
+  const body = text.replace(/\s+$/, "");
+  if (!body.trim()) {
+    return undefined;
+  }
+  const day = date.toISOString().slice(0, 10);
+  return [HUMAN_FEEDBACK_HEADING, "", `${day} — reported in VS Code by the human this stage is waiting on, alongside the requested checks:`, "", body].join("\n");
 }
 
 /** The checks Submit for review will write: outstanding checks with a drafted outcome. */

@@ -23,10 +23,13 @@ import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
 import { parseHandoffBranch, type PlanRunState, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
 import type { DeclaredRepository } from "./stageRepositories";
-import { deriveVerification, parseHumanEvidence, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
+import { deriveVerification, HUMAN_FEEDBACK_HEADING, parseHumanEvidence, parseHumanFeedback, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
+import { checkNameList } from "./humanTask";
+import { SUBMISSION_PRESERVED, type SubmissionRecord } from "./submission";
 import { formatTime } from "./logFormat";
 import { deriveLiveness, type ExecutionRecord, type LivenessState, type RunnerLiveness } from "./liveness";
 import { proposeNextStage, type NextStageProposal } from "./nextStage";
+import { buildPromptView, latestCapture, type CaptureEntry, type PromptView } from "./promptInspector";
 import { briefMentionedStages, buildStageIndex, locateStage, parsePlanHeadings, planTitle, sectionSummary, type HeadingRef, type MatchSource, type PlanHeading } from "./planAssociation";
 import { actionWord, presentStage, stageDisplayName, type StagePresentation } from "./presentation";
 import { hasSessions, planAction, stageActions, type PlanAction, type StageRunAction } from "./runner";
@@ -96,6 +99,18 @@ export interface ActorCard {
   quietFor?: string;
   /** True when the Working/Sparring claim rests on telemetry alone: no runner process has been observed alive. */
   uncertain?: boolean;
+  /**
+   * What this actor was actually told, built from the engine's captured
+   * prompt for its latest turn. Absent for a stage that has not run a turn
+   * since prompt capture existed, which is an ordinary state, not an error.
+   */
+  prompt?: PromptView;
+}
+
+/** One captured turn the caller read off disk: its index line, and the prompt file it names. */
+export interface CapturedPrompt {
+  entry: CaptureEntry;
+  text: string;
 }
 
 /** Git facts for the footer, supplied by the caller; never inferred here. */
@@ -166,10 +181,21 @@ export interface OverviewArtifacts {
   accepting?: boolean;
   /** Outcomes the user has recorded for the plan's manual checks (VS Code workspace state, drafts until submitted). */
   humanChecks?: Record<string, CheckRecord>;
+  /** Freeform findings the user has typed but not sent yet (VS Code workspace state); not a check result. */
+  humanFeedback?: string;
+  /** Evidence handed to the engine and not yet recorded by it, or a submission that failed; see submission.ts. */
+  submission?: SubmissionRecord;
   /** Contents of the stage's notes.md when readable; only its `## Human evidence` section is consulted (what is already recorded). */
   notesText?: string;
   /** Contents of the stage's handoff.md when readable; only its `## Git context` branch line is consulted. */
   handoffText?: string;
+  /**
+   * The engine's captured prompts for this stage — the latest turn per role,
+   * each with the exact text the provider was handed. Supplied by the caller
+   * that can read `prompts/`; empty for a stage last run by an engine
+   * without prompt capture, which is an ordinary state.
+   */
+  capturedPrompts?: CapturedPrompt[];
   /**
    * How the user wants a plan to progress (`agentSparring.planContinuation`):
    * `automatic` hands the whole plan to the engine as one managed run and
@@ -397,6 +423,42 @@ export interface ActionRequired extends VerificationView {
    */
   submit: { label: string; enabled: boolean; detail: string };
   /**
+   * The freeform channel beside the structured checks: what the human found
+   * that is not a result for any requested check.
+   *
+   * It exists because the three controls above force every observation into
+   * one of the reviewer's predefined checks, and verification does not work
+   * that way — a crash on the way to the feature, a table whose wording
+   * contradicts the parser, a reason the checks cannot be attempted yet.
+   * Sending it records nothing about any check: `submit` stays governed by
+   * its own completeness rule, no outstanding check becomes Can't test, and
+   * `progress` does not move.
+   *
+   * The reviewer reads the text against the unchanged candidate and rules
+   * again — SEND_BACK, the same checks, revised checks, or READY only where
+   * its own acceptance rules already allow it. Human feedback is input to
+   * that decision, never an implementation order.
+   */
+  feedback: {
+    /** Typed here and not sent yet; survives rerenders and reloads. */
+    draft?: string;
+    /** Feedback already recorded in notes.md, verbatim, oldest first. */
+    submitted: string[];
+    send: { label: string; enabled: boolean; detail: string };
+  };
+  /**
+   * Evidence is with the engine and its execution has not ended. Neither
+   * button is offered while this is set, and nothing is cleared: launching a
+   * command is not the same as the engine recording what it was given.
+   */
+  submitting?: { label: string; detail: string };
+  /**
+   * The last submission for this run ended without the engine recording it.
+   * `preserved` is the first thing said, because it is the answer to what the
+   * person is about to fear; `error` is the engine's own output, verbatim.
+   */
+  submissionFailure?: { preserved: string; reason: string; what: string; error?: string };
+  /**
    * Resume *implementation* without new evidence: the existing Resume stage
    * / Resume plan operation, when one is offered. Deliberately separate from
    * Submit for review — that asks the reviewer to evaluate the unchanged
@@ -527,8 +589,8 @@ export function buildOverviewModel(
   const model: OverviewModel = {
     kind: "run",
     title: run.kind === "plan" ? runLabel(run) : stageDisplayName(stage),
-    stageAgent: actorCard("stage", stage, live, halted, nowMs, uncertain),
-    sparrer: actorCard("sparrer", stage, live, halted, nowMs, uncertain),
+    stageAgent: actorCard("stage", stage, live, halted, nowMs, uncertain, artifacts.capturedPrompts),
+    sparrer: actorCard("sparrer", stage, live, halted, nowMs, uncertain, artifacts.capturedPrompts),
     actions: {
       handoff: artifacts.handoff,
       sparring: artifacts.sparring,
@@ -752,7 +814,8 @@ function actionRequired(
         ? { action: "runStage", label: model.stageAction.label, detail: `sparring run-loop ${model.stageId ?? ""}: the stage agent implements again first, then the reviewer looks. Use it when there is work to do, not to hand over evidence.` }
         : undefined;
   const ready = view.ready;
-  const pending = view.required.filter((item) => !item.record?.outcome).length;
+  const outstanding = view.required.filter((item) => !item.record?.outcome);
+  const pending = outstanding.length;
   const command =
     run.kind === "plan"
       ? "sparring resume-plan --evidence …: the engine records the evidence and continues the plan at this same stage"
@@ -768,12 +831,70 @@ function actionRequired(
   } else if (view.recorded.length === 0 && view.required.length === 0) {
     submitDetail = "No requested check is listed, so there is no recorded evidence to send.";
   } else if (!ready) {
-    submitDetail = `Record a result for ${pending === 1 ? "the remaining check" : `all ${pending} remaining checks`} first. Submitting asks the reviewer to rule on the evidence, so it goes when the evidence is complete.`;
+    // The reviewer's own ids, when the checks have them: "all 2 remaining
+    // checks" makes a person go and work out which two, and the names that
+    // answer that are already recorded.
+    const names = checkNameList(outstanding);
+    const which = names ? `the remaining ${pending === 1 ? "check" : "checks"} (${names})` : pending === 1 ? "the remaining check" : `all ${pending} remaining checks`;
+    submitDetail = `Record a result for ${which} first. Submitting asks the reviewer to rule on the evidence, so it goes when the evidence is complete.`;
   } else if (blocked(model)) {
     submitDetail = "Nothing can run right now (a runner is alive or its status is unknown).";
   } else {
     submitEnabled = true;
     submitDetail = `Records the drafted results under '## Human evidence' and asks the reviewer to rule on them (${command}). The reviewer decides; nothing is marked ready or accepted here.`;
+  }
+  // The freeform channel. It shares the submit path's guards — the wrong
+  // branch and a live runner stop everything — but not its completeness rule:
+  // a crash found on the way to the first check is exactly what has to reach
+  // the reviewer *before* the checks are done.
+  const draft = artifacts.humanFeedback?.trim() ? artifacts.humanFeedback : undefined;
+  let sendEnabled = false;
+  let sendDetail: string;
+  if (branchGuard) {
+    sendDetail = `Switch to ${branchGuard.expected} first; the engine refuses to review a candidate from another branch.`;
+  } else if (!draft) {
+    sendDetail = "Describe what you found in the field above first. It goes to the reviewer as it is written, against the unchanged candidate.";
+  } else if (blocked(model)) {
+    sendDetail = "Nothing can run right now (a runner is alive or its status is unknown).";
+  } else {
+    sendEnabled = true;
+    sendDetail = `Records this text under '## Human evidence' as '${HUMAN_FEEDBACK_HEADING.replace(/^#+\s*/, "")}' and asks the reviewer to rule again on the unchanged candidate (${command}). It records no check result: ${pending === 0 ? "nothing is claimed about the checks either way" : `the ${pending === 1 ? "outstanding check stays outstanding" : `${pending} outstanding checks stay outstanding`}`}. The reviewer decides what follows — changes, the same checks again, or revised checks.`;
+  }
+  // A submission in flight, or one that failed. While the engine holds the
+  // evidence neither button is offered — pressing Submit twice would ask the
+  // reviewer to rule on the same thing twice — and when it comes back without
+  // having recorded anything, the panel says so above the reviewer's own
+  // checks, with every drafted result still where the user left it.
+  const submission = artifacts.submission?.runId === run.id ? artifacts.submission : undefined;
+  const inFlight = submission && !submission.failure ? submission : undefined;
+  const submitting = inFlight
+    ? {
+        label: "Submitting…",
+        detail: `${inFlight.results > 0 ? `${inFlight.results} result${inFlight.results === 1 ? "" : "s"} are` : "Your feedback is"} with the engine (${inFlight.channel === "checks" ? "to be recorded under '## Human evidence'" : "to be recorded as additional human feedback"}). Nothing is cleared until it finishes; if it fails, everything you entered is still here.`,
+      }
+    : undefined;
+  // `resume-plan --evidence` records the evidence and *then* continues the
+  // plan, which can run for a long time and fail at a later stage for reasons
+  // that have nothing to do with this submission. So a failed execution whose
+  // entry is nevertheless in notes.md — verbatim, as the engine appends it —
+  // is not a lost submission, and is not reported as one. The drafts are kept
+  // either way; those checks now read their outcome from the recorded
+  // evidence, so nothing is claimed twice.
+  const landed = Boolean(submission && artifacts.notesText?.includes(submission.entry.trim()));
+  const failure = landed ? undefined : submission?.failure;
+  const submissionFailure = failure && submission
+    ? {
+        preserved: SUBMISSION_PRESERVED,
+        reason: failure.reason,
+        what: submission.results > 0 ? `${submission.results} check result${submission.results === 1 ? "" : "s"} and any notes are still drafted below.` : "Your feedback is still in the field below.",
+        error: failure.output,
+      }
+    : undefined;
+  if (submitting) {
+    submitEnabled = false;
+    submitDetail = submitting.detail;
+    sendEnabled = false;
+    sendDetail = submitting.detail;
   }
   // The simple, gate-shaped presentation: the reviewer stated the
   // requirement, so it is shown once as their gate title and their note goes
@@ -792,6 +913,9 @@ function actionRequired(
     technical: technicalDetails(view, outcome, plan, sectionLine, { summaryShown: !ready, noteShown: !gateLayer }),
     noChecks,
     submit: { label: submitLabel, enabled: submitEnabled, detail: submitDetail },
+    feedback: { draft, submitted: parseHumanFeedback(artifacts.notesText), send: { label: "Send feedback for review", enabled: sendEnabled, detail: sendDetail } },
+    submitting,
+    submissionFailure,
     resume,
     planSection: Boolean(sectionLine && (run.kind === "plan" ? artifacts.plan : artifacts.associatedPlan?.exists)),
     review: artifacts.sparring,
@@ -845,7 +969,10 @@ function technicalDetails(
   checks.forEach((check, at) => {
     const prefix = many ? `Check ${at + 1} ` : "Check ";
     if (view.source === "gate") {
-      out.push({ label: `${prefix}id`, value: check.key });
+      out.push({
+        label: `${prefix}id`,
+        value: check.gateId ?? `${check.key} (derived from the instruction: the reviewer's own id is not a shape this panel can round-trip)`,
+      });
     }
     out.push({ label: `${prefix}instruction, verbatim`, value: check.text });
     if (check.passCriteria) {
@@ -1018,7 +1145,7 @@ function isHalted(run: RunSnapshot): boolean {
   return run.stage.state?.status === "accepted";
 }
 
-function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveState | undefined, halted: boolean, nowMs: number, uncertain: boolean): ActorCard {
+function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveState | undefined, halted: boolean, nowMs: number, uncertain: boolean, captures: CapturedPrompt[] | undefined): ActorCard {
   const actor = live?.[role];
   const persisted = role === "stage" ? stage.state?.implementationSessionId : stage.state?.sparringSessionId;
   const sessionId = persisted ?? actor?.sessionId ?? undefined;
@@ -1046,7 +1173,30 @@ function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveSt
     sessionKind: role === "stage" ? "session" : "thread",
     quietFor,
     uncertain: activity === "Working" || activity === "Sparring" ? uncertain : undefined,
+    // Built here so "this turn" versus "the last turn" rests on exactly the
+    // liveness that decided the Working/Waiting word above, and the two can
+    // never contradict each other on the same card.
+    prompt: promptView(role, captures, activity === "Working" || activity === "Sparring"),
   };
+}
+
+/** The captured prompt for this role's latest turn, as the card's view of it. */
+function promptView(role: "stage" | "sparrer", captures: CapturedPrompt[] | undefined, busy: boolean): PromptView | undefined {
+  if (!captures || captures.length === 0) {
+    return undefined;
+  }
+  const entry = latestCapture(
+    captures.map((capture) => capture.entry),
+    role,
+  );
+  if (!entry) {
+    return undefined;
+  }
+  const captured = captures.find((capture) => capture.entry.seq === entry.seq && capture.entry.role === entry.role);
+  if (!captured) {
+    return undefined;
+  }
+  return buildPromptView(entry, captured.text, { live: busy });
 }
 
 /**

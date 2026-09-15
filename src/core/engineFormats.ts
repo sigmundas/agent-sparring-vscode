@@ -356,6 +356,13 @@ export interface SparringOutcome {
   /** The body of the engine-rendered `## Deferred` section (the sparrer's deferred / human-gated items), when present and non-empty. */
   deferred?: string;
   /**
+   * The body of the engine-rendered `## Finding / discussion` section
+   * (sparring_exchange.py: render_sparring) — the reviewer's own findings, in
+   * their own words. It is the reviewer's written output, never a provider
+   * prompt or a transcript, and it is carried verbatim wherever it is shown.
+   */
+  findings?: string;
+  /**
    * The structured human gate, when the recorded verdict carries one. This
    * is the only trustworthy list of what a human must do: everything else in
    * sparring.md is prose, and prose was previously mined for checks, which
@@ -458,8 +465,27 @@ export function parseSparringOutcome(markdown: string): SparringOutcome | undefi
     summary,
     needsYouReason,
     deferred: sectionBody(lines, "## Deferred"),
+    findings: sectionBody(lines, SPARRING_FINDINGS_HEADING),
     humanGate: action === "NEEDS_YOU" ? parseHumanGate(markdown) : undefined,
   };
+}
+
+/** The reviewer's findings section of sparring.md (sparring_exchange.py: render_sparring). */
+export const SPARRING_FINDINGS_HEADING = "## Finding / discussion";
+
+/**
+ * The stage agent's own account of the candidate: the `## Claims` body of
+ * handoff.md (handoff.py: render_thin_handoff). It is the last thing the
+ * implementing agent wrote down about what it did, so it is what a reader of
+ * the review needs in order to know what is being reviewed. Undefined when the
+ * file has no such section or the engine wrote its `(not recorded)` placeholder.
+ *
+ * Nothing else of handoff.md is read here. The embedded diff of a
+ * self-contained packet, the changed-file list and the test/build evidence are
+ * all deliberately left alone: they are transcripts and payloads, not a summary.
+ */
+export function parseHandoffClaims(markdown: string): string | undefined {
+  return sectionBody(markdown.split(/\r?\n/), "## Claims");
 }
 
 /** The trimmed prose under a `##` heading of sparring.md, up to the next `#`/`##` heading; undefined when absent, empty or the template's `(none)`. */
@@ -476,7 +502,7 @@ function sectionBody(lines: string[], heading: string): string | undefined {
     body.push(lines[index]);
   }
   const text = body.join("\n").trim();
-  return !text || /^\((?:none|not applicable|none recorded)\)$/i.test(text) ? undefined : text;
+  return !text || /^\((?:none|not applicable|none recorded|not recorded)\)$/i.test(text) ? undefined : text;
 }
 
 // ---------------------------------------------------------------------------

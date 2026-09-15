@@ -76,15 +76,24 @@ describe("run-sparring is the review invocation", () => {
     const commands = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "commands.ts"), "utf8");
     const submit = /async function submitForReviewCommand[\s\S]*?\n}\n/.exec(commands)?.[0] ?? "";
     assert.ok(submit, "submitForReviewCommand exists");
-    assert.match(submit, /buildRunSparringArgs\(\{ stageId: run\.stage\.stageId, repoRoot: run\.location\.repoRoot, expectedBranch, sparringDir: run\.location\.sparringDir \}\)/);
-    assert.ok(!/buildRunLoopArgs|launchStageLoop/.test(submit), "submitting evidence never starts the stage agent");
-    assert.match(submit, /configured: configuredExecutable\(\)/, "the shared agentSparring.executable setting");
-    assert.match(submit, /cwd: run\.location\.repoRoot/);
-    assert.match(submit, /kind: "run-sparring"/, "the execution is tracked as a review, so a failure is reported as one");
-    assert.match(submit, /const expectedBranch = await currentBranch\(run\.location\.repoRoot\)/, "the branch comes from the run's own repository");
     assert.match(submit, /if \(model\.branchGuard\)/, "the wrong branch refuses before anything is written");
-    assert.match(submit, /buildResumePlanArgs\(\{[^}]*evidence: entry/, "a managed plan run keeps the engine's own resume-plan --evidence");
-    assert.ok(!/acceptStage|freeze/.test(submit), "submitting evidence never freezes or accepts");
+    assert.match(submit, /submittableChecks\(panel\)/, "only checks with a drafted outcome are written");
+    assert.match(submit, /askReviewerAgain\(controller, run, entry/, "and the recorded entry goes to the reviewer through the one shared path");
+    // Both submission buttons reach the engine through that one function, so
+    // "the reviewer looks at the unchanged candidate" is the same command, on
+    // the same branch, however the human got there.
+    const ask = /async function askReviewerAgain[\s\S]*?\n}\n/.exec(commands)?.[0] ?? "";
+    assert.ok(ask, "askReviewerAgain exists");
+    assert.match(ask, /buildRunSparringArgs\(\{ stageId: run\.stage\.stageId, repoRoot: run\.location\.repoRoot, expectedBranch, sparringDir: run\.location\.sparringDir \}\)/);
+    assert.ok(!/buildRunLoopArgs|launchStageLoop/.test(ask), "submitting evidence never starts the stage agent");
+    assert.match(ask, /configured: configuredExecutable\(\)/, "the shared agentSparring.executable setting");
+    assert.match(ask, /cwd: run\.location\.repoRoot/);
+    assert.match(ask, /kind: "run-sparring"/, "the execution is tracked as a review, so a failure is reported as one");
+    assert.match(ask, /const expectedBranch = await currentBranch\(run\.location\.repoRoot\)/, "the branch comes from the run's own repository");
+    assert.match(ask, /buildResumePlanArgs\(\{[^}]*evidence: entry/, "a managed plan run keeps the engine's own resume-plan --evidence");
+    for (const source of [submit, ask]) {
+      assert.ok(!/acceptStage|freeze/.test(source), "submitting evidence never freezes or accepts");
+    }
   });
 });
 
