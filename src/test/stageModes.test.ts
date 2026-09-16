@@ -14,6 +14,7 @@ import {
   modeForStage,
   modeLabelKey,
   modesForPlan,
+  stageModeScope,
   withStageMode,
   type StageModes,
 } from "../core/stageModes";
@@ -45,26 +46,29 @@ function rendered(modes?: Record<string, "implementation" | "independent_review"
   return renderManifest(built.manifest);
 }
 
+/** The worktree a declaration is made in; every read and write names one. */
+const WORKTREE = "/code/sporely/sporely-py-reported-statistics";
+
 describe("stage mode declarations", () => {
   it("defaults to implementation and normalises how a stage is addressed", () => {
-    assert.equal(modeForStage(undefined, "plan", "5"), "implementation");
-    const state = withStageMode(undefined, "plan", "Stage 5", "independent_review");
-    assert.equal(modeForStage(state, "plan", "5"), "independent_review");
-    assert.equal(modeForStage(state, "plan", "stage 5"), "independent_review");
+    assert.equal(modeForStage(undefined, "plan", WORKTREE, "5"), "implementation");
+    const state = withStageMode(undefined, "plan", WORKTREE, "Stage 5", "independent_review");
+    assert.equal(modeForStage(state, "plan", WORKTREE, "5"), "independent_review");
+    assert.equal(modeForStage(state, "plan", WORKTREE, "stage 5"), "independent_review");
     assert.equal(modeLabelKey(" Stage 3c "), "3C");
   });
 
   it("declaring the default removes the entry, so there is one way to say it", () => {
-    const declared = withStageMode(undefined, "plan", "5", "independent_review");
-    const back = withStageMode(declared, "plan", "5", "implementation");
+    const declared = withStageMode(undefined, "plan", WORKTREE, "5", "independent_review");
+    const back = withStageMode(declared, "plan", WORKTREE, "5", "implementation");
     assert.deepEqual(back, {}, "no declaration and declared-as-default are the same state");
-    assert.equal(modeForStage(back, "plan", "5"), "implementation");
+    assert.equal(modeForStage(back, "plan", WORKTREE, "5"), "implementation");
   });
 
   it("drops shapes it does not recognise rather than throwing on them", () => {
-    const corrupt = { plan: { "5": "review", "4": null, "3": "independent_review" } } as unknown as StageModes;
-    assert.deepEqual(modesForPlan(corrupt, "plan"), { "3": "independent_review" });
-    assert.deepEqual(modesForPlan(undefined, "plan"), {});
+    const corrupt = { [stageModeScope("plan", WORKTREE)]: { "5": "review", "4": null, "3": "independent_review" } } as unknown as StageModes;
+    assert.deepEqual(modesForPlan(corrupt, "plan", WORKTREE), { "3": "independent_review" });
+    assert.deepEqual(modesForPlan(undefined, "plan", WORKTREE), {});
   });
 });
 

@@ -108,21 +108,39 @@ describe("a managed run that advances past the stage it adopted", () => {
     );
   });
 
-  it("is what the Overview follows, even though a finished stage was the explicit choice", async () => {
+  it("is what the Overview follows when the stage was chosen while it was still running", async () => {
+    // The reported sequence: 3D was selected *while it was working*, so the
+    // request was "watch this work". The plan run then accepted it and moved
+    // to Stage 4 — following that plan run is the same request answered.
     const { plan, stage, runs, ownership } = await afterAdvancement();
-    const chosenLongAgo = selectRun(runs, { id: stage.id, atMs: plan.stateMtimeMs - 60_000 }, undefined, undefined, ownership);
-    assert.equal(chosenLongAgo.selected?.id, plan.id, "the plan run advanced after the choice, so the cockpit follows it");
-    assert.equal(chosenLongAgo.selected?.kind, "plan");
-    assert.equal((chosenLongAgo.selected as PlanRunSnapshot).currentStage.stageId, STAGE_4, "and it is at Stage 4");
+    const followed = selectRun(runs, { id: stage.id, atMs: plan.stateMtimeMs - 60_000, intent: "follow" }, undefined, undefined, ownership);
+    assert.equal(followed.selected?.id, plan.id, "the plan run advanced after the choice, so the cockpit follows it");
+    assert.equal(followed.selected?.kind, "plan");
+    assert.equal((followed.selected as PlanRunSnapshot).currentStage.stageId, STAGE_4, "and it is at Stage 4");
+    assert.equal(followed.released?.reason, "superseded", "and the pin is let go once, not re-decided every pass");
 
     assert.equal(selectRun(runs).selected?.id, plan.id, "with no choice at all, the one open plan run wins as before");
-    assert.equal(selectRun(runs, stage.id, undefined, undefined, ownership).selected?.id, plan.id, "a choice recorded before this was tracked counts as long ago");
   });
 
   it("does not steal a deliberate visit to that history", async () => {
     const { plan, stage, runs, ownership } = await afterAdvancement();
-    const openedNow = selectRun(runs, { id: stage.id, atMs: plan.stateMtimeMs + 1 }, undefined, undefined, ownership);
-    assert.equal(openedNow.selected?.id, stage.id, "the plan has not advanced since it was opened, so it stays on screen");
+    // Chosen after the plan had already moved on: this is someone opening
+    // history, and only they can close it.
+    const openedNow = selectRun(runs, { id: stage.id, atMs: plan.stateMtimeMs + 1, intent: "inspect" }, undefined, undefined, ownership);
+    assert.equal(openedNow.selected?.id, stage.id, "it stays on screen");
+    assert.equal(openedNow.released, undefined);
+  });
+
+  it("keeps a pin whose intent was never recorded, rather than guessing that it was following", async () => {
+    // A pin stored by a build from before intent was tracked. Reading it as
+    // "following" is what released explicit inspections on nothing more than
+    // the owning plan rewriting its position, so the unrecorded case is read
+    // as an inspection instead: the worst that does is keep a pin its owner
+    // can release with one click.
+    const { stage, runs, ownership } = await afterAdvancement();
+    for (const pin of [stage.id, { id: stage.id }, { id: stage.id, atMs: 0 }]) {
+      assert.equal(selectRun(runs, pin, undefined, undefined, ownership).selected?.id, stage.id);
+    }
   });
 
   it("keeps an explicitly chosen run that is still going, and one with no plan beside it", async () => {

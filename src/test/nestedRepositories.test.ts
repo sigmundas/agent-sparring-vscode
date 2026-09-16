@@ -33,7 +33,7 @@ import { describe, it } from "node:test";
 import { locateAll, type SparringLocation } from "../core/discovery";
 import { chooseLaunchRepository, launchRepositories, pathDepth, repositoryForFile } from "../core/launchRepositories";
 import { repositoryOfPath, type GitSource } from "../core/activeRepository";
-import { Workspace } from "./fixtures";
+import { Workspace, everywhereIsAGitRepo, gitWorkTreesIn } from "./fixtures";
 
 /** The worktrees that must stay separate repositories, named as they really are. */
 const WORKTREES = ["sporely-py-reported-statistics", "sporely-py-inaturalist-republish-media", "sporely-py-taxonomy-v2-identity-reconciliation", "sporely-py-ui-cleanup"];
@@ -74,32 +74,40 @@ describe("a file in a nested repository belongs to that repository", () => {
     assert.ok(locations.some((location) => location.repoRoot === container.root), "the container is a discovered project");
     assert.ok(activeFile.startsWith(container.root + path.sep), "and the file is inside it");
 
-    const candidates = launchRepositories(locations, gitRoots, folders);
+    const candidates = await launchRepositories(locations, gitRoots, folders, gitWorkTreesIn(...gitRoots));
     assert.equal(repositoryForFile(candidates, activeFile)?.location.repoRoot, nested.root, "the deepest root containing the file wins");
     assert.equal(chooseLaunchRepository(candidates, undefined, activeFile)?.location.repoRoot, nested.root, "so that is what a launch targets");
   });
 
-  it("resolves a file in the container itself to the container", async () => {
+  it("does not launch in the container for a file in the container, because it is not a repository", async () => {
+    // The container is the deepest candidate containing its own README, and
+    // it was therefore chosen — but it is not a git repository, and the
+    // engine refuses to run a plan outside one. Containment made it the right
+    // answer to the wrong question; the right answer is to ask.
     const { locations, gitRoots, folders, container } = await sporelyWorkspace();
-    const candidates = launchRepositories(locations, gitRoots, folders);
-    assert.equal(chooseLaunchRepository(candidates, undefined, path.join(container.root, "README.md"))?.location.repoRoot, container.root, "nothing deeper contains it");
+    const candidates = await launchRepositories(locations, gitRoots, folders, gitWorkTreesIn(...gitRoots));
+    const containerCandidate = candidates.find((candidate) => candidate.location.repoRoot === container.root);
+    assert.ok(containerCandidate, "it is still a discovered project, and still inspectable");
+    assert.equal(containerCandidate.launchable, false, "but it is not somewhere a plan can be started");
+    assert.match(containerCandidate.blocked ?? "", /not inside a git repository/);
+    assert.equal(chooseLaunchRepository(candidates, undefined, path.join(container.root, "README.md")), undefined, "so nothing is chosen silently");
   });
 
   it("resolves a file in a worktree to that worktree, never to a sibling or the container", async () => {
     const { locations, gitRoots, folders, worktrees } = await sporelyWorkspace();
-    const candidates = launchRepositories(locations, gitRoots, folders);
+    const candidates = await launchRepositories(locations, gitRoots, folders, gitWorkTreesIn(...gitRoots));
     for (const worktree of worktrees) {
       const resolved = chooseLaunchRepository(candidates, undefined, path.join(worktree.root, "src", "main.py"));
       assert.equal(resolved?.location.repoRoot, worktree.root, `a file in ${path.basename(worktree.root)} is that worktree's`);
     }
   });
 
-  it("is not fooled by a long name at a shallower depth", () => {
+  it("is not fooled by a long name at a shallower depth", async () => {
     // Sorting roots by string length ranks a long sibling above a deeper
     // child; depth is counted in segments instead.
     const shallowButLong: SparringLocation = location("/code/aaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     const deepButShort: SparringLocation = location("/code/aaaaaaaaaaaaaaaaaaaaaaaaaaaa/a/b");
-    const candidates = launchRepositories([shallowButLong, deepButShort], []);
+    const candidates = await launchRepositories([shallowButLong, deepButShort], [], [], everywhereIsAGitRepo);
     assert.equal(repositoryForFile(candidates, "/code/aaaaaaaaaaaaaaaaaaaaaaaaaaaa/a/b/file.py")?.location.repoRoot, deepButShort.repoRoot);
     assert.ok(pathDepth("/code/a/b") > pathDepth("/code/aaaaaaaaaa"), "depth is segments, not characters");
   });
@@ -113,7 +121,7 @@ describe("Run plan… offers repositories that have no Agent Sparring state yet"
     assert.ok(!locations.some((location) => location.repoRoot === nested.root), "it has no .sparring, so it is not a discovered project");
     await assert.rejects(fs.stat(path.join(nested.root, ".sparring")), "and the directory really is absent");
 
-    const candidates = launchRepositories(locations, gitRoots, folders);
+    const candidates = await launchRepositories(locations, gitRoots, folders, gitWorkTreesIn(...gitRoots));
     const offered = candidates.find((candidate) => candidate.location.repoRoot === nested.root);
     assert.ok(offered, "Run plan… offers it anyway");
     assert.equal(offered.established, false, "marked as having no state, so the picker can say so rather than imply a history");
@@ -126,7 +134,7 @@ describe("Run plan… offers repositories that have no Agent Sparring state yet"
 
   it("offers every repository the window can start a plan in, and nothing it cannot", async () => {
     const { locations, gitRoots, folders, container, nested, worktrees } = await sporelyWorkspace();
-    const candidates = launchRepositories(locations, gitRoots, folders);
+    const candidates = await launchRepositories(locations, gitRoots, folders, gitWorkTreesIn(...gitRoots));
     assert.deepEqual(
       candidates.map((candidate) => candidate.location.folderName).sort(),
       [path.basename(container.root), path.basename(nested.root), ...worktrees.map((worktree) => path.basename(worktree.root))].sort(),
@@ -135,7 +143,7 @@ describe("Run plan… offers repositories that have no Agent Sparring state yet"
 
   it("keeps each separate worktree a separate repository, listed once", async () => {
     const { locations, gitRoots, folders, worktrees } = await sporelyWorkspace();
-    const candidates = launchRepositories(locations, gitRoots, folders);
+    const candidates = await launchRepositories(locations, gitRoots, folders, gitWorkTreesIn(...gitRoots));
     for (const worktree of worktrees) {
       const matching = candidates.filter((candidate) => candidate.location.repoRoot === worktree.root);
       assert.equal(matching.length, 1, `${path.basename(worktree.root)} appears exactly once`);
@@ -149,7 +157,7 @@ describe("Run plan… offers repositories that have no Agent Sparring state yet"
     // `undefined` is "the extension is not installed, not active yet, or has
     // no API version 1" — different from an active extension with nothing
     // open. Either way nothing here scans for `.git` on its own.
-    const candidates = launchRepositories(locations, undefined, folders);
+    const candidates = await launchRepositories(locations, undefined, folders, everywhereIsAGitRepo);
     assert.deepEqual(
       candidates.map((candidate) => candidate.location.repoRoot).sort(),
       locations.map((location) => location.repoRoot).sort(),
@@ -157,8 +165,8 @@ describe("Run plan… offers repositories that have no Agent Sparring state yet"
     assert.ok(candidates.every((candidate) => candidate.established));
   });
 
-  it("offers a repository even when the window has no Agent Sparring state at all", () => {
-    const candidates = launchRepositories([], ["/code/fresh-repo"], [{ path: "/code", name: "code" }]);
+  it("offers a repository even when the window has no Agent Sparring state at all", async () => {
+    const candidates = await launchRepositories([], ["/code/fresh-repo"], [{ path: "/code", name: "code" }], gitWorkTreesIn("/code/fresh-repo"));
     assert.equal(candidates.length, 1);
     assert.equal(candidates[0].established, false);
     assert.equal(chooseLaunchRepository(candidates, undefined, "/code/fresh-repo/main.py")?.location.repoRoot, "/code/fresh-repo");
@@ -203,7 +211,7 @@ describe("the active editor's repository is the deepest one containing it", () =
 describe("repository identity never comes from a branch", () => {
   it("resolves by root even when two checkouts are on the same branch", async () => {
     const { locations, gitRoots, folders, worktrees } = await sporelyWorkspace();
-    const candidates = launchRepositories(locations, gitRoots, folders);
+    const candidates = await launchRepositories(locations, gitRoots, folders, gitWorkTreesIn(...gitRoots));
     const [first, second] = worktrees;
     assert.notEqual(
       chooseLaunchRepository(candidates, undefined, path.join(first.root, "a.py"))?.location.repoRoot,

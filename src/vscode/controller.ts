@@ -16,6 +16,7 @@ import {
   canonicalPath,
   currentStageOf,
   discoverRuns,
+  intentForChoosing,
   isNestedLocation,
   locateAll,
   runLabel,
@@ -31,7 +32,7 @@ import {
   type RunSnapshot,
   type SparringLocation,
 } from "../core/discovery";
-import { manifestPathFor, type ManifestBinding, type ManifestStageIdentity } from "../core/manifest";
+import { type ManifestStageIdentity } from "../core/manifest";
 import { launchRepositories, type LaunchRepository } from "../core/launchRepositories";
 import { resolveMemberships, stageOwnership, type PlanMembership } from "../core/planMembership";
 import { deriveLiveness, type ExecutionRecord, type RunnerLiveness } from "../core/liveness";
@@ -73,6 +74,7 @@ import {
 } from "../core/stageRepositories";
 import {
   STAGE_MODES_KEY,
+  migrateStageModes,
   modeForStage,
   modesForPlan,
   withStageMode,
@@ -83,8 +85,9 @@ import { deriveStatus } from "../core/status";
 import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
 import { TerminalPool } from "./terminalPool";
 import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult } from "./executionTracker";
-import { ManifestReader } from "./manifestReader";
+import { ManifestReader, type BoundManifest } from "./manifestReader";
 import { ActiveRepositoryTracker, RealPaths } from "./activeRepository";
+import { describeReadiness } from "../core/gitReadiness";
 
 const SELECTED_RUN_KEY = "agentSparring.selectedRunId";
 /** When that choice was made, so a managed run that advances afterwards can overtake it. */
@@ -106,6 +109,13 @@ const STICKY_RUN_KEY = "agentSparring.lastShownRunId";
  */
 const PIN_POLICY_KEY = "agentSparring.pinPolicy";
 const PIN_POLICY = "repository-scoped-pin-v1";
+/**
+ * What the stored pin meant when it was made: `inspect` or `follow` (see
+ * `RunPreference.intent`). Absent — a pin stored before this was recorded — is
+ * read as `inspect`, the reading that cannot move the screen out from under
+ * the person who made it.
+ */
+const PIN_INTENT_KEY = "agentSparring.pinIntent";
 const OUTPUT_CHANNEL_NAME = "Agent Sparring";
 /** How often the process table may be read for one run whose liveness nothing in this window watched. */
 const PROBE_COOLDOWN_MS = 15_000;
@@ -141,6 +151,8 @@ export class SparringController implements vscode.Disposable {
   private readonly manifests = new ManifestReader();
   /** The last rejection reported for a manifest file, so a steady refusal is logged once rather than per render. */
   private readonly manifestRefusals = new Map<string, string>();
+  /** Unscoped stage-mode declarations already reported, so a steady one is said once rather than per discovery. */
+  private readonly reportedAmbiguousModes = new Set<string>();
 
   private readonly changeEmitter = new vscode.EventEmitter<void>();
   /** Fires after every re-render: selection, authoritative state or live activity changed. */
@@ -254,6 +266,7 @@ export class SparringController implements vscode.Disposable {
       );
       await this.context.workspaceState.update(SELECTED_RUN_KEY, undefined);
       await this.context.workspaceState.update(SELECTED_AT_KEY, undefined);
+      await this.context.workspaceState.update(PIN_INTENT_KEY, undefined);
       if (!this.context.workspaceState.get<string>(STICKY_RUN_KEY)) {
         await this.context.workspaceState.update(STICKY_RUN_KEY, stored);
       }
@@ -298,6 +311,7 @@ export class SparringController implements vscode.Disposable {
       stickyId: this.attachedRunId ?? this.context.workspaceState.get<string>(STICKY_RUN_KEY),
       scope: await this.repositoryScope(),
       gitAttached: this.activeRepository.attached,
+      gitReadiness: this.activeRepository.gitReadiness,
       manifestStages: (run) => this.manifestStagesFor(run),
     });
     this.output.appendLine("");
@@ -388,12 +402,16 @@ export class SparringController implements vscode.Disposable {
     this.refreshTimer = undefined;
     await this.relocate();
     this.discovery = await discoverRuns(this.locations);
+    await this.migrateStageModeScopes();
     const sticky = this.attachedRunId ?? this.context.workspaceState.get<string>(STICKY_RUN_KEY);
     // Ownership first: whether a plan run has taken over from a pinned stage
     // is a question about recorded membership, and answering it any other way
     // is the guessing that made unrelated stages look like a plan's history.
     const ownership = stageOwnership(await this.planMemberships());
-    this.selection = selectRun(this.discovery.runs, this.preference(), sticky, await this.repositoryScope(), ownership);
+    this.selection = selectRun(this.discovery.runs, this.preference(), sticky, await this.repositoryScope(), ownership, this.locations);
+    if (this.selection.released) {
+      await this.retireReleasedPin(this.selection.released);
+    }
     if (this.selection.selected && this.selection.selected.id !== this.context.workspaceState.get<string>(STICKY_RUN_KEY)) {
       await this.context.workspaceState.update(STICKY_RUN_KEY, this.selection.selected.id);
     }
@@ -583,21 +601,32 @@ export class SparringController implements vscode.Disposable {
     if (run.kind !== "plan" || run.state.source !== "manifest") {
       return undefined;
     }
-    const bound = await this.manifests.read(this.manifestDirectoryPath, run);
-    this.reportManifestBinding(manifestPathFor(this.manifestDirectoryPath, run), run, bound);
-    return bound.ok ? bound.identity.stages : undefined;
+    // The other discovered plan runs, so a manifest written before sidecars
+    // existed can be refused when more than one of them could claim it.
+    const peers = this.discovery.runs.filter((candidate): candidate is PlanRunSnapshot => candidate.kind === "plan" && candidate.state.source === "manifest");
+    const bound = await this.manifests.readBound(this.manifestDirectoryPath, run, peers);
+    this.reportManifestBinding(run, bound);
+    return bound.binding.ok ? bound.binding.identity.stages : undefined;
   }
 
-  /** Log a refusal the first time it is reached, and again whenever it changes; never once per render. */
-  private reportManifestBinding(file: string, run: PlanRunSnapshot, bound: ManifestBinding): void {
-    const key = `${run.id} ${file}`;
-    const signature = bound.ok ? "bound" : `${bound.reason}: ${bound.detail}`;
+  /** Say what was decided the first time, and again whenever it changes; never once per render. */
+  private reportManifestBinding(run: PlanRunSnapshot, bound: BoundManifest): void {
+    const key = `${run.id} ${bound.file}`;
+    const signature = bound.binding.ok ? (bound.derived ? "derived" : "bound") : `${bound.binding.reason}: ${bound.binding.detail}`;
     if (this.manifestRefusals.get(key) === signature) {
       return;
     }
     this.manifestRefusals.set(key, signature);
-    if (!bound.ok) {
-      this.log(`the execution manifest ${path.basename(file)} is not this run's: ${bound.detail}. Its stages are not used, and no stage is attributed to this plan run from it.`);
+    if (!bound.binding.ok) {
+      this.log(`the execution manifest ${bound.file} is not this run's: ${bound.binding.detail}. Its stages are not used, and no stage is attributed to this plan run from it.`);
+      return;
+    }
+    if (bound.derived) {
+      // Never silent: this run's history is being attributed to a file that
+      // does not itself say which worktree wrote it.
+      this.log(
+        `the execution manifest ${bound.file} was written before manifests recorded which worktree they belong to. It is this run's: its executable content digests to the plan_digest the engine recorded, it contains the recorded current stage, and no other discovered plan run could claim it. Its stages are used, and nothing was written to reach that conclusion.`,
+      );
     }
   }
 
@@ -684,14 +713,21 @@ export class SparringController implements vscode.Disposable {
 
   // ---------------------------------------------------------------- stage modes (declaration, emitted into the manifest)
 
-  /** Stages of one plan declared review-only, keyed by label (`5`). Workspace state; never written into engine state. */
-  stageModes(planKey: string): Record<string, StageMode> {
-    return modesForPlan(this.context.workspaceState.get<StageModes>(STAGE_MODES_KEY), planKey);
+  /**
+   * Stages of one plan **in one worktree** declared review-only, keyed by
+   * label (`5`). Workspace state; never written into engine state.
+   *
+   * `projectDir` is not optional and is not a detail: a plan key is shared by
+   * every worktree running the same plan path, so without it this answers for
+   * the wrong checkout (stageModes.ts).
+   */
+  stageModes(planKey: string, projectDir: string): Record<string, StageMode> {
+    return modesForPlan(this.context.workspaceState.get<StageModes>(STAGE_MODES_KEY), planKey, projectDir);
   }
 
-  /** One stage's declared mode; `implementation` when nothing was declared. */
-  stageModeFor(planKey: string, label: string): StageMode {
-    return modeForStage(this.context.workspaceState.get<StageModes>(STAGE_MODES_KEY), planKey, label);
+  /** One stage's declared mode in one worktree; `implementation` when nothing was declared. */
+  stageModeFor(planKey: string, projectDir: string, label: string): StageMode {
+    return modeForStage(this.context.workspaceState.get<StageModes>(STAGE_MODES_KEY), planKey, projectDir, label);
   }
 
   /**
@@ -702,14 +738,56 @@ export class SparringController implements vscode.Disposable {
    * engine refuses to continue across until its `reset-stage` command
    * re-records that digest. Said here rather than left to be discovered.
    */
-  async declareStageMode(planKey: string, label: string, mode: StageMode): Promise<void> {
-    const next = withStageMode(this.context.workspaceState.get<StageModes>(STAGE_MODES_KEY), planKey, label, mode);
+  async declareStageMode(planKey: string, projectDir: string, label: string, mode: StageMode): Promise<void> {
+    const next = withStageMode(this.context.workspaceState.get<StageModes>(STAGE_MODES_KEY), planKey, projectDir, label, mode);
     await this.context.workspaceState.update(STAGE_MODES_KEY, next);
+    const where = path.basename(path.resolve(projectDir));
     this.log(
       mode === "independent_review"
-        ? `Stage ${label}: declared review-only; the execution manifest will carry mode=independent_review, so no implementation agent runs for it and a fresh reviewer inspects the accepted candidate set`
-        : `Stage ${label}: back to the implementation lifecycle; the manifest carries no mode for it, which is the engine's default`,
+        ? `Stage ${label} in ${where}: declared review-only; the execution manifest built for this worktree will carry mode=independent_review, so no implementation agent runs for it and a fresh reviewer inspects the accepted candidate set. Another worktree running the same plan is unaffected.`
+        : `Stage ${label} in ${where}: back to the implementation lifecycle; the manifest carries no mode for it, which is the engine's default`,
     );
+    this.render();
+  }
+
+  /**
+   * Move stage-mode declarations made before they were scoped to a worktree
+   * onto the worktree they were made in.
+   *
+   * Run after every discovery rather than once at startup, because what makes
+   * a legacy declaration attributable is a *discovered plan run* with that
+   * plan key — and the folder holding it may only be opened later. A pass
+   * that can attribute nothing writes nothing, so this is free when there is
+   * nothing to do.
+   */
+  private async migrateStageModeScopes(): Promise<void> {
+    const state = this.context.workspaceState.get<StageModes>(STAGE_MODES_KEY);
+    if (!state || Object.keys(state).length === 0) {
+      return;
+    }
+    const plans = this.discovery.runs.filter((run): run is PlanRunSnapshot => run.kind === "plan");
+    const { next, migrated, ambiguous } = migrateStageModes(state, plans);
+    for (const entry of ambiguous) {
+      const key = `${entry.planKey}:${entry.labels.join(",")}`;
+      if (this.reportedAmbiguousModes.has(key)) {
+        continue;
+      }
+      this.reportedAmbiguousModes.add(key);
+      this.log(
+        `a stage mode declared before modes were scoped to a worktree (plan ${entry.planKey}, stage(s) ${entry.labels.join(", ")}) ${
+          entry.candidates.length > 1
+            ? `could belong to ${entry.candidates.length} discovered worktrees (${entry.candidates.join(", ")})`
+            : "belongs to no plan run discovered in this window"
+        }, so it is kept but not applied. Declare it again through Stage Mode for a Plan Stage… in the worktree you mean.`,
+      );
+    }
+    if (migrated.length === 0) {
+      return;
+    }
+    await this.context.workspaceState.update(STAGE_MODES_KEY, next);
+    for (const entry of migrated) {
+      this.log(`stage mode declaration for plan ${entry.planKey} (stage(s) ${entry.labels.join(", ")}) is now scoped to ${entry.projectDir}, the only worktree with a recorded run of it.`);
+    }
     this.render();
   }
 
@@ -867,23 +945,76 @@ export class SparringController implements vscode.Disposable {
    */
   async launchRepositories(): Promise<LaunchRepository[]> {
     await this.activeRepository.ready();
+    if (!this.activeRepository.repositoriesKnown) {
+      // Said out loud rather than shown as a short list: the repositories
+      // that exist *only* in the Git extension's answer are precisely the
+      // ones with no Agent Sparring state, which is the first-run case.
+      this.log(`the repository list may be incomplete — ${describeReadiness(this.activeRepository.gitReadiness)}. Repositories with no .sparring directory yet cannot be offered.`);
+    }
     const folders = (vscode.workspace.workspaceFolders ?? []).map((folder) => ({ path: folder.uri.fsPath, name: folder.name }));
     return launchRepositories(this.locations, this.activeRepository.knownRepoRoots, folders);
   }
 
-  /** The run the user chose, with the moment they chose it (see selectRun). */
+  /** The run the user chose, when, and what choosing it meant (see selectRun). */
   private preference(): RunPreference | undefined {
     const id = this.context.workspaceState.get<string>(SELECTED_RUN_KEY);
-    return id ? { id, atMs: this.context.workspaceState.get<number>(SELECTED_AT_KEY) } : undefined;
+    if (!id) {
+      return undefined;
+    }
+    const stored = this.context.workspaceState.get<string>(PIN_INTENT_KEY);
+    return {
+      id,
+      atMs: this.context.workspaceState.get<number>(SELECTED_AT_KEY),
+      intent: stored === "follow" || stored === "inspect" ? stored : undefined,
+    };
   }
 
+  /**
+   * Pin a run, recording what pinning it meant.
+   *
+   * The intent is taken from the run as it is *now*, because that is the only
+   * moment it is knowable: a run that was open when it was chosen is being
+   * followed, and one that was already finished is being inspected. By the
+   * next refresh the first has often become the second, and nothing on disk
+   * remembers which it was.
+   */
   async chooseRun(run: RunSnapshot | undefined): Promise<void> {
+    const intent = run ? intentForChoosing(run) : undefined;
     await this.context.workspaceState.update(SELECTED_RUN_KEY, run?.id);
     await this.context.workspaceState.update(SELECTED_AT_KEY, run ? Date.now() : undefined);
+    await this.context.workspaceState.update(PIN_INTENT_KEY, intent);
     if (run) {
-      this.log(`pinned to ${run.location.folderName} · ${runLabel(run)}; it stays on screen even in another repository. ${FOLLOW_ACTIVE_LABEL} to go back to automatic selection.`);
+      this.log(
+        intent === "inspect"
+          ? `pinned to ${run.location.folderName} · ${runLabel(run)} for inspection; it stays on screen until you choose another run or ${FOLLOW_ACTIVE_LABEL}, whatever the plan it belongs to does next.`
+          : `pinned to ${run.location.folderName} · ${runLabel(run)} while it runs; if the managed plan run that owns it moves on, the cockpit follows that plan. ${FOLLOW_ACTIVE_LABEL} to go back to automatic selection.`,
+      );
     }
     await this.refresh();
+  }
+
+  /**
+   * Forget a pin the selection has just let go of, so each release happens
+   * once and in one direction.
+   *
+   * Leaving the stored pin in place made a release a condition rather than an
+   * event: a `follow` pin handed over to its owning plan run came back the
+   * instant that plan completed, because handing over needs an *open* owner.
+   * Completing a plan then moved the screen to a stage from before the plan
+   * started — a change nobody asked for, arriving at the least expected
+   * moment. The remembered run is set to whatever is now on screen, so the
+   * cockpit does not jump anywhere else either.
+   */
+  private async retireReleasedPin(released: NonNullable<RunSelection["released"]>): Promise<void> {
+    await this.context.workspaceState.update(SELECTED_RUN_KEY, undefined);
+    await this.context.workspaceState.update(SELECTED_AT_KEY, undefined);
+    await this.context.workspaceState.update(PIN_INTENT_KEY, undefined);
+    const stage = released.id.split("|").pop();
+    this.log(
+      released.reason === "superseded"
+        ? `the pinned stage ${stage} was being followed while it ran, and the plan run that executed it has moved on to ${released.by.currentStage.stageId}; following that plan run. The stage is still in Select repository / run.`
+        : `the pinned run ${stage} is no longer on disk in a project that was scanned; the pin is released and automatic selection applies.`,
+    );
   }
 
   /**

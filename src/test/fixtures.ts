@@ -7,7 +7,8 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { PlanRunSnapshot, RunSnapshot, SparringLocation, StageOwnership } from "../core/discovery";
+import { isInsidePath, samePath, type PlanRunSnapshot, type RunSnapshot, type SparringLocation, type StageOwnership } from "../core/discovery";
+import type { GitWorkTreeProbe } from "../core/launchRepositories";
 import type { ActivityEvent } from "../core/engineFormats";
 import { BINDING_VERSION, bindManifest, bindingPathFor, manifestExpectationFor, manifestPathFor, parseExecutionManifest, renderBindingRecord, type ManifestStageIdentity } from "../core/manifest";
 import { resolveMemberships, stageOwnership, type PlanMembership } from "../core/planMembership";
@@ -159,6 +160,23 @@ export class Workspace {
     const text = events.map((event) => (typeof event === "string" ? event : JSON.stringify(event) + "\n")).join("");
     await fs.appendFile(this.activityPath(stageId), text);
   }
+}
+
+/**
+ * A launchability probe for tests that are not about launchability: every
+ * directory is inside a git repository.
+ *
+ * Temporary fixture directories are not git repositories, so without this
+ * every candidate would be refused as a launch target and a test about, say,
+ * which nested root owns a file would be testing the wrong thing. A test that
+ * *is* about launchability passes {@link gitWorkTreesIn} or the real
+ * on-disk probe instead.
+ */
+export const everywhereIsAGitRepo: GitWorkTreeProbe = async () => true;
+
+/** A probe that says yes only at or below the given roots — a stand-in for the real `.git` layout. */
+export function gitWorkTreesIn(...roots: string[]): GitWorkTreeProbe {
+  return async (dir) => roots.some((root) => samePath(root, dir) || isInsidePath(dir, root));
 }
 
 let clock = Date.parse("2026-09-12T19:02:13.000Z");

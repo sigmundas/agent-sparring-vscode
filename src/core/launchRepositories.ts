@@ -48,6 +48,7 @@
  * No dependency on the vscode API.
  */
 
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { SPARRING_DIRNAME, isInsidePath, samePath, type RunSnapshot, type SparringLocation } from "./discovery";
 
@@ -72,6 +73,14 @@ export interface LaunchRepository {
    * would be the repository's first plan run.
    */
   established: boolean;
+  /**
+   * Whether the engine can actually run a plan here, which is a statement
+   * about the resolved **execution repository** (`location.repoRoot`) and not
+   * about `.sparring`. See {@link launchable}.
+   */
+  launchable: boolean;
+  /** Why not, in the user's terms; present only when {@link launchable} is false. */
+  blocked?: string;
 }
 
 /**
@@ -91,19 +100,120 @@ export interface LaunchRepository {
  * *does* have `.sparring` appears exactly once — as an established project,
  * keeping the spelling and the folder name discovery gave it.
  */
-export function launchRepositories(
+export async function launchRepositories(
   locations: readonly SparringLocation[],
   gitRoots: readonly string[] | undefined,
   folders: readonly WorkspaceFolderRef[] = [],
-): LaunchRepository[] {
-  const out: LaunchRepository[] = locations.map((location) => ({ location, established: true }));
+  isWorkTree: GitWorkTreeProbe = gitWorkTreeOnDisk,
+): Promise<LaunchRepository[]> {
+  const candidates: { location: SparringLocation; established: boolean }[] = locations.map((location) => ({ location, established: true }));
   for (const root of gitRoots ?? []) {
-    const covered = out.some((candidate) => samePath(candidate.location.repoRoot, root) || samePath(candidate.location.projectDir, root));
+    const covered = candidates.some((candidate) => samePath(candidate.location.repoRoot, root) || samePath(candidate.location.projectDir, root));
     if (!covered) {
-      out.push({ location: locationForRepository(root, folders), established: false });
+      candidates.push({ location: locationForRepository(root, folders), established: false });
     }
   }
-  return out;
+  return Promise.all(
+    candidates.map(async (candidate) => {
+      const verdict = await launchable(candidate.location, gitRoots, isWorkTree);
+      return { ...candidate, ...verdict };
+    }),
+  );
+}
+
+/**
+ * Whether the engine can run a plan whose execution root is `dir`: is it
+ * inside a git work tree?
+ *
+ * Supplied as a function so the check can be driven in a test, and defaulted
+ * to {@link gitWorkTreeOnDisk}.
+ */
+export type GitWorkTreeProbe = (dir: string) => Promise<boolean>;
+
+/**
+ * Whether a candidate is a **launch target**, and why not when it is not.
+ *
+ * The question is about the resolved execution repository — `repoRoot`, which
+ * `resolveRepoRoot` already takes from `[repo] root` in `project.toml` when
+ * one is set — and deliberately not about `.sparring`. The two come apart in
+ * both directions, and both directions were wrong before:
+ *
+ *  - a directory with a `.sparring` in it need not be a repository at all. The
+ *    real `/Users/…/Code/sporely` holds `.sparring/handoffs` and
+ *    `.sparring/prompts` from an earlier way of working, and is not a git
+ *    repository — nor is anything above it. The engine cannot run a plan
+ *    there: `ensure_branch_for_unattended_run` calls `current_branch`, which
+ *    runs `git -C <repo_root> symbolic-ref --quiet --short HEAD` and fails,
+ *    so the stage-agent run refuses. Offering it as a target was offering
+ *    something that could only fail, and — because it is the *container* of a
+ *    dozen real checkouts — it was the candidate that won on containment.
+ *  - a git repository with no `.sparring` is a perfectly good target, and the
+ *    most important one: the first plan run in a repository is exactly when
+ *    there is nothing there yet, and the engine creates what it needs under
+ *    `--sparring-dir` on its first write.
+ *  - a project whose `project.toml` points `[repo] root` at a separate, valid
+ *    git repository is launchable on the strength of *that* root, whatever the
+ *    directory holding `.sparring` happens to be.
+ *
+ * Two sources answer it, and either suffices: a root the Git extension has
+ * open at or above `repoRoot`, and `.git` present at or above it on disk. The
+ * second is what covers a repository the extension has not opened (or has not
+ * finished finding — see core/gitReadiness.ts), and it is the same thing git
+ * itself looks for rather than a guess: `git -C` walks up for `.git`, and a
+ * linked worktree's `.git` is a file rather than a directory, so existence
+ * and not directory-ness is the test.
+ */
+async function launchable(
+  location: SparringLocation,
+  gitRoots: readonly string[] | undefined,
+  isWorkTree: GitWorkTreeProbe,
+): Promise<{ launchable: boolean; blocked?: string }> {
+  const known = (gitRoots ?? []).some((root) => samePath(root, location.repoRoot) || isInsidePath(location.repoRoot, root));
+  if (known || (await isWorkTree(location.repoRoot))) {
+    return { launchable: true };
+  }
+  const via = samePath(location.repoRoot, location.projectDir) ? "" : ` (its project configuration points [repo] root there)`;
+  return {
+    launchable: false,
+    // Worded without naming a ref, deliberately: nothing in this module reads
+    // or reasons about one, and saying so here would blur the line that keeps
+    // repository identity a matter of roots alone.
+    blocked: `${location.repoRoot} is not inside a git repository${via}, so the engine cannot run a plan there — it refuses every unattended turn outside a git work tree.`,
+  };
+}
+
+/**
+ * `.git` at `dir` or any directory above it — what `git -C dir` itself looks
+ * for. Existence, not directory-ness: a linked worktree's `.git` is a file
+ * pointing at the real git directory.
+ */
+export async function gitWorkTreeOnDisk(dir: string): Promise<boolean> {
+  let at = path.resolve(dir);
+  for (;;) {
+    try {
+      await fs.stat(path.join(at, ".git"));
+      return true;
+    } catch {
+      // Not here; keep walking up.
+    }
+    const parent = path.dirname(at);
+    if (parent === at) {
+      return false;
+    }
+    at = parent;
+  }
+}
+
+/**
+ * The candidates "Run plan…" may actually offer.
+ *
+ * The rest are kept — they are still discovered, still inspectable, and still
+ * in the run picker — because a `.sparring` directory in a non-repository is
+ * real history and hiding it would be its own lie. What must not happen is
+ * offering it as somewhere to *start* work, since the engine would refuse.
+ */
+export function launchTargets(candidates: readonly LaunchRepository[]): LaunchRepository[] {
+  return candidates.filter((candidate) => candidate.launchable);
 }
 
 /**
@@ -168,7 +278,14 @@ export function repositoryForFile(candidates: readonly LaunchRepository[], file:
  * nothing when the file is inside that one and is what makes the nested case
  * come out right as soon as a second candidate exists.
  */
-export function chooseLaunchRepository(candidates: readonly LaunchRepository[], selected: RunSnapshot | undefined, activeFile?: string): LaunchRepository | undefined {
+export function chooseLaunchRepository(all: readonly LaunchRepository[], selected: RunSnapshot | undefined, activeFile?: string): LaunchRepository | undefined {
+  // Only launch targets, always — including for the "there is only one"
+  // shortcut. A non-repository is not a place a plan can start, so it must not
+  // be picked automatically, silently, or as the sole remaining option; and
+  // dropping the non-targets *before* ranking is what makes a nested valid
+  // repository beat the non-git container folder above it holding a stray
+  // `.sparring`, which is the reported failure.
+  const candidates = launchTargets(all);
   if (selected) {
     const owner = candidates.find((candidate) => samePath(candidate.location.projectDir, selected.location.projectDir));
     if (owner) {

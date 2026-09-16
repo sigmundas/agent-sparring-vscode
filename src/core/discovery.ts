@@ -496,6 +496,23 @@ export interface RunSelection {
    * must not make — and both remain reachable through the explicit picker.
    */
   unattributed?: RunSnapshot[];
+  /**
+   * The stored pin stopped applying on this pass, and why. The caller is
+   * expected to **forget it**, which is what makes each release one-way.
+   *
+   * Without that, a release is a state the selection keeps flipping in and out
+   * of. A `follow` pin superseded by its owning plan run came straight back
+   * the moment that plan completed — `supersedingPlanRun` requires an *open*
+   * owner — so finishing a plan resurrected a pin from before it started and
+   * moved the screen for no reason anyone had asked for. A pin that has been
+   * let go is gone; the run is still one click away in the picker.
+   *
+   *  - `superseded` — a `follow` pin whose owning plan run has moved on
+   *    ({@link supersedingPlanRun}). `by` is that run.
+   *  - `gone` — the pinned run is not in this discovery although its project
+   *    still is, so it was deleted rather than merely not scanned yet.
+   */
+  released?: { id: string; reason: "superseded"; by: PlanRunSnapshot } | { id: string; reason: "gone" };
 }
 
 /**
@@ -604,15 +621,51 @@ export function isOpenRun(run: RunSnapshot): boolean {
 }
 
 /**
- * What the user explicitly chose, and when. The timestamp is what lets an
- * old choice be told from a deliberate one: a managed plan run that has
- * advanced *since* the choice has overtaken it (see `supersedingPlanRun`),
- * while opening a finished stage as history right now is respected.
+ * What an explicit selection *means*, which decides what may release it.
+ *
+ * The two are genuinely different requests and were conflated:
+ *
+ *  - `inspect` — the run was already finished when it was chosen. The person
+ *    asked to look at history, and nothing about the live world is an answer
+ *    to that: only they can end it.
+ *  - `follow` — the run was still open when it was chosen. The person asked to
+ *    watch *that work*, and when the managed plan run that owns it moves on,
+ *    following the plan is the continuation of the same request rather than a
+ *    contradiction of it.
+ */
+export type PinIntent = "inspect" | "follow";
+
+/**
+ * What the user explicitly chose, when, and what choosing it meant.
+ *
+ * `intent` is recorded at the moment of choosing because it cannot be
+ * recovered later: an open run becomes a finished one, and by the time a
+ * selection is being re-evaluated there is nothing left to say whether it was
+ * open when it was picked.
+ *
+ * `atMs` is kept only for a `follow` pin, where it bounds what counts as the
+ * owning plan run having advanced *since* the choice. It is deliberately not
+ * consulted for an `inspect` pin: a state file's modification time says
+ * nothing about whether someone is still reading the stage it belongs to, and
+ * using it as though it did is what silently dropped people out of history.
  */
 export interface RunPreference {
   id: string;
   /** When it was chosen (epoch ms); absent means "long ago", from before this was recorded. */
   atMs?: number;
+  /**
+   * What the selection meant. Absent — a pin stored before this was
+   * recorded — is read as `inspect`, which is the reading that cannot lose
+   * someone's place: the worst it does is keep a pin that its owner could
+   * have released with one click, where the other default silently moves the
+   * screen out from under them.
+   */
+  intent?: PinIntent;
+}
+
+/** The intent a run being chosen *now* implies: history is inspected, live work is followed. */
+export function intentForChoosing(run: RunSnapshot): PinIntent {
+  return isOpenRun(run) ? "follow" : "inspect";
 }
 
 /**
@@ -623,24 +676,48 @@ export interface RunPreference {
 export type StageOwnership = ReadonlyMap<string, string>;
 
 /**
- * The plan run that has taken over from `run` — undefined when none has.
+ * The plan run that has taken over from a **followed** stage — undefined when
+ * none has, and always undefined for a stage someone is inspecting.
  *
- * A managed run adopts stages that existed on their own; when it then
- * advances, the stage it has left behind becomes an accepted standalone run
- * again (the plan document's own stage list does not always name it, and only
- * the plan's *current* stage is claimed). Following that stage would show a
- * finished screen offering actions the live plan has already taken.
+ * The case this exists for: a managed run adopts a stage that existed on its
+ * own, and when it advances, the stage it left behind becomes an accepted
+ * standalone run again (the plan document's own stage list does not always
+ * name it, and only the plan's *current* stage is claimed). Someone who
+ * selected that stage **while it was still running** asked to watch that work,
+ * so following the plan run that continued it is the same request answered;
+ * leaving them on a finished screen offering actions the live plan has already
+ * taken is not.
  *
- * `ownership` is what makes this safe to act on, and it is required: the run
- * that takes over must be the run that **recorded this stage as one of its
- * own**. It used to be any open plan run in the same project whose current
- * stage differed, so an unrelated plan merely being open — or merely having
- * advanced — could claim a stage it had never executed.
+ * ### What this must never do
  *
- * `sinceMs` keeps a deliberate visit to that history: only a plan run whose
- * state was written after that moment counts as having advanced past it.
+ * Release an explicit visit to history. That is why `intent` is a parameter
+ * and not an inference: the ordinary way to pin a historical stage is to pin
+ * one the plan has *already* moved past, so `owner.currentStage !== run` is
+ * true from the very first moment and every subsequent write to the owner's
+ * state file pushed `stateMtimeMs` past `sinceMs` and released the pin. A plan
+ * that merely re-recorded its position — the engine writes that file on every
+ * transition — silently closed the stage a person was reading. Modification
+ * time is evidence that a file changed and evidence of nothing else; it was
+ * standing in for "the run advanced past the stage you were following", which
+ * it cannot tell you.
+ *
+ * `ownership` is required, and is recorded membership only: the run that takes
+ * over must be the run that **executed this stage**. It used to be any open
+ * plan run in the same project whose current stage differed, so an unrelated
+ * plan merely being open could claim a stage it had never run.
+ *
+ * `sinceMs` bounds the advance to one that happened after the choice.
  */
-export function supersedingPlanRun(run: RunSnapshot, runs: readonly RunSnapshot[], sinceMs: number, ownership: StageOwnership): PlanRunSnapshot | undefined {
+export function supersedingPlanRun(
+  run: RunSnapshot,
+  runs: readonly RunSnapshot[],
+  sinceMs: number,
+  ownership: StageOwnership,
+  intent: PinIntent = "follow",
+): PlanRunSnapshot | undefined {
+  if (intent === "inspect") {
+    return undefined;
+  }
   if (run.kind !== "stage" || isOpenRun(run)) {
     return undefined;
   }
@@ -674,9 +751,16 @@ export const NO_STAGE_OWNERSHIP: StageOwnership = new Map<string, string>();
  *     scope** — pinning a run is how someone asks to inspect history in
  *     another repository, so following the active repository must not undo it.
  *     The selection says so (`pinned`), and the Overview offers the way back.
- *     The one exception is unchanged: a managed plan run in the same project
- *     that has advanced past it since it was chosen takes over
- *     (`supersedingPlanRun`);
+ *
+ *     Exactly three things end a pin, and all three are reported in
+ *     `released` so the caller can forget it rather than keep re-deciding it:
+ *     the user pinning something else, the user choosing Follow active
+ *     repository (both of which simply replace or clear the stored pin), and
+ *     the run itself ceasing to exist. A `follow` pin — one made while the run
+ *     was still open — additionally hands over to the managed plan run that
+ *     continued it (`supersedingPlanRun`). An `inspect` pin never does: a
+ *     plan re-recording its position is not a reason to close the history
+ *     someone is reading;
  *  2. exactly one open plan run (status running/paused) is selected;
  *  3. several open plan runs: the remembered (`stickyId`) one if it is among
  *     them, otherwise ambiguous and nothing is selected;
@@ -694,6 +778,13 @@ export function selectRun(
   stickyId?: string,
   scope?: RepositoryScope,
   ownership: StageOwnership = NO_STAGE_OWNERSHIP,
+  /**
+   * The projects this discovery actually scanned. Only used to tell a pinned
+   * run that was *deleted* from one that simply has not been located yet; with
+   * none supplied, a missing pin is never reported as released, which is the
+   * conservative answer.
+   */
+  locations: readonly SparringLocation[] = [],
 ): RunSelection {
   const view: RepositoryScopeView | undefined = scope
     ? { repoRoot: path.resolve(scope.repoRoot), name: repositoryDisplayName(scope.repoRoot, scope.knownRoots ?? []) }
@@ -719,11 +810,28 @@ export function selectRun(
   const pick = typeof preferred === "string" ? { id: preferred } : preferred;
   if (pick) {
     const chosen = runs.find((run) => run.id === pick.id);
-    if (chosen && !supersedingPlanRun(chosen, runs, pick.atMs ?? 0, ownership)) {
+    if (!chosen) {
+      // Absent from the discovery. That is only a *release* when the project
+      // it belongs to was scanned and the run was not there; a project that
+      // has not been located yet (a window still starting, a folder briefly
+      // unreadable) must not cost someone their pin, so the pin is simply not
+      // applied this pass and is kept.
+      const gone = locations.some((location) => runIdBelongsTo(pick.id, location));
+      return decorate({ ...selectAutomatically(inScope, stickyId), ...(gone ? { released: { id: pick.id, reason: "gone" as const } } : {}) });
+    }
+    const by = supersedingPlanRun(chosen, runs, pick.atMs ?? 0, ownership, pick.intent ?? "inspect");
+    if (!by) {
       return decorate({ selected: chosen, ambiguous: [], pinned: true });
     }
+    return decorate({ ...selectAutomatically(inScope, stickyId), released: { id: pick.id, reason: "superseded", by } });
   }
   return decorate(selectAutomatically(inScope, stickyId));
+}
+
+/** Whether a run id names a run of this location; run ids are `<projectDir>|<kind>:<key>`. */
+function runIdBelongsTo(runId: string, location: SparringLocation): boolean {
+  const at = runId.lastIndexOf("|");
+  return at > 0 && samePath(runId.slice(0, at), location.projectDir);
 }
 
 function selectAutomatically(runs: RunSnapshot[], stickyId?: string): RunSelection {

@@ -54,7 +54,7 @@ import { buildRunPickGroups, describeRun } from "../core/runPick";
 import { stageDisplayName } from "../core/presentation";
 import { stageActions, stageRunAction } from "../core/runner";
 import { planKey, planLabel, planRunId, type SparringSubcommand } from "../core/sparringCommand";
-import { chooseLaunchRepository } from "../core/launchRepositories";
+import { chooseLaunchRepository, launchTargets } from "../core/launchRepositories";
 import { manifestRepositories, relativeRepositoryPath, type DeclaredRepository } from "../core/stageRepositories";
 import { STAGE_MODE_LABELS, STAGE_MODES, type StageMode } from "../core/stageModes";
 import { withTemporaryFile } from "../core/tempFile";
@@ -164,6 +164,19 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     }),
     vscode.commands.registerCommand("agentSparring._test.manifestDirectory", () => controller.manifestDirectoryPath),
     vscode.commands.registerCommand("agentSparring._test.lastEngineFailure", () => lastEngineFailure),
+    // What `Run plan…` would have to choose from, after the same wait it
+    // performs: the integration suite checks in a real window both that the
+    // wait is for repository *discovery* and not merely for the Git API, and
+    // that a `.sparring` directory outside a repository is not offered.
+    vscode.commands.registerCommand("agentSparring._test.launchCandidates", async () =>
+      (await controller.launchRepositories()).map((candidate) => ({
+        repoRoot: candidate.location.repoRoot,
+        folderName: candidate.location.folderName,
+        established: candidate.established,
+        launchable: candidate.launchable,
+        blocked: candidate.blocked,
+      })),
+    ),
     controller.onEngineFailed((event) => {
       lastEngineFailure = event;
     }),
@@ -1112,11 +1125,25 @@ async function collectStageMatches(controller: SparringController, run: RunSnaps
  * (launchRepositories.ts). A file in `sporely/sporely-py/` belongs to
  * `sporely-py`, never to the container folder above it that happens to hold a
  * `.sparring` directory of its own.
+ *
+ * And a candidate is only offered when the engine could actually run there:
+ * `.sparring` in a directory that is not inside a git repository is history,
+ * not a place to start work (see `launchable` in launchRepositories.ts). Such
+ * a location stays discovered and inspectable; it is named here as excluded,
+ * with the reason, rather than silently dropped — a repository going missing
+ * from this list without explanation is the failure that produced the list in
+ * the first place.
  */
 async function pickLocation(controller: SparringController): Promise<SparringLocation | undefined> {
   const candidates = await controller.launchRepositories();
-  if (candidates.length === 0) {
-    void vscode.window.showErrorMessage("Agent Sparring: no repository to run a plan in — no Git repository is open, and no workspace folder has a `.sparring` directory.");
+  const targets = launchTargets(candidates);
+  if (targets.length === 0) {
+    const excluded = candidates.filter((candidate) => !candidate.launchable);
+    void vscode.window.showErrorMessage(
+      excluded.length > 0
+        ? `Agent Sparring: no repository to run a plan in. ${excluded[0].blocked} Open the repository you mean, or set [repo] root in its .sparring/project.toml.`
+        : "Agent Sparring: no repository to run a plan in — no Git repository is open, and no workspace folder has a `.sparring` directory.",
+    );
     return undefined;
   }
   const active = vscode.window.activeTextEditor?.document;
@@ -1125,8 +1152,11 @@ async function pickLocation(controller: SparringController): Promise<SparringLoc
   if (chosen) {
     return chosen.location;
   }
+  for (const candidate of candidates.filter((entry) => !entry.launchable)) {
+    controller.log(`Run plan…: ${candidate.location.folderName} is not offered. ${candidate.blocked}`);
+  }
   const picked = await vscode.window.showQuickPick(
-    candidates.map((candidate) => ({
+    targets.map((candidate) => ({
       label: candidate.location.folderName,
       description: candidate.location.repoRoot,
       // Said rather than implied: an offered repository with no history must
@@ -1677,7 +1707,7 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
     planName: path.basename(run.planPath),
     known: await knownStageIds(controller, run, markdown),
     repositories: manifestRepositories(controller.stageRepositories(run.planKey), run.location.repoRoot),
-    modes: controller.stageModes(run.planKey),
+    modes: controller.stageModes(run.planKey, run.location.projectDir),
   });
   if (!built.ok) {
     void vscode.window.showWarningMessage(`Agent Sparring: the execution manifest for ${path.basename(run.planPath)} could not be rebuilt: ${built.problems[0]?.reason ?? "the plan changed."}`);
@@ -1759,7 +1789,7 @@ async function performContinueAutomatically(controller: SparringController, over
     planName: path.basename(planPath),
     known: await knownStageIds(controller, run, markdown),
     repositories: manifestRepositories(controller.stageRepositories(planKey(label)), location.repoRoot),
-    modes: controller.stageModes(planKey(label)),
+    modes: controller.stageModes(planKey(label), location.projectDir),
   });
   if (!built.ok) {
     const detail = built.problems.map((problem) => `• ${problem.reason}`).join("\n");
@@ -2241,7 +2271,7 @@ async function stageModeCommand(controller: SparringController): Promise<void> {
   const stage = await vscode.window.showQuickPick(
     entries.map((entry) => ({
       label: entry.display,
-      description: controller.stageModeFor(key, entry.label) === "independent_review" ? "review only" : "",
+      description: controller.stageModeFor(key, run.location.projectDir, entry.label) === "independent_review" ? "review only" : "",
       value: entry.label,
     })),
     { title: "Stage mode", placeHolder: "Which stage is a review of work rather than work?" },
@@ -2250,7 +2280,7 @@ async function stageModeCommand(controller: SparringController): Promise<void> {
     return;
   }
 
-  const current = controller.stageModeFor(key, stage.value);
+  const current = controller.stageModeFor(key, run.location.projectDir, stage.value);
   const mode = await vscode.window.showQuickPick(
     STAGE_MODES.map((candidate) => ({
       label: `${candidate === current ? "$(check) " : "$(blank) "}${STAGE_MODE_LABELS[candidate].label}`,
@@ -2262,7 +2292,7 @@ async function stageModeCommand(controller: SparringController): Promise<void> {
   if (!mode || mode.value === current) {
     return;
   }
-  await controller.declareStageMode(key, stage.value, mode.value);
+  await controller.declareStageMode(key, run.location.projectDir, stage.value, mode.value);
   void vscode.window.showInformationMessage(
     mode.value === "independent_review"
       ? `Agent Sparring: Stage ${stage.value} is now review-only. If its stage has already run under the other mode, the engine will refuse to continue it and tell you to run sparring reset-stage, which archives that attempt and restarts the stage with a fresh reviewer.`

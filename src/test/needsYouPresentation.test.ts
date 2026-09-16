@@ -287,15 +287,23 @@ describe("a stage is called what the plan calls it", () => {
     const reader = /async manifestStagesFor[\s\S]*?\n {2}}\n/.exec(controller)?.[0] ?? "";
     assert.ok(reader, "manifestStagesFor exists");
     assert.match(reader, /run\.state\.source !== "manifest"/, "only a manifest run has one");
-    assert.match(reader, /this\.manifests\.read\(this\.manifestDirectoryPath, run\)/, "through the one reader that binds a manifest to the run asking for it");
+    assert.match(reader, /this\.manifests\.readBound\(this\.manifestDirectoryPath, run, peers\)/, "through the one reader that binds a manifest to the run asking for it");
 
     // The reader caches the bytes and re-derives the binding every call, so a
     // cache can never become an authority of its own.
     const manifestReader = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "manifestReader.ts"), "utf8");
     assert.match(manifestReader, /manifestPathFor\(directory, run\)/, "the file is the one scoped to this run's own project");
-    assert.match(manifestReader, /readCached\(this\.manifests, manifestPathFor\(directory, run\), \(text\) => parseExecutionManifest\(text\)\)/, "the parse is cached, because a manifest is the largest file either surface reads");
-    assert.match(manifestReader, /return bindParsedManifest\(parsed, binding, manifestExpectationFor\(run\)\);/, "and the binding is derived from this run, on this call, before any of it is believed");
+    assert.match(manifestReader, /readCached\(this\.manifests, current, \(text\) => parseExecutionManifest\(text\)\)/, "the parse is cached, because a manifest is the largest file either surface reads");
+    assert.match(
+      manifestReader,
+      /const expect = manifestExpectationFor\(run\);/,
+      "and what the manifest must match is derived from this run, on this call, before any of it is believed",
+    );
     assert.ok(!/CachedFile<Manifest(Binding|Stage)/.test(manifestReader.replace(/ManifestBindingRecord/g, "")), "nothing bound is ever what is cached");
+    // A sidecar that exists is still the only thing that can satisfy the
+    // strict path: the legacy derivation is opened by its *absence*, never by
+    // its disagreeing.
+    assert.match(manifestReader, /if \(binding\) \{\n\s*return \{ binding: bindParsedManifest\(parsed, binding, expect\)/, "a present sidecar goes through the unchanged strict binding");
   });
 });
 

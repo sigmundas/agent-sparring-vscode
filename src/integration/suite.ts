@@ -73,6 +73,7 @@ export async function run(): Promise<void> {
     ["advance", () => advancementAssertions(reportedRepo)],
     ["terminals", () => terminalReuseAssertions(report, reportedRepo)],
     ["closed", () => closedTerminalAssertions(report, reportedRepo)],
+    ["launchable", () => launchTargetAssertions(fixtureRoot, reportedRepo)],
   ];
   const only = (process.env.AGENT_SPARRING_IT_ONLY ?? "").split(",").map((name) => name.trim()).filter(Boolean);
   for (const [name, section] of sections) {
@@ -714,10 +715,32 @@ async function promptInspectorAssertions(): Promise<void> {
 // ---------------------------------------------------------------- the managed run advances, and the cockpit follows
 
 /**
- * Stage 3D on its own, explicitly chosen; then a managed plan run adopts it,
- * accepts it and advances to Stage 4. The Overview must follow the managed
- * run — the reported bug was that it kept showing
- * "Standalone stage · Stage 3D · Accepted" and the actions that go with it.
+ * Stage 3D, finished and explicitly chosen; then a managed plan run that
+ * executed it advances to Stage 4.
+ *
+ * The reported bug was that this screen kept showing
+ * "Standalone stage · Stage 3D · Accepted" **and offered the actions the live
+ * plan had already taken** — Continue plan automatically, Start next stage.
+ * Two separate things were wrong there, and only the second one was about
+ * what is on screen:
+ *
+ *  - the stage was not shown as history of the run that executed it, so
+ *    nothing said where the work actually was;
+ *  - and the wrong actions were offered, in the screen *and* in the command
+ *    path behind it.
+ *
+ * Taking the selection away was the wrong fix for either, and this section
+ * asserts the right one. The stage here is **accepted when it is chosen**, so
+ * choosing it is a deliberate visit to history: the pin holds, whatever the
+ * plan does next (see core/discovery.ts, `supersedingPlanRun`). What changes
+ * is everything else — the screen reads as a historical stage, names the run
+ * that has taken over and where it now is, offers one way back to it, and
+ * refuses to adopt work that run already did.
+ *
+ * A pin made while a stage is still *running* is the other case, and there
+ * handing over to the plan run that continued it is right; that is covered in
+ * managedRunTakesOver.test.ts, where the stage's status can be controlled
+ * precisely.
  *
  * The plan document is written the way the real one is, with `## Stage 3D
  * handoff — …` records above the stage sections: the engine-shaped parser
@@ -801,14 +824,18 @@ async function advancementAssertions(reportedRepo: string): Promise<void> {
   await writeExecutionManifest(THE_STAGES);
   await vscode.commands.executeCommand("agentSparring.refresh");
 
+  // The stage was accepted when it was chosen, so choosing it was a visit to
+  // history — and the plan moving on is news about another run, not a reason
+  // to close the page someone is reading. What the advance *does* change is
+  // that the screen now knows whose history this is.
   const after = await model();
-  assert.equal(after.runKind, "Plan run", `the cockpit follows the managed run, got ${String(after.runKind)} · ${String(after.stageHeading)}`);
-  assert.equal(after.stageId, stage4, "at the stage that run is actually on");
-  assert.match(after.stageHeading ?? "", /^Stage 4 — Editor and UI inspection/, `named as the plan names it, got ${String(after.stageHeading)}`);
-  assert.notEqual(after.stageStatus, "Accepted", "not the finished stage it came from");
+  assert.equal(after.runKind, "Historical stage", `the deliberate visit is kept, got ${String(after.runKind)} · ${String(after.stageHeading)}`);
+  assert.match(after.stageHeading ?? "", /^Stage 3D — Snapshot v2/, `still the stage that was chosen, got ${String(after.stageHeading)}`);
+  assert.match(after.followPlan?.text ?? "", /now at Stage 4/, "and the screen names the run that has taken over, and where it is");
+  assert.equal(after.followPlan?.label, "Back to plan run", "with one way across, rather than the cockpit moving on its own");
 
-  // Opening that finished stage deliberately is still allowed, and then the
-  // screen says where the work is instead of offering to sequence it here.
+  // Choosing it again changes nothing, which is the point: there is no state
+  // here that a second look could disturb.
   assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", stageRunId), stageRunId);
   // With the plan linked to the finished stage, this screen is exactly the
   // one that offered Continue plan automatically and Start next stage.
@@ -859,7 +886,9 @@ async function advancementAssertions(reportedRepo: string): Promise<void> {
   const followed = await model();
   assert.equal(followed.runKind, "Plan run");
   assert.equal(followed.stageId, stage4);
-  console.log("integration: after the managed run advanced, the Overview follows it to Stage 4; the finished stage stays reachable as history, and adopting it a second time is refused in the command path");
+  console.log(
+    "integration: after the managed run advanced, the deliberate visit to the finished stage is kept and reads as history of that run, one button crosses to it at Stage 4, an unbound manifest attributes nothing, and adopting the stage a second time is refused in the command path",
+  );
 }
 
 // ---------------------------------------------------------------- one reusable terminal per project
@@ -1191,4 +1220,68 @@ function shellIntegrationFor(terminal: vscode.Terminal, timeoutMs: number): Prom
       }
     });
   });
+}
+
+// ---------------------------------------------------------------- Run plan… candidates, in a real window
+
+/**
+ * What `Run plan…` may target, decided by the production code path in a real
+ * extension host.
+ *
+ * Two things are checked that only a real window can show.
+ *
+ * **Repository discovery, not merely the Git API.** `launchRepositories()`
+ * awaits `ActiveRepositoryTracker.ready()`, which used to resolve as soon as
+ * `getAPI(1)` returned an object — a moment at which the Git extension is
+ * still scanning and its `repositories` array is legitimately empty. The
+ * candidates that exist *only* in that array are the repositories with no
+ * `.sparring` yet, so the list was briefly missing exactly the first-run case.
+ * After the wait, readiness must be settled: `initialized`, or `unavailable`
+ * if this host has no Git extension at all. Never still going.
+ *
+ * **A `.sparring` outside a repository is not a target.** The fixture has the
+ * reported shape: `sporely/` holds a legacy `.sparring` and is not a git
+ * repository, and neither is `sporely/nested-repo/`, while
+ * `sporely-py-reported-statistics/` is one. The engine refuses every
+ * unattended turn outside a git work tree, so offering the first two would be
+ * offering something that can only fail — and `sporely` is the container, so
+ * it is the one containment picks.
+ */
+async function launchTargetAssertions(fixtureRoot: string, reportedRepo: string): Promise<void> {
+  const candidates = (await vscode.commands.executeCommand("agentSparring._test.launchCandidates")) as {
+    repoRoot: string;
+    folderName: string;
+    established: boolean;
+    launchable: boolean;
+    blocked?: string;
+  }[];
+
+  const report = (await vscode.commands.executeCommand("agentSparring.diagnoseDiscovery")) as DiscoveryDiagnostic;
+  assert.ok(report.gitReadiness, "the diagnostic reports how far repository discovery got, separately from whether the API is attached");
+  assert.ok(
+    report.gitReadiness === "initialized" || report.gitReadiness === "unavailable",
+    `after awaiting readiness the Git extension must have settled, not still be ${report.gitReadiness}`,
+  );
+
+  const at = (dir: string) => candidates.find((candidate) => path.resolve(candidate.repoRoot) === path.resolve(dir));
+
+  const reported = at(reportedRepo);
+  assert.ok(reported, "the repository with .sparring and .git is a candidate");
+  assert.equal(reported.launchable, true, "and it is somewhere a plan can be started");
+  assert.equal(reported.established, true, "with Agent Sparring state already");
+
+  const container = at(path.join(fixtureRoot, "sporely"));
+  assert.ok(container, "the container is still discovered, so its history stays inspectable");
+  assert.equal(container.launchable, false, "but it is not a git repository, so the engine cannot run a plan there");
+  assert.match(container.blocked ?? "", /not inside a git repository/, "and the reason is said, not implied");
+
+  const nested = at(path.join(fixtureRoot, "sporely", "nested-repo"));
+  assert.ok(nested, "the nested project is discovered too");
+  assert.equal(nested.launchable, false, "and is excluded for the same reason: a .sparring directory is not a repository");
+
+  assert.ok(
+    candidates.some((candidate) => candidate.launchable),
+    "at least one real repository is offered, or the exclusions above would be vacuous",
+  );
+  console.log(`integration: Run plan… offers ${candidates.filter((c) => c.launchable).length} of ${candidates.length} candidates; git discovery ${report.gitReadiness}`);
 }

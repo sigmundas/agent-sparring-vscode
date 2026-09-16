@@ -170,6 +170,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "compile-tests": "tsc -p tsconfig.test.json",
     "test": "npm run compile-tests && node --test \"out/test/**/*.test.js\"",
+    "test:parity": "npm run compile-tests && node --test out/test/manifestParity.test.js",
     "compile-integration": "tsc -p tsconfig.integration.json",
     "test:integration": "npm run bundle && npm run compile-integration && node out/integration/runTests.js",
     "lint": "eslint src",

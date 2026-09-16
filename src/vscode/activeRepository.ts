@@ -25,12 +25,26 @@
  * construction, and attachment is retried from every later signal — an editor
  * change, the installed-extension set changing — so a window that starts
  * before the Git extension attaches as soon as anything happens.
+ *
+ * ### Attached is not ready
+ *
+ * Getting the API is the *first* of two moments. The Git extension finds the
+ * workspace's repositories asynchronously and publishes its progress as
+ * `API.state` / `API.onDidChangeState` (API version 1), and while that state
+ * is `"uninitialized"` its `repositories` array is legitimately empty. So
+ * both are tracked here, through core/gitReadiness.ts, and the difference is
+ * load-bearing in two places: `repositories()` answers `undefined` rather
+ * than `[]` until discovery has finished, so nothing reads "not scanned yet"
+ * as "no repository is open"; and {@link ActiveRepositoryTracker.ready} waits
+ * for `initialized` rather than for the API object — bounded, so a Git
+ * extension that never publishes a state cannot hang a command.
  */
 
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { ActiveRepositoryFold, type GitRepositoryView, type GitSource } from "../core/activeRepository";
+import { GitReadinessFold, describeReadiness, type GitApiState, type GitReadiness } from "../core/gitReadiness";
 
 /** The slice of the Git extension's public API version 1 this file uses. */
 interface GitRepository {
@@ -39,6 +53,13 @@ interface GitRepository {
 }
 
 interface GitApi {
+  /**
+   * `"uninitialized"` until the Git extension has finished finding the
+   * workspace's repositories. Part of API version 1 (see core/gitReadiness.ts
+   * for why this, and not the API's existence, is what "ready" means).
+   */
+  state: GitApiState;
+  onDidChangeState: vscode.Event<GitApiState>;
   repositories: GitRepository[];
   onDidOpenRepository: vscode.Event<GitRepository>;
   onDidCloseRepository: vscode.Event<GitRepository>;
@@ -49,8 +70,23 @@ interface GitExtension {
   getAPI(version: 1): GitApi;
 }
 
+/**
+ * How long a caller that needs the repository list waits for the Git
+ * extension to finish finding repositories.
+ *
+ * A bound is necessary and is not a guess at how long a scan takes: readiness
+ * already resolves the instant the state turns `initialized`, and the
+ * `unavailable` state already settles without waiting. This is for the case
+ * neither covers — an extension that activated, handed over an API, and then
+ * never published a state at all. The alternative is a `Run plan…` that never
+ * opens, which is worse than one that opens with a list it says is incomplete.
+ */
+const READY_TIMEOUT_MS = 5_000;
+
 export class ActiveRepositoryTracker implements vscode.Disposable {
   private api: GitApi | undefined;
+  /** How much the Git extension has told us; `attached` is not `ready`. */
+  private readonly readiness = new GitReadinessFold();
   private readonly fold: ActiveRepositoryFold;
   private readonly disposables: vscode.Disposable[] = [];
   /** Per-repository `ui.onDidChange` subscriptions, keyed by resolved root. */
@@ -67,7 +103,9 @@ export class ActiveRepositoryTracker implements vscode.Disposable {
   constructor(private readonly log: (message: string) => void) {
     const source: GitSource = {
       repositories: () => this.repositoryViews(),
-      repositoryOf: (fsPath) => this.api?.getRepository(vscode.Uri.file(fsPath))?.rootUri.fsPath,
+      // Gated on the same readiness: an answer taken while the extension is
+      // still scanning is not one to rank against a containment match.
+      repositoryOf: (fsPath) => (this.readiness.repositoriesKnown ? this.api?.getRepository(vscode.Uri.file(fsPath))?.rootUri.fsPath : undefined),
     };
     this.fold = new ActiveRepositoryFold(source, Date.now());
     this.disposables.push(this.changeEmitter);
@@ -79,6 +117,9 @@ export class ActiveRepositoryTracker implements vscode.Disposable {
 
   dispose(): void {
     this.disposed = true;
+    // Released before anything else: a window closing must not leave a
+    // `ready()` promise that nothing will ever settle.
+    this.readiness.dispose();
     for (const subscription of this.uiSubscriptions.values()) {
       subscription.dispose();
     }
@@ -108,18 +149,66 @@ export class ActiveRepositoryTracker implements vscode.Disposable {
   }
 
   /**
-   * Resolve once the Git extension has been attached, or once attaching has
-   * been tried and failed.
+   * How much the Git extension has told us — `attaching`, `uninitialized`,
+   * `initialized` or `unavailable` (core/gitReadiness.ts). Attached is not
+   * ready, and the diagnostic says which of the two it is.
+   */
+  get gitReadiness(): GitReadiness {
+    return this.readiness.readiness;
+  }
+
+  /**
+   * Resolve once the Git extension has **finished finding repositories**, or
+   * once it is clear that it never will.
    *
-   * Attachment normally happens at construction, but ordering between `*`
-   * extensions is not guaranteed and this window can activate first. A
-   * user-initiated moment that needs the repository list — "Run plan…", which
-   * offers repositories that have no Agent Sparring state and therefore exist
-   * only in the Git extension's answer — waits for it rather than silently
-   * working from a shorter list.
+   * This used to resolve as soon as `getAPI(1)` handed back an object, which
+   * is a different and much earlier moment: the Git extension scans the
+   * workspace asynchronously, publishes `state: "uninitialized"` while it
+   * does, and its `repositories` array is legitimately empty until it is
+   * done. So a window that activated first offered `Run plan…` a list
+   * containing only the `.sparring` locations discovery had found — missing
+   * exactly the first-run repositories that exist nowhere else — and did it
+   * only in the first seconds of the window, which is the hardest kind of
+   * wrongness to report.
+   *
+   * It settles on the first of: the state turning `initialized`; the
+   * extension turning out to be unavailable, where waiting cannot help; this
+   * tracker being disposed; or {@link READY_TIMEOUT_MS}, so a Git extension
+   * that activated and then published nothing cannot hang a command for ever.
+   * Callers are expected to check {@link repositoriesKnown} afterwards and
+   * say so rather than assume: this resolving does not promise an answer, only
+   * that waiting longer would not have produced one.
    */
   async ready(): Promise<void> {
-    await this.attach("the repository list was needed");
+    void this.attach("the repository list was needed");
+    if (this.readiness.settled) {
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) {
+          return;
+        }
+        done = true;
+        clearTimeout(timer);
+        cancel();
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        this.log(`waited ${READY_TIMEOUT_MS}ms for the built-in Git extension to finish finding repositories and it has not; ${describeReadiness(this.readiness.readiness)}`);
+        finish();
+      }, READY_TIMEOUT_MS);
+      const cancel = this.readiness.onSettled(finish);
+    });
+  }
+
+  /**
+   * Whether the repository list may be believed. `false` means *unknown* —
+   * still scanning, or no Git extension — and never "there are none".
+   */
+  get repositoriesKnown(): boolean {
+    return this.readiness.repositoriesKnown;
   }
 
   // ------------------------------------------------------------------ activation
@@ -140,7 +229,11 @@ export class ActiveRepositoryTracker implements vscode.Disposable {
     }
     const extension = vscode.extensions.getExtension<GitExtension>("vscode.git");
     if (!extension) {
-      return; // not installed or disabled; `onDidChange` brings us back if that changes
+      // Not installed, or disabled. Settled rather than pending: waiting
+      // cannot help, so nothing waits. `onDidChange` brings us back if the
+      // installed set changes.
+      this.settleUnavailable("the built-in Git extension is not installed or is disabled");
+      return;
     }
     this.attaching = (async () => {
       try {
@@ -154,18 +247,26 @@ export class ActiveRepositoryTracker implements vscode.Disposable {
       } catch (error) {
         // An API version this build does not offer, or an activation failure.
         // Stay unscoped, say so once per attempt, and let a later signal retry.
-        this.log(`the built-in Git extension could not be attached (${(error as Error).message}); the cockpit is not scoped to a repository`);
+        this.settleUnavailable(`the built-in Git extension could not be attached (${(error as Error).message}); the cockpit is not scoped to a repository`);
         return;
       }
       const api = this.api;
       if (!api) {
+        this.settleUnavailable("the built-in Git extension offered no API version 1; the cockpit is not scoped to a repository");
         return;
       }
       this.disposables.push(
         api.onDidOpenRepository(() => this.resync("a repository was opened")),
         api.onDidCloseRepository(() => this.resync("a repository was closed")),
+        // Repository discovery finishing is the moment the list becomes
+        // believable, and the moment anything waiting on it may proceed.
+        api.onDidChangeState((state) => this.onReadinessChanged(state)),
       );
-      this.log(`following the active repository through the Git extension API (${api.repositories.length} repository/repositories open) — ${why}`);
+      // Read the state *now* as well as subscribing: a window that attaches
+      // after the scan has already finished would otherwise wait for an event
+      // that has already fired.
+      this.readiness.attached(api.state === "initialized" ? "initialized" : "uninitialized");
+      this.log(`attached to the built-in Git extension's API version 1 — ${why}; ${describeReadiness(this.readiness.readiness)}`);
       this.resync("the Git extension became available");
     })();
     try {
@@ -226,7 +327,43 @@ export class ActiveRepositoryTracker implements vscode.Disposable {
     this.settle(this.answer, this.fold.editorActivated(filePathOf(editor?.document.uri), Date.now()), "the active editor changed");
   }
 
+  /**
+   * Repository discovery finished (or restarted). Logged and re-synced,
+   * because the answer to "which repository is this window in" can only
+   * change once the repositories are known.
+   */
+  private onReadinessChanged(state: GitApiState): void {
+    const before = this.readiness.readiness;
+    const after = this.readiness.stateChanged(state === "initialized" ? "initialized" : "uninitialized");
+    if (before !== after) {
+      this.log(describeReadiness(after));
+    }
+    this.resync("the Git extension's repository discovery changed state");
+  }
+
+  /** Record that the Git extension cannot answer for now, and release anything waiting on it. */
+  private settleUnavailable(message: string): void {
+    if (this.readiness.readiness !== "unavailable") {
+      this.log(message);
+    }
+    this.readiness.unavailable();
+  }
+
+  /**
+   * The repositories the Git extension has open, or `undefined` when it has
+   * told us nothing we may believe.
+   *
+   * `undefined` while the state is `uninitialized` is the whole point: the
+   * array is empty then, and reading that as "no repository is open" is a
+   * positive claim about a scan that has not finished. Every caller already
+   * distinguishes "told us nothing" from "told us there are none" (see
+   * `GitSource` and `launchRepositories`), so the honest answer is the one
+   * they are built for.
+   */
   private repositoryViews(): GitRepositoryView[] | undefined {
+    if (!this.readiness.repositoriesKnown) {
+      return undefined;
+    }
     return this.api?.repositories.map((repository) => ({ rootPath: repository.rootUri.fsPath, selected: repository.ui.selected }));
   }
 

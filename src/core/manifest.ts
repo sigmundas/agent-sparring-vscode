@@ -408,6 +408,117 @@ const STAGE_KEYS: ReadonlySet<string> = new Set(["stage_id", "label", "title", "
 const REPOSITORY_KEYS: ReadonlySet<string> = new Set(["name", "path", "branch", "candidate_sha"]);
 const STAGE_MODES: ReadonlySet<string> = new Set(["implementation", "independent_review"]);
 
+// ---------------------------------------------------------------------------
+// three places where JavaScript's own semantics are the wrong contract
+// ---------------------------------------------------------------------------
+
+/**
+ * Every code point Python's `str.strip()` removes, which is **not** the set
+ * JavaScript's `String.prototype.trim()` removes.
+ *
+ * The engine trims with `str.strip()` (`manifest.py: _text`), so that set is
+ * the contract, and `trim()` differs from it in both directions:
+ *
+ *  - Python strips and JavaScript does not: U+001C…U+001F (the four ASCII
+ *    separator controls) and **U+0085** (NEL). A title of `"\u0085Cloud"`
+ *    reaches the engine's digest as `"Cloud"` and reached ours as
+ *    `"\u0085Cloud"` — a different digest for the same file, which is exactly
+ *    the divergence that makes a run's manifest unreadable or, worse, makes an
+ *    unrelated one look readable.
+ *  - JavaScript strips and Python does not: **U+FEFF** (ZWNBSP), which ES
+ *    spec-lists in `WhiteSpace` and `str.isspace()` does not. A BOM-wrapped
+ *    title digests verbatim in the engine and was silently stripped here.
+ *
+ * The set is generated from the engine's own runtime — every `c` where
+ * `chr(c).isspace()` is true, Python 3.14 — and pinned rather than derived
+ * from a JavaScript Unicode property, because no JavaScript property matches
+ * it: Python's rule is "bidirectional class WS, B or S, or category Zs", and
+ * the separator controls come from the `B`/`S` classes alone.
+ *
+ * It is written as code points and not as characters in a string literal. An
+ * invisible character in source is exactly what an editor, a formatter or a
+ * careless edit changes without anyone noticing, and this list is a contract
+ * with another language.
+ */
+const PYTHON_WHITESPACE: ReadonlySet<string> = new Set(
+  [
+    0x09, 0x0a, 0x0b, 0x0c, 0x0d, // tab, newline, vertical tab, form feed, carriage return
+    0x1c, 0x1d, 0x1e, 0x1f, // file, group, record and unit separators — Python whitespace, not JavaScript whitespace
+    0x20, // space
+    0x85, // NEL — the divergence that changed digests
+    0xa0, 0x1680, // no-break space, Ogham space mark
+    0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a,
+    0x2028, 0x2029, // line and paragraph separators
+    0x202f, 0x205f, 0x3000,
+    // Deliberately absent: U+FEFF, which JavaScript trims and Python does not.
+  ].map((code) => String.fromCharCode(code)),
+);
+
+/** Python's `str.strip()`, exactly. Never `trim()`: see {@link PYTHON_WHITESPACE}. */
+export function pythonStrip(value: string): string {
+  let start = 0;
+  let end = value.length;
+  while (start < end && PYTHON_WHITESPACE.has(value[start])) {
+    start++;
+  }
+  while (end > start && PYTHON_WHITESPACE.has(value[end - 1])) {
+    end--;
+  }
+  return value.slice(start, end);
+}
+
+/**
+ * Whether the engine's `version` check would pass: `payload.get("version") !=
+ * 1` in Python.
+ *
+ * Python compares *values*, and `True == 1`, so the engine accepts
+ * `"version": true` — as it accepts `1.0`, and refuses `false`, `0` and
+ * `"1"`. This extension used `!== 1`, which refused `true`, so a manifest the
+ * engine runs happily had no digest here and its run lost its stage list.
+ *
+ * Parity is the rule and not a preference: the digest computed here is
+ * compared against a `plan_digest` the engine wrote, so a file this side
+ * refuses is a run this side cannot describe. `true` is a wart in the engine's
+ * contract rather than a feature, and tightening it is a change to the engine
+ * that has to happen there, in a change that moves both sides at once.
+ */
+function acceptedVersion(value: unknown): boolean {
+  return value === MANIFEST_VERSION || value === true;
+}
+
+/**
+ * The UTF-8 bytes of one digest part, or `undefined` when Python could not
+ * produce them.
+ *
+ * `digest_planned_stages` does `part.encode("utf-8")`, and Python raises
+ * `UnicodeEncodeError` on an unpaired surrogate — which `json.loads` will
+ * happily produce from a `"\ud800"` escape. Node's `Buffer.from(…, "utf8")`
+ * instead substitutes U+FFFD, so the extension used to hand out a confident
+ * digest for a manifest the engine cannot digest at all.
+ *
+ * A value the engine cannot digest must never be given an authoritative
+ * digest here, so this returns `undefined` and the whole parse fails: such a
+ * file can never be the manifest a recorded run executes, because the engine
+ * would have raised before recording anything.
+ */
+function utf8Bytes(part: string): Buffer | undefined {
+  for (let at = 0; at < part.length; at++) {
+    const unit = part.charCodeAt(at);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = at + 1 < part.length ? part.charCodeAt(at + 1) : 0;
+      if (next < 0xdc00 || next > 0xdfff) {
+        return undefined; // high surrogate with no low surrogate after it
+      }
+      at++;
+      continue;
+    }
+    if (unit >= 0xdc00 && unit <= 0xdfff) {
+      return undefined; // low surrogate with no high surrogate before it
+    }
+  }
+  return Buffer.from(part, "utf8");
+}
+
 /** One manifest stage as the engine's parser normalises it, which is what its digest is taken over. */
 interface ExecutableStage {
   /** `_text`: trimmed, and valid as a single path segment (stage.py: `validate_stage_id`). */
@@ -464,13 +575,20 @@ export function parseExecutionManifest(text: string | undefined): ParsedManifest
   if (!executable) {
     return undefined;
   }
+  // A manifest the engine would accept but could not *digest* (an unpaired
+  // surrogate anywhere in it) has no identity to compare against a recorded
+  // run, so it yields nothing rather than a digest only this side can compute.
+  const digest = digestOf(executable);
+  if (digest === undefined) {
+    return undefined;
+  }
   return {
     identity: {
       planLabel: executable.planLabel,
       sourceDigest: executable.sourceDigest,
       stages: executable.stages.map((stage) => ({ stageId: stage.stageId, label: stage.label, title: stage.title })),
     },
-    digest: digestOf(executable),
+    digest,
   };
 }
 
@@ -479,7 +597,8 @@ export function manifestDigest(manifest: ExecutionManifest): string | undefined 
   return parseExecutionManifest(renderManifest(manifest))?.digest;
 }
 
-function digestOf(manifest: ExecutableManifest): string {
+/** The engine's `manifest_digest`, or `undefined` when Python's own encode step would raise. */
+function digestOf(manifest: ExecutableManifest): string | undefined {
   const parts: string[] = [String(MANIFEST_VERSION), manifest.planLabel, manifest.sourceDigest];
   for (const stage of manifest.stages) {
     parts.push(stage.stageId, stage.label, stage.title, stage.brief);
@@ -492,7 +611,11 @@ function digestOf(manifest: ExecutableManifest): string {
   }
   const digest = crypto.createHash("sha256");
   for (const part of parts) {
-    digest.update(part, "utf8");
+    const bytes = utf8Bytes(part);
+    if (bytes === undefined) {
+      return undefined;
+    }
+    digest.update(bytes);
     digest.update(NUL);
   }
   return digest.digest("hex");
@@ -502,7 +625,7 @@ const NUL = Buffer.from([0]);
 
 function readExecutableManifest(text: string | undefined): ExecutableManifest | undefined {
   const payload = asObject(text);
-  if (!payload || unknownKeys(payload, TOP_LEVEL_KEYS) || payload["version"] !== MANIFEST_VERSION) {
+  if (!payload || unknownKeys(payload, TOP_LEVEL_KEYS) || !acceptedVersion(payload["version"])) {
     return undefined;
   }
   const planLabel = requiredText(payload["plan_label"]);
@@ -543,7 +666,10 @@ function readExecutableStage(entry: unknown): ExecutableStage | undefined {
   if (!STAGE_ID_RE.test(stageId) || stageId === "." || stageId === "..") {
     return undefined;
   }
-  if (typeof brief !== "string" || !brief.trim()) {
+  // `brief` is validated as non-empty under Python's strip and then digested
+  // verbatim, because that is the byte-for-byte content the engine writes to
+  // `brief.md` (`manifest.py: _stage`).
+  if (typeof brief !== "string" || !pythonStrip(brief)) {
     return undefined;
   }
   const mode = readMode(payload["mode"]);
@@ -562,10 +688,14 @@ function readMode(raw: unknown): "independent_review" | undefined | false {
   if (raw === undefined || raw === null) {
     return undefined;
   }
-  if (typeof raw !== "string" || !STAGE_MODES.has(raw.trim())) {
+  if (typeof raw !== "string") {
     return false;
   }
-  return raw.trim() === "independent_review" ? "independent_review" : undefined;
+  const mode = pythonStrip(raw);
+  if (!STAGE_MODES.has(mode)) {
+    return false;
+  }
+  return mode === "independent_review" ? "independent_review" : undefined;
 }
 
 function readRepositories(raw: unknown): ExecutableStage["repositories"] | undefined {
@@ -616,13 +746,21 @@ function unknownKeys(payload: Record<string, unknown>, allowed: ReadonlySet<stri
   return Object.keys(payload).some((key) => !allowed.has(key));
 }
 
-/** The engine's `_text`: a non-empty string, trimmed. */
+/** The engine's `_text`: a string that is non-empty once Python-stripped, returned stripped. */
 function requiredText(value: unknown): string | undefined {
-  return isNonEmptyString(value) ? value.trim() : undefined;
+  return isNonEmptyString(value) ? pythonStrip(value) : undefined;
 }
 
+/**
+ * The engine's `not isinstance(value, str) or not value.strip()`.
+ *
+ * Python's strip, never `trim()`: a repository name of `"\\u0085"` is empty to
+ * the engine and was not empty here, and one of `"\\ufeff"` is the other way
+ * round. `CandidateRepository.from_dict` validates with this rule and then
+ * keeps the value **verbatim**, so the two must not be conflated.
+ */
 function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.trim().length > 0;
+  return typeof value === "string" && pythonStrip(value).length > 0;
 }
 
 function unique(values: readonly string[]): boolean {
@@ -740,7 +878,7 @@ export interface ManifestExpectation {
 }
 
 /** Why a manifest on disk was not accepted as a run's stage list; for the log and the diagnostic. */
-export type ManifestRejection = "unreadable" | "plan-label" | "plan-digest" | "current-stage" | "unbound-worktree";
+export type ManifestRejection = "unreadable" | "plan-label" | "plan-digest" | "current-stage" | "unbound-worktree" | "ambiguous-legacy";
 
 export type ManifestBinding = { ok: true; identity: ManifestIdentity } | { ok: false; reason: ManifestRejection; detail: string };
 
@@ -764,6 +902,83 @@ export function bindManifest(text: string | undefined, binding: string | undefin
  * fresh from a `RunSnapshot` every time.
  */
 export function bindParsedManifest(parsed: ParsedManifest | undefined, binding: ManifestBindingRecord | undefined, expect: ManifestExpectation): ManifestBinding {
+  const bound = bindWithoutWorktree(parsed, expect);
+  if (!bound.ok || !parsed) {
+    return bound;
+  }
+  const unbound = worktreeMismatch(binding, parsed.digest, expect);
+  if (unbound) {
+    return { ok: false, reason: "unbound-worktree", detail: unbound };
+  }
+  return bound;
+}
+
+/**
+ * Bind a manifest written **before binding records existed**, without writing
+ * anything and without weakening any check that can still be made.
+ *
+ * ### The problem this closes
+ *
+ * Binding is strict, and correctly so. But a manifest is only ever *written*
+ * when a plan run is started or resumed, and a **completed** run is never
+ * resumed again — so upgrading to a build that requires a sidecar left every
+ * finished run permanently unable to prove its own stage list. Its historical
+ * stages went back to looking like unrelated standalone work, its journey
+ * stopped being drawn, and there was no action a person could take to fix it
+ * short of re-running an engine that has nothing left to do. That failure is
+ * real and reproduced: a completed plan run whose manifest sits at the
+ * oldest, unscoped file name with no sidecar beside it.
+ *
+ * ### Why nothing is written
+ *
+ * The obvious repair is to synthesise the missing sidecar. This does not,
+ * deliberately: the fact a sidecar states can be established at read time from
+ * evidence that is already on disk, so writing one would add a file that is
+ * *derived* from that evidence and then outlives it — a second authority,
+ * created by a reader, which is the shape of mistake the binding rules exist
+ * to prevent. Deriving it instead is idempotent by construction, has no
+ * side effects, cannot half-succeed, and needs no repair command and no user
+ * action for a failure they cannot see.
+ *
+ * ### What is still proved
+ *
+ * Everything except the one thing the sidecar exists for, plus a replacement
+ * for that one thing:
+ *
+ *  - the plan label is the one the run records;
+ *  - the manifest's **executable digest equals the `plan_digest` the engine
+ *    itself recorded** for this run. This is not a resemblance: it is a
+ *    SHA-256 over every byte that decides what executes, computed by the
+ *    engine's own rules (see {@link parseExecutionManifest}) and compared
+ *    against a value the engine wrote. A manifest for a different plan, or a
+ *    rewritten one, cannot match it;
+ *  - the run's recorded current stage is one of the manifest's stages;
+ *  - and `sole` — no *other* discovered plan run could bind to this same file.
+ *
+ * That last clause is what stands in for the worktree. The sidecar exists
+ * because two worktrees of one repository running the same plan write
+ * byte-identical manifests to one shared legacy name and record identical
+ * state, so nothing in the file can tell them apart. When only one discovered
+ * run could claim it, there is nothing to tell apart. When two could, this
+ * refuses — `ambiguous-legacy` — rather than attributing history to a guess.
+ */
+export function bindLegacyManifest(parsed: ParsedManifest | undefined, expect: ManifestExpectation, provenance: { file: string; sole: boolean }): ManifestBinding {
+  const bound = bindWithoutWorktree(parsed, expect);
+  if (!bound.ok) {
+    return bound;
+  }
+  if (!provenance.sole) {
+    return {
+      ok: false,
+      reason: "ambiguous-legacy",
+      detail: `${provenance.file} was written before manifests said which worktree they belong to, and more than one discovered plan run executes exactly what it contains; it is not attributed to any of them`,
+    };
+  }
+  return bound;
+}
+
+/** The checks that do not need the sidecar, shared by the strict and the legacy paths. */
+function bindWithoutWorktree(parsed: ParsedManifest | undefined, expect: ManifestExpectation): ManifestBinding {
   if (!parsed) {
     return { ok: false, reason: "unreadable", detail: "not a version 1 execution manifest this engine would accept" };
   }
@@ -781,11 +996,24 @@ export function bindParsedManifest(parsed: ParsedManifest | undefined, binding: 
   if (!identity.stages.some((stage) => stage.stageId === expect.currentStageId)) {
     return { ok: false, reason: "current-stage", detail: `it does not contain the run's recorded current stage ${expect.currentStageId}` };
   }
-  const unbound = worktreeMismatch(binding, digest, expect);
-  if (unbound) {
-    return { ok: false, reason: "unbound-worktree", detail: unbound };
-  }
   return { ok: true, identity };
+}
+
+/**
+ * Whether a manifest could belong to more than one of these runs — the
+ * question {@link bindLegacyManifest} asks before attributing an unbound file.
+ *
+ * "Could belong to" is exactly the legacy binding's own test, applied to every
+ * other discovered run: same plan label, same recorded `plan_digest`, and that
+ * run's current stage present. Anything less would be a weaker question than
+ * the one being answered.
+ */
+export function soleLegacyClaimant(parsed: ParsedManifest | undefined, expect: ManifestExpectation, peers: readonly ManifestExpectation[]): boolean {
+  return !peers.some((peer) => !sameRun(peer, expect) && bindWithoutWorktree(parsed, peer).ok);
+}
+
+function sameRun(a: ManifestExpectation, b: ManifestExpectation): boolean {
+  return path.resolve(a.projectDir) === path.resolve(b.projectDir) && a.manifestFile === b.manifestFile;
 }
 
 /** Why the sidecar record does not prove this manifest was written for this run's worktree, or undefined when it does. */

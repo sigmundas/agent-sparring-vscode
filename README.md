@@ -645,6 +645,71 @@ npm run test:integration   # downloads VS Code once, opens a generated multi-roo
 
 Press F5 in VS Code to launch an Extension Development Host.
 
+### Keeping the manifest contract in step with the engine
+
+`src/core/manifest.ts` reimplements the engine's `parse_manifest` and
+`manifest_digest` in TypeScript, because the digest it produces is compared
+against the `plan_digest` the engine recorded for a run. The two are therefore
+one contract with two authors, and a divergence is silent and expensive: it
+either refuses a run's real manifest — costing that run its stage list, its
+journey and the membership of every stage it executed — or accepts one the
+engine never ran.
+
+So the engine is the oracle, and it is asked rather than read. The inputs are
+in `src/test/manifestVectors.ts`, what a live engine answered for them is
+generated into `src/test/manifestParityPins.ts`, and
+`src/test/manifestParity.test.ts` checks both directions:
+
+```sh
+npm test                                  # the TypeScript side against the pins — no Python needed
+
+# and the pins themselves against a live engine:
+AGENT_SPARRING_SRC=../agent-sparring/src PYTHON=/path/to/venv/bin/python3 \
+  npm run compile-tests && node --test out/test/manifestParity.test.js
+```
+
+When the engine's manifest contract changes on purpose, regenerate the pins and
+review the diff — that diff *is* the review of the change:
+
+```sh
+npm run compile-tests
+AGENT_SPARRING_SRC=../agent-sparring/src PYTHON=/path/to/venv/bin/python3 \
+  node scripts/generate-manifest-pins.js
+```
+
+Three divergences this found, none of them visible by reading the two
+implementations side by side: Python's `str.strip()` removes U+0085 and
+U+001C–U+001F while JavaScript's `trim()` does not, and `trim()` removes U+FEFF
+while `str.strip()` does not; `version != 1` in Python accepts `true`, because
+`True == 1`; and `str.encode("utf-8")` raises on an unpaired surrogate where
+Node substitutes U+FFFD, so the extension used to hand a confident digest to a
+manifest the engine cannot digest at all.
+
+### Known follow-ups
+
+Recorded rather than fixed, so they are visible without being smuggled into an
+unrelated change:
+
+- **Sibling repository declarations are not worktree-scoped.**
+  `src/core/stageModes.ts` now keys a stage's declared mode by worktree as well
+  as by plan and stage, because a plan key is a hash of the plan's
+  *repo-relative* path and two worktrees running the same plan share one.
+  `src/core/stageRepositories.ts` has exactly the same exposure and the same
+  consequence — a declaration made in one worktree changes the manifest, and
+  therefore the run digest, of another — and is still keyed by plan alone.
+  `stageModeScope` / `migrateStageModes` are the shape a fix would reuse.
+- **A file cache keyed on size and mtime can serve a stale parse** if a file's
+  contents are replaced while both are preserved (`src/vscode/fileHead.ts`).
+- **Symlink aliases** are resolved for repository roots (`RealPaths`) but not
+  everywhere a path is compared; `/tmp` and `/private/tmp` on macOS are the
+  usual way to meet this.
+- **`repositoryOwning` ranks candidate roots by string length** rather than by
+  path depth, unlike `repositoryForFile` and `repositoryOfPath`, which were
+  corrected to count segments.
+- **Case sensitivity is assumed per platform, not per volume**
+  (`canonicalPath`): a case-sensitive volume on macOS is treated as
+  case-insensitive.
+
 ## Install locally
 
 ```sh

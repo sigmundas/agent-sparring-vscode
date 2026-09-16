@@ -32,6 +32,7 @@ import {
   type SparringLocation,
 } from "./discovery";
 import { EngineFormatError, parsePlanRunState, parseStageState } from "./engineFormats";
+import { describeReadiness, type GitReadiness } from "./gitReadiness";
 import type { ManifestStageIdentity } from "./manifest";
 import { resolveMemberships, stageOwnership } from "./planMembership";
 import { buildRunPickGroups } from "./runPick";
@@ -93,6 +94,13 @@ export interface DiscoveryDiagnostic {
   scope?: { repoRoot: string; name: string; knownRoots: string[] };
   /** Whether the built-in Git extension's API is attached; without it nothing is scoped. */
   gitAttached?: boolean;
+  /**
+   * How much that extension has actually told us (core/gitReadiness.ts).
+   * Reported separately from `gitAttached` because the two are different
+   * moments: the API object can exist while repository discovery is still
+   * running, and its `repositories` array is empty and meaningless then.
+   */
+  gitReadiness?: GitReadiness;
   /** Runs positively attributed to another repository, so "no run here" can be told from "no run anywhere". */
   elsewhereIds?: string[];
   /** Runs no known repository root owns; never candidates for automatic selection, always in the picker. */
@@ -117,6 +125,8 @@ export interface DiagnoseOptions extends LocateOptions {
   scope?: RepositoryScope;
   /** Whether the Git extension's API was attached when the report was taken. */
   gitAttached?: boolean;
+  /** And how far its repository discovery had got; see {@link DiscoveryDiagnostic.gitReadiness}. */
+  gitReadiness?: GitReadiness;
   /**
    * The stage identities of a managed run's execution manifest, when the
    * caller can read them (the extension's cached reader). Supplying it is what
@@ -164,6 +174,7 @@ export async function diagnoseDiscovery(folders: DiagnosticFolder[], options: Di
       ? { scope: { repoRoot: selection.scope.repoRoot, name: selection.scope.name, knownRoots: [...(options.scope.knownRoots ?? [])] } }
       : {}),
     ...(options.gitAttached === undefined ? {} : { gitAttached: options.gitAttached }),
+    ...(options.gitReadiness === undefined ? {} : { gitReadiness: options.gitReadiness }),
     ...(selection.elsewhere ? { elsewhereIds: selection.elsewhere.map((run) => run.id) } : {}),
     ...(selection.unattributed ? { unattributedIds: selection.unattributed.map((run) => run.id) } : {}),
     pickLabels: buildRunPickGroups(discovery.runs, { selectedId: selection.selected?.id, memberships }).flatMap((group) =>
@@ -340,6 +351,12 @@ export function renderDiagnostic(report: DiscoveryDiagnostic): string[] {
     lines.push(`  ${run.kind} ${run.label} (${run.open ? "open" : "terminal"}) id ${run.id}`);
   }
   lines.push(`Git extension API: ${report.gitAttached === undefined ? "not reported" : report.gitAttached ? "attached" : "not attached; nothing is scoped to a repository"}`);
+  if (report.gitReadiness) {
+    // Said separately from "attached", because a window that attached but has
+    // not finished scanning offers a short repository list for reasons that
+    // have nothing to do with attachment.
+    lines.push(`Git repository discovery: ${report.gitReadiness} — ${describeReadiness(report.gitReadiness)}`);
+  }
   lines.push(`active repository: ${report.scope ? `${report.scope.name} (${report.scope.repoRoot})` : "none resolved; selection is not confined to a repository"}`);
   if (report.scope) {
     lines.push(`  repository roots runs were attributed against: ${report.scope.knownRoots.length === 0 ? "none" : report.scope.knownRoots.join(", ")}`);
