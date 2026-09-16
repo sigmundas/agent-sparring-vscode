@@ -11,7 +11,22 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { acceptStage, type AcceptStageResult } from "../core/acceptance";
 import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, readGitBranch, type ExecutableProblem } from "../core/cli";
-import { adoptionGaps, buildManifest, carriedForward, legacyManifestFileName, manifestFileName, renderManifest, type ExecutionManifest, type KnownStage } from "../core/manifest";
+import {
+  BINDING_VERSION,
+  adoptionGaps,
+  bindingPathFor,
+  buildManifest,
+  carriedForward,
+  manifestDigest,
+  manifestPathFor,
+  previousManifestFileNames,
+  renderBindingRecord,
+  renderManifest,
+  type ExecutionManifest,
+  type KnownStage,
+  type ManifestBindingRecord,
+  type ManifestOwner,
+} from "../core/manifest";
 import {
   BRIEF_FILENAME,
   HANDOFF_FILENAME,
@@ -1543,27 +1558,59 @@ async function performStartNextStage(controller: SparringController, overview: O
  * produced, in which case the caller must not launch.
  */
 /**
- * Write the manifest, keeping the provenance of the one already there when
- * the new one executes the same thing (manifest.ts: `carriedForward`). The
- * engine's run identity includes `source_digest`, so rebuilding it from an
- * edited plan document — even one where only a handoff record changed — would
- * otherwise end the recorded run.
+ * Write the manifest and the binding record that says which worktree it was
+ * written for, and return the manifest's path.
  *
- * `legacyName` is the pre-scoping file name for the same plan key, read for
- * provenance only when the scoped file does not exist yet. A run started
- * before manifests were scoped to their project would otherwise take a fresh
- * `source_digest` on its very next continuation and be refused by the engine
- * mid-flight. It is never read as authority and never written.
+ * Provenance first: the manifest keeps the `source_digest` of the one already
+ * there when the new one executes the same thing (manifest.ts:
+ * `carriedForward`). The engine's run identity includes `source_digest`, so
+ * rebuilding it from an edited plan document — even one where only a handoff
+ * record changed — would otherwise end the recorded run. When this run has no
+ * file at its current name, the names manifests were written under before
+ * (`previousManifestFileNames`) are read for that provenance and nothing else;
+ * they are never authority and never written again.
+ *
+ * Then the binding record. The manifest itself cannot say which worktree it
+ * belongs to — the engine refuses a manifest carrying a field it does not
+ * know, and nothing in the payload it *does* know identifies the primary
+ * repository — so the statement goes in a sidecar next to it, naming the
+ * resolved project directory, the manifest file and its executable digest.
+ * Without it a reader has no way to tell two worktrees of one repository
+ * apart, and degrades to no membership; so the two files are written together,
+ * the manifest first.
  */
-async function writeManifestFile(controller: SparringController, file: string, legacyName: string, manifest: ExecutionManifest): Promise<void> {
+async function writeManifestFile(controller: SparringController, owner: ManifestOwner, manifest: ExecutionManifest): Promise<string> {
+  const directory = controller.manifestDirectoryPath;
+  const file = manifestPathFor(directory, owner);
   let previous = await readOptional(file);
-  if (previous === undefined) {
-    previous = await readOptional(path.join(controller.manifestDirectoryPath, legacyName));
+  for (const name of previousManifestFileNames(owner.planKey, owner.location.projectDir)) {
     if (previous !== undefined) {
-      controller.log(`carrying the execution manifest provenance of ${legacyName} forward into ${path.basename(file)}, which is scoped to this worktree.`);
+      break;
+    }
+    previous = await readOptional(path.join(directory, name));
+    if (previous !== undefined) {
+      controller.log(`carrying the execution manifest provenance of ${name} forward into ${path.basename(file)}, which is scoped to this worktree.`);
     }
   }
-  await fs.writeFile(file, renderManifest(carriedForward(manifest, previous)), "utf8");
+  const written = carriedForward(manifest, previous);
+  await fs.writeFile(file, renderManifest(written), "utf8");
+
+  const digest = manifestDigest(written);
+  if (digest === undefined) {
+    controller.log(`the execution manifest ${path.basename(file)} could not be read back under the engine's own rules, so no binding record was written; this run's historical stages will not be attributed to it.`);
+    return file;
+  }
+  const record: ManifestBindingRecord = {
+    version: BINDING_VERSION,
+    manifestFile: path.basename(file),
+    manifestDigest: digest,
+    planKey: owner.planKey,
+    planLabel: written.plan_label,
+    projectDir: path.resolve(owner.location.projectDir),
+  };
+  const bindingFile = bindingPathFor(directory, owner);
+  await fs.writeFile(bindingFile, renderBindingRecord(record), "utf8");
+  return file;
 }
 
 /**
@@ -1615,9 +1662,8 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
     return undefined;
   }
   try {
-    const file = path.join(await controller.manifestDirectory(), manifestFileName(run.planKey, run.location.projectDir));
-    await writeManifestFile(controller, file, legacyManifestFileName(run.planKey), built.manifest);
-    return { manifest: file };
+    await controller.manifestDirectory();
+    return { manifest: await writeManifestFile(controller, run, built.manifest) };
   } catch (error) {
     void vscode.window.showErrorMessage(`Agent Sparring: could not write the execution manifest: ${(error as Error).message}. Nothing was started.`);
     return undefined;
@@ -1779,8 +1825,8 @@ async function performContinueAutomatically(controller: SparringController, over
 
   let manifestPath: string;
   try {
-    manifestPath = path.join(await controller.manifestDirectory(), manifestFileName(planKey(label), location.projectDir));
-    await writeManifestFile(controller, manifestPath, legacyManifestFileName(planKey(label)), built.manifest);
+    await controller.manifestDirectory();
+    manifestPath = await writeManifestFile(controller, { planKey: planKey(label), location }, built.manifest);
   } catch (error) {
     void vscode.window.showErrorMessage(`Agent Sparring: could not write the execution manifest: ${(error as Error).message}. Nothing was started.`);
     return { ok: false, reason: "write", message: (error as Error).message };

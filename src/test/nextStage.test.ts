@@ -235,14 +235,12 @@ describe("new-stage is the engine's own lifecycle", () => {
     const commandWrites = (await fs.readFile(path.join(src, "vscode", "commands.ts"), "utf8")).match(/\bfs\.writeFile\([^\n]*/g) ?? [];
     assert.deepEqual(
       commandWrites.map((call) => /\(([^,]+),/.exec(call)?.[1]),
-      ["notesPath", "file"],
-      "the only workspace file the extension writes is the stage's notes.md (the engine's own '## Human evidence' append, which the engine then reads live); the other is the execution manifest, written by one helper into the extension's own global storage and never into a repository",
+      ["notesPath", "file", "bindingFile"],
+      "the only workspace file the extension writes is the stage's notes.md (the engine's own '## Human evidence' append, which the engine then reads live); the other two are the execution manifest and its binding record, written by one helper into the extension's own global storage and never into a repository",
     );
-    assert.match(
-      await fs.readFile(path.join(src, "vscode", "commands.ts"), "utf8"),
-      /async function writeManifestFile\(controller: SparringController, file: string, legacyName: string, manifest: ExecutionManifest\): Promise<void> \{[\s\S]*?await fs\.writeFile\(file, renderManifest\(carriedForward\(manifest, previous\)\), "utf8"\);\n\}/,
-      "and every manifest write goes through the one helper that carries an unchanged manifest's provenance forward",
-    );
+    const manifestWriter = /async function writeManifestFile\([\s\S]*?\n}\n/.exec(await fs.readFile(path.join(src, "vscode", "commands.ts"), "utf8"))?.[0] ?? "";
+    assert.match(manifestWriter, /const written = carriedForward\(manifest, previous\);\n {2}await fs\.writeFile\(file, renderManifest\(written\), "utf8"\)/, "every manifest write goes through the one helper that carries an unchanged manifest's provenance forward");
+    assert.match(manifestWriter, /const bindingFile = bindingPathFor\(directory, owner\);\n {2}await fs\.writeFile\(bindingFile, renderBindingRecord\(record\), "utf8"\)/, "and the same helper states which worktree it was written for");
     const temp = await fs.readFile(path.join(src, "core", "tempFile.ts"), "utf8");
     assert.match(temp, /mkdtemp\(path\.join\(os\.tmpdir\(\)/, "the temporary file lives under the OS temporary directory");
     assert.ok(!/\.sparring["'/]|sparringDir|repoRoot|workspace/.test(temp.replace(/\/\*[\s\S]*?\*\/|\/\/.*$/gm, "")), "and its location is never derived from the workspace or .sparring");

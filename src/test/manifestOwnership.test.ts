@@ -113,7 +113,7 @@ describe("a manifest is bound to the run and the worktree it belongs to", () => 
   it("a manifest for another plan is refused even at the right path", async () => {
     const { runs, plan, historical } = await worktree("beta");
     const store = await ManifestStore.create();
-    await store.write(plan, STAGES, { plan_label: "docs/plans/active/something-else.md" });
+    await store.write(plan, STAGES, { overrides: { plan_label: "docs/plans/active/something-else.md" } });
     assert.equal((await membershipsOf(runs, store)).get(historical.id), undefined);
   });
 
@@ -151,16 +151,13 @@ describe("moving a run's manifest to its scoped name", () => {
     const body = /async function writeManifestFile\([\s\S]*?\n}\n/.exec(source)?.[0] ?? "";
     assert.ok(body, "writeManifestFile exists");
     assert.match(body, /readOptional\(file\)/, "the scoped file is the first source of provenance");
-    assert.match(body, /readOptional\(path\.join\(controller\.manifestDirectoryPath, legacyName\)\)/, "and the unscoped one is the fallback");
+    assert.match(body, /for \(const name of previousManifestFileNames\(owner\.planKey, owner\.location\.projectDir\)\)/, "and every name manifests were written under before is the fallback");
     assert.match(body, /carriedForward\(manifest, previous\)/, "which is then carried forward rather than re-hashed");
-    assert.ok(!/fs\.writeFile\([^)]*legacyName/.test(body), "the old name is never written to again");
+    assert.ok(!/fs\.writeFile\(path\.join\(directory, name\)/.test(body), "an old name is never written to again");
 
-    // Every caller passes both names: there is no path that writes a manifest
-    // without the migration.
+    // The migration lives inside the one helper, so there is no caller that
+    // can write a manifest without it.
     const calls = source.match(/writeManifestFile\(controller, [^\n]*/g) ?? [];
     assert.equal(calls.length, 2, "run-plan/resume-plan and continue-automatically");
-    for (const call of calls) {
-      assert.match(call, /legacyManifestFileName\(/, `provenance fallback passed: ${call}`);
-    }
   });
 });

@@ -26,6 +26,25 @@
  * manifest still executes the same thing — see {@link carriedForward}.
  * Without that, appending a handoff record to the plan document ends the run.
  *
+ * ### Reading one back, and the authority boundary
+ *
+ * The same file is also the only record of *which stages a plan run executed*,
+ * so the Overview reads it back to name a stage, draw a journey and decide
+ * whether a rediscovered stage is that run's history. That is a much stronger
+ * claim than "a file for this plan exists", and the second half of this module
+ * draws the line:
+ *
+ *     global-storage manifest  =  candidate evidence
+ *     run state + executable digest + worktree identity  =  authority
+ *
+ * {@link parseExecutionManifest} reimplements the engine's own parser and
+ * `manifest_digest`, so the extension can ask the only question that settles
+ * it — *is this the manifest the run recorded?* — and
+ * {@link bindParsedManifest} refuses everything that cannot answer yes. The
+ * worktree, which no digest can distinguish, is stated in a sidecar
+ * ({@link ManifestBindingRecord}). Anything missing or uncertain degrades to
+ * no membership.
+ *
  * No dependency on the vscode API.
  */
 
@@ -363,142 +382,464 @@ export interface ManifestIdentity {
 }
 
 /**
+ * A manifest file parsed under the engine's own rules, with the digest the
+ * engine would record for it.
+ *
+ * Keeping the two together is deliberate: the digest is only meaningful for a
+ * manifest the engine would actually accept, so nothing can compute one from a
+ * half-read file.
+ */
+export interface ParsedManifest {
+  identity: ManifestIdentity;
+  /**
+   * The engine's `manifest_digest` (manifest.py) for this file — the value it
+   * writes as `plan_digest` when a run starts from it, and the value it
+   * re-checks on every resume.
+   */
+  digest: string;
+}
+
+// ---------------------------------------------------------------------------
+// the engine's executable identity, recomputed here
+// ---------------------------------------------------------------------------
+
+const TOP_LEVEL_KEYS: ReadonlySet<string> = new Set(["version", "plan_label", "source_digest", "stages"]);
+const STAGE_KEYS: ReadonlySet<string> = new Set(["stage_id", "label", "title", "brief", "mode", "repositories"]);
+const REPOSITORY_KEYS: ReadonlySet<string> = new Set(["name", "path", "branch", "candidate_sha"]);
+const STAGE_MODES: ReadonlySet<string> = new Set(["implementation", "independent_review"]);
+
+/** One manifest stage as the engine's parser normalises it, which is what its digest is taken over. */
+interface ExecutableStage {
+  /** `_text`: trimmed, and valid as a single path segment (stage.py: `validate_stage_id`). */
+  stageId: string;
+  label: string;
+  title: string;
+  /** Not trimmed: the engine digests the brief exactly as written, because that is what it writes to `brief.md`. */
+  brief: string;
+  /** Only the non-default mode contributes, exactly as in `manifest_digest`. */
+  mode?: "independent_review";
+  repositories: { name: string; path: string; branch: string; candidateSha: string | null }[];
+}
+
+interface ExecutableManifest {
+  planLabel: string;
+  sourceDigest: string;
+  stages: ExecutableStage[];
+}
+
+/**
+ * Parse a manifest file exactly as the engine parses it, and compute the
+ * identity the engine records for it.
+ *
+ * This is a reimplementation of `agent_sparring/manifest.py` — `parse_manifest`
+ * and `manifest_digest` — and it is deliberately not "a similar hash". The
+ * value it produces is compared against `plan_digest` in the engine's own
+ * `.sparring/plans/<key>.json`, so any divergence would either reject a run's
+ * real manifest or accept one the engine never ran. What that means in
+ * practice:
+ *
+ *  - **The validation is the engine's.** Unknown top-level, stage or
+ *    repository keys are refused rather than ignored, the version must be 1,
+ *    `plan_label`/`source_digest`/`stage_id`/`label`/`title` must be non-empty
+ *    strings and are trimmed, `brief` must be non-empty but is digested
+ *    verbatim, `mode` must be one the engine knows, repository names must be
+ *    unique, and stage ids must be unique and usable as one path segment. A
+ *    file the engine would refuse has no digest here either, so it can never
+ *    be read as membership.
+ *  - **The digest content is the engine's.** SHA-256 over NUL-terminated
+ *    parts (`plan_model.digest_planned_stages`): the version, the plan label
+ *    and the source digest, then per stage in order its id, label, title and
+ *    brief, a *non-default* mode, and each declared repository's name, path,
+ *    branch and candidate SHA (`""` when null). A stage in the default
+ *    implementation mode contributes nothing for its mode — that is the
+ *    engine's rule, and copying it is what keeps manifests written before
+ *    modes existed digesting to the value their recorded runs hold.
+ *
+ * `source_digest` is *provenance* of the plan text (see {@link sourceDigest})
+ * and is a different concept: it is one input to this digest, never a
+ * substitute for it.
+ */
+export function parseExecutionManifest(text: string | undefined): ParsedManifest | undefined {
+  const executable = readExecutableManifest(text);
+  if (!executable) {
+    return undefined;
+  }
+  return {
+    identity: {
+      planLabel: executable.planLabel,
+      sourceDigest: executable.sourceDigest,
+      stages: executable.stages.map((stage) => ({ stageId: stage.stageId, label: stage.label, title: stage.title })),
+    },
+    digest: digestOf(executable),
+  };
+}
+
+/** The digest of a manifest this extension has just built, taken through the same path a reader takes. */
+export function manifestDigest(manifest: ExecutionManifest): string | undefined {
+  return parseExecutionManifest(renderManifest(manifest))?.digest;
+}
+
+function digestOf(manifest: ExecutableManifest): string {
+  const parts: string[] = [String(MANIFEST_VERSION), manifest.planLabel, manifest.sourceDigest];
+  for (const stage of manifest.stages) {
+    parts.push(stage.stageId, stage.label, stage.title, stage.brief);
+    if (stage.mode) {
+      parts.push(stage.mode);
+    }
+    for (const repository of stage.repositories) {
+      parts.push(repository.name, repository.path, repository.branch, repository.candidateSha ?? "");
+    }
+  }
+  const digest = crypto.createHash("sha256");
+  for (const part of parts) {
+    digest.update(part, "utf8");
+    digest.update(NUL);
+  }
+  return digest.digest("hex");
+}
+
+const NUL = Buffer.from([0]);
+
+function readExecutableManifest(text: string | undefined): ExecutableManifest | undefined {
+  const payload = asObject(text);
+  if (!payload || unknownKeys(payload, TOP_LEVEL_KEYS) || payload["version"] !== MANIFEST_VERSION) {
+    return undefined;
+  }
+  const planLabel = requiredText(payload["plan_label"]);
+  const sourceDigest = requiredText(payload["source_digest"]);
+  const raw = payload["stages"];
+  if (planLabel === undefined || sourceDigest === undefined || !Array.isArray(raw) || raw.length === 0) {
+    return undefined;
+  }
+  const stages: ExecutableStage[] = [];
+  for (const entry of raw) {
+    const stage = readExecutableStage(entry);
+    if (!stage) {
+      return undefined;
+    }
+    stages.push(stage);
+  }
+  if (!unique(stages.map((stage) => stage.stageId))) {
+    return undefined;
+  }
+  return { planLabel, sourceDigest, stages };
+}
+
+function readExecutableStage(entry: unknown): ExecutableStage | undefined {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    return undefined;
+  }
+  const payload = entry as Record<string, unknown>;
+  if (unknownKeys(payload, STAGE_KEYS)) {
+    return undefined;
+  }
+  const stageId = requiredText(payload["stage_id"]);
+  const label = requiredText(payload["label"]);
+  const title = requiredText(payload["title"]);
+  const brief = payload["brief"];
+  if (stageId === undefined || label === undefined || title === undefined) {
+    return undefined;
+  }
+  if (!STAGE_ID_RE.test(stageId) || stageId === "." || stageId === "..") {
+    return undefined;
+  }
+  if (typeof brief !== "string" || !brief.trim()) {
+    return undefined;
+  }
+  const mode = readMode(payload["mode"]);
+  if (mode === false) {
+    return undefined;
+  }
+  const repositories = readRepositories(payload["repositories"]);
+  if (!repositories) {
+    return undefined;
+  }
+  return { stageId, label, title, brief, ...(mode ? { mode } : {}), repositories };
+}
+
+/** `undefined` for the default implementation mode, the mode itself for the other, `false` for one the engine refuses. */
+function readMode(raw: unknown): "independent_review" | undefined | false {
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+  if (typeof raw !== "string" || !STAGE_MODES.has(raw.trim())) {
+    return false;
+  }
+  return raw.trim() === "independent_review" ? "independent_review" : undefined;
+}
+
+function readRepositories(raw: unknown): ExecutableStage["repositories"] | undefined {
+  if (raw === undefined || raw === null) {
+    return [];
+  }
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const out: ExecutableStage["repositories"] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return undefined;
+    }
+    const payload = entry as Record<string, unknown>;
+    if (unknownKeys(payload, REPOSITORY_KEYS)) {
+      return undefined;
+    }
+    // Validated as non-empty, but digested as written: the engine keeps these
+    // three verbatim (`stage.py: CandidateRepository.from_dict`).
+    const [name, repoPath, branch] = [payload["name"], payload["path"], payload["branch"]];
+    if (!isNonEmptyString(name) || !isNonEmptyString(repoPath) || !isNonEmptyString(branch)) {
+      return undefined;
+    }
+    const sha = payload["candidate_sha"];
+    if (sha !== undefined && sha !== null && typeof sha !== "string") {
+      return undefined;
+    }
+    out.push({ name, path: repoPath, branch, candidateSha: typeof sha === "string" ? sha : null });
+  }
+  return unique(out.map((repository) => repository.name)) ? out : undefined;
+}
+
+function asObject(text: string | undefined): Record<string, unknown> | undefined {
+  if (!text) {
+    return undefined;
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  return raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : undefined;
+}
+
+function unknownKeys(payload: Record<string, unknown>, allowed: ReadonlySet<string>): boolean {
+  return Object.keys(payload).some((key) => !allowed.has(key));
+}
+
+/** The engine's `_text`: a non-empty string, trimmed. */
+function requiredText(value: unknown): string | undefined {
+  return isNonEmptyString(value) ? value.trim() : undefined;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function unique(values: readonly string[]): boolean {
+  return new Set(values).size === values.length;
+}
+
+// ---------------------------------------------------------------------------
+// binding a manifest to a run and a worktree
+// ---------------------------------------------------------------------------
+
+/**
+ * The extension's own record of which worktree a manifest in global storage
+ * was written for, kept beside the manifest and never inside it.
+ *
+ * It is a *sidecar* because the manifest is the engine's payload: the engine
+ * refuses a manifest that carries a field it does not know, so extension-only
+ * metadata cannot go in the file itself without breaking the contract it
+ * exists to satisfy. And it is needed because nothing inside the engine's
+ * payload identifies the worktree — `plan_label` is repo-relative, and a
+ * stage's `repositories` name *sibling* repositories, not the primary one. Two
+ * worktrees of the same repository running `docs/plans/foo.md` therefore write
+ * byte-identical manifests, and their recorded plan-run state is identical
+ * too.
+ *
+ * So the worktree is stated here, as a resolved absolute path, together with
+ * the manifest file it vouches for and that file's executable digest. A reader
+ * requires all three to agree before it treats the manifest as this run's; the
+ * *file name* proves nothing on its own, whatever it hashes.
+ */
+export interface ManifestBindingRecord {
+  version: number;
+  /** Base name of the manifest this record vouches for. */
+  manifestFile: string;
+  /** `path.resolve`d project directory of the worktree that wrote it. */
+  projectDir: string;
+  planKey: string;
+  planLabel: string;
+  /** The executable digest of the manifest as written (see {@link parseExecutionManifest}). */
+  manifestDigest: string;
+}
+
+export const BINDING_VERSION = 1;
+
+export function renderBindingRecord(record: ManifestBindingRecord): string {
+  return `${JSON.stringify(
+    {
+      version: record.version,
+      manifest_file: record.manifestFile,
+      manifest_digest: record.manifestDigest,
+      plan_key: record.planKey,
+      plan_label: record.planLabel,
+      project_dir: record.projectDir,
+    },
+    null,
+    2,
+  )}\n`;
+}
+
+export function readBindingRecord(text: string | undefined): ManifestBindingRecord | undefined {
+  const payload = asObject(text);
+  if (!payload || payload["version"] !== BINDING_VERSION) {
+    return undefined;
+  }
+  const manifestFile = requiredText(payload["manifest_file"]);
+  const manifestDigest = requiredText(payload["manifest_digest"]);
+  const planKey = requiredText(payload["plan_key"]);
+  const planLabel = requiredText(payload["plan_label"]);
+  const projectDir = requiredText(payload["project_dir"]);
+  if (!manifestFile || !manifestDigest || !planKey || !planLabel || !projectDir) {
+    return undefined;
+  }
+  return { version: BINDING_VERSION, manifestFile, manifestDigest, planKey, planLabel, projectDir };
+}
+
+/**
  * What a manifest must match before it may describe a run's stages.
  *
  * A manifest is only ever *written* by this extension, into global storage,
  * and global storage is per-user, not per-worktree or per-machine-state. So a
- * file being there is not evidence that it belongs to the run being displayed;
- * it has to say so. Two independent checks, both against what the **engine**
- * recorded in `.sparring/plans/<key>.json`:
+ * file being there is not evidence that it belongs to the run being displayed,
+ * and neither is its name. The manifest in global storage is **candidate
+ * evidence**; the authority is the run's own recorded state, the executable
+ * digest and the worktree identity, and every one of them is checked:
  *
  *  - the plan label must be the one the run records as executing, so a
  *    manifest for another plan can never be read as this one's stage list;
- *  - the run's recorded current stage must be one of the manifest's stages,
- *    which is what catches a manifest that has since been regenerated into
- *    something the run does not execute. A complete run passes it as readily
- *    as a live one, because its current stage is its last.
+ *  - the manifest's **executable digest** must equal the `plan_digest` the
+ *    engine recorded for the run. This is the check that makes membership
+ *    authoritative rather than plausible: a regenerated manifest that keeps
+ *    the plan label and the current stage but adds, removes or rewrites any
+ *    other stage executes something else, digests to something else, would be
+ *    refused by the engine on the next resume — and is refused here too,
+ *    before it can move a historical stage between runs;
+ *  - the run's recorded current stage must still be one of the manifest's
+ *    stages, which is what a truncated or otherwise surprising file fails;
+ *  - the sidecar binding record must name this worktree, this manifest file
+ *    and this digest (see {@link ManifestBindingRecord}), because the digest
+ *    and the recorded state are *identical* between two worktrees running the
+ *    same plan and cannot tell them apart.
  *
- * Neither check can distinguish two worktrees that run the same plan path —
- * their recorded state is identical by construction. That is why the file name
- * is scoped to the project as well (see {@link manifestFileName}): the
- * validation says the manifest describes this *plan run*, and the path says it
- * belongs to this *worktree*.
+ * Any check that is missing or uncertain degrades to no membership. Nothing
+ * here guesses at historical ownership.
  */
 export interface ManifestExpectation {
   /** The plan label the run records (`PlanRunState.plan`). */
   planLabel: string;
   /** The stage the run records itself as being at (`PlanRunState.currentStage`). */
   currentStageId: string;
+  /** The identity the engine recorded for what this run executes (`PlanRunState.planDigest`). */
+  planDigest: string;
+  /** The worktree the run belongs to, resolved. */
+  projectDir: string;
+  /** The manifest file name this run reads, which the binding record must vouch for. */
+  manifestFile: string;
 }
 
 /** Why a manifest on disk was not accepted as a run's stage list; for the log and the diagnostic. */
-export type ManifestRejection = "unreadable" | "plan-label" | "current-stage";
+export type ManifestRejection = "unreadable" | "plan-label" | "plan-digest" | "current-stage" | "unbound-worktree";
 
 export type ManifestBinding = { ok: true; identity: ManifestIdentity } | { ok: false; reason: ManifestRejection; detail: string };
 
 /**
- * Read a manifest and bind it to the run it is claimed to describe, or say
- * why it cannot be. Never returns a partial answer: an unbound manifest
- * yields nothing, and the caller degrades to "no recorded membership" rather
- * than to a guess.
+ * Read a manifest and its binding record and bind them to the run they are
+ * claimed to describe, or say why they cannot be. Never returns a partial
+ * answer: an unbound manifest yields nothing, and the caller degrades to "no
+ * recorded membership" rather than to a guess.
  */
-export function bindManifest(text: string | undefined, expect: ManifestExpectation): ManifestBinding {
-  const identity = readManifestIdentity(text);
-  if (!identity) {
-    return { ok: false, reason: "unreadable", detail: "not a version 1 execution manifest with a complete stage list" };
+export function bindManifest(text: string | undefined, binding: string | undefined, expect: ManifestExpectation): ManifestBinding {
+  return bindParsedManifest(parseExecutionManifest(text), readBindingRecord(binding), expect);
+}
+
+/**
+ * The same binding, over content that has already been parsed.
+ *
+ * Parsing is what costs — a manifest carries every stage's brief verbatim and
+ * is by far the largest file the Overview reads — so a caller may cache the
+ * parsed bytes. It may never cache *this*: the answer depends on the run's
+ * recorded state, which changes under a file that does not, so it is derived
+ * fresh from a `RunSnapshot` every time.
+ */
+export function bindParsedManifest(parsed: ParsedManifest | undefined, binding: ManifestBindingRecord | undefined, expect: ManifestExpectation): ManifestBinding {
+  if (!parsed) {
+    return { ok: false, reason: "unreadable", detail: "not a version 1 execution manifest this engine would accept" };
   }
+  const { identity, digest } = parsed;
   if (identity.planLabel !== expect.planLabel) {
     return { ok: false, reason: "plan-label", detail: `it executes ${identity.planLabel}, while the run records ${expect.planLabel}` };
+  }
+  if (digest !== expect.planDigest) {
+    return {
+      ok: false,
+      reason: "plan-digest",
+      detail: `its executable content digests to ${short(digest)}, while the run records ${short(expect.planDigest)}; it is not the manifest this run executes`,
+    };
   }
   if (!identity.stages.some((stage) => stage.stageId === expect.currentStageId)) {
     return { ok: false, reason: "current-stage", detail: `it does not contain the run's recorded current stage ${expect.currentStageId}` };
   }
+  const unbound = worktreeMismatch(binding, digest, expect);
+  if (unbound) {
+    return { ok: false, reason: "unbound-worktree", detail: unbound };
+  }
   return { ok: true, identity };
+}
+
+/** Why the sidecar record does not prove this manifest was written for this run's worktree, or undefined when it does. */
+function worktreeMismatch(binding: ManifestBindingRecord | undefined, digest: string, expect: ManifestExpectation): string | undefined {
+  if (!binding) {
+    return "no binding record says which worktree it was written for";
+  }
+  if (path.resolve(binding.projectDir) !== path.resolve(expect.projectDir)) {
+    return `it was written for ${binding.projectDir}, not for ${expect.projectDir}`;
+  }
+  if (binding.manifestFile !== expect.manifestFile) {
+    return `its binding record vouches for ${binding.manifestFile}, not for ${expect.manifestFile}`;
+  }
+  if (binding.manifestDigest !== digest) {
+    return `its binding record vouches for ${short(binding.manifestDigest)}, while the file digests to ${short(digest)}`;
+  }
+  if (binding.planLabel !== expect.planLabel) {
+    return `its binding record names ${binding.planLabel}, while the run records ${expect.planLabel}`;
+  }
+  return undefined;
+}
+
+function short(digest: string): string {
+  return digest.length > 12 ? `${digest.slice(0, 12)}…` : digest;
 }
 
 /**
  * Where a plan run's manifest lives. One place this is computed, so the
  * writer, the reader and the tests cannot drift into different files.
  */
-export function manifestPathFor(directory: string, run: { planKey: string; location: { projectDir: string } }): string {
+export function manifestPathFor(directory: string, run: ManifestOwner): string {
   return path.join(directory, manifestFileName(run.planKey, run.location.projectDir));
 }
 
+/** Where its binding record lives: beside the manifest, under the same identity. */
+export function bindingPathFor(directory: string, run: ManifestOwner): string {
+  return path.join(directory, bindingFileName(run.planKey, run.location.projectDir));
+}
+
+/** The parts of a run that decide where its manifest is kept. */
+export interface ManifestOwner {
+  planKey: string;
+  location: { projectDir: string };
+}
+
 /** What a manifest must match to be that run's: taken from the engine's own recorded state. */
-export function manifestExpectationFor(run: { state: { plan: string; currentStage: string } }): ManifestExpectation {
-  return { planLabel: run.state.plan, currentStageId: run.state.currentStage };
-}
-
-/** A manifest as it is on disk, with its identity fields; `undefined` when it is absent or not one. */
-export function readManifestIdentity(text: string | undefined): ManifestIdentity | undefined {
-  if (!text) {
-    return undefined;
-  }
-  let raw: unknown;
-  try {
-    raw = JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-  if (!raw || typeof raw !== "object") {
-    return undefined;
-  }
-  const payload = raw as Record<string, unknown>;
-  const planLabel = typeof payload["plan_label"] === "string" ? payload["plan_label"] : undefined;
-  const sourceDigest = typeof payload["source_digest"] === "string" ? payload["source_digest"] : undefined;
-  const stages = readManifestStages(text);
-  if (planLabel === undefined || sourceDigest === undefined || !stages) {
-    return undefined;
-  }
-  return { planLabel, sourceDigest, stages };
-}
-
-/**
- * Read back the stages of a manifest this extension wrote, for display.
- *
- * A manifest run's stages are not the plan document's `## Stage <n>`
- * headings, so without this the Overview can only call the current stage by
- * its position in the execution order — "Stage 6" for what everyone involved
- * calls Stage 3D — and can draw no journey at all.
- *
- * Lenient about absence, strict about certainty: a missing file, another
- * version, or an entry without an id, label and title yields nothing rather
- * than a partial list, because a half-read journey would misstate where the
- * run is. The caller checks that the run's recorded current stage is among
- * the stages before showing any of it.
- */
-export function readManifestStages(text: string | undefined): ManifestStageIdentity[] | undefined {
-  if (!text) {
-    return undefined;
-  }
-  let raw: unknown;
-  try {
-    raw = JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-  if (!raw || typeof raw !== "object") {
-    return undefined;
-  }
-  const payload = raw as Record<string, unknown>;
-  if (payload["version"] !== MANIFEST_VERSION || !Array.isArray(payload["stages"]) || payload["stages"].length === 0) {
-    return undefined;
-  }
-  const out: ManifestStageIdentity[] = [];
-  for (const entry of payload["stages"] as unknown[]) {
-    if (!entry || typeof entry !== "object") {
-      return undefined;
-    }
-    const stage = entry as Record<string, unknown>;
-    const stageId = typeof stage["stage_id"] === "string" ? stage["stage_id"].trim() : "";
-    const label = typeof stage["label"] === "string" ? stage["label"].trim() : "";
-    const title = typeof stage["title"] === "string" ? stage["title"].trim() : "";
-    if (!stageId || !label || !title) {
-      return undefined;
-    }
-    out.push({ stageId, label, title });
-  }
-  return out;
+export function manifestExpectationFor(run: ManifestOwner & { state: { plan: string; currentStage: string; planDigest: string } }): ManifestExpectation {
+  return {
+    planLabel: run.state.plan,
+    currentStageId: run.state.currentStage,
+    planDigest: run.state.planDigest,
+    projectDir: run.location.projectDir,
+    manifestFile: manifestFileName(run.planKey, run.location.projectDir),
+  };
 }
 
 /**
@@ -509,35 +850,57 @@ export function readManifestStages(text: string | undefined): ManifestStageIdent
  * a hash of the plan's **repo-relative** path: two worktrees of the same
  * repository — the ordinary way to run two stages of the same plan side by
  * side — produce the same key for `docs/plans/foo.md`, and used to share one
- * file in global storage. Whichever window wrote last decided what the other
- * one believed its stages were, and the Overview would then attribute one
- * worktree's historical stages to the other worktree's run.
+ * file in global storage.
  *
- * The project directory is the same thing `runIdFor` uses to make a run
- * identity unique, so the manifest and the run it belongs to are now scoped
- * the same way. See {@link legacyManifestFileName} for how a run started
- * before this keeps its provenance.
+ * The scope is the *full* SHA-256 of the resolved project directory. It was
+ * eight hex digits, which is 32 bits and collides in practice: a reviewer
+ * found `/tmp/sparring-worktree-33503` and `/tmp/sparring-worktree-75970`
+ * sharing one file name. A file name is not an authority in any case — see
+ * {@link ManifestBindingRecord} for what actually proves ownership — but a
+ * namespace that collides is not even a useful *index*, and there is no reason
+ * to spend only 32 bits on it.
  */
 export function manifestFileName(planKey: string, projectDir: string): string {
   return `${planKey}-${projectDigest(projectDir)}.manifest.json`;
 }
 
+/** The binding record beside it, under the same plan-and-project identity. */
+export function bindingFileName(planKey: string, projectDir: string): string {
+  return `${planKey}-${projectDigest(projectDir)}.binding.json`;
+}
+
 /**
- * The name manifests had before they were scoped to a project: shared by every
+ * The names this plan run's manifest has been written under before, newest
+ * first: the 8-hex project scope, then the unscoped name shared by every
  * worktree with the same plan path.
  *
- * It is never written any more and never read as authority. It is read for one
- * thing only: `source_digest` provenance when a run that started against the
- * old file writes its first scoped one (see `carriedForward`). Without that,
- * the rebuilt manifest would take a fresh hash of the plan text, the engine's
- * run identity would change, and a run in flight would be refused — the exact
- * failure that lost a submission before.
+ * None of them is ever written again, and none is ever read as authority. They
+ * are read for one thing only: `source_digest` provenance when a run that
+ * started against an older name writes its first manifest under the current
+ * one (see {@link carriedForward}). Without that, the rebuilt manifest would
+ * take a fresh hash of the plan text, the engine's run identity would change,
+ * and a run in flight would be refused — the exact failure that lost a
+ * submission before.
+ *
+ * Until that next write happens such a run has no manifest at the name it
+ * reads, so its stage membership degrades honestly to "not recorded here"
+ * rather than being taken from a file whose worktree nothing vouches for.
  */
+export function previousManifestFileNames(planKey: string, projectDir: string): string[] {
+  return [`${planKey}-${shortProjectDigest(projectDir)}.manifest.json`, legacyManifestFileName(planKey)];
+}
+
+/** The name manifests had before they were scoped to a project at all. */
 export function legacyManifestFileName(planKey: string): string {
   return `${planKey}.manifest.json`;
 }
 
-/** First 8 hex digits of SHA-256 of the resolved project directory; short enough to keep the file name readable. */
+/** SHA-256 of the resolved project directory, in full: an index, never an authority. */
 function projectDigest(projectDir: string): string {
-  return crypto.createHash("sha256").update(path.resolve(projectDir), "utf8").digest("hex").slice(0, 8);
+  return crypto.createHash("sha256").update(path.resolve(projectDir), "utf8").digest("hex");
+}
+
+/** The first 8 hex digits it used to be, kept only to find a run's previous file for provenance. */
+function shortProjectDigest(projectDir: string): string {
+  return projectDigest(projectDir).slice(0, 8);
 }

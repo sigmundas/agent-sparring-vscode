@@ -22,7 +22,7 @@ import { describe, it } from "node:test";
 import { discoverRuns, selectRun } from "../core/discovery";
 import { HUMAN_GATE_MARKER } from "../core/engineFormats";
 import { humanTask, sentences, splitPassCriteria } from "../core/humanTask";
-import { readManifestStages } from "../core/manifest";
+import { parseExecutionManifest } from "../core/manifest";
 import { renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel, type ManifestStageView, type OverviewArtifacts } from "../core/overviewModel";
 import { Workspace, normalUi } from "./fixtures";
@@ -265,12 +265,13 @@ describe("a stage is called what the plan calls it", () => {
 
   it("reading a manifest back is strict about what it will believe", () => {
     const good = JSON.stringify({ version: 1, plan_label: "p.md", source_digest: "sha256:x", stages: [{ stage_id: "s1", label: "Stage 1", title: "One", brief: "…" }] });
-    assert.deepEqual(readManifestStages(good), [{ stageId: "s1", label: "Stage 1", title: "One" }]);
-    assert.equal(readManifestStages(undefined), undefined);
-    assert.equal(readManifestStages("{ not json"), undefined);
-    assert.equal(readManifestStages(JSON.stringify({ version: 2, stages: [{ stage_id: "s", label: "l", title: "t" }] })), undefined, "a later shape is not guessed at");
-    assert.equal(readManifestStages(JSON.stringify({ version: 1, stages: [] })), undefined);
-    assert.equal(readManifestStages(JSON.stringify({ version: 1, stages: [{ stage_id: "s", title: "t" }] })), undefined, "a stage without a label is a half-read journey");
+    assert.deepEqual(parseExecutionManifest(good)?.identity.stages, [{ stageId: "s1", label: "Stage 1", title: "One" }]);
+    assert.equal(parseExecutionManifest(undefined), undefined);
+    assert.equal(parseExecutionManifest("{ not json"), undefined);
+    assert.equal(parseExecutionManifest(JSON.stringify({ version: 2, plan_label: "p.md", source_digest: "x", stages: [{ stage_id: "s", label: "l", title: "t", brief: "b" }] })), undefined, "a later shape is not guessed at");
+    assert.equal(parseExecutionManifest(JSON.stringify({ version: 1, plan_label: "p.md", source_digest: "x", stages: [] })), undefined);
+    assert.equal(parseExecutionManifest(JSON.stringify({ version: 1, plan_label: "p.md", source_digest: "x", stages: [{ stage_id: "s", title: "t", brief: "b" }] })), undefined, "a stage without a label is a half-read journey");
+    assert.equal(parseExecutionManifest(JSON.stringify({ version: 1, stages: [{ stage_id: "s", label: "l", title: "t", brief: "b" }] })), undefined, "and one without the fields that say whose it is");
   });
 
   it("the Overview panel reads that file for the run it is showing, through the one cached reader", async () => {
@@ -286,9 +287,15 @@ describe("a stage is called what the plan calls it", () => {
     const reader = /async manifestStagesFor[\s\S]*?\n {2}}\n/.exec(controller)?.[0] ?? "";
     assert.ok(reader, "manifestStagesFor exists");
     assert.match(reader, /run\.state\.source !== "manifest"/, "only a manifest run has one");
-    assert.match(reader, /manifestPathFor\(this\.manifestDirectoryPath, run\)/, "the file is the one scoped to this run's own project");
-    assert.match(reader, /bindManifest\([\s\S]*?manifestExpectationFor\(run\)\)/, "and it is bound to the run before any of it is believed");
-    assert.match(reader, /mtimeMs/, "and it is cached by the file's modification time, not re-read per render");
+    assert.match(reader, /this\.manifests\.read\(this\.manifestDirectoryPath, run\)/, "through the one reader that binds a manifest to the run asking for it");
+
+    // The reader caches the bytes and re-derives the binding every call, so a
+    // cache can never become an authority of its own.
+    const manifestReader = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "manifestReader.ts"), "utf8");
+    assert.match(manifestReader, /manifestPathFor\(directory, run\)/, "the file is the one scoped to this run's own project");
+    assert.match(manifestReader, /readCached\(this\.manifests, manifestPathFor\(directory, run\), \(text\) => parseExecutionManifest\(text\)\)/, "the parse is cached, because a manifest is the largest file either surface reads");
+    assert.match(manifestReader, /return bindParsedManifest\(parsed, binding, manifestExpectationFor\(run\)\);/, "and the binding is derived from this run, on this call, before any of it is believed");
+    assert.ok(!/CachedFile<Manifest(Binding|Stage)/.test(manifestReader.replace(/ManifestBindingRecord/g, "")), "nothing bound is ever what is cached");
   });
 });
 

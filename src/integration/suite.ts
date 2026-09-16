@@ -18,7 +18,7 @@ import * as crypto from "node:crypto";
 import * as os from "node:os";
 import type { DiscoveryDiagnostic } from "../core/diagnose";
 import { discoverRuns, selectRun } from "../core/discovery";
-import { manifestFileName } from "../core/manifest";
+import { BINDING_VERSION, bindingFileName, manifestFileName, parseExecutionManifest, renderBindingRecord } from "../core/manifest";
 import { isCopyPromptMessage, isHumanCheckMessage, isHumanFeedbackMessage, isOpenPromptSourceMessage, renderOverviewHtml } from "../core/overviewHtml";
 import { withHumanCheck, type HumanCheckDrafts } from "../core/humanChecks";
 import type { ExecutionRecord, LivenessState, RunnerLiveness } from "../core/liveness";
@@ -766,29 +766,39 @@ async function advancementAssertions(reportedRepo: string): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 20));
   await fs.mkdir(path.join(sparring, "stages", stage4), { recursive: true });
   await fs.writeFile(path.join(sparring, "stages", stage4, "state.json"), JSON.stringify({ status: "working", base_sha: null, candidate_sha: null, implementation_session_id: null, sparring_session_id: null }));
-  await fs.writeFile(planState, JSON.stringify({ current_stage: stage4, current_stage_index: 6, expected_branch: "feature/reported-statistics", plan: GATE_PLAN_LABEL, plan_digest: "0".repeat(64), source: "manifest", status: "running" }));
   // The manifest this managed run executes, as the extension wrote it when
   // the plan was adopted: it is what gives Stage 4 its plan identity.
   //
-  // Written under the name the extension itself uses, which is scoped to this
-  // project as well as to the plan key, and carrying the fields a manifest is
-  // bound by: the plan label it executes, and a stage list containing the
-  // run's recorded current stage.
+  // Everything that makes it *this run's* is written too, because none of it
+  // is optional: the file goes under the name the extension itself uses
+  // (scoped to this project as well as to the plan key), beside the binding
+  // record that says which worktree it was written for, and the plan-run state
+  // records the executable digest of exactly those bytes — which is what the
+  // engine does when it starts a run from a manifest.
   const manifests = (await vscode.commands.executeCommand("agentSparring._test.manifestDirectory")) as string;
   await fs.mkdir(manifests, { recursive: true });
   const manifestFile = path.join(manifests, manifestFileName(GATE_PLAN_KEY, reportedRepo));
-  await fs.writeFile(
-    manifestFile,
-    JSON.stringify({
-      version: 1,
-      plan_label: GATE_PLAN_LABEL,
-      source_digest: `sha256:${"0".repeat(64)}`,
-      stages: [
-        { stage_id: GATE_STAGE, label: "Stage 3D", title: "Snapshot v2 and attachment/export/import transport", brief: "The transport." },
-        { stage_id: stage4, label: "Stage 4", title: "Editor and UI inspection and guarded editing", brief: "The editor." },
-      ],
-    }),
-  );
+  const THE_STAGES = [
+    { stage_id: GATE_STAGE, label: "Stage 3D", title: "Snapshot v2 and attachment/export/import transport", brief: "The transport." },
+    { stage_id: stage4, label: "Stage 4", title: "Editor and UI inspection and guarded editing", brief: "The editor." },
+  ];
+
+  /** Write the manifest and its binding record; `record: false` leaves the run's recorded identity alone. */
+  const writeExecutionManifest = async (stages: unknown[], options: { record?: boolean } = {}): Promise<void> => {
+    const text = JSON.stringify({ version: 1, plan_label: GATE_PLAN_LABEL, source_digest: `sha256:${"0".repeat(64)}`, stages });
+    const digest = parseExecutionManifest(text)?.digest;
+    assert.ok(digest, "the manifest an integration scenario writes is one the engine would accept");
+    await fs.writeFile(manifestFile, text);
+    await fs.writeFile(
+      path.join(manifests, bindingFileName(GATE_PLAN_KEY, reportedRepo)),
+      renderBindingRecord({ version: BINDING_VERSION, manifestFile: path.basename(manifestFile), manifestDigest: digest, planKey: GATE_PLAN_KEY, planLabel: GATE_PLAN_LABEL, projectDir: reportedRepo }),
+    );
+    if (options.record !== false) {
+      await fs.writeFile(planState, JSON.stringify({ current_stage: stage4, current_stage_index: 6, expected_branch: "feature/reported-statistics", plan: GATE_PLAN_LABEL, plan_digest: digest, source: "manifest", status: "running" }));
+    }
+  };
+
+  await writeExecutionManifest(THE_STAGES);
   await vscode.commands.executeCommand("agentSparring.refresh");
 
   const after = await model();
@@ -833,15 +843,7 @@ async function advancementAssertions(reportedRepo: string): Promise<void> {
   // A manifest that no longer describes the run is not half-believed: the
   // stage goes back to standing on its own rather than being attributed to a
   // run that cannot be shown to have executed it.
-  await fs.writeFile(
-    manifestFile,
-    JSON.stringify({
-      version: 1,
-      plan_label: GATE_PLAN_LABEL,
-      source_digest: `sha256:${"0".repeat(64)}`,
-      stages: [{ stage_id: "stage-9-rewritten", label: "Stage 9", title: "Rewritten", brief: "x" }],
-    }),
-  );
+  await writeExecutionManifest([{ stage_id: "stage-9-rewritten", label: "Stage 9", title: "Rewritten", brief: "x" }], { record: false });
   await vscode.commands.executeCommand("agentSparring.refresh");
   await vscode.commands.executeCommand("agentSparring._test.chooseRun", stageRunId);
   const unbound = await model();
@@ -849,18 +851,7 @@ async function advancementAssertions(reportedRepo: string): Promise<void> {
   assert.equal(unbound.followPlan, undefined, "and there is no dead Back to plan run");
 
   // And that button switches to it.
-  await fs.writeFile(
-    manifestFile,
-    JSON.stringify({
-      version: 1,
-      plan_label: GATE_PLAN_LABEL,
-      source_digest: `sha256:${"0".repeat(64)}`,
-      stages: [
-        { stage_id: GATE_STAGE, label: "Stage 3D", title: "Snapshot v2 and attachment/export/import transport", brief: "The transport." },
-        { stage_id: stage4, label: "Stage 4", title: "Editor and UI inspection and guarded editing", brief: "The editor." },
-      ],
-    }),
-  );
+  await writeExecutionManifest(THE_STAGES, { record: false });
   await vscode.commands.executeCommand("agentSparring.refresh");
   await vscode.commands.executeCommand("agentSparring._test.associatePlan", undefined);
   await vscode.commands.executeCommand("agentSparring._test.chooseRun", stageRunId);

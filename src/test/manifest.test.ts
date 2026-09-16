@@ -10,7 +10,24 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { adoptionGaps, bindManifest, buildManifest, legacyManifestFileName, manifestFileName, renderManifest, sourceDigest, type KnownStage } from "../core/manifest";
+import {
+  BINDING_VERSION,
+  adoptionGaps,
+  bindManifest,
+  bindingFileName,
+  buildManifest,
+  legacyManifestFileName,
+  manifestDigest,
+  manifestFileName,
+  parseExecutionManifest,
+  previousManifestFileNames,
+  renderBindingRecord,
+  renderManifest,
+  sourceDigest,
+  type KnownStage,
+  type ManifestBindingRecord,
+  type ManifestExpectation,
+} from "../core/manifest";
 
 const PLAN_LABEL = "docs/plans/active/reported-statistics.md";
 const PLAN_NAME = "reported-statistics.md";
@@ -308,9 +325,9 @@ describe("building an execution manifest from a human plan", () => {
 
   it("names the manifest file after the plan key *and* the project, so regenerating overwrites in place", () => {
     const name = manifestFileName("reported-statistics-3f9a2c1b", "/code/sporely-py-reported-statistics");
-    assert.match(name, /^reported-statistics-3f9a2c1b-[0-9a-f]{8}\.manifest\.json$/);
+    assert.match(name, /^reported-statistics-3f9a2c1b-[0-9a-f]{64}\.manifest\.json$/);
     assert.equal(name, manifestFileName("reported-statistics-3f9a2c1b", "/code/sporely-py-reported-statistics"), "same run, same file");
-    assert.equal(legacyManifestFileName("reported-statistics-3f9a2c1b"), "reported-statistics-3f9a2c1b.manifest.json");
+    assert.equal(bindingFileName("reported-statistics-3f9a2c1b", "/code/sporely-py-reported-statistics").replace(".binding.json", ""), name.replace(".manifest.json", ""), "the binding record shares the manifest's identity");
   });
 
   it("gives two worktrees running the same plan path two different manifests", () => {
@@ -323,6 +340,30 @@ describe("building an execution manifest from a human plan", () => {
       manifestFileName(key, "/code/sporely-py-reported-statistics"),
       manifestFileName(key, "/code/worktrees/sporely-py-reported-statistics"),
     );
+  });
+
+  /**
+   * The project scope used to be the first eight hex digits of SHA-256 — 32
+   * bits — and a reviewer found two real directories that collide under it.
+   * A file name is an index and never an authority (see the worktree binding
+   * below), but a 32-bit namespace is not a useful index either.
+   */
+  it("scopes the file name by enough of the project digest that the reviewer's collision is gone", () => {
+    const key = "same-plan-7ea7171f";
+    assert.notEqual(
+      manifestFileName(key, "/tmp/sparring-worktree-33503"),
+      manifestFileName(key, "/tmp/sparring-worktree-75970"),
+      "the two directories that produced one file name under an 8-hex scope",
+    );
+    assert.notEqual(bindingFileName(key, "/tmp/sparring-worktree-33503"), bindingFileName(key, "/tmp/sparring-worktree-75970"));
+  });
+
+  it("remembers the names it used to write, for provenance and never as authority", () => {
+    const names = previousManifestFileNames("reported-statistics-3f9a2c1b", "/code/sporely-py-reported-statistics");
+    assert.match(names[0], /^reported-statistics-3f9a2c1b-[0-9a-f]{8}\.manifest\.json$/, "the 8-hex project scope");
+    assert.equal(names[1], legacyManifestFileName("reported-statistics-3f9a2c1b"), "then the unscoped name");
+    assert.equal(names[1], "reported-statistics-3f9a2c1b.manifest.json");
+    assert.ok(!names.includes(manifestFileName("reported-statistics-3f9a2c1b", "/code/sporely-py-reported-statistics")), "the current name is not one of them");
   });
 
   it("carries no status, position, verdict or session: it is input, not a second workflow engine", () => {
@@ -344,31 +385,59 @@ describe("building an execution manifest from a human plan", () => {
 
 /**
  * A manifest lives in global storage, which is per-user and nothing else. It
- * being there is not evidence that it belongs to the run on screen, so before
- * it may define that run's stages — and therefore which historical stages
- * belong to it — it has to be bound to the run's own recorded state.
+ * being there is not evidence that it belongs to the run on screen, and
+ * neither is the name it is under. The manifest is candidate evidence; the
+ * authority is the run's recorded state, the executable digest and the
+ * worktree identity, and all of it is checked before a single stage of it is
+ * believed.
  */
 describe("binding a manifest to the run it is claimed to describe", () => {
+  const PLAN_LABEL = "docs/plans/reported-statistics.md";
+  const WORKTREE = "/code/sporely-py-reported-statistics";
   const STAGES = [
-    { stage_id: "stage-3d-transport", label: "Stage 3D", title: "Transport" },
-    { stage_id: "stage-4-editor", label: "Stage 4", title: "Editor" },
+    { stage_id: "stage-3d-transport", label: "Stage 3D", title: "Transport", brief: "# Stage brief: 3D\n\nThe transport.\n" },
+    { stage_id: "stage-4-editor", label: "Stage 4", title: "Editor", brief: "# Stage brief: 4\n\nThe editor.\n" },
   ];
-  const manifest = (overrides: Record<string, unknown> = {}) =>
-    JSON.stringify({ version: 1, plan_label: "docs/plans/reported-statistics.md", source_digest: "sha256:abc", stages: STAGES, ...overrides });
-  const expect = { planLabel: "docs/plans/reported-statistics.md", currentStageId: "stage-4-editor" };
+  const manifest = (overrides: Record<string, unknown> = {}) => JSON.stringify({ version: 1, plan_label: PLAN_LABEL, source_digest: "sha256:abc", stages: STAGES, ...overrides }, null, 2);
+
+  const MANIFEST_FILE = manifestFileName("reported-statistics-3f9a2c1b", WORKTREE);
+
+  /** The sidecar the extension writes beside a manifest, or a doctored one. */
+  const binding = (text: string, overrides: Partial<ManifestBindingRecord> = {}) =>
+    renderBindingRecord({
+      version: BINDING_VERSION,
+      manifestFile: MANIFEST_FILE,
+      manifestDigest: parseExecutionManifest(text)?.digest ?? "unreadable",
+      planKey: "reported-statistics-3f9a2c1b",
+      planLabel: PLAN_LABEL,
+      projectDir: WORKTREE,
+      ...overrides,
+    });
+
+  /** What the engine records for a run started from `text`, as this run's state holds it. */
+  const expectationFor = (text: string, overrides: Partial<ManifestExpectation> = {}): ManifestExpectation => ({
+    planLabel: PLAN_LABEL,
+    currentStageId: "stage-4-editor",
+    planDigest: parseExecutionManifest(text)?.digest ?? "",
+    projectDir: WORKTREE,
+    manifestFile: MANIFEST_FILE,
+    ...overrides,
+  });
 
   it("accepts the run's own manifest and hands back its stage identities", () => {
-    const bound = bindManifest(manifest(), expect);
+    const text = manifest();
+    const bound = bindManifest(text, binding(text), expectationFor(text));
     assert.ok(bound.ok);
     assert.deepEqual(
       bound.identity.stages.map((stage) => stage.label),
       ["Stage 3D", "Stage 4"],
     );
-    assert.equal(bound.identity.planLabel, "docs/plans/reported-statistics.md");
+    assert.equal(bound.identity.planLabel, PLAN_LABEL);
   });
 
   it("refuses a manifest that executes a different plan", () => {
-    const bound = bindManifest(manifest({ plan_label: "docs/plans/something-else.md" }), expect);
+    const text = manifest({ plan_label: "docs/plans/something-else.md" });
+    const bound = bindManifest(text, binding(text, { planLabel: "docs/plans/something-else.md" }), expectationFor(text));
     assert.equal(bound.ok, false);
     assert.equal(bound.ok === false && bound.reason, "plan-label");
   });
@@ -377,22 +446,360 @@ describe("binding a manifest to the run it is claimed to describe", () => {
     // The plan was rewritten and the stage ids changed under a run that is
     // still recorded as being at stage-4-editor. Redefining that run's stage
     // membership from it would move historical stages between runs.
-    const regenerated = manifest({ stages: [{ stage_id: "stage-5-something-new", label: "Stage 5", title: "New" }] });
-    const bound = bindManifest(regenerated, expect);
+    const text = manifest({ stages: [{ stage_id: "stage-5-something-new", label: "Stage 5", title: "New", brief: "x\n" }] });
+    const bound = bindManifest(text, binding(text), expectationFor(text));
     assert.equal(bound.ok, false);
     assert.equal(bound.ok === false && bound.reason, "current-stage");
   });
 
   it("refuses an absent or unreadable manifest rather than guessing at one", () => {
+    const good = manifest();
     for (const text of [undefined, "", "not json", JSON.stringify({ version: 2, plan_label: "x", source_digest: "y", stages: STAGES })]) {
-      const bound = bindManifest(text, expect);
+      const bound = bindManifest(text, binding(good), expectationFor(good));
       assert.equal(bound.ok, false, `refused: ${String(text).slice(0, 20)}`);
       assert.equal(bound.ok === false && bound.reason, "unreadable");
     }
   });
 
   it("a complete run keeps its stages: its recorded current stage is its last one", () => {
-    const bound = bindManifest(manifest(), { planLabel: "docs/plans/reported-statistics.md", currentStageId: "stage-4-editor" });
-    assert.ok(bound.ok, "completion is a status, and a manifest carries no status at all");
+    const text = manifest();
+    assert.ok(bindManifest(text, binding(text), expectationFor(text)).ok, "completion is a status, and a manifest carries no status at all");
+  });
+});
+
+/**
+ * The reviewer's first reproduction, and the invariant that answers it.
+ *
+ * Checking the plan label and the presence of the current stage is not
+ * membership: a regenerated manifest can keep both, add stages the run never
+ * executed, be refused by the engine on the next resume, and still be read by
+ * the UI as this run's history. The only honest statement of "this is the
+ * manifest this run executes" is the engine's own identity for it — the
+ * executable digest recorded as `plan_digest` — so that is what membership
+ * follows.
+ */
+describe("membership follows the executable digest the run recorded", () => {
+  const PLAN_LABEL = "docs/plans/reported-statistics.md";
+  const WORKTREE = "/code/sporely-py-reported-statistics";
+  const STAGE_3D = { stage_id: "stage-3d-transport", label: "Stage 3D", title: "Transport", brief: "# Stage brief: 3D\n\nThe transport.\n" };
+  const STAGE_4 = { stage_id: "stage-4-editor", label: "Stage 4", title: "Editor", brief: "# Stage brief: 4\n\nThe editor.\n" };
+  const M1 = JSON.stringify({ version: 1, plan_label: PLAN_LABEL, source_digest: "sha256:abc", stages: [STAGE_3D, STAGE_4] }, null, 2);
+
+  const D = parseExecutionManifest(M1)?.digest ?? "";
+  const MANIFEST_FILE = manifestFileName("reported-statistics-3f9a2c1b", WORKTREE);
+
+  const bindingFor = (text: string, overrides: Partial<ManifestBindingRecord> = {}) =>
+    renderBindingRecord({
+      version: BINDING_VERSION,
+      manifestFile: MANIFEST_FILE,
+      manifestDigest: parseExecutionManifest(text)?.digest ?? "unreadable",
+      planKey: "reported-statistics-3f9a2c1b",
+      planLabel: PLAN_LABEL,
+      projectDir: WORKTREE,
+      ...overrides,
+    });
+
+  /** The completed run: it recorded D when it started, and is at its last stage. */
+  const RUN: ManifestExpectation = { planLabel: PLAN_LABEL, currentStageId: "stage-4-editor", planDigest: D, projectDir: WORKTREE, manifestFile: MANIFEST_FILE };
+
+  const refused = (text: string, why: string) => {
+    const bound = bindManifest(text, bindingFor(text), RUN);
+    assert.equal(bound.ok, false, why);
+    assert.equal(bound.ok === false && bound.reason, "plan-digest", why);
+  };
+
+  it("computes the same digest the engine records, over the engine's own content", () => {
+    assert.match(D, /^[0-9a-f]{64}$/, "the engine's plan_digest shape");
+    assert.equal(manifestDigest({ version: 1, plan_label: PLAN_LABEL, source_digest: "sha256:abc", stages: [STAGE_3D, STAGE_4] }), D, "the writer and the reader agree");
+  });
+
+  it("accepts M1, which is what the run recorded", () => {
+    assert.ok(bindManifest(M1, bindingFor(M1), RUN).ok);
+  });
+
+  it("refuses M2: same plan label, same current stage, one stage the run never executed", () => {
+    // The reviewer's attack, exactly: everything the old validation looked at
+    // is unchanged, and the engine would refuse this file on the next resume.
+    const M2 = JSON.stringify(
+      { version: 1, plan_label: PLAN_LABEL, source_digest: "sha256:abc", stages: [STAGE_3D, STAGE_4, { stage_id: "stage-5-never-ran", label: "Stage 5", title: "Never ran", brief: "x\n" }] },
+      null,
+      2,
+    );
+    const identity = parseExecutionManifest(M2);
+    assert.equal(identity?.identity.planLabel, PLAN_LABEL, "the plan label is unchanged");
+    assert.ok(identity?.identity.stages.some((stage) => stage.stageId === "stage-4-editor"), "and the run's current stage is still there");
+    refused(M2, "an appended stage changes what would execute");
+  });
+
+  it("refuses a manifest whose only change is to a historical stage", () => {
+    refused(JSON.stringify({ version: 1, plan_label: PLAN_LABEL, source_digest: "sha256:abc", stages: [STAGE_4] }, null, 2), "a removed stage");
+    refused(JSON.stringify({ version: 1, plan_label: PLAN_LABEL, source_digest: "sha256:abc", stages: [STAGE_4, STAGE_3D] }, null, 2), "a reordered sequence");
+  });
+
+  it("refuses a changed title, brief, mode or declared repository", () => {
+    const withStage = (stage: Record<string, unknown>) => JSON.stringify({ version: 1, plan_label: PLAN_LABEL, source_digest: "sha256:abc", stages: [stage, STAGE_4] }, null, 2);
+    refused(withStage({ ...STAGE_3D, title: "Transport, revised" }), "the title participates");
+    refused(withStage({ ...STAGE_3D, label: "Stage 3E" }), "the label participates");
+    refused(withStage({ ...STAGE_3D, brief: "# Stage brief: 3D\n\nSomething else.\n" }), "the brief participates");
+    refused(withStage({ ...STAGE_3D, mode: "independent_review" }), "the mode participates when it is not the default");
+    refused(withStage({ ...STAGE_3D, repositories: [{ name: "sporely-web", path: "../sporely-web", branch: "feature/x", candidate_sha: null }] }), "a declared repository participates");
+    refused(JSON.stringify({ version: 1, plan_label: PLAN_LABEL, source_digest: "sha256:different", stages: [STAGE_3D, STAGE_4] }, null, 2), "and so does the source digest");
+  });
+
+  it("keeps the default mode out of the digest, as the engine does", () => {
+    // A manifest written before modes existed executes the implementation
+    // lifecycle either way, so it must digest to the value its recorded run
+    // already holds and must keep resuming.
+    const explicit = JSON.stringify({ version: 1, plan_label: PLAN_LABEL, source_digest: "sha256:abc", stages: [{ ...STAGE_3D, mode: "implementation" }, STAGE_4] }, null, 2);
+    assert.equal(parseExecutionManifest(explicit)?.digest, D, "declaring the default changes nothing");
+  });
+
+  it("refuses to digest a manifest the engine itself would refuse", () => {
+    const withStages = (stages: unknown[]) => JSON.stringify({ version: 1, plan_label: PLAN_LABEL, source_digest: "sha256:abc", stages }, null, 2);
+    assert.equal(parseExecutionManifest(JSON.stringify({ version: 1, plan_label: PLAN_LABEL, source_digest: "s", stages: [STAGE_3D], status: "running" })), undefined, "an unknown top-level key");
+    assert.equal(parseExecutionManifest(withStages([{ ...STAGE_3D, position: 1 }])), undefined, "an unknown stage key");
+    assert.equal(parseExecutionManifest(withStages([{ ...STAGE_3D, brief: "   " }])), undefined, "a stage with nothing to implement from");
+    assert.equal(parseExecutionManifest(withStages([{ ...STAGE_3D, stage_id: "../escape" }])), undefined, "a stage id that is not one path segment");
+    assert.equal(parseExecutionManifest(withStages([STAGE_3D, STAGE_3D])), undefined, "duplicate stage ids");
+    assert.equal(parseExecutionManifest(withStages([{ ...STAGE_3D, mode: "review" }])), undefined, "a mode this engine does not know");
+    assert.equal(parseExecutionManifest(withStages([{ ...STAGE_3D, repositories: [{ name: "a", path: "../a", branch: "b", role: "sibling" }] }])), undefined, "an unknown repository key");
+    assert.equal(
+      parseExecutionManifest(
+        withStages([{ ...STAGE_3D, repositories: [{ name: "a", path: "../a", branch: "b", candidate_sha: null }, { name: "a", path: "../b", branch: "c", candidate_sha: null }] }]),
+      ),
+      undefined,
+      "duplicate repository names",
+    );
+  });
+
+  it("does not mistake source-digest provenance for executable identity", () => {
+    // `source_digest` is a hash of the plan *document* and is carried forward
+    // across rebuilds precisely so prose edits do not end a run. It is one
+    // input to the executable digest, never a stand-in for it.
+    assert.notEqual(parseExecutionManifest(M1)?.identity.sourceDigest, D);
+    assert.equal(parseExecutionManifest(M1)?.identity.sourceDigest, "sha256:abc");
+  });
+});
+
+/**
+ * The reviewer's third reproduction. Two worktrees of one repository running
+ * the same plan path record identical state and build byte-identical
+ * manifests, so neither the recorded state nor the executable digest can tell
+ * them apart — and a file name never could, whatever it hashes. The worktree
+ * is therefore *stated*, in a sidecar record beside the manifest.
+ */
+describe("a manifest is bound to a worktree by what it says, not by where it sits", () => {
+  const PLAN_LABEL = "docs/plans/reported-statistics.md";
+  const PLAN_KEY = "same-plan-7ea7171f";
+  const A = "/tmp/sparring-worktree-33503";
+  const B = "/tmp/sparring-worktree-75970";
+  const TEXT = JSON.stringify(
+    {
+      version: 1,
+      plan_label: PLAN_LABEL,
+      source_digest: "sha256:abc",
+      stages: [{ stage_id: "stage-4-editor", label: "Stage 4", title: "Editor", brief: "# Stage brief: 4\n" }],
+    },
+    null,
+    2,
+  );
+  const DIGEST = parseExecutionManifest(TEXT)?.digest ?? "";
+
+  const expectationFor = (worktree: string): ManifestExpectation => ({
+    planLabel: PLAN_LABEL,
+    currentStageId: "stage-4-editor",
+    planDigest: DIGEST,
+    projectDir: worktree,
+    manifestFile: manifestFileName(PLAN_KEY, worktree),
+  });
+
+  const bindingWritten = (worktree: string) =>
+    renderBindingRecord({
+      version: BINDING_VERSION,
+      manifestFile: manifestFileName(PLAN_KEY, worktree),
+      manifestDigest: DIGEST,
+      planKey: PLAN_KEY,
+      planLabel: PLAN_LABEL,
+      projectDir: worktree,
+    });
+
+  it("accepts each worktree's own record", () => {
+    assert.ok(bindManifest(TEXT, bindingWritten(A), expectationFor(A)).ok);
+    assert.ok(bindManifest(TEXT, bindingWritten(B), expectationFor(B)).ok);
+  });
+
+  it("refuses the other worktree's record even when everything else matches", () => {
+    // Same plan path, same plan label, same current stage, same digest: the
+    // two runs are indistinguishable except for this statement.
+    const bound = bindManifest(TEXT, bindingWritten(B), expectationFor(A));
+    assert.equal(bound.ok, false, "B's record must never establish membership for A");
+    assert.equal(bound.ok === false && bound.reason, "unbound-worktree");
+    assert.match(bound.ok === false ? bound.detail : "", /it was written for/);
+  });
+
+  it("refuses a manifest with no binding record at all", () => {
+    const bound = bindManifest(TEXT, undefined, expectationFor(A));
+    assert.equal(bound.ok, false, "an unvouched file is candidate evidence and nothing more");
+    assert.equal(bound.ok === false && bound.reason, "unbound-worktree");
+  });
+
+  it("refuses a record that vouches for a different file or a different digest", () => {
+    const wrongFile = bindManifest(TEXT, bindingWritten(A).replace(manifestFileName(PLAN_KEY, A), "someone-elses.manifest.json"), expectationFor(A));
+    assert.equal(wrongFile.ok === false && wrongFile.reason, "unbound-worktree");
+    const wrongDigest = bindManifest(TEXT, bindingWritten(A).replace(DIGEST, "f".repeat(64)), expectationFor(A));
+    assert.equal(wrongDigest.ok === false && wrongDigest.reason, "unbound-worktree", "a stale record cannot vouch for a replaced manifest");
+  });
+});
+
+/**
+ * The digests below were produced by the engine itself, not by this code:
+ *
+ *     python -c "from agent_sparring.manifest import parse_manifest, manifest_digest; \
+ *                print(manifest_digest(parse_manifest(open('m.json').read())))"
+ *
+ * against `agent_sparring/manifest.py` as it stands. They are pinned here so
+ * that a change to either implementation is caught as a change to a recorded
+ * value rather than discovered when a real run is refused mid-flight: the
+ * extension compares this digest against the `plan_digest` the engine wrote,
+ * so the two agreeing is not an optimisation, it is the contract.
+ *
+ * Each case pins one rule of `manifest_digest`: field order and NUL
+ * separation, the default mode contributing nothing, a non-default mode and
+ * declared repositories contributing, `candidate_sha: null` digesting as the
+ * empty string, the trimming `_text` performs, and UTF-8 content.
+ */
+describe("the digest is the engine's own, vector by vector", () => {
+  const VECTORS: { why: string; manifest: unknown; digest: string }[] = [
+    {
+      why: "two ordinary stages",
+      manifest: {
+        version: 1,
+        plan_label: "docs/plans/active/reported-statistics.md",
+        source_digest: "sha256:abc",
+        stages: [
+          { stage_id: "stage-3d-transport", label: "Stage 3D", title: "Transport", brief: "# Stage brief: 3D\n\nThe transport.\n" },
+          { stage_id: "stage-4-editor", label: "Stage 4", title: "Editor", brief: "# Stage brief: 4\n\nThe editor.\n" },
+        ],
+      },
+      digest: "00e14ac8114c3da13a0820263e944746b3aca06f5b8f8e0b2e0b403e40cbeb2b",
+    },
+    {
+      why: "an explicitly declared default mode, which the engine leaves out of the digest",
+      manifest: {
+        version: 1,
+        plan_label: "docs/plans/active/reported-statistics.md",
+        source_digest: "sha256:abc",
+        stages: [
+          { stage_id: "stage-3d-transport", label: "Stage 3D", title: "Transport", brief: "b", mode: "implementation" },
+          { stage_id: "stage-4-editor", label: "Stage 4", title: "Editor", brief: "b2" },
+        ],
+      },
+      digest: "368a7af2cb47c5fbe9a340f11794775f3572808a948ef9f97180df9afdf9bdf2",
+    },
+    {
+      why: "a review-only stage with two declared repositories, one unpinned",
+      manifest: {
+        version: 1,
+        plan_label: "p.md",
+        source_digest: "sha256:x",
+        stages: [
+          {
+            stage_id: "s1",
+            label: "Stage 1",
+            title: "One",
+            brief: "brief one",
+            mode: "independent_review",
+            repositories: [
+              { name: "sporely-web", path: "../sporely-web-rs", branch: "feature/x", candidate_sha: null },
+              { name: "sporely-py", path: "../sporely-py", branch: "feature/y", candidate_sha: "abc123" },
+            ],
+          },
+        ],
+      },
+      digest: "1872dfed24f669c4e7f80016f1add8e90dd4eb5a2b2860da50a2a9eab0d63583",
+    },
+    {
+      why: "surrounding whitespace, which the engine trims everywhere except the brief",
+      manifest: {
+        version: 1,
+        plan_label: "  padded.md  ",
+        source_digest: "  sha256:pad  ",
+        stages: [{ stage_id: "  s1  ", label: "  Stage 1  ", title: "  One  ", brief: "  brief with spaces  " }],
+      },
+      digest: "458555dd56a9274fa909dbd3c3f0f235b2acae104aa9daac8dd554945ab95328",
+    },
+    {
+      why: "non-ASCII labels, titles and briefs",
+      manifest: {
+        version: 1,
+        plan_label: "unicode.md",
+        source_digest: "sha256:u",
+        stages: [{ stage_id: "s1-unicode", label: "Stage 1 — é", title: "Trykk på «knappen»", brief: "Norsk brief med æøå og — dash\n" }],
+      },
+      digest: "253586a7a82d0dddff4eaee3f60383bd8b8f59b6bc41ac01f031488a151d03e8",
+    },
+    {
+      why: "explicit nulls for the two optional fields",
+      manifest: { version: 1, plan_label: "nullrepo.md", source_digest: "sha256:n", stages: [{ stage_id: "s1", label: "L", title: "T", brief: "b", repositories: null, mode: null }] },
+      digest: "f0747985cb38f78c02310f859591c023818b56ee1228e166dac16d1b8cad7f8f",
+    },
+  ];
+
+  for (const vector of VECTORS) {
+    it(`matches the engine for ${vector.why}`, () => {
+      assert.equal(parseExecutionManifest(JSON.stringify(vector.manifest))?.digest, vector.digest);
+    });
+  }
+
+  /**
+   * And the other half of the agreement: a manifest the engine refuses has no
+   * digest here either. A more lenient reader would compute a value for a file
+   * the engine would never run, and the UI would read it as history.
+   */
+  it("refuses everything the engine refuses", () => {
+    const REFUSED: unknown[] = [
+      { version: 2, plan_label: "p.md", source_digest: "s", stages: [{ stage_id: "s1", label: "L", title: "T", brief: "b" }] },
+      { version: 1, plan_label: "p.md", source_digest: "s", stages: [{ stage_id: "s1", label: "L", title: "T", brief: "b" }], status: "running" },
+      { version: 1, plan_label: "p.md", source_digest: "s", stages: [{ stage_id: "s1", label: "L", title: "T", brief: "b", position: 1 }] },
+      { version: 1, plan_label: "p.md", source_digest: "s", stages: [{ stage_id: "s1", label: "L", title: "T", brief: "   " }] },
+      { version: 1, plan_label: "p.md", source_digest: "s", stages: [{ stage_id: "../escape", label: "L", title: "T", brief: "b" }] },
+      {
+        version: 1,
+        plan_label: "p.md",
+        source_digest: "s",
+        stages: [
+          { stage_id: "s1", label: "L", title: "T", brief: "b" },
+          { stage_id: "s1", label: "L2", title: "T2", brief: "b2" },
+        ],
+      },
+      { version: 1, plan_label: "p.md", source_digest: "s", stages: [{ stage_id: "s1", label: "L", title: "T", brief: "b", mode: "review" }] },
+      { version: 1, plan_label: "p.md", source_digest: "s", stages: [{ stage_id: "s1", label: "L", title: "T", brief: "b", repositories: [{ name: "a", path: "../a", branch: "b", role: "x" }] }] },
+      {
+        version: 1,
+        plan_label: "p.md",
+        source_digest: "s",
+        stages: [
+          {
+            stage_id: "s1",
+            label: "L",
+            title: "T",
+            brief: "b",
+            repositories: [
+              { name: "a", path: "../a", branch: "b", candidate_sha: null },
+              { name: "a", path: "../c", branch: "d", candidate_sha: null },
+            ],
+          },
+        ],
+      },
+      { version: 1, plan_label: "p.md", source_digest: "s", stages: [] },
+      { version: 1, plan_label: "", source_digest: "s", stages: [{ stage_id: "s1", label: "L", title: "T", brief: "b" }] },
+      { version: 1, plan_label: "p.md", stages: [{ stage_id: "s1", label: "L", title: "T", brief: "b" }] },
+      { version: 1, plan_label: "p.md", source_digest: "s", stages: [{ stage_id: "s1", label: "L", title: "T", brief: "b", repositories: [{ name: "a", path: "../a", branch: "b", candidate_sha: 7 }] }] },
+      { version: 1, plan_label: "p.md", source_digest: "s", stages: [{ stage_id: "s1", label: "", title: "T", brief: "b" }] },
+      { version: 1, plan_label: "p.md", source_digest: "s", stages: "not-an-array" },
+    ];
+    for (const refused of REFUSED) {
+      assert.equal(parseExecutionManifest(JSON.stringify(refused)), undefined, `refused: ${JSON.stringify(refused).slice(0, 90)}`);
+    }
   });
 });

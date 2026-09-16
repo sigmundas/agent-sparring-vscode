@@ -4,7 +4,7 @@
  * `../core`; this file only adapts it to the vscode API.
  */
 
-import * as fs from "node:fs/promises";
+
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { ActivityTailer } from "../core/activityTailer";
@@ -27,10 +27,11 @@ import {
   type RunPreference,
   type RepositoryScope,
   type RunSelection,
+  type PlanRunSnapshot,
   type RunSnapshot,
   type SparringLocation,
 } from "../core/discovery";
-import { bindManifest, manifestExpectationFor, manifestPathFor, type ManifestStageIdentity } from "../core/manifest";
+import { manifestPathFor, type ManifestBinding, type ManifestStageIdentity } from "../core/manifest";
 import { resolveMemberships, stageOwnership, type PlanMembership } from "../core/planMembership";
 import { deriveLiveness, type ExecutionRecord, type RunnerLiveness } from "../core/liveness";
 import { applyEvent, emptyLiveState, type LiveState } from "../core/liveState";
@@ -81,7 +82,7 @@ import { deriveStatus } from "../core/status";
 import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
 import { TerminalPool } from "./terminalPool";
 import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult } from "./executionTracker";
-import { MANIFEST_READ_LIMIT, readHead } from "./fileHead";
+import { ManifestReader } from "./manifestReader";
 import { ActiveRepositoryTracker, RealPaths } from "./activeRepository";
 
 const SELECTED_RUN_KEY = "agentSparring.selectedRunId";
@@ -135,8 +136,10 @@ export class SparringController implements vscode.Disposable {
   private readonly probed = new Map<string, number>();
   /** Run ids whose Accept stage operation from this window is still in flight. */
   private readonly accepting = new Set<string>();
-  /** Manifest stage identities by file, keyed by the file's mtime; see manifestStagesFor. */
-  private readonly manifestCache = new Map<string, { mtimeMs: number; stages: ManifestStageIdentity[] | undefined }>();
+  /** Reads execution manifests out of global storage; caches their bytes and never their binding. */
+  private readonly manifests = new ManifestReader();
+  /** The last rejection reported for a manifest file, so a steady refusal is logged once rather than per render. */
+  private readonly manifestRefusals = new Map<string, string>();
 
   private readonly changeEmitter = new vscode.EventEmitter<void>();
   /** Fires after every re-render: selection, authoritative state or live activity changed. */
@@ -553,53 +556,48 @@ export class SparringController implements vscode.Disposable {
 
   /**
    * The stage identities of the manifest a managed run executes — but only
-   * once that manifest has been bound to *this* run.
+   * once that manifest has been bound to *this* run, on this call.
    *
    * The file lives in global storage, which is per-user and nothing else, so
-   * finding a file there is not evidence that it belongs to the run on screen.
-   * Two things make it authoritative, and both are required:
+   * finding one there is not evidence that it belongs to the run on screen,
+   * and neither is its name. The manifest is candidate evidence; the authority
+   * is the run's own recorded state plus the worktree identity, and
+   * `bindParsedManifest` checks the lot (manifest.ts): the plan label, the
+   * **executable digest against the `plan_digest` the engine recorded**, the
+   * recorded current stage, and the sidecar record that says which worktree
+   * the file was written for.
    *
-   *  - its **path** is scoped to the project directory as well as the plan key
-   *    (`manifestFileName`), so two worktrees running `docs/plans/foo.md` no
-   *    longer share one file and cannot consume each other's;
-   *  - its **content** is validated against what the engine recorded in
-   *    `.sparring/plans/<key>.json` — the plan label it executes and its
-   *    current stage (`bindManifest`), which is what catches a manifest
-   *    regenerated into something this run does not execute.
-   *
-   * A manifest that fails either check yields `undefined`, and every caller
+   * A manifest that fails any check yields `undefined`, and every caller
    * degrades to "no recorded membership" — a standalone stage stays
    * standalone, the journey is not drawn, and nothing claims an ownership it
-   * cannot show. The rejection is logged once per file version, because a
-   * silent degradation is the one thing worse than an honest one.
+   * cannot show. The rejection is logged when it changes, because a silent
+   * degradation is the one thing worse than an honest one.
    *
-   * Cached by the file's modification time: a manifest carries every stage's
-   * brief verbatim, so it is by far the largest thing the Overview reads, and
-   * the Overview, the run picker and selection all need it now.
+   * The read is cached — a manifest is the largest file the Overview touches,
+   * and three surfaces want it on every render — but only its *bytes* are;
+   * `ManifestReader` re-derives the binding from this `RunSnapshot` on every
+   * call, and its header says why a cache must never hold the conclusion.
    */
   async manifestStagesFor(run: RunSnapshot): Promise<ManifestStageIdentity[] | undefined> {
     if (run.kind !== "plan" || run.state.source !== "manifest") {
       return undefined;
     }
-    const file = manifestPathFor(this.manifestDirectoryPath, run);
-    let mtimeMs: number;
-    try {
-      mtimeMs = (await fs.stat(file)).mtimeMs;
-    } catch {
-      this.manifestCache.delete(file);
-      return undefined;
+    const bound = await this.manifests.read(this.manifestDirectoryPath, run);
+    this.reportManifestBinding(manifestPathFor(this.manifestDirectoryPath, run), run, bound);
+    return bound.ok ? bound.identity.stages : undefined;
+  }
+
+  /** Log a refusal the first time it is reached, and again whenever it changes; never once per render. */
+  private reportManifestBinding(file: string, run: PlanRunSnapshot, bound: ManifestBinding): void {
+    const key = `${run.id} ${file}`;
+    const signature = bound.ok ? "bound" : `${bound.reason}: ${bound.detail}`;
+    if (this.manifestRefusals.get(key) === signature) {
+      return;
     }
-    const cached = this.manifestCache.get(file);
-    if (cached && cached.mtimeMs === mtimeMs) {
-      return cached.stages;
-    }
-    const bound = bindManifest(await readHead(file, MANIFEST_READ_LIMIT), manifestExpectationFor(run));
+    this.manifestRefusals.set(key, signature);
     if (!bound.ok) {
       this.log(`the execution manifest ${path.basename(file)} is not this run's: ${bound.detail}. Its stages are not used, and no stage is attributed to this plan run from it.`);
     }
-    const stages = bound.ok ? bound.identity.stages : undefined;
-    this.manifestCache.set(file, { mtimeMs, stages });
-    return stages;
   }
 
   /**
