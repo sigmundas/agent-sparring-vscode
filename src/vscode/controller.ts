@@ -32,6 +32,7 @@ import {
   type SparringLocation,
 } from "../core/discovery";
 import { manifestPathFor, type ManifestBinding, type ManifestStageIdentity } from "../core/manifest";
+import { launchRepositories, type LaunchRepository } from "../core/launchRepositories";
 import { resolveMemberships, stageOwnership, type PlanMembership } from "../core/planMembership";
 import { deriveLiveness, type ExecutionRecord, type RunnerLiveness } from "../core/liveness";
 import { applyEvent, emptyLiveState, type LiveState } from "../core/liveState";
@@ -852,6 +853,22 @@ export class SparringController implements vscode.Disposable {
 
   get sparringLocations(): SparringLocation[] {
     return this.locations;
+  }
+
+  /**
+   * Every repository a plan may be started in: this window's discovered
+   * Agent Sparring projects, plus every repository and worktree the built-in
+   * Git extension has open (launchRepositories.ts).
+   *
+   * The Git extension's API is what supplies a repository with no `.sparring`
+   * yet, so it is awaited rather than merely read: this is a user-initiated
+   * moment, and a window that started before the Git extension would
+   * otherwise offer the incomplete list once and the complete list ever after.
+   */
+  async launchRepositories(): Promise<LaunchRepository[]> {
+    await this.activeRepository.ready();
+    const folders = (vscode.workspace.workspaceFolders ?? []).map((folder) => ({ path: folder.uri.fsPath, name: folder.name }));
+    return launchRepositories(this.locations, this.activeRepository.knownRepoRoots, folders);
   }
 
   /** The run the user chose, with the moment they chose it (see selectRun). */

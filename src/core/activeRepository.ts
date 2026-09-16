@@ -51,6 +51,7 @@
  */
 
 import { canonicalPath, isInsidePath, samePath, type RunSelection, type RunSnapshot } from "./discovery";
+import { pathDepth } from "./launchRepositories";
 
 export interface ActiveRepositorySignal {
   /** Absolute repository/worktree root, exactly as the Git extension reports it. */
@@ -330,23 +331,30 @@ export class ActiveRepositoryFold {
 }
 
 /**
- * Which repository owns a path.
+ * Which repository owns a path: the **deepest** repository root containing it.
  *
- * The Git extension is asked first, because it is its own authority and knows
- * about submodules and worktrees. The containment fallback exists for the
- * cases it declines: there the *deepest* open root containing the path wins,
- * so a worktree checked out inside its parent repository is not mistaken for
- * the parent.
+ * Both sources are consulted and then ranked together, rather than one being
+ * trusted outright:
+ *
+ *  - the Git extension's own `API.getRepository`, which knows about submodules
+ *    and worktrees;
+ *  - every open repository root that contains the path.
+ *
+ * Repository roots nest — a worktree checked out inside its parent, a
+ * repository inside a container folder — so containment alone is ambiguous and
+ * only the most specific root is a correct answer. Ranking both sources
+ * together means a shallower answer can never win over a deeper open root,
+ * whichever source it came from, while the Git extension still decides every
+ * tie (its answer is first, and the sort is stable) and still supplies roots
+ * the containment scan cannot see.
+ *
+ * Depth is counted in path segments, not string length: `/code/a/b` is deeper
+ * than `/code/aaaaaaaaaa`, and sorting by length said otherwise.
  */
 export function repositoryOfPath(git: GitSource, fsPath: string): string | undefined {
   const owner = git.repositoryOf(fsPath);
-  if (owner) {
-    return owner;
-  }
-  return (git.repositories() ?? [])
-    .map((repository) => repository.rootPath)
-    .filter((root) => samePath(root, fsPath) || isInsidePath(fsPath, root))
-    .sort((a, b) => canonicalPath(b).length - canonicalPath(a).length)[0];
+  const contained = (git.repositories() ?? []).map((repository) => repository.rootPath).filter((root) => samePath(root, fsPath) || isInsidePath(fsPath, root));
+  return [...(owner ? [owner] : []), ...contained].sort((a, b) => pathDepth(b) - pathDepth(a) || canonicalPath(b).length - canonicalPath(a).length)[0];
 }
 
 // ---------------------------------------------------------------------------

@@ -32,7 +32,6 @@ import {
   HANDOFF_FILENAME,
   NOTES_FILENAME,
   SPARRING_FILENAME,
-  chooseLaunchLocation,
   currentStageOf,
   isInsidePath,
   runIdFor,
@@ -55,6 +54,7 @@ import { buildRunPickGroups, describeRun } from "../core/runPick";
 import { stageDisplayName } from "../core/presentation";
 import { stageActions, stageRunAction } from "../core/runner";
 import { planKey, planLabel, planRunId, type SparringSubcommand } from "../core/sparringCommand";
+import { chooseLaunchRepository } from "../core/launchRepositories";
 import { manifestRepositories, relativeRepositoryPath, type DeclaredRepository } from "../core/stageRepositories";
 import { STAGE_MODE_LABELS, STAGE_MODES, type StageMode } from "../core/stageModes";
 import { withTemporaryFile } from "../core/tempFile";
@@ -1098,23 +1098,45 @@ async function collectStageMatches(controller: SparringController, run: RunSnaps
 
 // ---------------------------------------------------------------- launching
 
+/**
+ * Which repository a launch targets.
+ *
+ * The candidates are every project Agent Sparring has state in *plus* every
+ * repository and worktree the Git extension has open
+ * (`controller.launchRepositories`), because the moment a repository most
+ * needs to be offered is before it has any Agent Sparring state — starting the
+ * first plan is exactly when that matters, and the engine creates what it
+ * needs under `--sparring-dir` on its first write.
+ *
+ * Roots nest, so the deepest one containing the active file wins
+ * (launchRepositories.ts). A file in `sporely/sporely-py/` belongs to
+ * `sporely-py`, never to the container folder above it that happens to hold a
+ * `.sparring` directory of its own.
+ */
 async function pickLocation(controller: SparringController): Promise<SparringLocation | undefined> {
-  const locations = controller.sparringLocations;
-  if (locations.length === 0) {
-    void vscode.window.showErrorMessage("Agent Sparring: no `.sparring` directory in any workspace folder.");
+  const candidates = await controller.launchRepositories();
+  if (candidates.length === 0) {
+    void vscode.window.showErrorMessage("Agent Sparring: no repository to run a plan in — no Git repository is open, and no workspace folder has a `.sparring` directory.");
     return undefined;
   }
   const active = vscode.window.activeTextEditor?.document;
   const activeFile = active?.uri.scheme === "file" ? active.uri.fsPath : undefined;
-  const chosen = chooseLaunchLocation(locations, controller.currentSelection.selected, activeFile);
+  const chosen = chooseLaunchRepository(candidates, controller.currentSelection.selected, activeFile);
   if (chosen) {
-    return chosen;
+    return chosen.location;
   }
   const picked = await vscode.window.showQuickPick(
-    locations.map((location) => ({ label: location.folderName, description: location.repoRoot, location })),
+    candidates.map((candidate) => ({
+      label: candidate.location.folderName,
+      description: candidate.location.repoRoot,
+      // Said rather than implied: an offered repository with no history must
+      // not look like one Agent Sparring has already run in.
+      detail: candidate.established ? undefined : "No Agent Sparring state yet — this would be its first plan run here.",
+      candidate,
+    })),
     { placeHolder: "Which repository?" },
   );
-  return picked?.location;
+  return picked?.candidate.location;
 }
 
 const isInside = isInsidePath;

@@ -750,31 +750,6 @@ function selectAutomatically(runs: RunSnapshot[], stickyId?: string): RunSelecti
   return { selected: terminal[0], ambiguous: [] };
 }
 
-/**
- * Which repository a launch (Run Plan) should target: the selected run's
- * repository first, then the only repository, then the one containing the
- * active document; undefined means the caller must ask.
- */
-export function chooseLaunchLocation(locations: SparringLocation[], selected: RunSnapshot | undefined, activeFile?: string): SparringLocation | undefined {
-  if (selected) {
-    const owner = locations.find((location) => location.projectDir === selected.location.projectDir);
-    if (owner) {
-      return owner;
-    }
-  }
-  if (locations.length === 1) {
-    return locations[0];
-  }
-  if (activeFile) {
-    // A nested project's directory lies inside its parent's too: the deepest
-    // (most specific) match owns the file.
-    return locations
-      .filter((location) => isInsidePath(activeFile, location.repoRoot) || isInsidePath(activeFile, location.projectDir))
-      .sort((a, b) => b.projectDir.length - a.projectDir.length)[0];
-  }
-  return undefined;
-}
-
 export function isInsidePath(file: string, root: string): boolean {
   const relative = path.relative(canonicalPath(root), canonicalPath(file));
   return !!relative && !relative.startsWith("..") && !path.isAbsolute(relative);

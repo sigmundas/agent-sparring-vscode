@@ -107,6 +107,21 @@ export class ActiveRepositoryTracker implements vscode.Disposable {
     return this.api !== undefined;
   }
 
+  /**
+   * Resolve once the Git extension has been attached, or once attaching has
+   * been tried and failed.
+   *
+   * Attachment normally happens at construction, but ordering between `*`
+   * extensions is not guaranteed and this window can activate first. A
+   * user-initiated moment that needs the repository list — "Run plan…", which
+   * offers repositories that have no Agent Sparring state and therefore exist
+   * only in the Git extension's answer — waits for it rather than silently
+   * working from a shorter list.
+   */
+  async ready(): Promise<void> {
+    await this.attach("the repository list was needed");
+  }
+
   // ------------------------------------------------------------------ activation
 
   /**

@@ -10,7 +10,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { diagnoseDiscovery, renderDiagnostic } from "../core/diagnose";
-import { chooseLaunchLocation, discoverRuns, isNestedLocation, locateAll, locateSparringDirs, runIdFor, selectRun } from "../core/discovery";
+import { discoverRuns, isNestedLocation, locateAll, locateSparringDirs, runIdFor, selectRun } from "../core/discovery";
+import { chooseLaunchRepository, launchRepositories } from "../core/launchRepositories";
 import { buildRunPickItems } from "../core/runPick";
 import { Workspace } from "./fixtures";
 
@@ -203,8 +204,8 @@ describe("nested project inside a workspace folder (the shape in VS Code's saved
   it("Run Plan targets the nested project for a file inside it, and the parent otherwise", async () => {
     const { sporely, reported } = await nestedWindow();
     const locations = await locateSparringDirs(sporely.root, "sporely");
-    assert.equal(chooseLaunchLocation(locations, undefined, path.join(reported.root, "main.py"))?.projectDir, reported.root);
-    assert.equal(chooseLaunchLocation(locations, undefined, path.join(sporely.root, "README.md"))?.projectDir, sporely.root);
+    assert.equal(chooseLaunchRepository(launchRepositories(locations, []), undefined, path.join(reported.root, "main.py"))?.location.projectDir, reported.root);
+    assert.equal(chooseLaunchRepository(launchRepositories(locations, []), undefined, path.join(sporely.root, "README.md"))?.location.projectDir, sporely.root);
   });
 
   it("a non-file workspace folder is reported as skipped, not probed", async () => {

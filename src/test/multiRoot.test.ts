@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { chooseLaunchLocation, discoverRuns, locateAll, runIdFor, selectRun, type StandaloneStageSnapshot } from "../core/discovery";
+import { discoverRuns, locateAll, runIdFor, selectRun, type StandaloneStageSnapshot } from "../core/discovery";
+import { chooseLaunchRepository, launchRepositories } from "../core/launchRepositories";
 import { buildOverviewModel } from "../core/overviewModel";
 import { deriveStatus } from "../core/status";
 import { Workspace } from "./fixtures";
@@ -108,10 +109,10 @@ describe("multi-root workspaces", () => {
     const locations = await folders(a, b);
     const runs = (await discoverRuns(locations)).runs;
     const selectedB = runs.find((run) => run.location.folderName === "beta");
-    assert.equal(chooseLaunchLocation(locations, selectedB, path.join(a.root, "docs", "plan.md"))?.folderName, "beta");
-    assert.equal(chooseLaunchLocation(locations, undefined, path.join(a.root, "docs", "plan.md"))?.folderName, "alpha");
-    assert.equal(chooseLaunchLocation(locations, undefined, undefined), undefined);
-    assert.equal(chooseLaunchLocation(locations, undefined, "/elsewhere/plan.md"), undefined);
+    assert.equal(chooseLaunchRepository(launchRepositories(locations, []), selectedB, path.join(a.root, "docs", "plan.md"))?.location.folderName, "beta");
+    assert.equal(chooseLaunchRepository(launchRepositories(locations, []), undefined, path.join(a.root, "docs", "plan.md"))?.location.folderName, "alpha");
+    assert.equal(chooseLaunchRepository(launchRepositories(locations, []), undefined, undefined), undefined);
+    assert.equal(chooseLaunchRepository(launchRepositories(locations, []), undefined, "/elsewhere/plan.md"), undefined);
   });
 
   it("single-root behaviour is unchanged", async () => {
@@ -120,7 +121,7 @@ describe("multi-root workspaces", () => {
     const locations = await folders(a);
     const selection = selectRun((await discoverRuns(locations)).runs);
     assert.equal(selection.selected?.location.folderName, "solo");
-    assert.equal(chooseLaunchLocation(locations, undefined, undefined)?.folderName, "solo");
+    assert.equal(chooseLaunchRepository(launchRepositories(locations, []), undefined, undefined)?.location.folderName, "solo");
     const view = deriveStatus(selection, undefined, NOW);
     assert.equal(view.text, "$(circle-filled) Agent Sparring: Hotfix 1 · working");
   });
