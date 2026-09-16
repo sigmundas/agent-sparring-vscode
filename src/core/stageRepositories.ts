@@ -29,6 +29,7 @@
  */
 
 import * as path from "node:path";
+import { declarationScope, migrateDeclarations, type DeclarationMigration, type ScopedPlanRun } from "./declarationScope";
 import type { ManifestRepository } from "./manifest";
 
 /** One sibling repository, as the user declared it. */
@@ -42,24 +43,55 @@ export interface DeclaredRepository {
 }
 
 /**
- * workspaceState entry: plan key → stage label (upper case, no `Stage `
- * prefix) → declarations. Keyed by plan rather than by run id because a
- * stage may not exist yet when its sibling is declared — that is the normal
- * case for automatic continuation, where every stage after the current one
- * is created by the engine.
+ * workspaceState entry: **scope key** → stage label (upper case, no `Stage `
+ * prefix) → declarations.
+ *
+ * Keyed by plan and stage rather than by run id because a stage may not exist
+ * yet when its sibling is declared — that is the normal case for automatic
+ * continuation, where every stage after the current one is created by the
+ * engine.
+ *
+ * And keyed by **worktree** as well, through the shared identity in
+ * declarationScope.ts. A plan key is a hash of the plan's repo-relative path,
+ * so every checkout of the same plan shares one; keyed by plan alone,
+ * declaring `sporely-web` as Stage 3D's sibling in one worktree changed what
+ * every other worktree of that repository executes. Like a stage's mode, this
+ * is not a display setting: it goes into the execution manifest, the engine
+ * folds each declared repository's name, path, branch and candidate SHA into
+ * the digest that identifies a recorded run, and it refuses to continue a run
+ * whose digest changed — so a declaration made in A could stop B's in-flight
+ * run over a change nobody made in B.
  */
 export type StageRepositories = Record<string, Record<string, DeclaredRepository[]>>;
 
 export const STAGE_REPOSITORIES_KEY = "agentSparring.stageRepositories";
+
+/**
+ * The scope one declaration belongs to: this plan, in this worktree. The same
+ * identity a stage's mode uses (declarationScope.ts), deliberately — two
+ * schemes for one question is how two surfaces end up disagreeing about which
+ * worktree they are talking about.
+ */
+export function stageRepositoryScope(planKey: string, projectDir: string): string {
+  return declarationScope(planKey, projectDir);
+}
 
 /** Normalised label key: `3c`, `Stage 3C`, `3C` all address the same stage. */
 export function repositoryLabelKey(label: string): string {
   return label.trim().replace(/^stage\s+/i, "").toUpperCase();
 }
 
-/** Every declaration recorded for one plan, defensively validated. Unknown shapes are dropped, never thrown on. */
-export function repositoriesForPlan(state: StageRepositories | undefined, planKey: string): Record<string, DeclaredRepository[]> {
-  const byLabel = state?.[planKey];
+/**
+ * Every declaration recorded for one plan **in one worktree**, defensively
+ * validated. Unknown shapes are dropped, never thrown on.
+ *
+ * Only the scoped key is ever read. An entry left at a bare plan key is one
+ * the migration could not attribute to a single worktree, and applying it
+ * would be exactly the accident the scope exists to prevent — so it is
+ * reported (see {@link migrateStageRepositories}) and never executed.
+ */
+export function repositoriesForPlan(state: StageRepositories | undefined, planKey: string, projectDir: string): Record<string, DeclaredRepository[]> {
+  const byLabel = state?.[stageRepositoryScope(planKey, projectDir)];
   if (!byLabel || typeof byLabel !== "object") {
     return {};
   }
@@ -73,9 +105,9 @@ export function repositoriesForPlan(state: StageRepositories | undefined, planKe
   return out;
 }
 
-/** The declarations for one stage of one plan. */
-export function repositoriesForStage(state: StageRepositories | undefined, planKey: string, label: string): DeclaredRepository[] {
-  return repositoriesForPlan(state, planKey)[repositoryLabelKey(label)] ?? [];
+/** The declarations for one stage of one plan, in one worktree. */
+export function repositoriesForStage(state: StageRepositories | undefined, planKey: string, projectDir: string, label: string): DeclaredRepository[] {
+  return repositoriesForPlan(state, planKey, projectDir)[repositoryLabelKey(label)] ?? [];
 }
 
 function validate(value: unknown): DeclaredRepository | undefined {
@@ -95,17 +127,23 @@ function validate(value: unknown): DeclaredRepository | undefined {
  * candidate overwriting the other — and declaring the same name again is how
  * a branch or path is corrected.
  */
-export function withStageRepository(state: StageRepositories | undefined, planKey: string, label: string, repository: DeclaredRepository): StageRepositories {
+export function withStageRepository(
+  state: StageRepositories | undefined,
+  planKey: string,
+  projectDir: string,
+  label: string,
+  repository: DeclaredRepository,
+): StageRepositories {
   const key = repositoryLabelKey(label);
-  const current = repositoriesForPlan(state, planKey);
+  const current = repositoriesForPlan(state, planKey, projectDir);
   const kept = (current[key] ?? []).filter((entry) => entry.name !== repository.name);
-  return write(state, planKey, { ...current, [key]: [...kept, repository].sort((a, b) => a.name.localeCompare(b.name)) });
+  return write(state, planKey, projectDir, { ...current, [key]: [...kept, repository].sort((a, b) => a.name.localeCompare(b.name)) });
 }
 
 /** Remove one declaration by name; removing the last one drops the stage's entry entirely. */
-export function withoutStageRepository(state: StageRepositories | undefined, planKey: string, label: string, name: string): StageRepositories {
+export function withoutStageRepository(state: StageRepositories | undefined, planKey: string, projectDir: string, label: string, name: string): StageRepositories {
   const key = repositoryLabelKey(label);
-  const current = repositoriesForPlan(state, planKey);
+  const current = repositoriesForPlan(state, planKey, projectDir);
   const kept = (current[key] ?? []).filter((entry) => entry.name !== name);
   const next = { ...current };
   if (kept.length > 0) {
@@ -113,17 +151,37 @@ export function withoutStageRepository(state: StageRepositories | undefined, pla
   } else {
     delete next[key];
   }
-  return write(state, planKey, next);
+  return write(state, planKey, projectDir, next);
 }
 
-function write(state: StageRepositories | undefined, planKey: string, byLabel: Record<string, DeclaredRepository[]>): StageRepositories {
+function write(state: StageRepositories | undefined, planKey: string, projectDir: string, byLabel: Record<string, DeclaredRepository[]>): StageRepositories {
+  const scope = stageRepositoryScope(planKey, projectDir);
   const next: StageRepositories = { ...(state ?? {}) };
   if (Object.keys(byLabel).length > 0) {
-    next[planKey] = byLabel;
+    next[scope] = byLabel;
   } else {
-    delete next[planKey];
+    delete next[scope];
   }
   return next;
+}
+
+/** A plan run as the migration reads one (declarationScope.ts). */
+export type { ScopedPlanRun };
+
+/** What a migration pass did; the shared shape, so both surfaces report alike. */
+export type StageRepositoryMigration = DeclarationMigration<DeclaredRepository[]>;
+
+/**
+ * Move sibling-repository declarations made before they were scoped to a
+ * worktree onto the worktree they were made in.
+ *
+ * The same rule, and the same helper, as a stage's mode: a legacy entry whose
+ * plan key matches exactly one discovered plan run belongs to that run's
+ * worktree, and anything else is kept unapplied rather than guessed at. See
+ * {@link migrateDeclarations}.
+ */
+export function migrateStageRepositories(state: StageRepositories | undefined, runs: readonly ScopedPlanRun[]): StageRepositoryMigration {
+  return migrateDeclarations<DeclaredRepository[]>(state, runs);
 }
 
 /**

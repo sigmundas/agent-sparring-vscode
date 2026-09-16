@@ -65,6 +65,7 @@ import { LogRenderer } from "../core/logFormat";
 import { PLAN_ASSOCIATIONS_KEY, planAssociationFor, withAssociation, withManualMatch, type HeadingRef, type PlanAssociation, type PlanAssociations } from "../core/planAssociation";
 import {
   STAGE_REPOSITORIES_KEY,
+  migrateStageRepositories,
   repositoriesForPlan,
   repositoriesForStage,
   withStageRepository,
@@ -88,6 +89,7 @@ import { ExecutionTracker, type CommandNotFound, type EngineFailure, type Launch
 import { ManifestReader, type BoundManifest } from "./manifestReader";
 import { ActiveRepositoryTracker, RealPaths } from "./activeRepository";
 import { describeReadiness } from "../core/gitReadiness";
+import type { DeclarationMigration } from "../core/declarationScope";
 
 const SELECTED_RUN_KEY = "agentSparring.selectedRunId";
 /** When that choice was made, so a managed run that advances afterwards can overtake it. */
@@ -151,8 +153,8 @@ export class SparringController implements vscode.Disposable {
   private readonly manifests = new ManifestReader();
   /** The last rejection reported for a manifest file, so a steady refusal is logged once rather than per render. */
   private readonly manifestRefusals = new Map<string, string>();
-  /** Unscoped stage-mode declarations already reported, so a steady one is said once rather than per discovery. */
-  private readonly reportedAmbiguousModes = new Set<string>();
+  /** Unscoped declarations already reported, so a steady one is said once rather than per discovery. */
+  private readonly reportedAmbiguousDeclarations = new Set<string>();
 
   private readonly changeEmitter = new vscode.EventEmitter<void>();
   /** Fires after every re-render: selection, authoritative state or live activity changed. */
@@ -402,7 +404,7 @@ export class SparringController implements vscode.Disposable {
     this.refreshTimer = undefined;
     await this.relocate();
     this.discovery = await discoverRuns(this.locations);
-    await this.migrateStageModeScopes();
+    await this.migrateDeclarationScopes();
     const sticky = this.attachedRunId ?? this.context.workspaceState.get<string>(STICKY_RUN_KEY);
     // Ownership first: whether a plan run has taken over from a pinned stage
     // is a question about recorded membership, and answering it any other way
@@ -687,27 +689,31 @@ export class SparringController implements vscode.Disposable {
   // ---------------------------------------------------------------- sibling repositories (declaration, emitted into the manifest)
 
   /** Every stage's declared sibling repositories for one plan, keyed by label (`3D`). Workspace state; never written into engine state. */
-  stageRepositories(planKey: string): Record<string, DeclaredRepository[]> {
-    return repositoriesForPlan(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey);
+  stageRepositories(planKey: string, projectDir: string): Record<string, DeclaredRepository[]> {
+    return repositoriesForPlan(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, projectDir);
   }
 
   /** One stage's declarations. */
-  stageRepositoriesFor(planKey: string, label: string): DeclaredRepository[] {
-    return repositoriesForStage(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, label);
+  stageRepositoriesFor(planKey: string, projectDir: string, label: string): DeclaredRepository[] {
+    return repositoriesForStage(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, projectDir, label);
   }
 
   /** Declare (or re-declare, by name) a sibling repository this stage's candidate spans. No commit is recorded: the engine pins that at the freeze boundary. */
-  async declareStageRepository(planKey: string, label: string, repository: DeclaredRepository): Promise<void> {
-    const next = withStageRepository(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, label, repository);
+  async declareStageRepository(planKey: string, projectDir: string, label: string, repository: DeclaredRepository): Promise<void> {
+    const next = withStageRepository(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, projectDir, label, repository);
     await this.context.workspaceState.update(STAGE_REPOSITORIES_KEY, next);
-    this.log(`Stage ${label}: also reviews ${repository.name} on ${repository.branch} (${repository.path}); it goes into the execution manifest, and the engine pins and re-verifies its commit`);
+    this.log(
+      `Stage ${label} in ${path.basename(path.resolve(projectDir))}: also reviews ${repository.name} on ${repository.branch} (${repository.path}); it goes into the execution manifest built for this worktree, and the engine pins and re-verifies its commit. Another worktree running the same plan is unaffected.`,
+    );
     this.render();
   }
 
-  async undeclareStageRepository(planKey: string, label: string, name: string): Promise<void> {
-    const next = withoutStageRepository(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, label, name);
+  async undeclareStageRepository(planKey: string, projectDir: string, label: string, name: string): Promise<void> {
+    const next = withoutStageRepository(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, projectDir, label, name);
     await this.context.workspaceState.update(STAGE_REPOSITORIES_KEY, next);
-    this.log(`Stage ${label}: no longer declares ${name}; already-recorded pins stay in the stage's state.json until the next run rewrites the declaration`);
+    this.log(
+      `Stage ${label} in ${path.basename(path.resolve(projectDir))}: no longer declares ${name}; already-recorded pins stay in the stage's state.json until the next run rewrites the declaration`,
+    );
     this.render();
   }
 
@@ -751,44 +757,59 @@ export class SparringController implements vscode.Disposable {
   }
 
   /**
-   * Move stage-mode declarations made before they were scoped to a worktree
-   * onto the worktree they were made in.
+   * Move declarations made before they were scoped to a worktree — a stage's
+   * mode, and the sibling repositories its candidate spans — onto the
+   * worktree they were made in.
    *
    * Run after every discovery rather than once at startup, because what makes
    * a legacy declaration attributable is a *discovered plan run* with that
-   * plan key — and the folder holding it may only be opened later. A pass
-   * that can attribute nothing writes nothing, so this is free when there is
+   * plan key, and the folder holding it may only be opened later. A pass that
+   * can attribute nothing writes nothing, so this is free when there is
    * nothing to do.
+   *
+   * Both kinds go through the same helper (declarationScope.ts) so they can
+   * never disagree about which worktree a declaration belongs to.
    */
-  private async migrateStageModeScopes(): Promise<void> {
-    const state = this.context.workspaceState.get<StageModes>(STAGE_MODES_KEY);
-    if (!state || Object.keys(state).length === 0) {
-      return;
-    }
+  private async migrateDeclarationScopes(): Promise<void> {
     const plans = this.discovery.runs.filter((run): run is PlanRunSnapshot => run.kind === "plan");
-    const { next, migrated, ambiguous } = migrateStageModes(state, plans);
-    for (const entry of ambiguous) {
-      const key = `${entry.planKey}:${entry.labels.join(",")}`;
-      if (this.reportedAmbiguousModes.has(key)) {
+    const modes = this.context.workspaceState.get<StageModes>(STAGE_MODES_KEY);
+    const repositories = this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY);
+    let moved = false;
+    if (modes && Object.keys(modes).length > 0) {
+      moved = (await this.applyMigration("stage mode", STAGE_MODES_KEY, migrateStageModes(modes, plans))) || moved;
+    }
+    if (repositories && Object.keys(repositories).length > 0) {
+      moved = (await this.applyMigration("sibling repository", STAGE_REPOSITORIES_KEY, migrateStageRepositories(repositories, plans))) || moved;
+    }
+    if (moved) {
+      this.render();
+    }
+  }
+
+  /** Store what could be attributed, and say once what could not. */
+  private async applyMigration<V>(what: string, key: string, migration: DeclarationMigration<V>): Promise<boolean> {
+    for (const entry of migration.ambiguous) {
+      const reported = `${key} ${entry.planKey}:${entry.labels.join(",")}`;
+      if (this.reportedAmbiguousDeclarations.has(reported)) {
         continue;
       }
-      this.reportedAmbiguousModes.add(key);
+      this.reportedAmbiguousDeclarations.add(reported);
       this.log(
-        `a stage mode declared before modes were scoped to a worktree (plan ${entry.planKey}, stage(s) ${entry.labels.join(", ")}) ${
+        `a ${what} declaration made before declarations were scoped to a worktree (plan ${entry.planKey}, stage(s) ${entry.labels.join(", ")}) ${
           entry.candidates.length > 1
             ? `could belong to ${entry.candidates.length} discovered worktrees (${entry.candidates.join(", ")})`
             : "belongs to no plan run discovered in this window"
-        }, so it is kept but not applied. Declare it again through Stage Mode for a Plan Stage… in the worktree you mean.`,
+        }, so it is kept but not applied. Declare it again in the worktree you mean.`,
       );
     }
-    if (migrated.length === 0) {
-      return;
+    if (migration.migrated.length === 0) {
+      return false;
     }
-    await this.context.workspaceState.update(STAGE_MODES_KEY, next);
-    for (const entry of migrated) {
-      this.log(`stage mode declaration for plan ${entry.planKey} (stage(s) ${entry.labels.join(", ")}) is now scoped to ${entry.projectDir}, the only worktree with a recorded run of it.`);
+    await this.context.workspaceState.update(key, migration.next);
+    for (const entry of migration.migrated) {
+      this.log(`${what} declaration for plan ${entry.planKey} (stage(s) ${entry.labels.join(", ")}) is now scoped to ${entry.projectDir}, the only worktree with a recorded run of it.`);
     }
-    this.render();
+    return true;
   }
 
   // ---------------------------------------------------------------- manual check drafts (UI state until submitted)

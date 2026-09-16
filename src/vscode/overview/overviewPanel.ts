@@ -458,7 +458,7 @@ export class OverviewPanelManager implements vscode.Disposable {
     const key = run.kind === "plan" ? run.planKey : planKey(planLabel(this.controller.associatedPlan(run.id) ?? "", run.location.repoRoot));
     const stage = currentStageOf(run);
     const label = locateStage(parsePlanHeadings(markdown), { stageId: stage.stageId, title: stage.title, briefText, manual })?.stage?.label;
-    return label ? this.controller.stageRepositoriesFor(key, label) : [];
+    return label ? this.controller.stageRepositoriesFor(key, run.location.projectDir, label) : [];
   }
 
   dispose(): void {

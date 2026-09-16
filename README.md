@@ -41,8 +41,8 @@ navigates.
 | `Agent Sparring: Review Stage Matches…` | The plan-level view: every stage this project has and which section of the plan it resolves to, with the ones nothing could place — and any two stages claiming the same section — first. Pick one to say which section *it* is. Use this to fix a historical stage; **Change match…** would remap the current one instead. When nothing needs placing the list says so — *All stages are matched. Select one only if you want to change it.* — and fixing the last unplaced stage closes it rather than reopening. Also **All stage matches…** in the Overview. |
 | `Agent Sparring: Start Next Stage from Plan…` | For an accepted standalone stage with an associated plan: create the stage that follows it (by stage label) with the engine's own `sparring new-stage <id>`, after a confirmation naming the title, the proposed id and the plan section. The Overview switches to the new stage, the plan association follows it, and its fresh `brief.md` opens beside the plan section for you to fill in before **Run stage**. Also **Start next stage** in the Overview. |
 | `Agent Sparring: Continue Plan Automatically` | Build the execution manifest for the plan of the selected run and start (or resume) the engine's managed plan run against it: `sparring run-plan --manifest … [--adopt]` / `sparring resume-plan --manifest …`. The engine then sequences the stages itself. One confirmation before the first stage; none between stages. Also **Continue automatically** in the Overview. |
-| `Agent Sparring: Sibling Repositories for a Plan Stage…` | Declare which *other* repositories a plan stage's reviewed candidate spans, so acceptance pins and verifies the complete set instead of the primary commit alone. Pick the stage, pick a repository this window knows (or browse to one) and confirm the branch its candidate must be on; no commit is ever asked for. Stored in VS Code workspace state per plan and stage label, emitted into the execution manifest, and shown quietly in the Overview. Removing a declaration is the same command. |
-| `Agent Sparring: Stage Mode for a Plan Stage…` | Declare that a plan stage is a *review* of work rather than work: no implementation agent runs for it, and a fresh independent reviewer inspects the candidates the earlier stages accepted. Nothing is inferred from a stage's title or its brief's prose — this command is the only way to say it. Stored in VS Code workspace state per plan and stage label and emitted into the execution manifest as `mode`. Setting it back to *Implementation* removes the declaration. |
+| `Agent Sparring: Sibling Repositories for a Plan Stage…` | Declare which *other* repositories a plan stage's reviewed candidate spans, so acceptance pins and verifies the complete set instead of the primary commit alone. Pick the stage, pick a repository this window knows (or browse to one) and confirm the branch its candidate must be on; no commit is ever asked for. Stored in VS Code workspace state per worktree, plan and stage label, emitted into the execution manifest, and shown quietly in the Overview. Removing a declaration is the same command. |
+| `Agent Sparring: Stage Mode for a Plan Stage…` | Declare that a plan stage is a *review* of work rather than work: no implementation agent runs for it, and a fresh independent reviewer inspects the candidates the earlier stages accepted. Nothing is inferred from a stage's title or its brief's prose — this command is the only way to say it. Stored in VS Code workspace state per worktree, plan and stage label, and emitted into the execution manifest as `mode`. Setting it back to *Implementation* removes the declaration. |
 | `Agent Sparring: Copy Review Context for Chat` | For a stage the reviewer handed back to you: put the whole review on the clipboard as plain Markdown — the stage and its goal, the routing state, the reviewer's summary and note, every human-gate check with its instruction and pass criteria verbatim, the concrete names the review refers to, the latest handoff claims, the reviewer's findings and the stage's plan section — so it can be pasted into ChatGPT/Claude, an issue or a message and asked about. No provider prompts, model reasoning, command output or activity log. Also **Copy context for chat** in the Overview, beside **Open detailed review**, with **Copy this check** under each outstanding check. |
 | `Agent Sparring: Choose sparring Executable…` | Pick the `sparring` CLI with a file dialog and store it as `agentSparring.executable`. |
 | `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / finalizing / future stages), the current stage as primary content (the stage as the plan names it — `Stage 3D — title`, with `6 of 8` as secondary metadata — a human state word with one explaining sentence, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), latest sparring result, small Stage Agent / Sparrer cards, Brief / Handoff / Sparring report / Diff / Plan document / Log buttons, and quiet metadata (where the engine's own words live). Never auto-opens; updates in place. |
@@ -235,12 +235,22 @@ stage, pick *Independent review (review only)*. Nothing is inferred — a stage
 titled "Independent final review and activation decision" runs the
 implementation lifecycle until someone declares otherwise, because which
 agent runs is not a thing to read off a heading. The declaration is workspace
-state per plan and stage label, exactly like a sibling repository, and it
-reaches the engine as `"mode": "independent_review"` in the execution
+state per worktree, plan and stage label, exactly like a sibling repository,
+and it reaches the engine as `"mode": "independent_review"` in the execution
 manifest. The engine then runs that stage as one fresh reviewer over the
 accepted candidate set with no implementation turn at all, treats a defect it
 finds as a stop rather than as work to do, and completes the stage over the
 commit it reviewed instead of manufacturing one. Nothing is merged.
+
+Both kinds of declaration are scoped to the **worktree** they were made in, as
+well as to the plan and the stage. A plan key is a hash of the plan's
+repo-relative path, so every checkout of the same plan shares one, and keying
+by plan alone meant a declaration made in one worktree changed what another
+worktree executed — and, through the run digest the engine folds it into,
+whether that worktree's in-flight run could continue at all. Declarations made
+before this move to the worktree they belong to when exactly one discovered
+plan run can be shown to own them; when two could, or none is open, they are
+kept, left unapplied, and said so in the Output Channel rather than guessed at.
 
 Two consequences worth knowing before declaring one. A declared mode is part
 of what the engine digests to identify a recorded run, so declaring it
@@ -690,14 +700,6 @@ manifest the engine cannot digest at all.
 Recorded rather than fixed, so they are visible without being smuggled into an
 unrelated change:
 
-- **Sibling repository declarations are not worktree-scoped.**
-  `src/core/stageModes.ts` now keys a stage's declared mode by worktree as well
-  as by plan and stage, because a plan key is a hash of the plan's
-  *repo-relative* path and two worktrees running the same plan share one.
-  `src/core/stageRepositories.ts` has exactly the same exposure and the same
-  consequence — a declaration made in one worktree changes the manifest, and
-  therefore the run digest, of another — and is still keyed by plan alone.
-  `stageModeScope` / `migrateStageModes` are the shape a fix would reuse.
 - **A file cache keyed on size and mtime can serve a stale parse** if a file's
   contents are replaced while both are preserved (`src/vscode/fileHead.ts`).
 - **Symlink aliases** are resolved for repository roots (`RealPaths`) but not

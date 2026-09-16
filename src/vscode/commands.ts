@@ -132,13 +132,29 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring._test.declareStageRepository", async (label: string, repository: DeclaredRepository | undefined) => {
       const run = controller.currentSelection.selected;
       const key = run ? await planKeyFor(controller, run) : undefined;
-      if (!key) {
+      if (!run || !key) {
         return undefined;
       }
       if (repository) {
-        await controller.declareStageRepository(key, label, repository);
+        await controller.declareStageRepository(key, run.location.projectDir, label, repository);
       }
-      return controller.stageRepositoriesFor(key, label);
+      return controller.stageRepositoriesFor(key, run.location.projectDir, label);
+    }),
+    // What a *given* worktree sees declared for a plan stage, so the
+    // integration suite can ask the same question of two worktrees and prove
+    // they are independent through real workspace state — where the scope key
+    // has to survive being a JSON key containing a path.
+    vscode.commands.registerCommand("agentSparring._test.stageDeclarations", async (projectDir: string, label: string) => {
+      const run = controller.currentSelection.selected;
+      const key = run ? await planKeyFor(controller, run) : undefined;
+      if (!key) {
+        return undefined;
+      }
+      return {
+        planKey: key,
+        repositories: controller.stageRepositoriesFor(key, projectDir, label),
+        mode: controller.stageModeFor(key, projectDir, label),
+      };
     }),
     vscode.commands.registerCommand("agentSparring._test.lastCommandNotFound", () => lastCommandNotFound),
     controller.onCommandNotFound((event) => {
@@ -1706,7 +1722,7 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
     planLabel: run.state.plan,
     planName: path.basename(run.planPath),
     known: await knownStageIds(controller, run, markdown),
-    repositories: manifestRepositories(controller.stageRepositories(run.planKey), run.location.repoRoot),
+    repositories: manifestRepositories(controller.stageRepositories(run.planKey, run.location.projectDir), run.location.repoRoot),
     modes: controller.stageModes(run.planKey, run.location.projectDir),
   });
   if (!built.ok) {
@@ -1788,7 +1804,7 @@ async function performContinueAutomatically(controller: SparringController, over
     planLabel: label,
     planName: path.basename(planPath),
     known: await knownStageIds(controller, run, markdown),
-    repositories: manifestRepositories(controller.stageRepositories(planKey(label)), location.repoRoot),
+    repositories: manifestRepositories(controller.stageRepositories(planKey(label), location.projectDir), location.repoRoot),
     modes: controller.stageModes(planKey(label), location.projectDir),
   });
   if (!built.ok) {
@@ -2221,7 +2237,7 @@ async function stageRepositoriesCommand(controller: SparringController): Promise
     void vscode.window.showInformationMessage(`Agent Sparring: ${path.basename(planPath)} defines no labelled stages.`);
     return;
   }
-  const label = await pickStageLabel(controller, key, entries);
+  const label = await pickStageLabel(controller, run.location, key, entries);
   if (!label) {
     return;
   }
@@ -2300,10 +2316,10 @@ async function stageModeCommand(controller: SparringController): Promise<void> {
   );
 }
 
-async function pickStageLabel(controller: SparringController, key: string, entries: StageEntry[]): Promise<string | undefined> {
+async function pickStageLabel(controller: SparringController, location: SparringLocation, key: string, entries: StageEntry[]): Promise<string | undefined> {
   const picked = await vscode.window.showQuickPick(
     entries.map((entry) => {
-      const declared = controller.stageRepositoriesFor(key, entry.label);
+      const declared = controller.stageRepositoriesFor(key, location.projectDir, entry.label);
       return {
         label: entry.display,
         description: declared.length === 0 ? "" : `also reviews ${declared.map((repository) => repository.name).join(", ")}`,
@@ -2317,7 +2333,7 @@ async function pickStageLabel(controller: SparringController, key: string, entri
 
 /** The declarations for one stage: what is there, plus adding one and removing one. */
 async function editStageRepositories(controller: SparringController, location: SparringLocation, key: string, label: string): Promise<void> {
-  const declared = controller.stageRepositoriesFor(key, label);
+  const declared = controller.stageRepositoriesFor(key, location.projectDir, label);
   const add = { label: "$(add) Add a repository…", value: undefined as string | undefined };
   const picked = await vscode.window.showQuickPick(
     [
@@ -2335,7 +2351,7 @@ async function editStageRepositories(controller: SparringController, location: S
     return;
   }
   if (picked.value) {
-    await controller.undeclareStageRepository(key, label, picked.value);
+    await controller.undeclareStageRepository(key, location.projectDir, label, picked.value);
     return;
   }
   await addStageRepository(controller, location, key, label);
@@ -2392,7 +2408,7 @@ async function addStageRepository(controller: SparringController, location: Spar
   if (!name?.trim()) {
     return;
   }
-  await controller.declareStageRepository(key, label, { name: name.trim(), path: chosen.rootPath, branch: branch.trim() });
+  await controller.declareStageRepository(key, location.projectDir, label, { name: name.trim(), path: chosen.rootPath, branch: branch.trim() });
   void vscode.window.showInformationMessage(
     `Agent Sparring: Stage ${label} also reviews ${name.trim()} on ${branch.trim()}. Acceptance will pin that repository's reviewed commit and refuse if it moved.`,
   );

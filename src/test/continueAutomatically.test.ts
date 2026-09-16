@@ -126,7 +126,11 @@ describe("the automatic path is one engine call, not a loop", () => {
     const add = fn(await commandsSource(), "addStageRepository");
     assert.equal((add.match(/showInputBox\(/g) ?? []).length, 2, "exactly two things are asked: the expected branch and the display name");
     assert.ok(!/candidate_?[Ss]ha/.test(add), "no commit is collected");
-    assert.match(add, /controller\.declareStageRepository\(key, label, \{ name: name\.trim\(\), path: chosen\.rootPath, branch: branch\.trim\(\) \}\)/);
+    assert.match(
+      add,
+      /controller\.declareStageRepository\(key, location\.projectDir, label, \{ name: name\.trim\(\), path: chosen\.rootPath, branch: branch\.trim\(\) \}\)/,
+      "and the declaration is scoped to the worktree it was made in, so another checkout of the same plan is unaffected",
+    );
   });
 
   it("one preflight, and only when something is actually wrong", async () => {

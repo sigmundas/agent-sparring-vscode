@@ -37,7 +37,7 @@
  * No dependency on the vscode API.
  */
 
-import * as path from "node:path";
+import { declarationScope, migrateDeclarations, type DeclarationMigration, type ScopedPlanRun } from "./declarationScope";
 
 /** The modes the engine reads. `implementation` is its default and is never emitted. */
 export type StageMode = "implementation" | "independent_review";
@@ -65,48 +65,26 @@ export const STAGE_MODE_LABELS: Record<StageMode, { label: string; detail: strin
  * which is the normal case for automatic continuation, where every stage
  * after the current one is created by the engine.
  *
- * ### Why the scope key is not just the plan key
- *
- * A plan key is a hash of the plan's **repo-relative** path (`plan.py:
- * plan_key`), so two worktrees of one repository running
- * `docs/plans/foo.md` produce the same key — and running two stages of a plan
- * side by side in two worktrees is the ordinary way to work here, not an edge
- * case. Keyed by plan alone, declaring Stage 5 review-only in worktree A
- * silently changed what worktree B executes.
- *
- * That is not a display bug. The mode goes into the execution manifest, the
- * engine folds a non-default mode into the digest that identifies a recorded
- * run, and it refuses to continue a run whose digest changed. So a
- * declaration made in A could stop B's in-flight run with a message about
- * changed executable content, for a change nobody made in B.
- *
- * The scope is therefore the plan key **and the worktree**, written as
- * `<plan key>@<resolved project directory>`. A path rather than a hash
- * because this is workspace state a person may have to read and repair, and
- * because {@link legacyScope} has to be able to tell a migrated key from an
- * unmigrated one by looking at it.
+ * And keyed by **worktree** as well, because a plan key is shared by every
+ * checkout of the same plan path — declaring Stage 5 review-only in worktree
+ * A used to change what worktree B executes, and through the run digest,
+ * whether B's in-flight run could continue at all. declarationScope.ts has
+ * the whole argument; sibling repository declarations are keyed the same way,
+ * by the same helpers.
  */
 export type StageModes = Record<string, Record<string, StageMode>>;
 
 export const STAGE_MODES_KEY = "agentSparring.stageModes";
 
 /**
- * The scope one declaration belongs to: this plan, in this worktree.
- *
- * `@` is a safe separator: a plan key is `<slug>-<8 hex>` with the slug drawn
- * from `[a-z0-9-]`, so it can never contain one, and everything after the
- * first `@` is the project directory.
+ * The scope one declaration belongs to: this plan, in this worktree. The
+ * shared identity (declarationScope.ts), not a second scheme of its own —
+ * sibling repository declarations are keyed exactly the same way, and two
+ * schemes for one question is how the two surfaces end up disagreeing about
+ * which worktree they are talking about.
  */
 export function stageModeScope(planKey: string, projectDir: string): string {
-  return `${planKey}@${path.resolve(projectDir)}`;
-}
-
-/**
- * The plan key of an **unscoped** entry, or undefined when the key is already
- * scoped to a worktree. Used only by the migration.
- */
-export function legacyScope(key: string): string | undefined {
-  return key.includes("@") ? undefined : key;
+  return declarationScope(planKey, projectDir);
 }
 
 /** Normalised label key: `5`, `Stage 5`, `3c` all address the same stage. */
@@ -172,67 +150,18 @@ export function withStageMode(state: StageModes | undefined, planKey: string, pr
   return all;
 }
 
-/** A plan run as the migration needs it: which plan, in which worktree. */
-export interface ScopedPlanRun {
-  planKey: string;
-  location: { projectDir: string };
-}
+/** A plan run as the migration reads one (declarationScope.ts). */
+export type { ScopedPlanRun };
 
-/** What a migration pass did, so the window can say it rather than doing it silently. */
-export interface StageModeMigration {
-  next: StageModes;
-  /** Declarations attributed to exactly one worktree and moved there. */
-  migrated: { planKey: string; projectDir: string; labels: string[] }[];
-  /**
-   * Declarations that could belong to more than one discovered worktree, or
-   * to none that is open. They are **kept and not applied**: re-declaring one
-   * is a click, and applying it to the wrong worktree changes what that
-   * worktree executes.
-   */
-  ambiguous: { planKey: string; labels: string[]; candidates: string[] }[];
-}
+/** What a migration pass did; the shared shape, so the two surfaces report alike. */
+export type StageModeMigration = DeclarationMigration<StageMode>;
 
 /**
- * Move declarations made before modes were scoped to a worktree onto the
- * worktree they were made in, where that can be established.
- *
- * It can be established from recorded execution and nothing else: a discovered
- * plan run carries both the plan key and the project directory, so a legacy
- * entry whose plan key matches **exactly one** discovered plan run belongs to
- * that run's worktree. That covers the case this has to cover — a person with
- * one checkout of a plan, who declared Stage 5 review-only before the scope
- * existed and must not silently lose it.
- *
- * Everything else is left alone rather than guessed at. Two worktrees running
- * the same plan is precisely when a wrong guess changes what one of them
- * executes, and "no discovered run" usually just means the relevant folder is
- * not open right now — dropping the declaration then would be destroying
- * someone's work to tidy up.
- *
- * Idempotent: an already-scoped key has no legacy form, so a second pass over
- * the same state changes nothing and reports nothing.
+ * Move stage-mode declarations made before they were scoped to a worktree
+ * onto the worktree they were made in. See
+ * {@link migrateDeclarations} for what counts as establishing that, and for
+ * why everything else is kept rather than guessed at.
  */
 export function migrateStageModes(state: StageModes | undefined, runs: readonly ScopedPlanRun[]): StageModeMigration {
-  const next: StageModes = { ...(state ?? {}) };
-  const migrated: StageModeMigration["migrated"] = [];
-  const ambiguous: StageModeMigration["ambiguous"] = [];
-  for (const [key, byLabel] of Object.entries(state ?? {})) {
-    const planKey = legacyScope(key);
-    if (planKey === undefined || !byLabel || typeof byLabel !== "object") {
-      continue;
-    }
-    const labels = Object.keys(byLabel);
-    const owners = [...new Set(runs.filter((run) => run.planKey === planKey).map((run) => path.resolve(run.location.projectDir)))];
-    if (owners.length !== 1) {
-      ambiguous.push({ planKey, labels, candidates: owners });
-      continue;
-    }
-    const scope = stageModeScope(planKey, owners[0]);
-    // An explicit declaration already made in that worktree wins: it is the
-    // newer statement, and the legacy entry is what is being retired.
-    next[scope] = { ...byLabel, ...(next[scope] ?? {}) };
-    delete next[key];
-    migrated.push({ planKey, projectDir: owners[0], labels });
-  }
-  return { next, migrated, ambiguous };
+  return migrateDeclarations<StageMode>(state, runs);
 }
