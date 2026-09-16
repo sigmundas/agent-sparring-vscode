@@ -18,6 +18,7 @@ import * as crypto from "node:crypto";
 import * as os from "node:os";
 import type { DiscoveryDiagnostic } from "../core/diagnose";
 import { discoverRuns, selectRun } from "../core/discovery";
+import { planKey } from "../core/sparringCommand";
 import { BINDING_VERSION, bindingFileName, manifestFileName, parseExecutionManifest, renderBindingRecord } from "../core/manifest";
 import { isCopyPromptMessage, isHumanCheckMessage, isHumanFeedbackMessage, isOpenPromptSourceMessage, renderOverviewHtml } from "../core/overviewHtml";
 import { withHumanCheck, type HumanCheckDrafts } from "../core/humanChecks";
@@ -74,7 +75,7 @@ export async function run(): Promise<void> {
     ["terminals", () => terminalReuseAssertions(report, reportedRepo)],
     ["closed", () => closedTerminalAssertions(report, reportedRepo)],
     ["launchable", () => launchTargetAssertions(fixtureRoot, reportedRepo)],
-    ["declarations", () => declarationScopeAssertions(reportedRepo)],
+    ["declarations", () => declarationScopeAssertions(reportedRepo, fixtureRoot)],
   ];
   const only = (process.env.AGENT_SPARRING_IT_ONLY ?? "").split(",").map((name) => name.trim()).filter(Boolean);
   for (const [name, section] of sections) {
@@ -478,8 +479,15 @@ async function startNextStageAssertions(report: DiscoveryDiagnostic, reportedRep
 // ---------------------------------------------------------------- a structured gate's Pass button, clicked for real
 
 const GATE_STAGE = "stage-3d-snapshot-v2-and-attachment-export-import-transport";
-const GATE_PLAN_KEY = "reported-statistics-1cd13d24";
+/**
+ * Derived, never written down: the engine names a plan run's state file from
+ * the plan's repo-relative label (`plan.py: plan_key`), so a hand-written
+ * constant can disagree with it — and this one did. A fixture whose state
+ * file is named something the engine would never produce quietly exempts
+ * itself from every code path that recomputes the key from the plan path.
+ */
 const GATE_PLAN_LABEL = "plans/reported-statistics.md";
+const GATE_PLAN_KEY = planKey(GATE_PLAN_LABEL);
 /** The reviewer's stable check id: a slug, which is exactly the shape the host used to refuse. */
 const GATE_CHECK_ID = "pre-activation-desktop-v2-feed";
 
@@ -1290,28 +1298,91 @@ async function launchTargetAssertions(fixtureRoot: string, reportedRepo: string)
 // ---------------------------------------------------------------- declarations belong to one worktree
 
 /**
- * A stage's declarations — its sibling repositories and its mode — belong to
- * the worktree they were made in, proved through real VS Code workspace
- * state.
+ * A stage's declarations — its sibling repositories *and* its mode — belong to
+ * the worktree they were made in, and the values VS Code stores are enough to
+ * resolve that again from cold.
  *
- * The unit tests hold the rule; what only a real window can show is that it
- * survives the storage. The scope key is `<plan key>@<resolved project
- * directory>`, so it travels as a JSON object key containing an absolute path
- * — and workspace state is persisted and reloaded by VS Code, not by us.
+ * ### What this cannot do, and why it is said here
  *
- * Why this matters more than a stored setting usually would: both kinds of
- * declaration go into the execution manifest, the engine folds the manifest's
- * executable content into the digest that identifies a recorded run, and it
- * refuses to continue a run whose digest moved. Keyed by plan alone — a plan
- * key is a hash of the plan's *repo-relative* path, so every checkout of a
- * plan shares one — a declaration made here would change what a sibling
- * worktree executes, and could stop its in-flight run over a change nobody
- * made there.
+ * The obvious test is: declare, restart VS Code, read back. That is not
+ * achievable in this harness, and the reason is worth recording so nobody
+ * spends another afternoon on it. VS Code run under `--extensionTestsPath`
+ * keeps its storage **in memory**: with a shared `--user-data-dir` across two
+ * launches, the same workspace-storage directory is created
+ * (`User/workspaceStorage/<hash>/`) and no `state.vscdb` is ever written to
+ * it — not after a settling delay, and not after a graceful
+ * `workbench.action.quit`. A second window therefore starts with an empty
+ * store no matter what the first one did, so a "restart" assertion would be
+ * testing the harness rather than the extension.
+ *
+ * So this proves the two halves that *are* ours, and claims nothing about
+ * VS Code's own durability:
+ *
+ *  1. **What is stored is enough.** The exact values VS Code holds for the two
+ *     declaration keys are taken out, sent back in as data, and used to build
+ *     each worktree's manifest through the same readers and the same builder
+ *     production uses — a cold read, with no access to the live state. If the
+ *     stored shape were missing the worktree, or ambiguous between two of
+ *     them, this is where it would show.
+ *  2. **Nothing is cached in the process.** Every accessor reads the Memento
+ *     on the call, so whatever VS Code restores is what the extension uses;
+ *     there is no in-memory copy for a reload to diverge from. That is
+ *     asserted against the source, below.
+ *
+ * B is a real second worktree of the same repository with the same plan
+ * document at the same *repo-relative* path, so both produce the same plan key
+ * — which is the whole reason the scope exists. It is deliberately not a
+ * workspace folder: it is here to be the checkout a declaration made next door
+ * must not reach.
+ *
+ * Why manifests and not just the stored values: both kinds of declaration go
+ * into the execution manifest, and the engine folds the manifest's executable
+ * content into the digest that identifies a recorded run, refusing to continue
+ * when it moves. The question that matters is not "what does workspace state
+ * say" but "what would each worktree now hand the engine".
  */
-async function declarationScopeAssertions(reportedRepo: string): Promise<void> {
-  // A worktree of the same repository with the same plan checked out: the
-  // ordinary way two stages of one plan get worked on at once.
-  const sibling = path.join(path.dirname(reportedRepo), "sporely-py-ui-cleanup");
+
+interface BuiltManifest {
+  ok: boolean;
+  planKey?: string;
+  text?: string;
+  digest?: string;
+  reason?: string;
+}
+
+interface StageDeclarations {
+  planKey: string;
+  repositories: { name: string; branch: string }[];
+  mode: string;
+}
+
+/** The values VS Code holds for the declaration keys: what it would restore, and all of it. */
+interface StoredDeclarations {
+  modes?: unknown;
+  repositories?: unknown;
+}
+
+async function declarationScopeAssertions(reportedRepo: string, fixtureRoot: string): Promise<void> {
+  const sibling = path.join(fixtureRoot, "sporely-py-ui-cleanup");
+  const planA = path.join(reportedRepo, ...GATE_PLAN_LABEL.split("/"));
+  const planB = path.join(sibling, ...GATE_PLAN_LABEL.split("/"));
+
+  // The same plan document at the same repo-relative path in both worktrees.
+  await fs.mkdir(path.dirname(planB), { recursive: true });
+  await fs.copyFile(planA, planB);
+
+  const declarations = async (projectDir: string): Promise<StageDeclarations> =>
+    (await vscode.commands.executeCommand("agentSparring._test.stageDeclarations", projectDir, "3D")) as StageDeclarations;
+  const live = async (projectDir: string, planPath: string): Promise<BuiltManifest> => built(await vscode.commands.executeCommand("agentSparring._test.manifestFor", projectDir, planPath), projectDir);
+  const cold = async (stored: StoredDeclarations, projectDir: string, planPath: string): Promise<BuiltManifest> =>
+    built(await vscode.commands.executeCommand("agentSparring._test.manifestFromStored", stored, projectDir, planPath), projectDir);
+  const stored = async (): Promise<StoredDeclarations> => {
+    // Through JSON on the way out and back, exactly as VS Code serialises it:
+    // a scope key is an object key containing an absolute path, and that has
+    // to survive the round trip intact or the cold read finds nothing.
+    const raw = (await vscode.commands.executeCommand("agentSparring._test.storedDeclarations")) as StoredDeclarations;
+    return JSON.parse(JSON.stringify(raw)) as StoredDeclarations;
+  };
 
   // Select the managed plan run explicitly rather than depending on whatever
   // the previous section left on screen: a declaration is made against the
@@ -1321,39 +1392,80 @@ async function declarationScopeAssertions(reportedRepo: string): Promise<void> {
   assert.ok(planRunId, `the managed plan run is discovered, got ${report.runs.map((run) => run.id.split("|").pop()).join(", ")}`);
   assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", planRunId), planRunId);
 
+  const aUndeclared = await live(reportedRepo, planA);
+  const bUndeclared = await live(sibling, planB);
+  assert.ok(!aUndeclared.text?.includes('"mode"'), "nothing is declared yet in A");
+  assert.ok(!aUndeclared.text?.includes("repositories"), "in either sense");
+  assert.equal(aUndeclared.planKey, bUndeclared.planKey, "both worktrees produce the same plan key — which is why the scope is needed at all");
+
+  // ---- declare both kinds in A
   const declared = (await vscode.commands.executeCommand("agentSparring._test.declareStageRepository", "3D", {
     name: "sporely-web",
-    path: path.join(path.dirname(reportedRepo), "sporely-web"),
+    path: path.join(fixtureRoot, "sporely-web"),
     branch: "feature/reported-statistics-cloud-transport",
   })) as { name: string }[] | undefined;
   assert.ok(declared, "a plan is associated with the selected run, so a declaration can be made");
   assert.deepEqual(
     declared.map((repository) => repository.name),
     ["sporely-web"],
-    "the worktree it was declared in sees it",
   );
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.declareStageMode", "3D", "independent_review"), "independent_review");
 
-  const here = (await vscode.commands.executeCommand("agentSparring._test.stageDeclarations", reportedRepo, "3D")) as {
-    planKey: string;
-    repositories: { name: string }[];
-    mode: string;
-  };
-  const there = (await vscode.commands.executeCommand("agentSparring._test.stageDeclarations", sibling, "3D")) as {
-    planKey: string;
-    repositories: { name: string }[];
-    mode: string;
-  };
-  assert.equal(there.planKey, here.planKey, "both worktrees produce the same plan key — which is the whole reason the scope is needed");
-  assert.deepEqual(
-    here.repositories.map((repository) => repository.name),
-    ["sporely-web"],
+  const a = await live(reportedRepo, planA);
+  const b = await live(sibling, planB);
+  assert.match(a.text ?? "", /"mode": "independent_review"/, "A's manifest now runs Stage 3D as a review");
+  assert.match(a.text ?? "", /"name": "sporely-web"/, "and declares the sibling it must also pin");
+  assert.notEqual(a.digest, aUndeclared.digest, "so A executes something different, and its digest says so");
+  assert.equal(b.text, bUndeclared.text, "B's manifest is byte-identical to the one it built before anything was declared");
+  assert.equal(b.digest, bUndeclared.digest, "so B's recorded run would keep resuming");
+
+  // ---- the cold read: only what VS Code stores, resolved again from scratch
+  const persisted = await stored();
+  assert.ok(persisted.repositories && persisted.modes, "both kinds reached workspace state");
+  assert.ok(
+    JSON.stringify(persisted.repositories).includes(`@${reportedRepo}`),
+    `the stored key names the worktree it was declared in, got ${JSON.stringify(persisted.repositories)}`,
   );
-  assert.deepEqual(there.repositories, [], "and the other worktree sees nothing, so its manifest and digest are untouched");
-  assert.equal(there.mode, "implementation", "the same separation holds for a stage's mode");
+  assert.ok(!JSON.stringify(persisted.modes).includes(`@${sibling}`), "and never the other one");
 
-  // Removing it is scoped too: it must not need the other worktree's state to
-  // be consulted, and must leave this one clean.
-  const removed = (await vscode.commands.executeCommand("agentSparring._test.declareStageRepository", "3D", undefined)) as { name: string }[] | undefined;
-  assert.ok(removed, "reading back without declaring anything still answers");
-  console.log(`integration: declarations for plan ${here.planKey} are scoped to the worktree that made them; a sibling worktree with the same plan key sees none`);
+  const coldA = await cold(persisted, reportedRepo, planA);
+  const coldB = await cold(persisted, sibling, planB);
+  assert.equal(coldA.text, a.text, "read cold, A rebuilds byte-identically to what the live session builds");
+  assert.equal(coldA.digest, a.digest, "so a restored window would resume A's run rather than be refused");
+  assert.equal(coldB.text, bUndeclared.text, "and B still builds the manifest of a worktree that has declared nothing");
+  assert.equal(coldB.digest, bUndeclared.digest, "its digest never moved, so a declaration next door could not have stopped it");
+  assert.notEqual(coldA.digest, coldB.digest, "the two worktrees execute different things, which is the point");
+
+  // Emptied state resolves to the undeclared manifests for both — the shape a
+  // window with nothing stored sees, and proof the cold read is reading the
+  // values handed to it rather than reaching the live ones.
+  const empty = await cold({}, reportedRepo, planA);
+  assert.equal(empty.digest, aUndeclared.digest, "with nothing stored, A declares nothing");
+
+  const here = await declarations(reportedRepo);
+  const there = await declarations(sibling);
+  assert.equal(here.mode, "independent_review");
+  assert.equal(there.mode, "implementation", "B's mode is still the engine's default");
+  assert.deepEqual(there.repositories, [], "and it has no sibling declaration");
+  assert.equal(there.planKey, here.planKey, "though it is the same plan, by the same key");
+
+  // ---- nothing is cached in the process, so what VS Code restores is what is used
+  const controllerSource = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "controller.ts"), "utf8");
+  for (const accessor of ["stageRepositories", "stageRepositoriesFor", "stageModes", "stageModeFor"]) {
+    const body = /\n {2}[a-zA-Z]+\([^)]*\)[^{]*\{([\s\S]*?)\n {2}\}/.exec(controllerSource.slice(controllerSource.indexOf(`  ${accessor}(`)))?.[1] ?? "";
+    assert.ok(body, `${accessor} exists`);
+    assert.match(body, /this\.context\.workspaceState\.get</, `${accessor} reads workspace state on the call, so a reload cannot diverge from an in-memory copy`);
+  }
+
+  console.log(
+    `integration: ${path.basename(reportedRepo)} declares sporely-web and mode=independent_review for Stage 3D and builds digest ${String(a.digest).slice(0, 12)}…; read cold from the stored values alone it rebuilds the same, while sporely-py-ui-cleanup — same plan key ${here.planKey} — declares neither and still builds ${String(b.digest).slice(0, 12)}…`,
+  );
+}
+
+/** A manifest a test command built, asserted to be one this plan can actually produce. */
+function built(result: unknown, projectDir: string): BuiltManifest {
+  const manifest = result as BuiltManifest | undefined;
+  assert.ok(manifest, `a manifest could be built for ${path.basename(projectDir)}`);
+  assert.equal(manifest.ok, true, `…and the plan is executable: ${String(manifest.reason)}`);
+  return manifest;
 }

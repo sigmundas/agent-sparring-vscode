@@ -55,8 +55,9 @@ import { stageDisplayName } from "../core/presentation";
 import { stageActions, stageRunAction } from "../core/runner";
 import { planKey, planLabel, planRunId, type SparringSubcommand } from "../core/sparringCommand";
 import { chooseLaunchRepository, launchTargets } from "../core/launchRepositories";
-import { manifestRepositories, relativeRepositoryPath, type DeclaredRepository } from "../core/stageRepositories";
-import { STAGE_MODE_LABELS, STAGE_MODES, type StageMode } from "../core/stageModes";
+import { STAGE_REPOSITORIES_KEY, manifestRepositories, relativeRepositoryPath, repositoriesForPlan, type DeclaredRepository, type StageRepositories } from "../core/stageRepositories";
+import type { ManifestRepository } from "../core/manifest";
+import { STAGE_MODES_KEY, STAGE_MODE_LABELS, STAGE_MODES, modesForPlan, type StageMode, type StageModes } from "../core/stageModes";
 import { withTemporaryFile } from "../core/tempFile";
 import type { SparringController } from "./controller";
 import type { EngineFailure, LaunchResult } from "./executionTracker";
@@ -144,6 +145,63 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     // integration suite can ask the same question of two worktrees and prove
     // they are independent through real workspace state — where the scope key
     // has to survive being a JSON key containing a path.
+    // The manifest a *given* worktree would hand the engine for a plan,
+    // built through the same `declarationsFor` the launcher uses — so the
+    // suite compares what would actually execute, not a restatement of it.
+    // Nothing is launched and nothing is written.
+    vscode.commands.registerCommand("agentSparring._test.manifestFor", async (projectDir: string, planPath: string) => {
+      const markdown = await readOptional(planPath);
+      if (markdown === undefined) {
+        return undefined;
+      }
+      const location: SparringLocation = { sparringDir: path.join(projectDir, ".sparring"), projectDir, repoRoot: projectDir, workspaceFolder: projectDir, folderName: path.basename(projectDir) };
+      const label = planLabel(planPath, projectDir);
+      const built = buildManifest({ markdown, planLabel: label, planName: path.basename(planPath), ...declarationsFor(controller, planKey(label), location) });
+      if (!built.ok) {
+        return { ok: false, reason: built.problems[0]?.reason };
+      }
+      return { ok: true, planKey: planKey(label), text: renderManifest(built.manifest), digest: manifestDigest(built.manifest) };
+    }),
+    // Exactly the values VS Code holds for the declaration keys — what it
+    // would restore into a new window, and all it would restore.
+    vscode.commands.registerCommand("agentSparring._test.storedDeclarations", () => ({
+      modes: context.workspaceState.get(STAGE_MODES_KEY),
+      repositories: context.workspaceState.get(STAGE_REPOSITORIES_KEY),
+    })),
+    // The manifest a worktree would build from *supplied* stored values
+    // instead of from the live workspace state: a cold read of the persisted
+    // shape, through the same readers and the same builder production uses.
+    vscode.commands.registerCommand(
+      "agentSparring._test.manifestFromStored",
+      async (stored: { modes?: StageModes; repositories?: StageRepositories }, projectDir: string, planPath: string) => {
+        const markdown = await readOptional(planPath);
+        if (markdown === undefined) {
+          return undefined;
+        }
+        const label = planLabel(planPath, projectDir);
+        const key = planKey(label);
+        const built = buildManifest({
+          markdown,
+          planLabel: label,
+          planName: path.basename(planPath),
+          repositories: manifestRepositories(repositoriesForPlan(stored.repositories, key, projectDir), projectDir),
+          modes: modesForPlan(stored.modes, key, projectDir),
+        });
+        if (!built.ok) {
+          return { ok: false, reason: built.problems[0]?.reason };
+        }
+        return { ok: true, planKey: key, text: renderManifest(built.manifest), digest: manifestDigest(built.manifest) };
+      },
+    ),
+    vscode.commands.registerCommand("agentSparring._test.declareStageMode", async (label: string, mode: StageMode) => {
+      const run = controller.currentSelection.selected;
+      const key = run ? await planKeyFor(controller, run) : undefined;
+      if (!run || !key) {
+        return undefined;
+      }
+      await controller.declareStageMode(key, run.location.projectDir, label, mode);
+      return controller.stageModeFor(key, run.location.projectDir, label);
+    }),
     vscode.commands.registerCommand("agentSparring._test.stageDeclarations", async (projectDir: string, label: string) => {
       const run = controller.currentSelection.selected;
       const key = run ? await planKeyFor(controller, run) : undefined;
@@ -1708,6 +1766,28 @@ async function ownedByPlanRun(
   };
 }
 
+/**
+ * The declarations a plan's manifest carries for one **worktree**: its stages'
+ * sibling repositories and their modes.
+ *
+ * One place, because every caller has to agree. Starting a run and resuming it
+ * must produce byte-identical manifests from an unchanged plan — the engine
+ * refuses a run whose digest moved — so `performContinueAutomatically` and
+ * `planInvocationFor` may not know different things; and anything that reports
+ * what *would* be built must read the same state, or it would be reporting on
+ * a manifest nothing executes.
+ *
+ * `projectDir` is not a detail: a plan key is shared by every worktree running
+ * the same plan path, so without it these answer for the wrong checkout
+ * (declarationScope.ts).
+ */
+function declarationsFor(controller: SparringController, key: string, location: SparringLocation): { repositories: Record<string, ManifestRepository[]>; modes: Record<string, StageMode> } {
+  return {
+    repositories: manifestRepositories(controller.stageRepositories(key, location.projectDir), location.repoRoot),
+    modes: controller.stageModes(key, location.projectDir),
+  };
+}
+
 async function planInvocationFor(controller: SparringController, run: PlanRunSnapshot): Promise<{ planPath: string } | { manifest: string } | undefined> {
   if (run.state.source !== "manifest") {
     return { planPath: run.planPath };
@@ -1722,8 +1802,7 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
     planLabel: run.state.plan,
     planName: path.basename(run.planPath),
     known: await knownStageIds(controller, run, markdown),
-    repositories: manifestRepositories(controller.stageRepositories(run.planKey, run.location.projectDir), run.location.repoRoot),
-    modes: controller.stageModes(run.planKey, run.location.projectDir),
+    ...declarationsFor(controller, run.planKey, run.location),
   });
   if (!built.ok) {
     void vscode.window.showWarningMessage(`Agent Sparring: the execution manifest for ${path.basename(run.planPath)} could not be rebuilt: ${built.problems[0]?.reason ?? "the plan changed."}`);
@@ -1804,8 +1883,7 @@ async function performContinueAutomatically(controller: SparringController, over
     planLabel: label,
     planName: path.basename(planPath),
     known: await knownStageIds(controller, run, markdown),
-    repositories: manifestRepositories(controller.stageRepositories(planKey(label), location.projectDir), location.repoRoot),
-    modes: controller.stageModes(planKey(label), location.projectDir),
+    ...declarationsFor(controller, planKey(label), location),
   });
   if (!built.ok) {
     const detail = built.problems.map((problem) => `• ${problem.reason}`).join("\n");

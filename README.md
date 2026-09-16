@@ -643,6 +643,22 @@ B. Developer: Reload Window
    targets the right terminal.
 6. If it did not survive: **Resume stage** is offered.
 
+C. Declarations across a reload
+
+The one check the integration harness cannot make for itself (see "What the
+integration harness cannot test"), because a test host never writes its
+workspace storage to disk.
+
+1. In a worktree with a plan, run **Agent Sparring: Sibling Repositories for a
+   Plan Stage…** and declare one for a stage, then **Agent Sparring: Stage Mode
+   for a Plan Stage…** and set that stage to *Independent review*.
+2. Run `Developer: Reload Window`.
+3. Re-open both commands: the stage still shows the sibling under its label and
+   *review only* beside it.
+4. If a second worktree of the same repository with the same plan path is open,
+   both commands must show it as declaring **nothing** — the two share a plan
+   key, and that is exactly what the worktree scope exists to separate.
+
 ## Develop
 
 ```sh
@@ -694,6 +710,30 @@ while `str.strip()` does not; `version != 1` in Python accepts `true`, because
 `True == 1`; and `str.encode("utf-8")` raises on an unpaired surrogate where
 Node substitutes U+FFFD, so the extension used to hand a confident digest to a
 manifest the engine cannot digest at all.
+
+### What the integration harness cannot test
+
+VS Code run under `--extensionTestsPath` keeps its storage **in memory**. With
+a shared `--user-data-dir` across two launches the same workspace-storage
+directory is created (`User/workspaceStorage/<hash>/`) and no `state.vscdb` is
+ever written to it — not after a settling delay, and not after a graceful
+`workbench.action.quit`. A second window therefore always starts with an empty
+store, so no assertion here can show that a value written in one window is read
+back in the next: it would be testing the harness.
+
+Anything kept in `workspaceState` — plan associations, stage-mode and
+sibling-repository declarations, the pin, manual check drafts — is therefore
+verified two ways instead, and neither claims VS Code's own durability:
+
+- the stored values are taken out and used to rebuild the result from cold,
+  through the same readers and builders production uses, so a stored shape that
+  was missing or ambiguous would fail (`declarations` in the integration
+  suite);
+- every accessor reads the Memento on the call and holds no in-process copy, so
+  whatever VS Code restores is what the extension uses. That is asserted
+  against the source.
+
+A real reload remains a manual check; see "Manual verification".
 
 ### Known follow-ups
 

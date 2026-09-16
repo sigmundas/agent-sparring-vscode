@@ -94,8 +94,14 @@ describe("the automatic path is one engine call, not a loop", () => {
     for (const where of ["performContinueAutomatically", "planInvocationFor"]) {
       const body = fn(source, where);
       assert.match(body, /known: await knownStageIds\(/, `${where} carries the project's existing stage ids and briefs`);
-      assert.match(body, /repositories: manifestRepositories\(controller\.stageRepositories\(/, `${where} carries the declared sibling repositories`);
+      assert.match(body, /\.\.\.declarationsFor\(controller, /, `${where} carries the declared sibling repositories and stage modes, from the one place that reads them`);
     }
+    // And that one place is keyed by the worktree, not by the plan alone: a
+    // plan key is shared by every checkout of the same plan path, so reading
+    // declarations without the project directory answers for the wrong one.
+    const helper = fn(source, "declarationsFor");
+    assert.match(helper, /controller\.stageRepositories\(key, location\.projectDir\)/);
+    assert.match(helper, /controller\.stageModes\(key, location\.projectDir\)/);
   });
 
   it("an already-executed stage is briefed from its own brief.md, not from the plan as it now reads", async () => {

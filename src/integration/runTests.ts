@@ -150,6 +150,17 @@ async function buildFixture(): Promise<{ root: string; workspaceFile: string }> 
     { mode: 0o755 },
   );
 
+  // A second worktree of the same repository, with the same plan document at
+  // the same *repo-relative* path — which is what makes both produce the same
+  // plan key, and is the whole reason declarations have to be scoped by
+  // worktree. Deliberately not a workspace folder and with no `.sparring`, so
+  // discovery is untouched: it exists to be the checkout a declaration made
+  // next door must not reach.
+  const uiCleanup = path.join(root, "sporely-py-ui-cleanup");
+  await fs.mkdir(path.join(uiCleanup, "plans"), { recursive: true });
+  await fs.mkdir(path.join(uiCleanup, ".git"), { recursive: true });
+  await fs.writeFile(path.join(uiCleanup, ".git", "HEAD"), "ref: refs/heads/feature/ui-cleanup\n");
+
   // The fake's directory is put on the *integrated shell's* PATH only (never
   // on the extension host's), so the bare-`sparring` scenario exercises the
   // real situation: the shell finds it, the extension process cannot.
