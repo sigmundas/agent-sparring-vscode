@@ -409,45 +409,59 @@ terminal is observed, never interrupted.
 
 Handing a command line to shell integration submits it. The shell may run it
 at once, later (a stopped or busy shell runs the line when it continues), or
-never — so a submission is tracked apart from executions, and becomes a
-runner only when the shell reports **that exact execution** as started:
+never. So every engine command — `run-plan`, `resume-plan`, `run-loop` and the
+short ones, `freeze-candidate`, `accept-candidate`, `new-stage` — goes through
+one submission registry, and a submission becomes a runner only when the shell
+reports **that exact execution** as started:
 
 | State | What it means | What the extension does |
 | --- | --- | --- |
-| Pending, waiting | submitted; the start report is being waited for (5 s) | nothing is `Running`, nothing is persisted as a live launch, no runner is claimed |
-| Pending, uncertain | the wait expired with no start report | the same, plus: that terminal is quarantined (never reused, never closed or signalled — your command may be what is holding it), and the submission is still watched |
+| Submitted, waiting | the start report is being waited for (5 s) | nothing is `Running`, nothing is persisted as a live launch, no runner is claimed |
+| Submitted, uncertain | that wait expired with no start report | the same, plus: the terminal is quarantined (never reused, never closed or signalled — your command may be what is holding it), and the extension keeps looking for evidence |
 | Running | the shell reported that execution as started | an ordinary tracked runner: persisted, shown, stopped with Ctrl-C, ended by its own end event |
 
-While a submission is pending, a second command for the same run is
-**refused**, because the first one may still start and running an engine
-operation twice is not safe. The wording says what is actually known —
-"Agent Sparring handed this command to the terminal but has not been able to
-confirm whether it started" — never that a runner is alive. The dialog offers
-**Show Log** and **Discard submission**, which is the human decision to forget
-it so the command may be given again.
+**The invariant.** Once a command has been handed to a shell and nothing has
+*proved* that it can no longer execute, that submission keeps refusing a second
+copy of the same operation — a second `run-plan` for that run, a second
+`freeze-candidate` for that stage. The check happens before the executable is
+resolved, before a terminal is acquired and before anything is sent. The
+wording says what is known — "Agent Sparring handed this command to the
+terminal and has not been able to confirm whether it started" — and never that
+a runner is alive.
 
-A pending submission is settled by: its exact execution starting (promoted to
-a real runner, however late), its exact execution ending, its terminal closing
-or its shell exiting (it can no longer run), a process probe finding this
-project's runner, or you discarding it.
+**What resolves a submission.** Only evidence:
 
-Short commands (`freeze-candidate`, `accept-candidate`, `new-stage`) follow the
-same rule and are deliberately **not** retried through the direct-process
-transport when their start cannot be confirmed: the submitted line may still
-run, and accepting a candidate twice is not a risk worth taking.
+| Evidence | What it proves |
+| --- | --- |
+| the shell reports that exact execution started | it ran (a runner is then tracked as usual, however late the start) |
+| the shell reports that exact execution finished | the shell only reports an end for a command it ran |
+| its terminal was closed | the pty and the shell reading it are gone, so a queued line can never be read |
+| `ps` no longer lists the shell process that took it | the same conclusion, for a submission this window can no longer identify |
+| `ps` lists *this exact command* (same subcommand, stage / plan / manifest) | it started |
+| the command line was never handed over (this shell's quoting could not be written) | there is no submitted line at all |
 
-**After a reload.** Pending submissions are persisted (separately from the
-launches: a reload never turns one into a live runner). VS Code cannot hand a
-`TerminalShellExecution` back, so a reloaded window can no longer recognise a
-late start by identity; it therefore fails safe — the submission is restored as
-uncertain, no runner is claimed, and a duplicate is refused until the terminal
-that took it turns out to be gone, a process probe finds the runner, or you
-discard it.
+**What never resolves one:** a timer of any kind, the terminal-reconnect grace
+period after a reload, and *any other* runner turning up in the project's
+process table. "There is a runner in this project" is not "the command I queued
+started": a probed runner and an unresolved submission coexist, and the probed
+runner ending does not settle the submission either.
 
-Terminal identity is not liveness. Every shell execution is tracked
-separately, so a finished command can never keep the Overview `Running`
-because its terminal is still open, and Stop still reaches exactly the
-terminal hosting the live execution.
+**The human override.** Agent Sparring cannot cancel a line a shell already
+has, so there is no "cancel". What there is, on the refusal, is
+**I checked — allow retry**: a modal confirmation stating that you have looked
+at that terminal and the command cannot start any more, and that retrying while
+it can could run the operation twice. It is recorded in the log as your
+override, never as evidence that the command did not run.
+
+**After a reload.** Submissions are persisted separately from the launches, so
+a reload never turns one into a live runner. VS Code cannot hand a
+`TerminalShellExecution` back, so a restored submission cannot be recognised by
+identity: it stays uncertain and keeps refusing a duplicate until its terminal
+closes, until `ps` shows the shell that took it is gone or shows the exact
+command running, or until you override it. A terminal that merely does not
+reconnect proves nothing. On a platform without a process probe, an unresolved
+submission stays unresolved until a terminal event or your override — the log
+says so.
 
 ### Which run the Overview follows
 

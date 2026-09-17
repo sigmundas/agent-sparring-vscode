@@ -61,6 +61,7 @@ import { STAGE_MODES_KEY, STAGE_MODE_LABELS, STAGE_MODES, modesForPlan, type Sta
 import { withTemporaryFile } from "../core/tempFile";
 import type { SparringController } from "./controller";
 import type { EngineFailure, LaunchProblem, LaunchResult } from "./executionTracker";
+import type { SubmissionView } from "./submissionRegistry";
 import { outputTail } from "./terminalOutput";
 import { currentBranch, knownRepositories, pendingChanges } from "./git";
 import { manifestSupport } from "./engineProbe";
@@ -112,8 +113,9 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring._test.hostingTerminal", (runId: string) => controller.hostingTerminal(runId)),
     // Submitted commands whose start has not been observed: never runners,
     // and the reason a second command for the same run is refused.
-    vscode.commands.registerCommand("agentSparring._test.pendingSubmissions", () => controller.pendingSubmissions()),
-    vscode.commands.registerCommand("agentSparring._test.discardPendingSubmission", (runId: string) => controller.discardPendingSubmission(runId)),
+    vscode.commands.registerCommand("agentSparring._test.unresolvedSubmissions", () => controller.unresolvedSubmissions()),
+    vscode.commands.registerCommand("agentSparring._test.overrideSubmission", (key: string, note: string) => controller.overrideSubmission(key, note ?? "confirmed by the person in a test")),
+    vscode.commands.registerCommand("agentSparring._test.probeSubmissions", () => controller.probeSubmissions()),
     vscode.commands.registerCommand("agentSparring._test.acceptStage", async () => {
       const run = controller.currentSelection.selected;
       return run?.kind === "stage" ? performAcceptStage(controller, run) : undefined;
@@ -667,18 +669,18 @@ async function performAcceptStage(controller: SparringController, run: Standalon
   const invocation = { stageId: run.stage.stageId, repoRoot, expectedBranch, sparringDir: run.location.sparringDir };
   controller.setAccepting(run.id, true);
   controller.log(`Accept stage ${run.stage.stageId}: freeze-candidate, then accept-candidate (branch ${expectedBranch})`);
-  let problem: { error: string; problem: LaunchProblem } | undefined;
+  let problem: { error: string; problem: LaunchProblem; submission?: SubmissionView } | undefined;
   try {
     const result = await acceptStage(async (args) => {
       const outcome = await controller.runCommand({ configured: configuredExecutable(), args, cwd: repoRoot, name: `Accept stage: ${run.stage.stageId}` });
       if (!outcome.ok) {
-        problem = { error: outcome.error, problem: outcome.problem };
+        problem = { error: outcome.error, problem: outcome.problem, submission: outcome.submission };
         return { exitCode: undefined, output: outcome.error };
       }
       return outcome.outcome;
     }, invocation);
     if (problem) {
-      await explainCommandProblem(problem.error, problem.problem);
+      await explainCommandProblem(controller, problem);
       return undefined;
     }
     if (result.ok) {
@@ -1362,37 +1364,55 @@ async function explainLaunch(controller: SparringController, result: LaunchResul
     await explainExecutableProblem(result.error);
     return;
   }
-  // A submission nobody can yet call started or dead. The person is the only
-  // one who can settle it, so the choice is theirs and it is named for what
-  // it does: forget this submission, so the command may be given again.
-  const pending = result.pending;
-  const choices = pending ? ["Show Log", "Discard submission"] : ["Show Log"];
-  const choice = await vscode.window.showWarningMessage(`Agent Sparring: ${result.error}`, ...choices);
+  await explainUnconfirmed(controller, result.error, result.submission);
+}
+
+/**
+ * A command whose fate nobody can establish.
+ *
+ * The only way out, other than evidence, is a person stating that the command
+ * cannot still run — and that is an override, not a cancellation: nothing here
+ * can stop a line already sitting in a shell's input. So it is asked for
+ * modally, in those words, and what it permits is a retry.
+ */
+async function explainUnconfirmed(controller: SparringController, error: string, submission: SubmissionView | undefined): Promise<void> {
+  const choices = submission ? ["Show Log", "I checked — allow retry"] : ["Show Log"];
+  const choice = await vscode.window.showWarningMessage(`Agent Sparring: ${error}`, ...choices);
   if (choice === "Show Log") {
     await vscode.commands.executeCommand("agentSparring.showLog");
-  } else if (choice === "Discard submission" && pending) {
-    if (controller.discardPendingSubmission(pending.runId)) {
-      void vscode.window.showInformationMessage(`Agent Sparring: the submitted ${pending.kind} is forgotten. Run it again when you have checked that terminal.`);
-    }
+    return;
+  }
+  if (choice !== "I checked — allow retry" || !submission) {
+    return;
+  }
+  const detail = [
+    `Agent Sparring cannot cancel a command a shell has already been given, and it has no evidence about this one either way.`,
+    "",
+    `Submitted: ${submission.label}`,
+    `To: ${submission.terminalName ?? "a terminal of this window"}`,
+    "",
+    "Only confirm this if you have looked at that terminal and that command cannot start any more. If it can, running the operation again may run it twice.",
+  ].join("\n");
+  const confirmed = await vscode.window.showWarningMessage("Allow this operation to be run again?", { modal: true, detail }, "Allow retry");
+  if (confirmed !== "Allow retry") {
+    return;
+  }
+  if (controller.overrideSubmission(submission.key, "the person confirmed, having checked the terminal, that this command cannot still run; this is an override, not an observation")) {
+    void vscode.window.showInformationMessage(`Agent Sparring: ${submission.label} may be run again. Its earlier submission was cleared by you, not by evidence.`);
   }
 }
 
 /**
- * A failed command is reported as what it was. A configuration problem gets
- * the settings dialog; a command the shell never started is not a
- * configuration problem at all — the executable was found and the terminal
- * was there — so it gets the plain reason and the log, and no advice about
- * PATH.
+ * A failed short command is reported as what it was: a configuration problem
+ * gets the settings dialog, a command whose fate is unknown gets the same
+ * treatment as an unconfirmed launch.
  */
-async function explainCommandProblem(error: string, problem: LaunchProblem): Promise<void> {
-  if (problem !== "unconfirmed") {
-    await explainExecutableProblem(error);
+async function explainCommandProblem(controller: SparringController, problem: { error: string; problem: LaunchProblem; submission?: SubmissionView }): Promise<void> {
+  if (problem.problem !== "unconfirmed") {
+    await explainExecutableProblem(problem.error);
     return;
   }
-  const choice = await vscode.window.showWarningMessage(`Agent Sparring: ${error}`, "Show Log");
-  if (choice === "Show Log") {
-    await vscode.commands.executeCommand("agentSparring.showLog");
-  }
+  await explainUnconfirmed(controller, problem.error, problem.submission);
 }
 
 /** Configuration errors: the honest message plus the two ways to fix it. */
@@ -1659,7 +1679,7 @@ async function performStartNextStage(controller: SparringController, overview: O
     }
   }
   controller.log(`Start next stage: sparring new-stage ${proposal.stageId} --brief-file <temporary copy of ${planName} › ${proposal.display}>`);
-  let problem: { error: string; problem: LaunchProblem } | undefined;
+  let problem: { error: string; problem: LaunchProblem; submission?: SubmissionView } | undefined;
   // The brief travels through a temporary file outside the workspace; the
   // engine reads it and writes brief.md. The file is removed afterwards.
   const result: NewStageResult = await withTemporaryFile(rendered.brief, `${proposal.stageId}.md`, (briefFile) =>
@@ -1667,7 +1687,7 @@ async function performStartNextStage(controller: SparringController, overview: O
       async (args) => {
         const outcome = await controller.runCommand({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: `New stage: ${proposal.stageId}` });
         if (!outcome.ok) {
-          problem = { error: outcome.error, problem: outcome.problem };
+          problem = { error: outcome.error, problem: outcome.problem, submission: outcome.submission };
           return { exitCode: undefined, output: outcome.error };
         }
         return outcome.outcome;
@@ -1676,7 +1696,7 @@ async function performStartNextStage(controller: SparringController, overview: O
     ),
   );
   if (problem) {
-    await explainCommandProblem(problem.error, problem.problem);
+    await explainCommandProblem(controller, problem);
     return { ok: false, reason: "executable", message: problem.error };
   }
   if (!result.ok) {

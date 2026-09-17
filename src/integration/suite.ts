@@ -25,6 +25,7 @@ import { withHumanCheck, type HumanCheckDrafts } from "../core/humanChecks";
 import type { ExecutionRecord, LivenessState, RunnerLiveness } from "../core/liveness";
 import { buildOverviewModel, type CapturedPrompt, type ManifestStageView, type OverviewArtifacts } from "../core/overviewModel";
 import { ExecutionTracker } from "../vscode/executionTracker";
+import { SubmissionRegistry, SUBMISSIONS_KEY } from "../vscode/submissionRegistry";
 import type { TerminalLease, TerminalPool } from "../vscode/terminalPool";
 
 const STAGES = ["stage-reported-statistics-contract", "stage-reported-statistics-local-schema-barrier", "stage-reported-statistics-typed-parser", "stage-review-complete", "stage-review-complete-dirty", "stage-stale-turn"];
@@ -79,6 +80,8 @@ export async function run(): Promise<void> {
     ["occupied", () => occupiedTerminalAssertions(report, reportedRepo, fixtureRoot)],
     ["falserunner", () => falseRunnerAssertions(reportedRepo, fixtureRoot)],
     ["latestart", () => lateStartAssertions(report, reportedRepo)],
+    ["shortcommand", () => shortCommandAssertions(report, reportedRepo)],
+    ["override", () => overrideAssertions(report, reportedRepo)],
     ["launchable", () => launchTargetAssertions(fixtureRoot, reportedRepo)],
     ["declarations", () => declarationScopeAssertions(reportedRepo, fixtureRoot)],
   ];
@@ -1150,7 +1153,7 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
 
     const { lease, retired } = bypassLease(terminal);
     const logged: string[] = [];
-    const tracker = new ExecutionTracker({ workspaceState: memento() } as unknown as vscode.ExtensionContext, (message) => logged.push(message), () => [], { acquire: () => lease } as unknown as TerminalPool);
+    const { tracker, registry, dispose } = trackerOver(lease, logged);
     const runId = "false-runner-regression";
     try {
       const result = await tracker.launch({
@@ -1176,25 +1179,25 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
 
       // The submission itself is kept: nothing here can prove that command
       // will never run, so a second one is refused rather than submitted.
-      const pending = tracker.pendingSubmissions();
+      const pending = registry.unresolved();
       assert.equal(pending.length, 1, `the submission is retained, got ${JSON.stringify(pending)}`);
       assert.equal(pending[0].state, "uncertain");
       assert.equal(pending[0].runId, runId);
       const second = await tracker.launch({ configured: executable, args: ["run-plan", "plans/never-executed.md", "--repo-root", reportedRepo], cwd: reportedRepo, name: "false-runner regression (again)", runId, kind: "run-plan", reveal: false });
       assert.equal(second.ok, false, "a second copy of the same operation is refused while the first may still start");
       assert.equal(second.ok ? undefined : second.problem, "unconfirmed");
-      assert.equal(tracker.pendingSubmissions().length, 1, "and nothing new was submitted");
+      assert.equal(registry.unresolved().length, 1, "and nothing new was submitted");
 
       // Closing that terminal is what settles it: the shell that took the
       // command is gone, so the command can no longer run.
       terminal.dispose();
       await new Promise((resolve) => setTimeout(resolve, 1000));
-      assert.deepEqual(tracker.pendingSubmissions(), [], "closing the terminal resolves the submission");
+      assert.deepEqual(registry.unresolved(), [], "closing the terminal resolves the submission");
       assert.equal(tracker.executionFor(runId), undefined, "and still records no execution: nothing ever ran");
       const received = await fs.readFile(typed, "utf8").catch(() => "");
       console.log(`integration: the bypassed terminal's occupant received ${JSON.stringify(received.trim().slice(0, 60))}`);
     } finally {
-      tracker.dispose();
+      dispose();
       terminal.dispose();
     }
   }
@@ -1217,7 +1220,7 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
     await fs.rm(argvLog, { force: true });
     const { lease, retired } = bypassLease(terminal);
     const logged: string[] = [];
-    const tracker = new ExecutionTracker({ workspaceState: memento() } as unknown as vscode.ExtensionContext, (message) => logged.push(message), () => [], { acquire: () => lease } as unknown as TerminalPool);
+    const { tracker, registry, dispose } = trackerOver(lease, logged);
     const runId = "late-start-regression";
     const stage = "stage-reported-statistics-typed-parser";
     let stopped = false;
@@ -1238,7 +1241,7 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
       assert.equal(result.ok ? undefined : result.problem, "unconfirmed");
       assert.equal(tracker.executionFor(runId), undefined, "and nothing is running");
       assert.equal(retired(), true, "its terminal is quarantined while its fate is unknown");
-      const waiting = tracker.pendingSubmissions();
+      const waiting = registry.unresolved();
       assert.equal(waiting.length, 1, "the identity of the submitted command is kept");
       assert.equal(waiting[0].state, "uncertain");
 
@@ -1249,14 +1252,14 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
       assert.equal(promoted.state, "running", "the exact execution became the runner");
       assert.equal(promoted.source, "launched", "promoted by execution identity, not rediscovered from a command line");
       assert.equal(tracker.hostingTerminal(runId), terminal.name);
-      assert.deepEqual(tracker.pendingSubmissions(), [], "and the submission is resolved by its own start");
+      assert.deepEqual(registry.unresolved(), [], "and the submission is resolved by its own start");
       await new Promise((resolve) => setTimeout(resolve, 250));
       assert.deepEqual(
         tracker.persisted().filter((launch) => launch.runId === runId),
         [{ runId, state: "running" }],
         "a reload would now find exactly this one live runner",
       );
-      assert.ok(logged.some((line) => /after it was submitted and after the wait had expired/.test(line)), `the log says it started late, got ${JSON.stringify(logged)}`);
+      assert.ok(logged.some((line) => /resolved as started — .*long after the wait had expired/.test(line)), `the log says it started late, got ${JSON.stringify(logged)}`);
       assert.ok(await fs.stat(argvLog).then(() => true, () => false), "and the engine really did run");
 
       const ended = await waitUntil(() => {
@@ -1273,59 +1276,277 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
           // the shell is already gone
         }
       }
-      tracker.dispose();
+      dispose();
       terminal.dispose();
     }
   }
   // ---- C. a window reload finds a submission it cannot recognise --------
   //
   // VS Code cannot hand a `TerminalShellExecution` back, so a reloaded window
-  // can no longer promote a late start by identity. That must fail safe: the
-  // submission is restored as uncertain, no runner is claimed for it, and a
-  // second copy of the same operation is refused until its fate is known —
-  // here, by the terminal that took it being gone.
+  // can no longer promote a late start by identity. That must fail safe, and
+  // failing safe is not the same as giving up after six seconds: the
+  // reconnect grace period says only that VS Code did not bring a terminal
+  // back in time, which is no evidence at all about whether a shell is alive.
+  // The submission survives it, and is settled only when the process table
+  // can say that the shell that took it is gone.
   {
     const runId = "reloaded-submission-regression";
-    const stored = memento();
-    await stored.update("agentSparring.pendingSubmissions", [
+    const shellPid = 2147480000; // a pid no process on this machine has
+    const persisted = [
       {
-        id: "pending-from-the-previous-window",
+        id: "submission-from-the-previous-window",
+        key: `run:${runId}`,
+        transport: "runner",
+        label: "run-plan plans/never-executed.md",
+        cwd: reportedRepo,
+        subcommand: "run-plan",
         runId,
-        kind: "run-plan",
+        runnerKind: "run-plan",
         planPath: "plans/never-executed.md",
         word: executable,
         submittedAtMs: Date.now() - 4000,
-        terminalPid: 2147480000, // a pid no terminal in this window has
+        terminalPid: shellPid,
+        terminalName: "Agent Sparring — sporely-py-reported-statistics",
+      },
+    ];
+
+    // C1: no process probe on this platform — the submission must simply stay.
+    {
+      const stored = memento();
+      await stored.update(SUBMISSIONS_KEY, persisted);
+      const logged: string[] = [];
+      const registry = new SubmissionRegistry({ workspaceState: stored } as unknown as vscode.ExtensionContext, (message) => logged.push(message), () => false, async () => []);
+      const tracker = trackerWith(registry, stored, logged);
+      try {
+        const reattaching = tracker.reattach();
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        assert.deepEqual(
+          registry.unresolved().map((item) => [item.runId, item.state, item.restored]),
+          [[runId, "uncertain", true]],
+          "restored as uncertain, and it says it came from before the reload",
+        );
+        assert.equal(tracker.executionFor(runId), undefined, "no runner is claimed for it");
+        const refused = await tracker.launch({ configured: executable, args: ["run-plan", "plans/never-executed.md"], cwd: reportedRepo, name: "after the reload", runId, kind: "run-plan", reveal: false });
+        assert.equal(refused.ok, false, "and a duplicate is not submitted on the assumption that nothing happened");
+        assert.equal(refused.ok ? undefined : refused.problem, "unconfirmed");
+        assert.match(refused.ok ? "" : refused.error, /window has reloaded since/, "the reason is the reload, and it is said so");
+
+        // The grace period passes with no terminal coming back. That settles
+        // nothing, and the submission must still be there.
+        await reattaching;
+        assert.equal(registry.unresolved().length, 1, "the reconnect grace period is not evidence and does not clear it");
+        const again = await tracker.launch({ configured: executable, args: ["run-plan", "plans/never-executed.md"], cwd: reportedRepo, name: "after the grace period", runId, kind: "run-plan", reveal: false });
+        assert.equal(again.ok, false, "so a duplicate is still refused");
+        assert.ok(logged.some((line) => /no process probe is available/.test(line)), `and the log says why nothing can settle it here, got ${JSON.stringify(logged)}`);
+
+        // Only a person can settle it on such a platform, and that is an
+        // override, recorded as theirs.
+        assert.equal(registry.override(`run:${runId}`, "the person checked the terminal"), true);
+        assert.deepEqual(registry.unresolved(), [], "after which the operation may be given again");
+        assert.ok(logged.some((line) => /resolved as overridden/.test(line)), "recorded as an override, not as evidence");
+      } finally {
+        tracker.dispose();
+        registry.dispose();
+      }
+    }
+
+    // C2: the process table can speak, and says that shell is gone.
+    {
+      const stored = memento();
+      await stored.update(SUBMISSIONS_KEY, persisted);
+      const logged: string[] = [];
+      const registry = new SubmissionRegistry({ workspaceState: stored } as unknown as vscode.ExtensionContext, (message) => logged.push(message), () => true, async () => [{ pid: 1, command: "/sbin/launchd" }]);
+      const tracker = trackerWith(registry, stored, logged);
+      try {
+        await tracker.reattach();
+        await waitUntil(() => (registry.unresolved().length === 0 ? true : undefined), 15_000, "the process table proves the shell that took it is gone");
+        assert.ok(logged.some((line) => /resolved as shell-gone/.test(line)), `settled by evidence, got ${JSON.stringify(logged)}`);
+        assert.equal(tracker.executionFor(runId), undefined, "and nothing is recorded as having run");
+      } finally {
+        tracker.dispose();
+        registry.dispose();
+      }
+    }
+
+    // C3: the process table can speak, and the shell is still alive. Nothing
+    // is proved, so the submission stays and a duplicate stays refused.
+    {
+      const stored = memento();
+      await stored.update(SUBMISSIONS_KEY, persisted);
+      const logged: string[] = [];
+      const registry = new SubmissionRegistry({ workspaceState: stored } as unknown as vscode.ExtensionContext, (message) => logged.push(message), () => true, async () => [{ pid: shellPid, command: "-zsh" }]);
+      const tracker = trackerWith(registry, stored, logged);
+      try {
+        await tracker.reattach();
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        assert.equal(registry.unresolved().length, 1, "a shell that is still alive settles nothing");
+        const refused = await tracker.launch({ configured: executable, args: ["run-plan", "plans/never-executed.md"], cwd: reportedRepo, name: "while the shell lives", runId, kind: "run-plan", reveal: false });
+        assert.equal(refused.ok, false, "and the duplicate stays refused");
+      } finally {
+        tracker.dispose();
+        registry.dispose();
+      }
+    }
+  }
+
+  // ---- D. an unrelated runner in the same project proves nothing ---------
+  //
+  // The project probe answers "is there a runner in this project". A queued
+  // `run-plan --manifest X` is not answered by a `run-loop` for some other
+  // stage, and the two must coexist: the probed runner may come and go while
+  // the submission keeps refusing a duplicate.
+  {
+    const runId = "unrelated-runner-regression";
+    const other = `${executable} run-loop stage-some-other-thing --repo-root ${reportedRepo}`;
+    const stored = memento();
+    await stored.update(SUBMISSIONS_KEY, [
+      {
+        id: "submission-awaiting-its-fate",
+        key: `run:${runId}`,
+        transport: "runner",
+        label: "run-plan reported-statistics.manifest.json",
+        cwd: reportedRepo,
+        subcommand: "run-plan",
+        runId,
+        runnerKind: "run-plan",
+        manifest: "/store/manifests/reported-statistics.manifest.json",
+        word: executable,
+        submittedAtMs: Date.now() - 4000,
+        terminalPid: 2147480001,
         terminalName: "Agent Sparring — sporely-py-reported-statistics",
       },
     ]);
     const logged: string[] = [];
-    const tracker = new ExecutionTracker({ workspaceState: stored } as unknown as vscode.ExtensionContext, (message) => logged.push(message), () => [], { acquire: () => bypassLease(vscode.window.terminals[0] ?? vscode.window.createTerminal({ name: "unused" })).lease } as unknown as TerminalPool);
+    // The process table holds that other runner *and* the shell that took our
+    // submission, so neither "shell-gone" nor "attributed" applies.
+    let processes = [
+      { pid: 2147480001, command: "-zsh" },
+      { pid: 4242, command: other },
+    ];
+    const registry = new SubmissionRegistry({ workspaceState: stored } as unknown as vscode.ExtensionContext, (message) => logged.push(message), () => true, async () => processes);
+    const tracker = trackerWith(registry, stored, logged);
     try {
-      const reattaching = tracker.reattach();
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      assert.deepEqual(
-        tracker.pendingSubmissions().map((item) => [item.runId, item.state, item.restored]),
-        [[runId, "uncertain", true]],
-        "the submission is restored as uncertain, and says it came from before the reload",
-      );
-      assert.equal(tracker.executionFor(runId), undefined, "no runner is claimed for it");
-      const refused = await tracker.launch({ configured: executable, args: ["run-plan", "plans/never-executed.md"], cwd: reportedRepo, name: "after the reload", runId, kind: "run-plan", reveal: false });
-      assert.equal(refused.ok, false, "and a duplicate is not submitted on the assumption that nothing happened");
-      assert.equal(refused.ok ? undefined : refused.problem, "unconfirmed");
-      assert.match(refused.ok ? "" : refused.error, /window reloaded since/, "the reason is the reload, and it is said so");
+      registry.restore();
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      assert.equal(registry.unresolved().length, 1, "an unrelated run-loop does not answer for a queued run-plan");
 
-      // Its terminal did not come back, so that command can never run.
-      await reattaching;
-      assert.deepEqual(tracker.pendingSubmissions(), [], "the missing terminal settles it");
-      assert.equal(tracker.executionFor(runId), undefined, "and nothing is recorded as having run");
-      assert.ok(logged.some((line) => /did not survive the reload/.test(line)), `the log says why, got ${JSON.stringify(logged)}`);
+      // The unrelated runner ends. That says nothing about our submission either.
+      processes = [{ pid: 2147480001, command: "-zsh" }];
+      await registry.probeAll();
+      assert.equal(registry.unresolved().length, 1, "and its ending does not answer for it retrospectively");
+      const refused = await tracker.launch({ configured: executable, args: ["run-plan", "--manifest", "/store/manifests/reported-statistics.manifest.json"], cwd: reportedRepo, name: "while another stage runs", runId, kind: "run-plan", manifest: "/store/manifests/reported-statistics.manifest.json", reveal: false });
+      assert.equal(refused.ok, false, "so the duplicate run-plan stays refused throughout");
+      assert.equal(refused.ok ? undefined : refused.problem, "unconfirmed");
+
+      // This exact command, though, is attributable evidence: it started.
+      processes = [
+        { pid: 2147480001, command: "-zsh" },
+        { pid: 4343, command: `${executable} run-plan --manifest /store/manifests/reported-statistics.manifest.json --repo-root ${reportedRepo}` },
+      ];
+      await registry.probeAll();
+      assert.deepEqual(registry.unresolved(), [], "the exact submitted command in the process table settles it");
+      assert.ok(logged.some((line) => /resolved as attributed/.test(line)), `and says so, got ${JSON.stringify(logged)}`);
     } finally {
       tracker.dispose();
+      registry.dispose();
     }
   }
 
-  console.log("integration: an unconfirmed submission keeps its identity, refuses a second copy, is settled by its terminal closing — and a stopped shell that runs it later is promoted to a real, persisted, normally-ended runner; a reloaded window fails safe on one it can no longer recognise");
+  console.log("integration: an unconfirmed submission keeps its identity, refuses a second copy, is settled by its terminal closing — and a stopped shell that runs it later is promoted to a real, persisted, normally-ended runner; a reload keeps it until evidence settles it, and an unrelated runner never does");
+}
+
+// ---------------------------------------------------------------- a short engine command submitted to a stopped shell
+
+/**
+ * The reviewer's third reproduction: the duplicate the *short* commands could
+ * still do.
+ *
+ * `freeze-candidate` and `accept-candidate` change engine state, and they go
+ * to a shell the same way a runner does. When that shell is stopped, the
+ * command is taken and not run — and the previous implementation only wrote a
+ * log line about it, so pressing Accept stage again submitted a second copy
+ * and both ran when the shell continued.
+ *
+ * They now use the same durable submission authority as the runner commands:
+ * the retry is refused, nothing is written anywhere, and when the shell
+ * continues the one submitted command runs once.
+ */
+async function shortCommandAssertions(report: DiscoveryDiagnostic, reportedRepo: string): Promise<void> {
+  if (process.platform === "win32" || !(await shellIntegrationAvailable(reportedRepo))) {
+    console.log("integration: SIGSTOP or shell integration unavailable in this host; short-command scenario skipped");
+    return;
+  }
+  for (const terminal of ownTerminals()) {
+    terminal.dispose();
+  }
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  const stage = "stage-review-complete-dirty";
+  const runId = runIdOf(report, reportedRepo, stage);
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  const callsLog = path.join(reportedRepo, ".sparring", "fake-calls.log");
+  await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=1\nexit_with=0\n");
+  await fs.rm(callsLog, { force: true });
+
+  // One ordinary run so the project's terminal exists, is ours and is idle.
+  await vscode.commands.executeCommand("agentSparring.runStage");
+  await waitFor(runId, (liveness) => liveness.state === "running", 15_000, "a first run opens the project's terminal");
+  await waitFor(runId, (liveness) => liveness.state === "stopped", 20_000, "and leaves it idle");
+  const [owned] = ownTerminals();
+  const pid = await owned.processId;
+  assert.ok(owned && pid !== undefined, "the extension's terminal and its shell's pid");
+  await fs.rm(callsLog, { force: true });
+
+  const warnings = captureWarnings();
+  let stopped = false;
+  try {
+    process.kill(pid, "SIGSTOP");
+    stopped = true;
+    const first = (await vscode.commands.executeCommand("agentSparring._test.acceptStage")) as { ok: boolean } | undefined;
+    assert.equal(first, undefined, "Accept stage cannot report a result for a command the shell has not run");
+    const submissions = await pendingSubmissions();
+    assert.deepEqual(
+      submissions.map((item) => [item.subcommand, item.state]),
+      [["freeze-candidate", "uncertain"]],
+      `the short command is on the same durable record as a runner command, got ${JSON.stringify(submissions)}`,
+    );
+
+    // The retry. This is the duplicate the reviewer produced.
+    warnings.messages.length = 0;
+    const retry = (await vscode.commands.executeCommand("agentSparring._test.acceptStage")) as { ok: boolean } | undefined;
+    assert.equal(retry, undefined, "the retry does not run either");
+    assert.ok(
+      warnings.messages.some((message) => /has not been able to confirm whether it started/.test(message)),
+      `it is refused for the right reason, got ${JSON.stringify(warnings.messages)}`,
+    );
+    assert.equal((await pendingSubmissions()).length, 1, "and no second copy was submitted");
+    assert.equal(ownTerminals().length, 1, "nor a second terminal opened for one");
+    assert.equal(await fs.readFile(callsLog, "utf8").catch(() => ""), "", "the engine has run nothing at all so far");
+
+    // The shell continues. The one submitted freeze-candidate runs, once.
+    process.kill(pid, "SIGCONT");
+    stopped = false;
+    const calls = await waitUntil(async () => {
+      const text = await fs.readFile(callsLog, "utf8").catch(() => "");
+      return text.includes("freeze-candidate") ? text : undefined;
+    }, 20_000, "the submitted freeze-candidate runs when the shell continues");
+    assert.deepEqual(calls.trim().split("\n"), [`freeze-candidate ${stage}`], "exactly once, and nothing else");
+    await waitUntil(async () => ((await pendingSubmissions()).length === 0 ? true : undefined), 15_000, "and its fate is reconciled by its own execution");
+  } finally {
+    if (stopped) {
+      try {
+        process.kill(pid, "SIGCONT");
+      } catch {
+        // already gone
+      }
+    }
+    warnings.restore();
+    for (const terminal of ownTerminals()) {
+      terminal.dispose();
+    }
+  }
+  console.log("integration: a short engine command submitted to a stopped shell blocks its own retry durably, runs exactly once when the shell continues, and is reconciled");
 }
 
 // ---------------------------------------------------------------- the reviewer's reproduction, through the product
@@ -1436,6 +1657,104 @@ async function lateStartAssertions(report: DiscoveryDiagnostic, reportedRepo: st
   console.log("integration: a command submitted to a stopped shell is never a runner, refuses a second copy with its own wording, and is promoted, persisted and ended normally when the shell continues");
 }
 
+// ---------------------------------------------------------------- the human override
+
+/**
+ * The only way out of an unresolvable submission that is not evidence.
+ *
+ * Agent Sparring cannot cancel a line a shell has already been given, so
+ * "Discard submission" would have been a lie: clicking it proves nothing about
+ * whether the command will run. It is therefore an explicit override — the
+ * person states that they have checked the terminal and that the command
+ * cannot start — it takes a modal confirmation, and it is recorded as theirs
+ * rather than as an observation.
+ */
+async function overrideAssertions(report: DiscoveryDiagnostic, reportedRepo: string): Promise<void> {
+  if (process.platform === "win32" || !(await shellIntegrationAvailable(reportedRepo))) {
+    console.log("integration: SIGSTOP or shell integration unavailable in this host; override scenario skipped");
+    return;
+  }
+  for (const terminal of ownTerminals()) {
+    terminal.dispose();
+  }
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  const runId = runIdOf(report, reportedRepo, "stage-reported-statistics-typed-parser");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+  await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=1\nexit_with=0\n");
+  await vscode.commands.executeCommand("agentSparring.runStage");
+  await waitFor(runId, (liveness) => liveness.state === "running", 15_000, "a first run opens the project's terminal");
+  await waitFor(runId, (liveness) => liveness.state === "stopped", 20_000, "and leaves it idle");
+  const [owned] = ownTerminals();
+  const pid = await owned.processId;
+  assert.ok(owned && pid !== undefined);
+
+  const warnings = captureWarnings();
+  let stopped = false;
+  try {
+    process.kill(pid, "SIGSTOP");
+    stopped = true;
+    await vscode.commands.executeCommand("agentSparring.runStage");
+    assert.equal((await pendingSubmissions()).length, 1, "the submission is unresolved");
+
+    // Dismissing the dialog is not an override: nothing changes.
+    assert.equal((await pendingSubmissions()).length, 1, "a dismissed dialog settles nothing");
+
+    // The offer is a confirmation, and its wording says what it costs.
+    assert.ok(
+      warnings.messages.some((message) => /If that command cannot run any more, confirm it/.test(message)),
+      `the way out is stated as a confirmation, got ${JSON.stringify(warnings.messages)}`,
+    );
+
+    // The person confirms. This is an override, recorded as such — never as
+    // evidence that the command did not run.
+    const key = (await pendingSubmissions())[0].key;
+    assert.equal(
+      await vscode.commands.executeCommand("agentSparring._test.overrideSubmission", key, "the person checked the terminal and confirmed the command cannot still run"),
+      true,
+    );
+    assert.deepEqual(await pendingSubmissions(), [], "after which the operation may be given again");
+    assert.notEqual((await livenessOf(runId)).state, "running", "and nothing about a runner was claimed by any of it");
+  } finally {
+    if (stopped) {
+      try {
+        process.kill(pid, "SIGCONT");
+      } catch {
+        // already gone
+      }
+    }
+    warnings.restore();
+    for (const terminal of ownTerminals()) {
+      terminal.dispose();
+    }
+  }
+  console.log("integration: an unresolvable submission is cleared only by an explicit human override, recorded as an override and not as evidence");
+}
+
+/** A tracker over one terminal the pool would never hand out, with its own registry. */
+function trackerOver(lease: TerminalLease, logged: string[]): { tracker: ExecutionTracker; registry: SubmissionRegistry; dispose: () => void } {
+  const stored = memento();
+  const context = { workspaceState: stored } as unknown as vscode.ExtensionContext;
+  const registry = new SubmissionRegistry(context, (message) => logged.push(message));
+  const tracker = new ExecutionTracker(context, (message) => logged.push(message), () => [], { acquire: () => lease } as unknown as TerminalPool, registry);
+  return {
+    tracker,
+    registry,
+    dispose: () => {
+      tracker.dispose();
+      registry.dispose();
+    },
+  };
+}
+
+/** A tracker over a given registry, for the reload and attribution scenarios. */
+function trackerWith(registry: SubmissionRegistry, stored: vscode.Memento, logged: string[]): ExecutionTracker {
+  const context = { workspaceState: stored } as unknown as vscode.ExtensionContext;
+  const terminal = { name: "never used", dispose: () => undefined } as unknown as vscode.Terminal;
+  const pool = { acquire: () => bypassLease(terminal).lease } as unknown as TerminalPool;
+  return new ExecutionTracker(context, (message) => logged.push(message), () => [], pool, registry);
+}
+
 /** A lease over a terminal the pool would never hand out, for the bypass scenarios. */
 function bypassLease(terminal: vscode.Terminal): { lease: TerminalLease; retired: () => boolean } {
   let retired = false;
@@ -1462,8 +1781,8 @@ function captureWarnings(): { messages: string[]; restore: () => void } {
   };
 }
 
-async function pendingSubmissions(): Promise<{ runId: string; state: string; kind: string }[]> {
-  return (await vscode.commands.executeCommand("agentSparring._test.pendingSubmissions")) as { runId: string; state: string; kind: string }[];
+async function pendingSubmissions(): Promise<{ runId?: string; key: string; state: string; subcommand: string }[]> {
+  return (await vscode.commands.executeCommand("agentSparring._test.unresolvedSubmissions")) as { runId?: string; key: string; state: string; subcommand: string }[];
 }
 
 async function runningLaunches(runId: string): Promise<{ runId: string; state: string }[]> {
@@ -1472,10 +1791,10 @@ async function runningLaunches(runId: string): Promise<{ runId: string; state: s
 }
 
 /** Poll a synchronous answer until it is there (for the tracker built inside this suite). */
-async function waitUntil<T>(read: () => T | undefined, timeoutMs: number, what: string): Promise<T> {
+async function waitUntil<T>(read: () => T | undefined | Promise<T | undefined>, timeoutMs: number, what: string): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const value = read();
+    const value = await read();
     if (value !== undefined) {
       return value;
     }

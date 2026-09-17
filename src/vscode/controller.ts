@@ -85,7 +85,8 @@ import {
 import { deriveStatus } from "../core/status";
 import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
 import { TerminalPool } from "./terminalPool";
-import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult, type PendingSubmission } from "./executionTracker";
+import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult } from "./executionTracker";
+import { SubmissionRegistry, runnerKey, type SubmissionView } from "./submissionRegistry";
 import { ManifestReader, type BoundManifest } from "./manifestReader";
 import { ActiveRepositoryTracker, RealPaths } from "./activeRepository";
 import { describeReadiness } from "../core/gitReadiness";
@@ -140,6 +141,8 @@ export class SparringController implements vscode.Disposable {
   private readonly commands: SparringCommandRunner;
   /** The integrated terminals this extension owns: one per project, reused. */
   private readonly terminals: TerminalPool;
+  /** Commands handed to a shell that may still execute; the duplicate-prevention authority. */
+  private readonly submissions: SubmissionRegistry;
   /** Which repository this window is in; automatic selection is confined to it. */
   private readonly activeRepository: ActiveRepositoryTracker;
   /** Symlink resolution for repository roots, so two spellings of one directory are one repository. */
@@ -177,15 +180,20 @@ export class SparringController implements vscode.Disposable {
     this.statusBar.command = "agentSparring.openOverview";
     this.disposables.push(this.output, this.statusBar, this.changeEmitter);
     this.terminals = new TerminalPool((message) => this.log(message));
+    // The one authority on commands handed to a shell, shared by both
+    // transports so neither can be made safe and the other left behind.
+    this.submissions = new SubmissionRegistry(context, (message) => this.log(message));
     this.tracker = new ExecutionTracker(
       context,
       (message) => this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} ${message}`),
       () => this.locations,
       this.terminals,
+      this.submissions,
     );
     this.onCommandNotFound = this.tracker.onCommandNotFound;
     this.onEngineFailed = this.tracker.onEngineFailed;
-    this.commands = new SparringCommandRunner((message) => this.log(message), this.terminals);
+    this.commands = new SparringCommandRunner((message) => this.log(message), this.terminals, this.submissions);
+    this.disposables.push(this.submissions, this.submissions.onDidChange(() => this.render()));
     // Moving to another repository re-decides which run the cockpit follows,
     // so it is a rediscovery like any other authoritative change.
     this.activeRepository = new ActiveRepositoryTracker((message) => this.log(message));
@@ -946,26 +954,37 @@ export class SparringController implements vscode.Disposable {
   }
 
   /**
-   * A command handed to a shell for this run whose start has not been
-   * observed. Never a runner: it is what makes a second command for the same
-   * run refuse, and it is asked for separately for exactly that reason.
+   * A command handed to a shell that may still execute — for this run, or for
+   * any operation. Never a runner: `executionFor` answers that. This answers
+   * "would running it again risk doing it twice", and it is what every engine
+   * action consults before submitting anything.
    */
-  pendingSubmissionFor(runId: string | undefined): PendingSubmission | undefined {
-    return this.tracker.pendingFor(runId);
+  unresolvedSubmissionFor(runId: string | undefined): SubmissionView | undefined {
+    return this.submissions.unresolvedForRun(runId);
   }
 
-  /** Every unresolved submission in this window. */
-  pendingSubmissions(): PendingSubmission[] {
-    return this.tracker.pendingSubmissions();
+  /** Every unresolved submission in this window, runner and short command alike. */
+  unresolvedSubmissions(): SubmissionView[] {
+    return this.submissions.unresolved();
   }
 
-  /** The person's decision to forget a submission, so the command may be given again. */
-  discardPendingSubmission(runId: string): boolean {
-    const discarded = this.tracker.discardPending(runId);
-    if (discarded) {
-      this.render();
-    }
-    return discarded;
+  /**
+   * A person's explicit override: they have checked that the submitted
+   * command cannot still run, and accept the risk of a duplicate if they are
+   * wrong. Recorded as an override, never as evidence that it never ran.
+   */
+  overrideSubmission(key: string, note: string): boolean {
+    return this.submissions.override(key, note);
+  }
+
+  /** Ask the process table what it can prove about every unresolved submission. */
+  probeSubmissions(): Promise<void> {
+    return this.submissions.probeAll();
+  }
+
+  /** The operation key of a run's submission, for the override action. */
+  submissionKeyForRun(runId: string): string {
+    return runnerKey(runId);
   }
 
   /** The terminal hosting this run's live execution, by name (integration tests). */

@@ -21,26 +21,26 @@
  * when its shell is idle, so they can never be sent into a terminal that is
  * already running something.
  *
- * Submitting is not running here either: a command the shell has not reported
- * as started is not treated as run, and — unlike the missing-integration case
- * — it is deliberately *not* retried through the direct-process transport. A
- * stopped or busy shell can still run the submitted line later, and running
- * freeze-candidate or accept-candidate twice is not a risk worth taking.
+ * Submitting is not running here either, and this transport carries the same
+ * risk of doing an engine operation twice as the runner launcher does. So it
+ * submits through the same authority (submissionRegistry.ts): an earlier
+ * freeze-candidate that may still execute refuses the next one, before the
+ * executable is resolved and before a terminal is acquired. A command the
+ * shell has not reported as started is not treated as run and — unlike the
+ * missing-integration case — is deliberately *not* retried through the
+ * direct-process transport, because the submitted line may still be read.
  */
 
 import { execFile } from "node:child_process";
-import * as vscode from "vscode";
 import type { CommandOutcome } from "../core/acceptance";
 import { executableWord, planExecutable, type ExecutablePlan } from "../core/cli";
 import type { LaunchProblem } from "./executionTracker";
-import { awaitExecutionEnd, awaitShellIntegration, executeThroughShell, hostEnv, watchExecutions } from "./shellIntegration";
+import { awaitExecutionEnd, awaitShellIntegration, EXECUTION_START_TIMEOUT_MS, executeThroughShell, hostEnv } from "./shellIntegration";
+import { commandKey, submissionRefusal, type SubmissionRegistry, type SubmissionView } from "./submissionRegistry";
 import { collectOutput } from "./terminalOutput";
 import type { TerminalPool } from "./terminalPool";
 
 export { stripAnsi } from "./terminalOutput";
-
-/** How long a submitted short command that never started is still watched, for the log alone. */
-const LATE_COMMAND_WATCH_MS = 10 * 60 * 1000;
 
 export interface RunCommandOptions {
   /** The configured `agentSparring.executable`, possibly empty. */
@@ -49,41 +49,39 @@ export interface RunCommandOptions {
   cwd: string;
   /** Terminal title suffix and log label. */
   name: string;
+  /** What must not be run twice while an earlier submission of it may still execute. */
+  operation?: { subcommand: string; target?: string };
 }
 
-export type RunCommandResult = { ok: true; outcome: CommandOutcome; via: "shell" | "process"; plan: ExecutablePlan } | { ok: false; error: string; problem: LaunchProblem };
+export type RunCommandResult =
+  | { ok: true; outcome: CommandOutcome; via: "shell" | "process"; plan: ExecutablePlan }
+  | { ok: false; error: string; problem: LaunchProblem; submission?: SubmissionView };
 
 export class SparringCommandRunner {
   constructor(
     private readonly log: (message: string) => void,
     private readonly terminals: TerminalPool,
+    /** The one authority on commands handed to a shell (submissionRegistry.ts). */
+    private readonly submissions: SubmissionRegistry,
   ) {}
 
   dispose(): void {
     // The terminals belong to the pool, which the controller disposes.
   }
 
-  /**
-   * Keep watching a submitted short command after the caller has been told
-   * it could not be confirmed, so what actually became of it is on the
-   * record. Nothing is retried and nothing is claimed from this: it exists
-   * because "Agent Sparring cannot tell whether freeze-candidate ran" is a
-   * question the log should be able to answer afterwards.
-   */
-  private watchLate(name: string, terminal: vscode.Terminal, execution: vscode.TerminalShellExecution): void {
-    const watch = watchExecutions(terminal);
-    void watch.settle(execution, LATE_COMMAND_WATCH_MS).then((outcome) => {
-      if (outcome === "never") {
-        this.log(`${name}: still not started ${Math.round(LATE_COMMAND_WATCH_MS / 60000)} minutes after it was handed to "${terminal.name}"; no longer watched`);
-      } else if (outcome === "closed") {
-        this.log(`${name}: the terminal "${terminal.name}" it was handed to was closed, so that command can no longer run`);
-      } else {
-        this.log(`${name}: the shell in "${terminal.name}" ${outcome === "started" ? "started it after all" : "reported it as finished"}, long after Agent Sparring reported that it could not confirm it. The engine ran; check the terminal for what it printed.`);
-      }
-    });
-  }
-
   async run(options: RunCommandOptions): Promise<RunCommandResult> {
+    // The operation this command is, for duplicate prevention. Falls back to
+    // the first argument, which is the subcommand in every call site.
+    const subcommand = options.operation?.subcommand ?? options.args[0] ?? "command";
+    const target = options.operation?.target ?? options.args[1];
+    const key = commandKey(options.cwd, subcommand, target);
+    // Before the executable is resolved and before a terminal is acquired: an
+    // earlier copy of this operation that may still execute forbids another.
+    const unresolved = this.submissions.unresolvedFor(key);
+    if (unresolved) {
+      this.log(`refused to run ${options.name}: ${unresolved.label} was submitted to a shell and may still execute; it is not run a second time`);
+      return { ok: false, error: submissionRefusal(unresolved), problem: "unconfirmed", submission: unresolved };
+    }
     const configured = await planExecutable(options.configured, hostEnv(options.cwd), true);
     if (!configured.ok) {
       return { ok: false, error: configured.error, problem: configured.problem };
@@ -93,26 +91,22 @@ export class SparringCommandRunner {
     const lease = this.terminals.acquire(options.cwd);
     const integration = await awaitShellIntegration(lease.terminal);
     const word = executableWord(configured.plan);
-    const watch = integration ? watchExecutions(lease.terminal) : undefined;
+    const submission = integration
+      ? this.submissions.open({ key, transport: "command", label: `${subcommand}${target ? ` ${target}` : ""}`, cwd: options.cwd, subcommand, stageId: target, word, plan: configured.plan }, lease)
+      : undefined;
     const request = integration ? executeThroughShell(integration, word, options.args) : undefined;
-    if (request && watch) {
+    if (request && submission) {
       lease.terminal.show(true);
       const output = collectOutput(request.execution);
-      if ((await watch.settle(request.execution)) === "never") {
-        // The shell has not started it. It still may: a stopped or busy shell
-        // runs a submitted line when it continues. So this is neither retried
-        // through another transport nor forgotten — running freeze-candidate
-        // or accept-candidate a second time is not a risk worth taking — and
-        // the terminal is retired while the submission is watched in the
-        // background, so the log says what became of it.
-        lease.retire();
-        this.log(`${options.name}: the shell in "${lease.terminal.name}" has not reported the command as started; nothing is treated as run, and that terminal will not be reused`);
-        this.watchLate(options.name, lease.terminal, request.execution);
-        return {
-          ok: false,
-          error: `${word} was handed to the terminal "${lease.terminal.name}" but its shell has not reported the command as started, so Agent Sparring cannot tell whether ${options.name} ran. Check that terminal before trying again: a stopped or busy shell can still run it later, and running it twice is not safe.`,
-          problem: "unconfirmed",
-        };
+      this.submissions.attach(submission, request.execution, output);
+      const settled = await this.submissions.wait(submission, EXECUTION_START_TIMEOUT_MS);
+      if (!settled.established) {
+        // The shell has not started it, and may still. Nothing is treated as
+        // run, nothing is retried through another transport, and the
+        // submission stays on the registry's books — it, not any timer, is
+        // what stops this operation being done twice.
+        this.log(`${options.name}: the shell in "${lease.terminal.name}" has not reported the command as started; nothing is treated as run, and this operation is refused until its fate is known`);
+        return { ok: false, error: submissionRefusal(settled.view), problem: "unconfirmed", submission: settled.view };
       }
       const exitCode = await awaitExecutionEnd(request.execution, lease.terminal);
       const text = await output;
@@ -120,7 +114,10 @@ export class SparringCommandRunner {
       this.log(`ran ${options.name} via shell integration (${word}, ${options.args.length} args${request.quotedHere ? ", command line quoted here" : ""}, cwd ${options.cwd}); exit ${exitCode === undefined ? "unknown" : exitCode}`);
       return { ok: true, outcome: { exitCode, output: text, resolvedBy: configured.plan.kind === "shell" ? "shell" : "path" }, via: "shell", plan: configured.plan };
     }
-    watch?.cancel();
+    if (submission) {
+      // Nothing was handed over, so nothing can still execute.
+      this.submissions.withdraw(key, "the command line was never handed to the shell, so nothing was submitted");
+    }
     if (integration) {
       lease.release();
     } else {
