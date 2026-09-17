@@ -17,11 +17,19 @@
  *
  * Runner liveness is untouched: these commands never register with the
  * ExecutionTracker. They run in the project's own reusable terminal
- * (terminalPool.ts), which is leased for the duration, so they can never be
- * sent into a terminal that is already running something.
+ * (terminalPool.ts), which is leased for the duration and only ever taken
+ * when its shell is idle, so they can never be sent into a terminal that is
+ * already running something.
+ *
+ * Submitting is not running here either: a command the shell has not reported
+ * as started is not treated as run, and — unlike the missing-integration case
+ * — it is deliberately *not* retried through the direct-process transport. A
+ * stopped or busy shell can still run the submitted line later, and running
+ * freeze-candidate or accept-candidate twice is not a risk worth taking.
  */
 
 import { execFile } from "node:child_process";
+import * as vscode from "vscode";
 import type { CommandOutcome } from "../core/acceptance";
 import { executableWord, planExecutable, type ExecutablePlan } from "../core/cli";
 import type { LaunchProblem } from "./executionTracker";
@@ -30,6 +38,9 @@ import { collectOutput } from "./terminalOutput";
 import type { TerminalPool } from "./terminalPool";
 
 export { stripAnsi } from "./terminalOutput";
+
+/** How long a submitted short command that never started is still watched, for the log alone. */
+const LATE_COMMAND_WATCH_MS = 10 * 60 * 1000;
 
 export interface RunCommandOptions {
   /** The configured `agentSparring.executable`, possibly empty. */
@@ -52,6 +63,26 @@ export class SparringCommandRunner {
     // The terminals belong to the pool, which the controller disposes.
   }
 
+  /**
+   * Keep watching a submitted short command after the caller has been told
+   * it could not be confirmed, so what actually became of it is on the
+   * record. Nothing is retried and nothing is claimed from this: it exists
+   * because "Agent Sparring cannot tell whether freeze-candidate ran" is a
+   * question the log should be able to answer afterwards.
+   */
+  private watchLate(name: string, terminal: vscode.Terminal, execution: vscode.TerminalShellExecution): void {
+    const watch = watchExecutions(terminal);
+    void watch.settle(execution, LATE_COMMAND_WATCH_MS).then((outcome) => {
+      if (outcome === "never") {
+        this.log(`${name}: still not started ${Math.round(LATE_COMMAND_WATCH_MS / 60000)} minutes after it was handed to "${terminal.name}"; no longer watched`);
+      } else if (outcome === "closed") {
+        this.log(`${name}: the terminal "${terminal.name}" it was handed to was closed, so that command can no longer run`);
+      } else {
+        this.log(`${name}: the shell in "${terminal.name}" ${outcome === "started" ? "started it after all" : "reported it as finished"}, long after Agent Sparring reported that it could not confirm it. The engine ran; check the terminal for what it printed.`);
+      }
+    });
+  }
+
   async run(options: RunCommandOptions): Promise<RunCommandResult> {
     const configured = await planExecutable(options.configured, hostEnv(options.cwd), true);
     if (!configured.ok) {
@@ -68,16 +99,19 @@ export class SparringCommandRunner {
       lease.terminal.show(true);
       const output = collectOutput(request.execution);
       if ((await watch.settle(request.execution)) === "never") {
-        // The shell never took it. Running it again without a shell could run
-        // it twice — the written line may still be read later by whatever is
-        // in that terminal — and freeze-candidate and accept-candidate are
-        // not commands to risk twice. So this is reported, not retried.
+        // The shell has not started it. It still may: a stopped or busy shell
+        // runs a submitted line when it continues. So this is neither retried
+        // through another transport nor forgotten — running freeze-candidate
+        // or accept-candidate a second time is not a risk worth taking — and
+        // the terminal is retired while the submission is watched in the
+        // background, so the log says what became of it.
         lease.retire();
-        this.log(`${options.name}: the shell in "${lease.terminal.name}" never started the command; nothing was run`);
+        this.log(`${options.name}: the shell in "${lease.terminal.name}" has not reported the command as started; nothing is treated as run, and that terminal will not be reused`);
+        this.watchLate(options.name, lease.terminal, request.execution);
         return {
           ok: false,
-          error: `${word} was written to the terminal "${lease.terminal.name}" but its shell never reported the command as started, so ${options.name} did not run. That terminal is running something else; check it, then try again — Agent Sparring will use a new terminal.`,
-          problem: "not-started",
+          error: `${word} was handed to the terminal "${lease.terminal.name}" but its shell has not reported the command as started, so Agent Sparring cannot tell whether ${options.name} ran. Check that terminal before trying again: a stopped or busy shell can still run it later, and running it twice is not safe.`,
+          problem: "unconfirmed",
         };
       }
       const exitCode = await awaitExecutionEnd(request.execution, lease.terminal);

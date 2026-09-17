@@ -85,7 +85,7 @@ import {
 import { deriveStatus } from "../core/status";
 import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
 import { TerminalPool } from "./terminalPool";
-import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult } from "./executionTracker";
+import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult, type PendingSubmission } from "./executionTracker";
 import { ManifestReader, type BoundManifest } from "./manifestReader";
 import { ActiveRepositoryTracker, RealPaths } from "./activeRepository";
 import { describeReadiness } from "../core/gitReadiness";
@@ -943,6 +943,29 @@ export class SparringController implements vscode.Disposable {
   /** What a window reload would find recorded about this window's launches (integration tests). */
   persistedLaunches(): { runId: string; state: "running" | "ended" }[] {
     return this.tracker.persisted();
+  }
+
+  /**
+   * A command handed to a shell for this run whose start has not been
+   * observed. Never a runner: it is what makes a second command for the same
+   * run refuse, and it is asked for separately for exactly that reason.
+   */
+  pendingSubmissionFor(runId: string | undefined): PendingSubmission | undefined {
+    return this.tracker.pendingFor(runId);
+  }
+
+  /** Every unresolved submission in this window. */
+  pendingSubmissions(): PendingSubmission[] {
+    return this.tracker.pendingSubmissions();
+  }
+
+  /** The person's decision to forget a submission, so the command may be given again. */
+  discardPendingSubmission(runId: string): boolean {
+    const discarded = this.tracker.discardPending(runId);
+    if (discarded) {
+      this.render();
+    }
+    return discarded;
   }
 
   /** The terminal hosting this run's live execution, by name (integration tests). */

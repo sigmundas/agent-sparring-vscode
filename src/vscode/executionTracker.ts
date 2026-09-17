@@ -27,6 +27,30 @@
  * "interrupted" instead of "running" — and they are persisted across a
  * window reload for the same reason, since a reload does not un-observe a
  * runner's death.
+ *
+ * ## Submitting is not running
+ *
+ * Handing a command line to `shellIntegration.executeCommand` submits it. The
+ * shell may run it at once, or much later — a stopped shell (SIGSTOP) takes
+ * the line and runs it when it continues — or never. So a submission is kept
+ * in a *separate* structure (`Pending`, below) and becomes a `Tracked`
+ * execution only when the shell reports that exact execution as started:
+ *
+ *   pending (waiting) ──exact start event──▶ running (Tracked, "launched")
+ *          │        └──exact end event────▶ running, then ended
+ *          │ user-facing wait expires
+ *          ▼
+ *   pending (uncertain) ──exact start event (late)──▶ running, persisted,
+ *          │                                          announced as usual
+ *          ├──its terminal closed / shell exited────▶ resolved: never ran
+ *          ├──a process probe finds this run's runner▶ resolved: it started
+ *          └──the person discards it────────────────▶ resolved by hand
+ *
+ * Nothing pending is ever a runner: `executionFor`, `recordById` and the
+ * persisted launches describe observed executions only. A pending submission
+ * is asked for on its own (`pendingFor`), and it blocks a second command for
+ * the same run — not because a runner is alive, but because nobody can yet
+ * say that one is not about to be.
  */
 
 import * as vscode from "vscode";
@@ -37,13 +61,15 @@ import { findDescendant } from "../core/processTree";
 import { probeRunnerProcesses, type RunnerProbe } from "../core/runnerProcesses";
 import { commandLineRuns, matchSparringCommand, parseSparringCommand, type SparringSubcommand } from "../core/sparringCommand";
 import { listProcesses, processProbeSupported } from "./processProbe";
-import { awaitShellIntegration, EXECUTION_START_TIMEOUT_MS, executeThroughShell, hostEnv, SHELL_INTEGRATION_TIMEOUT_MS, watchExecutions } from "./shellIntegration";
+import { awaitShellIntegration, EXECUTION_START_TIMEOUT_MS, executeThroughShell, hostEnv, SHELL_INTEGRATION_TIMEOUT_MS } from "./shellIntegration";
 import { collectOutput } from "./terminalOutput";
 import type { TerminalLease, TerminalPool } from "./terminalPool";
 
 export { EXECUTION_START_TIMEOUT_MS, SHELL_INTEGRATION_TIMEOUT_MS };
 
 const LAUNCHES_KEY = "agentSparring.launches";
+/** Submitted commands whose start was never observed; kept apart from the launches on purpose. */
+const PENDING_KEY = "agentSparring.pendingSubmissions";
 /** After a reload, how long reconnected terminals get to appear before a recorded launch is declared gone. */
 export const RECONNECT_GRACE_MS = 6000;
 const PROBE_INTERVAL_MS = 4000;
@@ -65,13 +91,45 @@ export interface LaunchOptions {
 }
 
 /**
- * Why a command could not be launched. `not-started` is not a configuration
- * problem and must never be reported as one: the executable was resolved and
- * the terminal was there — the shell simply never took the command.
+ * Why a command could not be launched. `unconfirmed` is not a configuration
+ * problem and must never be reported as one: the executable was resolved, the
+ * terminal was there and the command was submitted — the shell simply has not
+ * (yet) reported it as started. Nor is it a claim that nothing ran.
  */
-export type LaunchProblem = ExecutableProblem | "not-started";
+export type LaunchProblem = ExecutableProblem | "unconfirmed";
 
-export type LaunchResult = { ok: true; record: ExecutionRecord; via: "shell" | "terminal" } | { ok: false; error: string; problem: LaunchProblem };
+export type LaunchResult =
+  | { ok: true; record: ExecutionRecord; via: "shell" | "terminal" }
+  | { ok: false; error: string; problem: LaunchProblem; pending?: PendingSubmission };
+
+/**
+ * A command this window handed to a shell whose start has not been observed.
+ *
+ * It is deliberately not an `ExecutionRecord`: there is no execution to
+ * describe. What it carries is identity — enough to recognise the exact
+ * execution if it starts later, to keep its terminal out of reuse, and to
+ * refuse a second copy of the same operation meanwhile.
+ */
+export interface PendingSubmission {
+  id: string;
+  runId: string;
+  kind: SparringSubcommand;
+  /** When the command line was handed to the shell. */
+  submittedAtMs: number;
+  /** `waiting` while the caller is still waiting; `uncertain` once that wait has expired. */
+  state: "waiting" | "uncertain";
+  terminalName?: string;
+  /**
+   * Restored from workspaceState after a window reload. VS Code cannot hand
+   * back a `TerminalShellExecution`, so such a submission can no longer be
+   * recognised by identity: only a process probe, the terminal going away, or
+   * the person can settle it.
+   */
+  restored: boolean;
+}
+
+/** How a pending submission was settled, for the log and for the tests. */
+export type PendingOutcome = "started" | "terminal-gone" | "probed-running" | "discarded";
 
 /** The shell reported that the launched command word does not exist. */
 export interface CommandNotFound {
@@ -118,6 +176,57 @@ interface Tracked {
   lease?: TerminalLease;
 }
 
+/**
+ * A submitted command line, before anything is known about whether the shell
+ * ran it. Everything here exists to answer one question later: *is this exact
+ * execution the one we submitted?*
+ */
+interface Pending {
+  id: string;
+  runId: string;
+  kind: SparringSubcommand;
+  stageId?: string;
+  planPath?: string;
+  manifest?: string;
+  submittedAtMs: number;
+  state: "waiting" | "uncertain";
+  /** The command word or path that was submitted. */
+  word?: string;
+  plan?: ExecutablePlan;
+  terminal?: vscode.Terminal;
+  terminalPid?: number;
+  /** The terminal's name, kept separately because a restored submission has no terminal object. */
+  terminalName?: string;
+  /** The identity the shell will report if it ever starts it. Absent after a reload. */
+  execution?: vscode.TerminalShellExecution;
+  /** What that execution printed, read from the moment of hand-over. */
+  output?: Promise<string>;
+  /** The terminal it holds; retired (never reused, never closed) once the wait expires. */
+  lease?: TerminalLease;
+  restored: boolean;
+  /** Resolves the caller that is still waiting for establishment. */
+  announce?: (record: ExecutionRecord) => void;
+  timer?: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * A pending submission as a window reload can find it. The execution identity
+ * cannot be persisted, so what is kept is what makes the next window fail
+ * safe: which run it was for, and which terminal took it.
+ */
+interface PersistedPending {
+  id: string;
+  runId: string;
+  kind: SparringSubcommand;
+  stageId?: string;
+  planPath?: string;
+  manifest?: string;
+  word?: string;
+  submittedAtMs: number;
+  terminalPid: number;
+  terminalName: string;
+}
+
 interface PersistedLaunch {
   id: string;
   runId: string;
@@ -147,6 +256,8 @@ export type TrackerChange = "started" | "ended" | "changed";
 
 export class ExecutionTracker implements vscode.Disposable {
   private readonly tracked = new Map<string, Tracked>();
+  /** Commands handed to a shell whose start has not been observed. Never runners. */
+  private readonly pending = new Map<string, Pending>();
   private readonly disposables: vscode.Disposable[] = [];
   private readonly changeEmitter = new vscode.EventEmitter<TrackerChange>();
   readonly onDidChange = this.changeEmitter.event;
@@ -177,6 +288,9 @@ export class ExecutionTracker implements vscode.Disposable {
   dispose(): void {
     for (const item of this.tracked.values()) {
       this.stopProbe(item);
+    }
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
     }
     for (const disposable of this.disposables.splice(0)) {
       disposable.dispose();
@@ -308,6 +422,14 @@ export class ExecutionTracker implements vscode.Disposable {
    * from this process, or the launch fails with a configuration message.
    */
   async launch(options: LaunchOptions): Promise<LaunchResult> {
+    // A command for this run is already with a shell and may still start.
+    // Submitting a second one could run the operation twice.
+    const unresolved = this.pendingItemFor(options.runId);
+    if (unresolved) {
+      const pending = view(unresolved);
+      this.log(`refused to launch ${options.name}: ${describePending(unresolved)} and may still start; a second command for this run is not submitted`);
+      return { ok: false, error: pendingRefusal(unresolved), problem: "unconfirmed", pending };
+    }
     const configured = await planExecutable(options.configured, hostEnv(options.cwd), true);
     if (!configured.ok) {
       this.log(`refused to launch ${options.name}: ${configured.error}`);
@@ -323,33 +445,29 @@ export class ExecutionTracker implements vscode.Disposable {
     }
     const integration = await awaitShellIntegration(lease.terminal);
     const word = executableWord(configured.plan);
-    // Listening starts before the hand-over: the shell may report the command
-    // as started in the same tick, and that report is the only thing that
-    // distinguishes a launch from a line of text written into a terminal.
-    const watch = integration ? watchExecutions(lease.terminal) : undefined;
+    // The pending submission is registered *before* the hand-over: a start
+    // event that arrives in the same tick must find something to promote, and
+    // that report is the only thing that distinguishes a launch from a line
+    // of text written into a terminal.
+    const pending = integration ? this.submit(options, lease, word, configured.plan) : undefined;
     const request = integration ? executeThroughShell(integration, word, options.args) : undefined;
-    if (request && watch) {
-      const item = this.track(options, "launched", lease.terminal, request.execution);
-      item.word = word;
-      item.plan = configured.plan;
-      item.lease = lease;
+    if (request && pending) {
+      pending.execution = request.execution;
       // Must be read immediately after the hand-over or output is lost.
-      item.output = collectOutput(request.execution);
-      const established = await watch.settle(request.execution);
-      if (established === "never") {
-        return this.launchNeverStarted(item, lease, options, word);
-      }
-      // Only now is there a runner: earlier ended executions of this run may
-      // be dropped, and the record may be shown and persisted as running.
-      this.dropEnded(options.runId, item.record.id);
+      pending.output = collectOutput(request.execution);
       this.log(
-        `launched ${options.name} via shell integration (${configured.plan.kind === "shell" ? `'${word}' resolved by the shell` : word}, ${options.args.length} args${request.quotedHere ? ", command line quoted here" : ""}, cwd ${options.cwd}; the shell reported it ${established === "started" ? "started" : established})`,
+        `submitted ${options.name} to the shell in "${lease.terminal.name}" (${configured.plan.kind === "shell" ? `'${word}' resolved by the shell` : word}, ${options.args.length} args${request.quotedHere ? ", command line quoted here" : ""}, cwd ${options.cwd}); waiting for the shell to report it started`,
       );
-      void this.persistWithPid(item, lease.terminal);
-      this.changeEmitter.fire("started");
-      return { ok: true, record: item.record, via: "shell" };
+      const record = await this.awaitEstablished(pending);
+      if (record) {
+        return { ok: true, record, via: "shell" };
+      }
+      return { ok: false, error: pendingRefusal(pending), problem: "unconfirmed", pending: view(pending) };
     }
-    watch?.cancel();
+    if (pending) {
+      // Nothing was handed over, so there is nothing to wait for.
+      this.resolvePending(pending, "discarded", "this shell's quoting cannot be written safely, so nothing was submitted");
+    }
     if (integration) {
       // The shell is fine, it just cannot carry this command line; keep it.
       this.log(`${options.name}: this shell's quoting cannot be written safely, so the engine is run without a shell`);
@@ -408,30 +526,143 @@ export class ExecutionTracker implements vscode.Disposable {
     }
   }
 
+  // ---------------------------------------------------------------- pending submissions
+
+  /** A command handed to a shell whose start has not been observed, if there is one for this run. */
+  pendingFor(runId: string | undefined): PendingSubmission | undefined {
+    const pending = runId ? this.pendingItemFor(runId) : undefined;
+    return pending ? view(pending) : undefined;
+  }
+
+  /** Every unresolved submission, for the log, the tests and a reload's own reporting. */
+  pendingSubmissions(): PendingSubmission[] {
+    return [...this.pending.values()].map(view);
+  }
+
   /**
-   * The shell was handed a command line and never reported a command.
-   *
-   * `executeCommand` writes the line into the terminal, so this is what a
-   * shell that was not at a prompt looks like: the text went to whatever was
-   * reading stdin, and nothing was launched. A record here would be the
-   * reported defect — "a runner for this plan is alive in a terminal of this
-   * window" for a process that never existed — so the record is removed
-   * rather than ended: this window watched no execution, and liveness falls
-   * back to what it can actually establish (telemetry, or the process
-   * table).
-   *
-   * The terminal is retired, not closed and not interrupted: whatever is
-   * running in it belongs to the user. The command line may be sitting
-   * unread in it, which is exactly what the message says.
+   * The person decided: forget this submission, so the command may be given
+   * again. Nothing here can prove the first one will not start — that is
+   * exactly why it takes a decision — so the log records it as theirs.
    */
-  private launchNeverStarted(item: Tracked, lease: TerminalLease, options: LaunchOptions, word: string): LaunchResult {
-    this.tracked.delete(item.record.id);
-    lease.retire();
-    const error = `${word} was written to the terminal "${lease.terminal.name}" but its shell never reported the command as started, so no engine process was launched. That terminal is running something else; check it, then run the command again — Agent Sparring will use a new terminal.`;
-    this.log(`could not launch ${options.name}: the shell in "${lease.terminal.name}" did not start it within ${EXECUTION_START_TIMEOUT_MS} ms; nothing is recorded as running and that terminal will not be used again`);
+  discardPending(runId: string): boolean {
+    const pending = this.pendingItemFor(runId);
+    if (!pending) {
+      return false;
+    }
+    this.resolvePending(pending, "discarded", "discarded on request, so the command may be given again");
+    return true;
+  }
+
+  private pendingItemFor(runId: string): Pending | undefined {
+    return [...this.pending.values()].filter((item) => item.runId === runId).sort((a, b) => b.submittedAtMs - a.submittedAtMs)[0];
+  }
+
+  /** Register a submission before the command line is handed to the shell. */
+  private submit(options: LaunchOptions, lease: TerminalLease, word: string, plan: ExecutablePlan): Pending {
+    const submittedAtMs = Date.now();
+    const pending: Pending = {
+      id: `pending-${submittedAtMs}-${++this.counter}`,
+      runId: options.runId,
+      kind: options.kind,
+      stageId: options.stageId,
+      planPath: options.planPath,
+      manifest: options.manifest,
+      submittedAtMs,
+      state: "waiting",
+      word,
+      plan,
+      terminal: lease.terminal,
+      terminalName: lease.terminal.name,
+      lease,
+      restored: false,
+    };
+    this.pending.set(pending.id, pending);
+    void this.rememberPending(pending);
+    return pending;
+  }
+
+  /**
+   * Wait for the shell to report the submitted command as started, and give
+   * the caller the resulting execution record — or, when that wait expires,
+   * nothing at all.
+   *
+   * Expiry is a *user-facing* deadline, not a verdict: the submission stays,
+   * its terminal is retired from reuse (never closed, never signalled: the
+   * person's own command may be what is holding that shell), and the
+   * tracker's event handlers keep watching for that exact execution. A
+   * stopped shell continued minutes later still promotes it properly.
+   */
+  private awaitEstablished(pending: Pending): Promise<ExecutionRecord | undefined> {
+    return new Promise((resolve) => {
+      pending.announce = (record) => {
+        pending.announce = undefined;
+        clearTimeout(pending.timer);
+        pending.timer = undefined;
+        resolve(record);
+      };
+      pending.timer = setTimeout(() => {
+        pending.announce = undefined;
+        pending.timer = undefined;
+        pending.state = "uncertain";
+        // The shell may yet run it, so the terminal is quarantined rather
+        // than released: out of the pool, still watched, still the user's.
+        pending.lease?.retire();
+        this.log(
+          `${describePending(pending)}: the shell in "${pending.terminal?.name ?? "?"}" has not reported it started within ${EXECUTION_START_TIMEOUT_MS} ms. Nothing is recorded as running; that terminal will not be reused, and the submission is still being watched in case the shell starts it later.`,
+        );
+        void this.persist();
+        this.changeEmitter.fire("changed");
+        resolve(undefined);
+      }, EXECUTION_START_TIMEOUT_MS);
+    });
+  }
+
+  /**
+   * The shell reported the exact execution we submitted: now, or long after
+   * the caller stopped waiting. Either way this is the first moment there is
+   * a runner, so it becomes an ordinary tracked execution — persisted,
+   * announced, and ended by the ordinary end event.
+   */
+  private promote(pending: Pending, terminal: vscode.Terminal, execution: vscode.TerminalShellExecution): Tracked {
+    const late = pending.state === "uncertain";
+    this.pending.delete(pending.id);
+    clearTimeout(pending.timer);
+    this.dropEnded(pending.runId);
+    const item = this.track({ runId: pending.runId, kind: pending.kind, stageId: pending.stageId, planPath: pending.planPath, manifest: pending.manifest }, "launched", terminal, execution);
+    item.word = pending.word;
+    item.plan = pending.plan;
+    item.lease = pending.lease;
+    item.output = pending.output ?? collectOutput(execution);
+    this.log(`${describePending(pending)} started in "${terminal.name}"${late ? `, ${Math.round((Date.now() - pending.submittedAtMs) / 1000)} s after it was submitted and after the wait had expired` : ""}; the runner is alive`);
+    void this.persistWithPid(item, terminal);
+    pending.announce?.(item.record);
+    this.changeEmitter.fire("started");
+    return item;
+  }
+
+  /**
+   * This submission's fate is known, and no execution came of it. The
+   * terminal is retired rather than closed: whatever is in it is not ours.
+   */
+  private resolvePending(pending: Pending, outcome: PendingOutcome, detail: string): void {
+    this.pending.delete(pending.id);
+    clearTimeout(pending.timer);
+    pending.timer = undefined;
+    if (outcome === "discarded" || outcome === "terminal-gone") {
+      pending.lease?.retire();
+    }
+    this.log(`${describePending(pending)}: ${detail} (${outcome})`);
     void this.persist();
     this.changeEmitter.fire("changed");
-    return { ok: false, error, problem: "not-started" };
+  }
+
+  private async rememberPending(pending: Pending): Promise<void> {
+    try {
+      pending.terminalPid = await pending.terminal?.processId;
+    } catch {
+      pending.terminalPid = undefined;
+    }
+    await this.persist();
   }
 
   // ---------------------------------------------------------------- shell integration events
@@ -440,6 +671,14 @@ export class ExecutionTracker implements vscode.Disposable {
     const own = this.itemForExecution(event.execution);
     if (own) {
       return; // our own launch; already tracked as running
+    }
+    // The command we submitted to this shell, starting — immediately, or long
+    // after the caller gave up waiting for it. This is the first moment it is
+    // a runner, and the only thing that establishes it as one.
+    const submitted = this.pendingForExecution(event.execution, event.terminal);
+    if (submitted) {
+      this.promote(submitted, event.terminal, event.execution);
+      return;
     }
     // A shell runs one foreground command at a time: anything else starting
     // in a terminal that hosts a tracked runner means that runner has ended.
@@ -469,6 +708,15 @@ export class ExecutionTracker implements vscode.Disposable {
       this.end(own, event.exitCode, undefined);
       return;
     }
+    // The submitted command ending without our having seen it start: it ran,
+    // so it is promoted and then ended, exit code and all. The record is
+    // honest about a runner that existed and is over — never one that is
+    // still going.
+    const submitted = this.pendingForExecution(event.execution, event.terminal);
+    if (submitted) {
+      this.end(this.promote(submitted, event.terminal, event.execution), event.exitCode, undefined);
+      return;
+    }
     // An in-flight command from before a reload finishing: VS Code may report
     // its end without our ever having seen it start.
     for (const item of this.itemsHostedIn(event.terminal)) {
@@ -481,6 +729,33 @@ export class ExecutionTracker implements vscode.Disposable {
       const code = item.record.source === "terminal" ? terminal.exitStatus?.code : undefined;
       this.end(item, code, item.record.source === "terminal" ? undefined : "Its terminal was closed.");
     }
+    // The shell that was given a command is gone, so that command can never
+    // run: the submission's fate is settled, and the next one is allowed.
+    for (const pending of [...this.pending.values()]) {
+      if (pending.terminal === terminal) {
+        this.resolvePending(pending, "terminal-gone", `its terminal "${terminal.name}" was closed before the shell ever started it, so that command can no longer run`);
+      }
+    }
+  }
+
+  /**
+   * The submission this execution belongs to. Identity is the rule; a waiting
+   * submission whose hand-over has not returned yet is matched by its
+   * terminal, because that terminal is leased to us and idle-checked, so an
+   * execution starting there in that instant is the one we just submitted.
+   */
+  private pendingForExecution(execution: vscode.TerminalShellExecution, terminal: vscode.Terminal): Pending | undefined {
+    for (const pending of this.pending.values()) {
+      if (pending.execution === execution) {
+        return pending;
+      }
+    }
+    for (const pending of this.pending.values()) {
+      if (pending.execution === undefined && pending.state === "waiting" && !pending.restored && pending.terminal === terminal) {
+        return pending;
+      }
+    }
+    return undefined;
   }
 
   private itemForExecution(execution: vscode.TerminalShellExecution): Tracked | undefined {
@@ -575,6 +850,22 @@ export class ExecutionTracker implements vscode.Disposable {
       }
     }
     await this.context.workspaceState.update(LAUNCHES_KEY, [...live, ...newestEndedPerRun(ended)]);
+    // Pending submissions are persisted apart from the launches, and are
+    // never among them: a reload must not turn "a command may still start"
+    // into either a live runner or permission to submit a second one.
+    const submissions: PersistedPending[] = [...this.pending.values()].map((item) => ({
+      id: item.id,
+      runId: item.runId,
+      kind: item.kind,
+      stageId: item.stageId,
+      planPath: item.planPath,
+      manifest: item.manifest,
+      word: item.word,
+      submittedAtMs: item.submittedAtMs,
+      terminalPid: item.terminalPid ?? 0,
+      terminalName: item.terminalName ?? item.terminal?.name ?? "",
+    }));
+    await this.context.workspaceState.update(PENDING_KEY, submissions);
   }
 
   /**
@@ -590,8 +881,9 @@ export class ExecutionTracker implements vscode.Disposable {
    * a reload does not un-make it.
    */
   async reattach(): Promise<void> {
+    const submissions = this.restoreSubmissions();
     const launches = this.context.workspaceState.get<PersistedLaunch[]>(LAUNCHES_KEY, []);
-    if (launches.length === 0) {
+    if (launches.length === 0 && submissions.length === 0) {
       return;
     }
     const pending = new Map<string, PersistedLaunch>();
@@ -622,9 +914,10 @@ export class ExecutionTracker implements vscode.Disposable {
     this.changeEmitter.fire("changed");
     const reviving = launches.length - pending.size;
     this.log(`window reloaded with ${launches.length} recorded launch(es)${reviving > 0 ? ` (${reviving} already ended before the reload)` : ""}; re-establishing runner liveness`);
-    if (pending.size === 0) {
+    if (pending.size === 0 && submissions.length === 0) {
       return;
     }
+    const looking = new Map(submissions.map((item) => [item.id, item]));
 
     const tryTerminal = async (terminal: vscode.Terminal) => {
       let pid: number | undefined;
@@ -639,11 +932,26 @@ export class ExecutionTracker implements vscode.Disposable {
           await this.reattachTo(this.tracked.get(id) as Tracked, terminal);
         }
       }
+      for (const [id, submission] of looking) {
+        if (submission.terminalPid === pid) {
+          looking.delete(id);
+          submission.terminal = terminal;
+          submission.terminalName = terminal.name;
+          // The shell that took the command is still there, and VS Code
+          // cannot give back the execution identity, so nothing here can say
+          // whether it ran. It stays uncertain: a process probe, that
+          // terminal closing, or the person settles it.
+          this.log(`${describePending(submission)}: the terminal "${terminal.name}" that took it survived the reload, so whether it ran cannot be established from events any more`);
+        }
+      }
     };
     const opened = vscode.window.onDidOpenTerminal((terminal) => void tryTerminal(terminal));
     await Promise.all(vscode.window.terminals.map(tryTerminal));
     await new Promise((resolve) => setTimeout(resolve, RECONNECT_GRACE_MS));
     opened.dispose();
+    for (const submission of looking.values()) {
+      this.resolvePending(submission, "terminal-gone", "the terminal that took it did not survive the reload, so that command can no longer run");
+    }
     for (const id of pending.keys()) {
       const item = this.tracked.get(id);
       if (item && item.record.state !== "ended") {
@@ -651,6 +959,43 @@ export class ExecutionTracker implements vscode.Disposable {
       }
     }
     await this.persist();
+  }
+
+  /**
+   * Pending submissions as the previous window left them, restored as
+   * `uncertain` before anything else is looked at.
+   *
+   * They carry no execution identity — VS Code cannot hand a
+   * `TerminalShellExecution` back — so this window cannot recognise a late
+   * start by events. That is deliberately not treated as "nothing happened":
+   * the submission keeps blocking a second command for its run until the
+   * process table finds the runner, its terminal turns out to be gone, or the
+   * person discards it.
+   */
+  private restoreSubmissions(): Pending[] {
+    const stored = this.context.workspaceState.get<PersistedPending[]>(PENDING_KEY, []);
+    const restored = stored.map((item) => {
+      const pending: Pending = {
+        id: item.id,
+        runId: item.runId,
+        kind: item.kind,
+        stageId: item.stageId,
+        planPath: item.planPath,
+        manifest: item.manifest,
+        word: item.word,
+        submittedAtMs: item.submittedAtMs,
+        state: "uncertain",
+        terminalPid: item.terminalPid,
+        terminalName: item.terminalName || undefined,
+        restored: true,
+      };
+      this.pending.set(pending.id, pending);
+      return pending;
+    });
+    if (restored.length > 0) {
+      this.log(`window reloaded with ${restored.length} command(s) submitted to a shell whose start was never confirmed; no runner is claimed for them and no second command for those runs is submitted until their fate is known`);
+    }
+    return restored;
   }
 
   private async reattachTo(item: Tracked, terminal: vscode.Terminal): Promise<void> {
@@ -751,6 +1096,13 @@ export class ExecutionTracker implements vscode.Disposable {
     }
     const item = this.track({ runId, kind }, "probed", undefined, undefined);
     if (probe.kind === "alive") {
+      // A runner exists for this project, so a command submitted for this run
+      // is answered: it started. This is the one reconciliation left after a
+      // reload, where execution identity cannot be restored.
+      const submitted = this.pendingItemFor(runId);
+      if (submitted) {
+        this.resolvePending(submitted, "probed-running", "a sparring runner for this project is in the process table, so the submitted command did start");
+      }
       this.log(`no execution of ${kind} was watched from this window, but a sparring runner for ${location.projectDir} is running (pid ${probe.process.pid})`);
       // Nothing will tell us when it ends: there is no terminal behind it and
       // no shell execution to fire an end event. Keep asking the process
@@ -799,4 +1151,38 @@ function newestEndedPerRun(ended: PersistedLaunch[]): PersistedLaunch[] {
 
 function describe(item: Tracked): string {
   return `${item.kind} ${item.stageId ?? item.planPath ?? item.manifest ?? ""}`.trim();
+}
+
+function describePending(pending: Pending): string {
+  return `the ${pending.kind} ${pending.stageId ?? pending.planPath ?? pending.manifest ?? ""} submitted to a shell${pending.restored ? " before the window reloaded" : ""}`.replace(/\s+/g, " ").trim();
+}
+
+/** What the outside may know about a submission: identity and state, never a record. */
+function view(pending: Pending): PendingSubmission {
+  return {
+    id: pending.id,
+    runId: pending.runId,
+    kind: pending.kind,
+    submittedAtMs: pending.submittedAtMs,
+    state: pending.state,
+    terminalName: pending.terminalName ?? pending.terminal?.name,
+    restored: pending.restored,
+  };
+}
+
+/**
+ * What a person is told when a command cannot be given because an earlier one
+ * may still start. It says what is actually known — deliberately not "a
+ * runner is alive", which would be a claim about a process nobody has seen.
+ */
+function pendingRefusal(pending: Pending): string {
+  const where = pending.terminalName ?? pending.terminal?.name;
+  const seconds = Math.max(1, Math.round((Date.now() - pending.submittedAtMs) / 1000));
+  return [
+    `Agent Sparring handed ${pending.kind}${pending.stageId ? ` ${pending.stageId}` : ""} to the terminal${where ? ` "${where}"` : ""} ${seconds} s ago but has not been able to confirm whether it started.`,
+    pending.restored
+      ? "The window reloaded since, so that command can no longer be recognised from events."
+      : "A shell that is stopped or busy can still run it later, so running it again could run it twice.",
+    `Check that terminal. If the command is not going to run, discard the submission and give it again.`,
+  ].join(" ");
 }

@@ -110,6 +110,10 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     // which of them may be written to, and where a run's runner actually is.
     vscode.commands.registerCommand("agentSparring._test.ownedTerminals", () => controller.ownedTerminals()),
     vscode.commands.registerCommand("agentSparring._test.hostingTerminal", (runId: string) => controller.hostingTerminal(runId)),
+    // Submitted commands whose start has not been observed: never runners,
+    // and the reason a second command for the same run is refused.
+    vscode.commands.registerCommand("agentSparring._test.pendingSubmissions", () => controller.pendingSubmissions()),
+    vscode.commands.registerCommand("agentSparring._test.discardPendingSubmission", (runId: string) => controller.discardPendingSubmission(runId)),
     vscode.commands.registerCommand("agentSparring._test.acceptStage", async () => {
       const run = controller.currentSelection.selected;
       return run?.kind === "stage" ? performAcceptStage(controller, run) : undefined;
@@ -601,7 +605,7 @@ async function launchStageLoop(controller: SparringController, run: StandaloneSt
   }
   const args = buildRunLoopArgs({ stageId: run.stage.stageId, repoRoot, expectedBranch, sparringDir: run.location.sparringDir });
   const result = await controller.launch({ configured: configuredExecutable(), args, cwd: repoRoot, name: `${label}: ${run.stage.stageId}`, runId: run.id, kind: "run-loop", stageId: run.stage.stageId, reveal: false });
-  await explainLaunch(result);
+  await explainLaunch(controller, result);
 }
 
 // ---------------------------------------------------------------- accept stage (freeze, then accept)
@@ -900,7 +904,7 @@ async function askReviewerAgain(controller: SparringController, run: RunSnapshot
     stageId: run.stage.stageId,
     reveal: false,
   });
-  await explainLaunch(result);
+  await explainLaunch(controller, result);
   return result.ok ? { launched: true, executionId: result.record.id } : { launched: false };
 }
 
@@ -1350,9 +1354,26 @@ function configuredExecutable(): string {
   return vscode.workspace.getConfiguration("agentSparring").get<string>("executable", "");
 }
 
-async function explainLaunch(result: LaunchResult): Promise<void> {
-  if (!result.ok) {
-    await explainCommandProblem(result.error, result.problem);
+async function explainLaunch(controller: SparringController, result: LaunchResult): Promise<void> {
+  if (result.ok) {
+    return;
+  }
+  if (result.problem !== "unconfirmed") {
+    await explainExecutableProblem(result.error);
+    return;
+  }
+  // A submission nobody can yet call started or dead. The person is the only
+  // one who can settle it, so the choice is theirs and it is named for what
+  // it does: forget this submission, so the command may be given again.
+  const pending = result.pending;
+  const choices = pending ? ["Show Log", "Discard submission"] : ["Show Log"];
+  const choice = await vscode.window.showWarningMessage(`Agent Sparring: ${result.error}`, ...choices);
+  if (choice === "Show Log") {
+    await vscode.commands.executeCommand("agentSparring.showLog");
+  } else if (choice === "Discard submission" && pending) {
+    if (controller.discardPendingSubmission(pending.runId)) {
+      void vscode.window.showInformationMessage(`Agent Sparring: the submitted ${pending.kind} is forgotten. Run it again when you have checked that terminal.`);
+    }
   }
 }
 
@@ -1364,11 +1385,11 @@ async function explainLaunch(result: LaunchResult): Promise<void> {
  * PATH.
  */
 async function explainCommandProblem(error: string, problem: LaunchProblem): Promise<void> {
-  if (problem !== "not-started") {
+  if (problem !== "unconfirmed") {
     await explainExecutableProblem(error);
     return;
   }
-  const choice = await vscode.window.showErrorMessage(`Agent Sparring: ${error}`, "Show Log");
+  const choice = await vscode.window.showWarningMessage(`Agent Sparring: ${error}`, "Show Log");
   if (choice === "Show Log") {
     await vscode.commands.executeCommand("agentSparring.showLog");
   }
@@ -1450,7 +1471,7 @@ async function launch(controller: SparringController, location: SparringLocation
   // this same route (controller.launch / controller.runCommand): nothing
   // here builds a command line or starts a process of its own.
   const result = await controller.launch({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: kind, runId: planRunId(location, planPath), kind, planPath, manifest, reveal: true });
-  await explainLaunch(result);
+  await explainLaunch(controller, result);
   return result;
 }
 
@@ -2020,7 +2041,7 @@ async function performContinueAutomatically(controller: SparringController, over
     manifest: manifestPath,
     reveal: true,
   });
-  await explainLaunch(result);
+  await explainLaunch(controller, result);
   await overview.update();
   if (!result.ok) {
     return { ok: false, reason: "write", message: result.error };

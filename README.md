@@ -405,11 +405,44 @@ closed is replaced, and projects never share one. Only terminals the
 extension opened are ever written to — a command you type in your own
 terminal is observed, never interrupted.
 
-Handing a command to a shell is not the same as the shell running it. A
-launch is recorded as a runner only once the shell reports the command as
-started (within 5 s); if it never does, nothing is recorded as live, that
-terminal is not used again, and the failure is reported as what it is — not
-as a missing executable.
+### Submitting a command is not running it
+
+Handing a command line to shell integration submits it. The shell may run it
+at once, later (a stopped or busy shell runs the line when it continues), or
+never — so a submission is tracked apart from executions, and becomes a
+runner only when the shell reports **that exact execution** as started:
+
+| State | What it means | What the extension does |
+| --- | --- | --- |
+| Pending, waiting | submitted; the start report is being waited for (5 s) | nothing is `Running`, nothing is persisted as a live launch, no runner is claimed |
+| Pending, uncertain | the wait expired with no start report | the same, plus: that terminal is quarantined (never reused, never closed or signalled — your command may be what is holding it), and the submission is still watched |
+| Running | the shell reported that execution as started | an ordinary tracked runner: persisted, shown, stopped with Ctrl-C, ended by its own end event |
+
+While a submission is pending, a second command for the same run is
+**refused**, because the first one may still start and running an engine
+operation twice is not safe. The wording says what is actually known —
+"Agent Sparring handed this command to the terminal but has not been able to
+confirm whether it started" — never that a runner is alive. The dialog offers
+**Show Log** and **Discard submission**, which is the human decision to forget
+it so the command may be given again.
+
+A pending submission is settled by: its exact execution starting (promoted to
+a real runner, however late), its exact execution ending, its terminal closing
+or its shell exiting (it can no longer run), a process probe finding this
+project's runner, or you discarding it.
+
+Short commands (`freeze-candidate`, `accept-candidate`, `new-stage`) follow the
+same rule and are deliberately **not** retried through the direct-process
+transport when their start cannot be confirmed: the submitted line may still
+run, and accepting a candidate twice is not a risk worth taking.
+
+**After a reload.** Pending submissions are persisted (separately from the
+launches: a reload never turns one into a live runner). VS Code cannot hand a
+`TerminalShellExecution` back, so a reloaded window can no longer recognise a
+late start by identity; it therefore fails safe — the submission is restored as
+uncertain, no runner is claimed, and a duplicate is refused until the terminal
+that took it turns out to be gone, a process probe finds the runner, or you
+discard it.
 
 Terminal identity is not liveness. Every shell execution is tracked
 separately, so a finished command can never keep the Overview `Running`
@@ -590,7 +623,7 @@ Liveness sources, most exact first:
 
 | Source | How it is observed | Ends when |
 | --- | --- | --- |
-| Launched from the extension | This project's integrated terminal (your normal shell, cwd = project — only when its shell is idle) runs `sparring` through the terminal shell-integration API with an argument array (see "Free-text arguments" for the one case that is quoted here instead). Recorded as a runner only once the shell reports the command started; a command the shell never took records nothing. | The shell-execution end event fires (normal exit, non-zero exit, Ctrl-C), another command starts in that terminal, or the terminal closes. |
+| Launched from the extension | This project's integrated terminal (your normal shell, cwd = project — only when its shell is idle) runs `sparring` through the terminal shell-integration API with an argument array (see "Free-text arguments" for the one case that is quoted here instead). Recorded as a runner only once the shell reports that exact execution started; a submission the shell has not started is kept apart from the launches and is never a runner (see "Submitting a command is not running it"). | The shell-execution end event fires (normal exit, non-zero exit, Ctrl-C), another command starts in that terminal, or the terminal closes. |
 | Dedicated terminal (fallback) | Only if shell integration does not activate within 5 s: a terminal whose process *is* `sparring` (argument array, no shell). | That terminal closes, which VS Code does as soon as the process exits. |
 | Typed in an integrated terminal | Shell integration reports the command line and cwd; `sparring run-loop <stage>`, `run-plan` and `resume-plan` are recognised and tied to the project by `--repo-root` / `--sparring-dir` / cwd (nested projects match their own root). | Same as a launched command. |
 | Re-found after a window reload | Launches are recorded in `workspaceState`; after a reload the hosting terminal is re-found by process id and, on macOS/Linux, a `ps` probe checks that the runner still runs under it. | The probe no longer finds it, or a shell execution starts/ends in that terminal. On Windows the state stays `unknown`. |

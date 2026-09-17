@@ -78,6 +78,7 @@ export async function run(): Promise<void> {
     ["closed", () => closedTerminalAssertions(report, reportedRepo)],
     ["occupied", () => occupiedTerminalAssertions(report, reportedRepo, fixtureRoot)],
     ["falserunner", () => falseRunnerAssertions(reportedRepo, fixtureRoot)],
+    ["latestart", () => lateStartAssertions(report, reportedRepo)],
     ["launchable", () => launchTargetAssertions(fixtureRoot, reportedRepo)],
     ["declarations", () => declarationScopeAssertions(reportedRepo, fixtureRoot)],
   ];
@@ -1101,90 +1102,386 @@ function memento(): vscode.Memento {
 
 /**
  * The other half of the same defect: what must happen when a command *is*
- * handed to an occupied shell.
+ * handed to a shell that does not run it.
  *
  * Handing `shellIntegration.executeCommand` a command line writes that line
- * into the terminal; it does not guarantee that the shell runs it. When the
- * shell is not at a prompt the text goes to whatever is reading stdin — and
- * the extension used to record a runner as live on the strength of the
- * hand-over alone, which is what produced "a runner for this plan is alive in
- * a terminal of this window" with no sparring process anywhere.
+ * into the terminal; it does not guarantee that the shell runs it, and it does
+ * not guarantee that the shell never will. The extension used to record a
+ * runner as live on the strength of the hand-over alone — "a runner for this
+ * plan is alive in a terminal of this window" with no sparring process
+ * anywhere — and then, when that was fixed by discarding the submission at
+ * the timeout, it lost the identity of a command that could still start.
  *
- * The ownership boundary now keeps this from happening in the product, so the
- * situation is built here on purpose: a real occupied terminal, and a tracker
- * whose pool hands it out regardless. Nothing may be recorded as running, a
- * reload must find nothing either, the terminal must never be written to
- * again — and the engine must not have run.
+ * Both halves are built here on purpose, with a tracker whose pool hands out a
+ * terminal regardless of occupancy:
+ *
+ *  A. a shell whose foreground belongs to an interactive process that eats the
+ *     command line. Nothing may be recorded as running, nothing persisted, the
+ *     terminal never written to again, the engine never run — and the
+ *     submission stays unresolved until its terminal is closed, which is the
+ *     one thing that proves the command can no longer run.
+ *  B. a shell stopped with SIGSTOP, the reviewer's reproduction: the command is
+ *     taken now and executed minutes later. Until then nothing is running and
+ *     a second copy is refused; when the shell continues, that exact execution
+ *     must be promoted to a real runner, persisted, and ended normally.
  */
 async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string): Promise<void> {
   if (!(await shellIntegrationAvailable(reportedRepo))) {
     console.log("integration: shell integration unavailable in this host; false-runner scenario skipped");
     return;
   }
-  const terminal = vscode.window.createTerminal({ name: "user's own terminal (false-runner regression)", cwd: reportedRepo });
-  const integration = await shellIntegrationFor(terminal, 8000);
-  if (!integration) {
-    terminal.dispose();
-    console.log("integration: shell integration did not activate for a plain terminal; false-runner scenario skipped");
+  const executable = vscode.workspace.getConfiguration("agentSparring").get<string>("executable", "");
+  const argvLog = path.join(fixtureRoot, "fake-argv.log");
+
+  // ---- A. the command line is eaten by whatever holds the shell ----------
+  {
+    const terminal = vscode.window.createTerminal({ name: "user's own terminal (false-runner regression)", cwd: reportedRepo });
+    const integration = await shellIntegrationFor(terminal, 8000);
+    if (!integration) {
+      terminal.dispose();
+      console.log("integration: shell integration did not activate for a plain terminal; false-runner scenario skipped");
+      return;
+    }
+    const typed = path.join(fixtureRoot, "typed-into-the-bypassed-terminal.txt");
+    await fs.rm(typed, { force: true });
+    await fs.rm(argvLog, { force: true });
+    occupy(terminal, typed);
+    await new Promise((resolve) => setTimeout(resolve, 2000)); // let the occupant take the foreground
+
+    const { lease, retired } = bypassLease(terminal);
+    const logged: string[] = [];
+    const tracker = new ExecutionTracker({ workspaceState: memento() } as unknown as vscode.ExtensionContext, (message) => logged.push(message), () => [], { acquire: () => lease } as unknown as TerminalPool);
+    const runId = "false-runner-regression";
+    try {
+      const result = await tracker.launch({
+        configured: executable,
+        args: ["run-plan", "plans/never-executed.md", "--repo-root", reportedRepo],
+        cwd: reportedRepo,
+        name: "false-runner regression",
+        runId,
+        kind: "run-plan",
+        reveal: false,
+      });
+      assert.equal(result.ok, false, "a command the shell has not started is not a launch");
+      assert.equal(result.ok ? undefined : result.problem, "unconfirmed", "and it is not reported as a configuration problem");
+      assert.match(result.ok ? "" : result.error, /has not been able to confirm whether it started/);
+      assert.doesNotMatch(result.ok ? "" : result.error, /runner .*alive/i, "and never as a live runner");
+      assert.equal(tracker.executionFor(runId), undefined, "no runner record: not running, not even ended");
+      assert.equal(tracker.hostingTerminal(runId), undefined);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      assert.deepEqual(tracker.persisted(), [], "and a window reload would find no live runner either");
+      assert.equal(retired(), true, "the terminal is quarantined: never written to again");
+      assert.equal(terminal.exitStatus, undefined, "while the user's command is left alone, not interrupted");
+      assert.ok(!(await fs.stat(argvLog).then(() => true, () => false)), "the engine never ran: the fake sparring recorded no argv");
+
+      // The submission itself is kept: nothing here can prove that command
+      // will never run, so a second one is refused rather than submitted.
+      const pending = tracker.pendingSubmissions();
+      assert.equal(pending.length, 1, `the submission is retained, got ${JSON.stringify(pending)}`);
+      assert.equal(pending[0].state, "uncertain");
+      assert.equal(pending[0].runId, runId);
+      const second = await tracker.launch({ configured: executable, args: ["run-plan", "plans/never-executed.md", "--repo-root", reportedRepo], cwd: reportedRepo, name: "false-runner regression (again)", runId, kind: "run-plan", reveal: false });
+      assert.equal(second.ok, false, "a second copy of the same operation is refused while the first may still start");
+      assert.equal(second.ok ? undefined : second.problem, "unconfirmed");
+      assert.equal(tracker.pendingSubmissions().length, 1, "and nothing new was submitted");
+
+      // Closing that terminal is what settles it: the shell that took the
+      // command is gone, so the command can no longer run.
+      terminal.dispose();
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      assert.deepEqual(tracker.pendingSubmissions(), [], "closing the terminal resolves the submission");
+      assert.equal(tracker.executionFor(runId), undefined, "and still records no execution: nothing ever ran");
+      const received = await fs.readFile(typed, "utf8").catch(() => "");
+      console.log(`integration: the bypassed terminal's occupant received ${JSON.stringify(received.trim().slice(0, 60))}`);
+    } finally {
+      tracker.dispose();
+      terminal.dispose();
+    }
+  }
+
+  // ---- B. a stopped shell runs the command minutes later ------------------
+  if (process.platform === "win32") {
+    console.log("integration: SIGSTOP is not available on this platform; late-start half skipped");
     return;
   }
-  const typed = path.join(fixtureRoot, "typed-into-the-bypassed-terminal.txt");
-  const argvLog = path.join(fixtureRoot, "fake-argv.log");
-  await fs.rm(typed, { force: true });
-  await fs.rm(argvLog, { force: true });
-  occupy(terminal, typed);
-  await new Promise((resolve) => setTimeout(resolve, 2000)); // let the occupant take the foreground
+  {
+    const terminal = vscode.window.createTerminal({ name: "a stopped shell (late-start regression)", cwd: reportedRepo });
+    const integration = await shellIntegrationFor(terminal, 8000);
+    const pid = await terminal.processId;
+    if (!integration || pid === undefined) {
+      terminal.dispose();
+      console.log("integration: no shell integration or pid for the stopped-shell terminal; late-start half skipped");
+      return;
+    }
+    await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=1\nexit_with=0\n");
+    await fs.rm(argvLog, { force: true });
+    const { lease, retired } = bypassLease(terminal);
+    const logged: string[] = [];
+    const tracker = new ExecutionTracker({ workspaceState: memento() } as unknown as vscode.ExtensionContext, (message) => logged.push(message), () => [], { acquire: () => lease } as unknown as TerminalPool);
+    const runId = "late-start-regression";
+    const stage = "stage-reported-statistics-typed-parser";
+    let stopped = false;
+    try {
+      process.kill(pid, "SIGSTOP");
+      stopped = true;
+      const result = await tracker.launch({
+        configured: executable,
+        args: ["run-loop", stage, "--repo-root", reportedRepo, "--expected-branch", "feature/reported-statistics"],
+        cwd: reportedRepo,
+        name: "late-start regression",
+        runId,
+        kind: "run-loop",
+        stageId: stage,
+        reveal: false,
+      });
+      assert.equal(result.ok, false, "the stopped shell has not started it, so this is not a launch");
+      assert.equal(result.ok ? undefined : result.problem, "unconfirmed");
+      assert.equal(tracker.executionFor(runId), undefined, "and nothing is running");
+      assert.equal(retired(), true, "its terminal is quarantined while its fate is unknown");
+      const waiting = tracker.pendingSubmissions();
+      assert.equal(waiting.length, 1, "the identity of the submitted command is kept");
+      assert.equal(waiting[0].state, "uncertain");
 
-  let retired = false;
-  const lease: TerminalLease = {
-    terminal,
-    release: () => undefined,
-    discard: () => undefined,
-    retire: () => {
-      retired = true;
-    },
-  };
-  const pool = { acquire: () => lease } as unknown as TerminalPool;
-  const logged: string[] = [];
-  const tracker = new ExecutionTracker({ workspaceState: memento() } as unknown as vscode.ExtensionContext, (message) => logged.push(message), () => [], pool);
-  const runId = "false-runner-regression";
-  try {
-    const result = await tracker.launch({
-      configured: vscode.workspace.getConfiguration("agentSparring").get<string>("executable", ""),
-      args: ["run-plan", "plans/never-executed.md", "--repo-root", reportedRepo],
-      cwd: reportedRepo,
-      name: "false-runner regression",
-      runId,
-      kind: "run-plan",
-      reveal: false,
-    });
-    assert.equal(result.ok, false, "a command the shell never started is not a launch");
-    assert.equal(result.ok ? undefined : result.problem, "not-started", "and it is not reported as a configuration problem");
-    assert.match(result.ok ? "" : result.error, /never reported the command as started/);
-    assert.equal(tracker.executionFor(runId), undefined, "no runner record survives it: not running, not even ended");
-    assert.equal(tracker.hostingTerminal(runId), undefined);
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    assert.deepEqual(tracker.persisted(), [], "and a window reload would find no live runner either");
-    assert.equal(retired, true, "the terminal is never written to again");
-    assert.equal(terminal.exitStatus, undefined, "while the user's command is left alone, not interrupted");
-    assert.ok(
-      !(await fs.stat(argvLog).then(() => true, () => false)),
-      "the engine never ran: the fake sparring recorded no argv",
-    );
-    // The receipt for what actually happened to the command line: it was
-    // typed into the process that held the shell. That is the defect this
-    // extension must never turn into a live runner.
-    const received = await fs.readFile(typed, "utf8").catch(() => "");
-    console.log(`integration: the bypassed terminal's occupant received ${JSON.stringify(received.trim().slice(0, 80))}`);
-    assert.ok(
-      logged.some((line) => /did not start it/.test(line)),
-      `the log says what happened, got ${JSON.stringify(logged)}`,
-    );
-  } finally {
-    tracker.dispose();
+      // The shell continues, reads the line it was given, and runs it.
+      process.kill(pid, "SIGCONT");
+      stopped = false;
+      const promoted = await waitUntil(() => tracker.executionFor(runId), 20_000, "the late start is promoted to a real running execution");
+      assert.equal(promoted.state, "running", "the exact execution became the runner");
+      assert.equal(promoted.source, "launched", "promoted by execution identity, not rediscovered from a command line");
+      assert.equal(tracker.hostingTerminal(runId), terminal.name);
+      assert.deepEqual(tracker.pendingSubmissions(), [], "and the submission is resolved by its own start");
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      assert.deepEqual(
+        tracker.persisted().filter((launch) => launch.runId === runId),
+        [{ runId, state: "running" }],
+        "a reload would now find exactly this one live runner",
+      );
+      assert.ok(logged.some((line) => /after it was submitted and after the wait had expired/.test(line)), `the log says it started late, got ${JSON.stringify(logged)}`);
+      assert.ok(await fs.stat(argvLog).then(() => true, () => false), "and the engine really did run");
+
+      const ended = await waitUntil(() => {
+        const record = tracker.executionFor(runId);
+        return record?.state === "ended" ? record : undefined;
+      }, 25_000, "its end is observed in the ordinary way");
+      assert.equal(ended.exitCode, 0, "with the shell's own exit code");
+      assert.deepEqual(tracker.persisted().filter((launch) => launch.runId === runId), [{ runId, state: "ended" }]);
+    } finally {
+      if (stopped) {
+        try {
+          process.kill(pid, "SIGCONT");
+        } catch {
+          // the shell is already gone
+        }
+      }
+      tracker.dispose();
+      terminal.dispose();
+    }
+  }
+  // ---- C. a window reload finds a submission it cannot recognise --------
+  //
+  // VS Code cannot hand a `TerminalShellExecution` back, so a reloaded window
+  // can no longer promote a late start by identity. That must fail safe: the
+  // submission is restored as uncertain, no runner is claimed for it, and a
+  // second copy of the same operation is refused until its fate is known —
+  // here, by the terminal that took it being gone.
+  {
+    const runId = "reloaded-submission-regression";
+    const stored = memento();
+    await stored.update("agentSparring.pendingSubmissions", [
+      {
+        id: "pending-from-the-previous-window",
+        runId,
+        kind: "run-plan",
+        planPath: "plans/never-executed.md",
+        word: executable,
+        submittedAtMs: Date.now() - 4000,
+        terminalPid: 2147480000, // a pid no terminal in this window has
+        terminalName: "Agent Sparring — sporely-py-reported-statistics",
+      },
+    ]);
+    const logged: string[] = [];
+    const tracker = new ExecutionTracker({ workspaceState: stored } as unknown as vscode.ExtensionContext, (message) => logged.push(message), () => [], { acquire: () => bypassLease(vscode.window.terminals[0] ?? vscode.window.createTerminal({ name: "unused" })).lease } as unknown as TerminalPool);
+    try {
+      const reattaching = tracker.reattach();
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.deepEqual(
+        tracker.pendingSubmissions().map((item) => [item.runId, item.state, item.restored]),
+        [[runId, "uncertain", true]],
+        "the submission is restored as uncertain, and says it came from before the reload",
+      );
+      assert.equal(tracker.executionFor(runId), undefined, "no runner is claimed for it");
+      const refused = await tracker.launch({ configured: executable, args: ["run-plan", "plans/never-executed.md"], cwd: reportedRepo, name: "after the reload", runId, kind: "run-plan", reveal: false });
+      assert.equal(refused.ok, false, "and a duplicate is not submitted on the assumption that nothing happened");
+      assert.equal(refused.ok ? undefined : refused.problem, "unconfirmed");
+      assert.match(refused.ok ? "" : refused.error, /window reloaded since/, "the reason is the reload, and it is said so");
+
+      // Its terminal did not come back, so that command can never run.
+      await reattaching;
+      assert.deepEqual(tracker.pendingSubmissions(), [], "the missing terminal settles it");
+      assert.equal(tracker.executionFor(runId), undefined, "and nothing is recorded as having run");
+      assert.ok(logged.some((line) => /did not survive the reload/.test(line)), `the log says why, got ${JSON.stringify(logged)}`);
+    } finally {
+      tracker.dispose();
+    }
+  }
+
+  console.log("integration: an unconfirmed submission keeps its identity, refuses a second copy, is settled by its terminal closing — and a stopped shell that runs it later is promoted to a real, persisted, normally-ended runner; a reloaded window fails safe on one it can no longer recognise");
+}
+
+// ---------------------------------------------------------------- the reviewer's reproduction, through the product
+
+/**
+ * The same late start, but through the commands a person actually presses.
+ *
+ * `Run stage` on an idle owned terminal whose shell has been stopped
+ * (SIGSTOP): shell integration takes the command line, the shell runs nothing,
+ * and five seconds later the extension has to say something. What it must not
+ * say is that a runner is alive, and what it must not do is submit a second
+ * copy — the stopped shell will run the first one the moment it continues,
+ * which is what this asserts.
+ */
+async function lateStartAssertions(report: DiscoveryDiagnostic, reportedRepo: string): Promise<void> {
+  if (process.platform === "win32" || !(await shellIntegrationAvailable(reportedRepo))) {
+    console.log("integration: SIGSTOP or shell integration unavailable in this host; late-start scenario skipped");
+    return;
+  }
+  for (const terminal of ownTerminals()) {
     terminal.dispose();
   }
-  console.log("integration: a command handed to an occupied shell leaves no live-runner record, no persisted launch, and no further writes to that terminal");
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  const runId = runIdOf(report, reportedRepo, "stage-reported-statistics-typed-parser");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+  await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=1\nexit_with=0\n");
+
+  // An ordinary run first, so the terminal is one of ours, idle, and proven.
+  await vscode.commands.executeCommand("agentSparring.runStage");
+  await waitFor(runId, (liveness) => liveness.state === "running", 15_000, "the first run starts");
+  const first = await waitFor(runId, (liveness) => liveness.state === "stopped", 20_000, "and ends, leaving the terminal idle");
+  const [owned] = ownTerminals();
+  const pid = await owned.processId;
+  assert.ok(owned && pid !== undefined, "the extension's terminal and its shell's pid");
+
+  const warnings = captureWarnings();
+  let stopped = false;
+  try {
+    process.kill(pid, "SIGSTOP");
+    stopped = true;
+    // Not awaited: the assertions below are about the window *while* the
+    // extension is waiting for a start that is not coming yet.
+    const launching = vscode.commands.executeCommand("agentSparring.runStage");
+
+    // Before the wait expires: a submission is not a runner.
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const early = await livenessOf(runId);
+    assert.notEqual(early.state, "running", "a submitted command is not a running runner");
+    assert.notEqual(early.execution?.state, "running", `and no running execution record is exposed, got ${JSON.stringify(early.execution)}`);
+    assert.equal(early.execution?.id, first.execution?.id, "the newest record is still the previous, ended one");
+    const pendingEarly = await pendingSubmissions();
+    assert.deepEqual(
+      pendingEarly.map((item) => [item.runId, item.state]),
+      [[runId, "waiting"]],
+      `the submission is tracked separately, got ${JSON.stringify(pendingEarly)}`,
+    );
+    assert.deepEqual(await runningLaunches(runId), [], "and nothing is persisted as an established running launch");
+
+    // After it expires: still no runner, and the person is told what is
+    // actually known.
+    await launching;
+    assert.notEqual((await livenessOf(runId)).state, "running");
+    assert.deepEqual((await pendingSubmissions()).map((item) => item.state), ["uncertain"], "the submission survives the wait");
+    assert.ok(
+      warnings.messages.some((message) => /has not been able to confirm whether it started/.test(message)),
+      `the wording says exactly that, got ${JSON.stringify(warnings.messages)}`,
+    );
+    assert.ok(!warnings.messages.some((message) => /runner .*alive/i.test(message)), "and never claims a live runner");
+    const pool = await ownedTerminalReport();
+    assert.ok(!pool.some((terminal) => terminal.name === owned.name), `the quarantined terminal is out of the pool, got ${JSON.stringify(pool)}`);
+
+    // A retry is refused for that reason, and submits nothing.
+    warnings.messages.length = 0;
+    await vscode.commands.executeCommand("agentSparring.runStage");
+    assert.ok(
+      warnings.messages.some((message) => /has not been able to confirm whether it started/.test(message)),
+      `the retry is refused as unconfirmed, got ${JSON.stringify(warnings.messages)}`,
+    );
+    assert.equal((await pendingSubmissions()).length, 1, "no second command was submitted");
+    assert.equal(ownTerminals().length, 1, "and no second terminal was opened for it");
+
+    // The shell continues and runs the command it was given five seconds ago.
+    process.kill(pid, "SIGCONT");
+    stopped = false;
+    const late = await waitFor(runId, (liveness) => liveness.state === "running", 20_000, "the late start becomes a real running runner");
+    assert.equal(late.execution?.source, "launched", "promoted by execution identity");
+    assert.notEqual(late.execution?.id, first.execution?.id);
+    assert.deepEqual(await pendingSubmissions(), [], "and the submission is resolved");
+    assert.equal(await vscode.commands.executeCommand("agentSparring._test.hostingTerminal", runId), owned.name);
+    assert.deepEqual(await runningLaunches(runId), [{ runId, state: "running" }], "now, and only now, a reload would find a live runner");
+
+    const ended = await waitFor(runId, (liveness) => liveness.state === "stopped", 25_000, "and its end clears the state in the ordinary way");
+    assert.equal(ended.execution?.exitCode, 0);
+  } finally {
+    if (stopped) {
+      try {
+        process.kill(pid, "SIGCONT");
+      } catch {
+        // already gone
+      }
+    }
+    warnings.restore();
+    for (const terminal of ownTerminals()) {
+      terminal.dispose();
+    }
+  }
+  console.log("integration: a command submitted to a stopped shell is never a runner, refuses a second copy with its own wording, and is promoted, persisted and ended normally when the shell continues");
+}
+
+/** A lease over a terminal the pool would never hand out, for the bypass scenarios. */
+function bypassLease(terminal: vscode.Terminal): { lease: TerminalLease; retired: () => boolean } {
+  let retired = false;
+  return {
+    lease: { terminal, release: () => undefined, discard: () => undefined, retire: () => { retired = true; } },
+    retired: () => retired,
+  };
+}
+
+/** The warnings the extension showed, with every dialog dismissed. */
+function captureWarnings(): { messages: string[]; restore: () => void } {
+  const window = vscode.window as unknown as Record<string, unknown>;
+  const original = window["showWarningMessage"];
+  const messages: string[] = [];
+  window["showWarningMessage"] = async (message: string) => {
+    messages.push(message);
+    return undefined;
+  };
+  return {
+    messages,
+    restore: () => {
+      window["showWarningMessage"] = original;
+    },
+  };
+}
+
+async function pendingSubmissions(): Promise<{ runId: string; state: string; kind: string }[]> {
+  return (await vscode.commands.executeCommand("agentSparring._test.pendingSubmissions")) as { runId: string; state: string; kind: string }[];
+}
+
+async function runningLaunches(runId: string): Promise<{ runId: string; state: string }[]> {
+  const launches = (await vscode.commands.executeCommand("agentSparring._test.persistedLaunches")) as { runId: string; state: string }[];
+  return launches.filter((launch) => launch.runId === runId && launch.state === "running");
+}
+
+/** Poll a synchronous answer until it is there (for the tracker built inside this suite). */
+async function waitUntil<T>(read: () => T | undefined, timeoutMs: number, what: string): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = read();
+    if (value !== undefined) {
+      return value;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  assert.fail(`timed out waiting for: ${what}`);
 }
 
 // ---------------------------------------------------------------- the terminal closed mid-run
