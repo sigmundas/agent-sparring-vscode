@@ -945,6 +945,20 @@ export class SparringController implements vscode.Disposable {
     return this.tracker.persisted();
   }
 
+  /** The terminal hosting this run's live execution, by name (integration tests). */
+  hostingTerminal(runId: string): string | undefined {
+    return this.tracker.hostingTerminal(runId);
+  }
+
+  /**
+   * The terminals in the pool and why each one may not be sent a command
+   * (integration tests); `undefined` means its shell is idle and the next
+   * engine command for that project would reuse it.
+   */
+  ownedTerminals(): { name: string; cwd: string; unavailable?: string }[] {
+    return this.terminals.owned();
+  }
+
   /** Live state as presented: turns a runner known to have ended cannot be executing are cleared. */
   get presentedLive(): LiveState | undefined {
     return this.currentLiveness.live;

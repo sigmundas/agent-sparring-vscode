@@ -24,6 +24,8 @@ import { isCopyPromptMessage, isHumanCheckMessage, isHumanFeedbackMessage, isOpe
 import { withHumanCheck, type HumanCheckDrafts } from "../core/humanChecks";
 import type { ExecutionRecord, LivenessState, RunnerLiveness } from "../core/liveness";
 import { buildOverviewModel, type CapturedPrompt, type ManifestStageView, type OverviewArtifacts } from "../core/overviewModel";
+import { ExecutionTracker } from "../vscode/executionTracker";
+import type { TerminalLease, TerminalPool } from "../vscode/terminalPool";
 
 const STAGES = ["stage-reported-statistics-contract", "stage-reported-statistics-local-schema-barrier", "stage-reported-statistics-typed-parser", "stage-review-complete", "stage-review-complete-dirty", "stage-stale-turn"];
 
@@ -74,6 +76,8 @@ export async function run(): Promise<void> {
     ["advance", () => advancementAssertions(reportedRepo)],
     ["terminals", () => terminalReuseAssertions(report, reportedRepo)],
     ["closed", () => closedTerminalAssertions(report, reportedRepo)],
+    ["occupied", () => occupiedTerminalAssertions(report, reportedRepo, fixtureRoot)],
+    ["falserunner", () => falseRunnerAssertions(reportedRepo, fixtureRoot)],
     ["launchable", () => launchTargetAssertions(fixtureRoot, reportedRepo)],
     ["declarations", () => declarationScopeAssertions(reportedRepo, fixtureRoot)],
   ];
@@ -961,6 +965,226 @@ async function terminalReuseAssertions(report: DiscoveryDiagnostic, reportedRepo
     terminal.dispose();
   }
   console.log("integration: four engine commands, one reusable terminal per project, each execution tracked on its own");
+}
+
+// ---------------------------------------------------------------- the user is working in the extension's terminal
+
+/** The pool's own view: which owned terminals may be written to, and why not. */
+async function ownedTerminalReport(): Promise<{ name: string; cwd: string; unavailable?: string }[]> {
+  return (await vscode.commands.executeCommand("agentSparring._test.ownedTerminals")) as { name: string; cwd: string; unavailable?: string }[];
+}
+
+async function waitForOccupancy(name: string, expected: string | undefined, timeoutMs: number, what: string): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let last: unknown;
+  while (Date.now() < deadline) {
+    last = (await ownedTerminalReport()).find((terminal) => terminal.name === name);
+    if ((last as { unavailable?: string } | undefined)?.unavailable === expected) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  assert.fail(`timed out waiting for: ${what}; last ${JSON.stringify(last)}`);
+}
+
+/**
+ * An interactive occupant for a real terminal: it holds the shell's
+ * foreground until it is killed, ignores ^C the way an interactive agent CLI
+ * does — `shellIntegration.executeCommand` is documented to send ^C "as
+ * necessary to interrupt any running command", and a `cat` that dies from it
+ * would not reproduce anything — and writes down everything typed at it, so
+ * `file` is the receipt for whether the terminal was written to.
+ */
+function occupy(terminal: vscode.Terminal, file: string): void {
+  terminal.sendText(`sh -c 'trap "" INT; cat > ${file}'`, true);
+}
+
+/**
+ * The reported defect, reproduced with a real shell.
+ *
+ * Agent Sparring had created and reused its project terminal; the engine
+ * command finished; the person then started an interactive CLI in that same
+ * terminal and left it running. The next engine command was handed to that
+ * terminal anyway — because the only thing consulted was Agent Sparring's own
+ * lease — so the `sparring …` line was typed into the interactive process
+ * instead of being executed, and the extension went on to report "a runner
+ * for this plan is alive in a terminal of this window" for a process that had
+ * never been started.
+ *
+ * The occupant here is `cat > <file>`: an interactive command that holds the
+ * shell's foreground for as long as it is left alone, and that writes down
+ * anything typed at it — so the file is the receipt for whether the terminal
+ * was written to. It must stay empty, the runner must be in a second Agent
+ * Sparring terminal, and the occupant must still be running afterwards.
+ */
+async function occupiedTerminalAssertions(report: DiscoveryDiagnostic, reportedRepo: string, fixtureRoot: string): Promise<void> {
+  if (!(await shellIntegrationAvailable(reportedRepo))) {
+    console.log("integration: shell integration unavailable in this host; occupied-terminal scenario skipped");
+    return;
+  }
+  for (const terminal of ownTerminals()) {
+    terminal.dispose();
+  }
+  await new Promise((resolve) => setTimeout(resolve, 500));
+
+  const runId = runIdOf(report, reportedRepo, "stage-reported-statistics-typed-parser");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+  await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=1\nexit_with=0\n");
+
+  // 1. Agent Sparring opens its project terminal and finishes a command in it.
+  await vscode.commands.executeCommand("agentSparring.runStage");
+  await waitFor(runId, (liveness) => liveness.state === "running", 15_000, "the first run starts in the project's terminal");
+  const [owned] = ownTerminals();
+  assert.ok(owned, "the extension's terminal is open");
+  const ownedName = "Agent Sparring — sporely-py-reported-statistics";
+  assert.equal(owned.name, ownedName);
+  const first = await waitFor(runId, (liveness) => liveness.state === "stopped", 20_000, "and ends, leaving the terminal idle");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.hostingTerminal", runId), undefined, "a finished execution hosts nothing");
+  await waitForOccupancy(ownedName, undefined, 10_000, "the idle terminal is available for reuse again");
+
+  // 2. The user starts something interactive in it and leaves it running.
+  const typed = path.join(fixtureRoot, "typed-into-the-occupied-terminal.txt");
+  await fs.rm(typed, { force: true });
+  occupy(owned, typed);
+  await waitForOccupancy(ownedName, "occupied", 15_000, "the user's command makes the extension's own terminal unavailable");
+
+  // 3. Run the stage again. Nothing may be written into the occupied terminal.
+  await vscode.commands.executeCommand("agentSparring.runStage");
+  const second = await waitFor(runId, (liveness) => liveness.state === "running" && liveness.execution?.id !== first.execution?.id, 15_000, "the new run starts although the project's terminal is occupied");
+  assert.equal(second.execution?.source, "launched", "and it was launched by this window, not inferred");
+
+  const host = (await vscode.commands.executeCommand("agentSparring._test.hostingTerminal", runId)) as string | undefined;
+  assert.notEqual(host, ownedName, "the runner is not in the terminal the user is working in");
+  assert.equal(host, `${ownedName} (2)`, `a second Agent Sparring terminal ran it, got ${String(host)}`);
+  const pool = await ownedTerminalReport();
+  assert.deepEqual(
+    pool.map((terminal) => [terminal.name, terminal.unavailable]),
+    [
+      [ownedName, "occupied"],
+      [`${ownedName} (2)`, "leased"],
+    ],
+    `the occupied terminal is still the user's and the new one is ours, got ${JSON.stringify(pool)}`,
+  );
+
+  const received = await fs.readFile(typed, "utf8");
+  assert.equal(received, "", `the occupied terminal received nothing, got ${JSON.stringify(received)}`);
+  assert.equal(owned.exitStatus, undefined, "and the user's shell was neither interrupted nor closed");
+
+  // 4. Only the runner that exists is tracked as live.
+  const launches = ((await vscode.commands.executeCommand("agentSparring._test.persistedLaunches")) as { runId: string; state: string }[]).filter(
+    (launch) => launch.runId === runId && launch.state === "running",
+  );
+  assert.equal(launches.length, 1, `exactly one live runner is recorded for this run, got ${JSON.stringify(launches)}`);
+
+  await waitFor(runId, (liveness) => liveness.state === "stopped", 20_000, "the new runner ends on its own");
+  await waitForOccupancy(ownedName, "occupied", 5000, "and the user's command is still running after all of it");
+  owned.dispose(); // ends the interactive occupant that was left running
+  for (const terminal of ownTerminals()) {
+    terminal.dispose();
+  }
+  console.log("integration: a terminal the user occupied received nothing, a second Agent Sparring terminal ran the engine, and only that runner is recorded as live");
+}
+
+// ---------------------------------------------------------------- a command the shell never took must not leave a runner
+
+/** A workspaceState stand-in for a tracker built inside this suite. */
+function memento(): vscode.Memento {
+  const values = new Map<string, unknown>();
+  return {
+    keys: () => [...values.keys()],
+    get: (<T>(key: string, fallback?: T) => (values.has(key) ? (values.get(key) as T) : fallback)) as vscode.Memento["get"],
+    update: async (key: string, value: unknown) => {
+      values.set(key, value);
+    },
+  };
+}
+
+/**
+ * The other half of the same defect: what must happen when a command *is*
+ * handed to an occupied shell.
+ *
+ * Handing `shellIntegration.executeCommand` a command line writes that line
+ * into the terminal; it does not guarantee that the shell runs it. When the
+ * shell is not at a prompt the text goes to whatever is reading stdin — and
+ * the extension used to record a runner as live on the strength of the
+ * hand-over alone, which is what produced "a runner for this plan is alive in
+ * a terminal of this window" with no sparring process anywhere.
+ *
+ * The ownership boundary now keeps this from happening in the product, so the
+ * situation is built here on purpose: a real occupied terminal, and a tracker
+ * whose pool hands it out regardless. Nothing may be recorded as running, a
+ * reload must find nothing either, the terminal must never be written to
+ * again — and the engine must not have run.
+ */
+async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string): Promise<void> {
+  if (!(await shellIntegrationAvailable(reportedRepo))) {
+    console.log("integration: shell integration unavailable in this host; false-runner scenario skipped");
+    return;
+  }
+  const terminal = vscode.window.createTerminal({ name: "user's own terminal (false-runner regression)", cwd: reportedRepo });
+  const integration = await shellIntegrationFor(terminal, 8000);
+  if (!integration) {
+    terminal.dispose();
+    console.log("integration: shell integration did not activate for a plain terminal; false-runner scenario skipped");
+    return;
+  }
+  const typed = path.join(fixtureRoot, "typed-into-the-bypassed-terminal.txt");
+  const argvLog = path.join(fixtureRoot, "fake-argv.log");
+  await fs.rm(typed, { force: true });
+  await fs.rm(argvLog, { force: true });
+  occupy(terminal, typed);
+  await new Promise((resolve) => setTimeout(resolve, 2000)); // let the occupant take the foreground
+
+  let retired = false;
+  const lease: TerminalLease = {
+    terminal,
+    release: () => undefined,
+    discard: () => undefined,
+    retire: () => {
+      retired = true;
+    },
+  };
+  const pool = { acquire: () => lease } as unknown as TerminalPool;
+  const logged: string[] = [];
+  const tracker = new ExecutionTracker({ workspaceState: memento() } as unknown as vscode.ExtensionContext, (message) => logged.push(message), () => [], pool);
+  const runId = "false-runner-regression";
+  try {
+    const result = await tracker.launch({
+      configured: vscode.workspace.getConfiguration("agentSparring").get<string>("executable", ""),
+      args: ["run-plan", "plans/never-executed.md", "--repo-root", reportedRepo],
+      cwd: reportedRepo,
+      name: "false-runner regression",
+      runId,
+      kind: "run-plan",
+      reveal: false,
+    });
+    assert.equal(result.ok, false, "a command the shell never started is not a launch");
+    assert.equal(result.ok ? undefined : result.problem, "not-started", "and it is not reported as a configuration problem");
+    assert.match(result.ok ? "" : result.error, /never reported the command as started/);
+    assert.equal(tracker.executionFor(runId), undefined, "no runner record survives it: not running, not even ended");
+    assert.equal(tracker.hostingTerminal(runId), undefined);
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.deepEqual(tracker.persisted(), [], "and a window reload would find no live runner either");
+    assert.equal(retired, true, "the terminal is never written to again");
+    assert.equal(terminal.exitStatus, undefined, "while the user's command is left alone, not interrupted");
+    assert.ok(
+      !(await fs.stat(argvLog).then(() => true, () => false)),
+      "the engine never ran: the fake sparring recorded no argv",
+    );
+    // The receipt for what actually happened to the command line: it was
+    // typed into the process that held the shell. That is the defect this
+    // extension must never turn into a live runner.
+    const received = await fs.readFile(typed, "utf8").catch(() => "");
+    console.log(`integration: the bypassed terminal's occupant received ${JSON.stringify(received.trim().slice(0, 80))}`);
+    assert.ok(
+      logged.some((line) => /did not start it/.test(line)),
+      `the log says what happened, got ${JSON.stringify(logged)}`,
+    );
+  } finally {
+    tracker.dispose();
+    terminal.dispose();
+  }
+  console.log("integration: a command handed to an occupied shell leaves no live-runner record, no persisted launch, and no further writes to that terminal");
 }
 
 // ---------------------------------------------------------------- the terminal closed mid-run

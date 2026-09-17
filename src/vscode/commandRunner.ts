@@ -24,7 +24,8 @@
 import { execFile } from "node:child_process";
 import type { CommandOutcome } from "../core/acceptance";
 import { executableWord, planExecutable, type ExecutablePlan } from "../core/cli";
-import { awaitExecutionEnd, awaitShellIntegration, executeThroughShell, hostEnv } from "./shellIntegration";
+import type { LaunchProblem } from "./executionTracker";
+import { awaitExecutionEnd, awaitShellIntegration, executeThroughShell, hostEnv, watchExecutions } from "./shellIntegration";
 import { collectOutput } from "./terminalOutput";
 import type { TerminalPool } from "./terminalPool";
 
@@ -39,7 +40,7 @@ export interface RunCommandOptions {
   name: string;
 }
 
-export type RunCommandResult = { ok: true; outcome: CommandOutcome; via: "shell" | "process"; plan: ExecutablePlan } | { ok: false; error: string; problem: "configured-invalid" | "unresolvable" };
+export type RunCommandResult = { ok: true; outcome: CommandOutcome; via: "shell" | "process"; plan: ExecutablePlan } | { ok: false; error: string; problem: LaunchProblem };
 
 export class SparringCommandRunner {
   constructor(
@@ -56,20 +57,36 @@ export class SparringCommandRunner {
     if (!configured.ok) {
       return { ok: false, error: configured.error, problem: configured.problem };
     }
-    // The project's own terminal, for as long as this command runs.
+    // The project's own terminal, for as long as this command runs — and only
+    // when its shell is idle, never one the user is working in.
     const lease = this.terminals.acquire(options.cwd);
     const integration = await awaitShellIntegration(lease.terminal);
     const word = executableWord(configured.plan);
+    const watch = integration ? watchExecutions(lease.terminal) : undefined;
     const request = integration ? executeThroughShell(integration, word, options.args) : undefined;
-    if (request) {
+    if (request && watch) {
       lease.terminal.show(true);
       const output = collectOutput(request.execution);
+      if ((await watch.settle(request.execution)) === "never") {
+        // The shell never took it. Running it again without a shell could run
+        // it twice — the written line may still be read later by whatever is
+        // in that terminal — and freeze-candidate and accept-candidate are
+        // not commands to risk twice. So this is reported, not retried.
+        lease.retire();
+        this.log(`${options.name}: the shell in "${lease.terminal.name}" never started the command; nothing was run`);
+        return {
+          ok: false,
+          error: `${word} was written to the terminal "${lease.terminal.name}" but its shell never reported the command as started, so ${options.name} did not run. That terminal is running something else; check it, then try again — Agent Sparring will use a new terminal.`,
+          problem: "not-started",
+        };
+      }
       const exitCode = await awaitExecutionEnd(request.execution, lease.terminal);
       const text = await output;
       lease.release();
       this.log(`ran ${options.name} via shell integration (${word}, ${options.args.length} args${request.quotedHere ? ", command line quoted here" : ""}, cwd ${options.cwd}); exit ${exitCode === undefined ? "unknown" : exitCode}`);
       return { ok: true, outcome: { exitCode, output: text, resolvedBy: configured.plan.kind === "shell" ? "shell" : "path" }, via: "shell", plan: configured.plan };
     }
+    watch?.cancel();
     if (integration) {
       lease.release();
     } else {

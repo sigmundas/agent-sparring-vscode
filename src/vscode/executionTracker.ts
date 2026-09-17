@@ -37,11 +37,11 @@ import { findDescendant } from "../core/processTree";
 import { probeRunnerProcesses, type RunnerProbe } from "../core/runnerProcesses";
 import { commandLineRuns, matchSparringCommand, parseSparringCommand, type SparringSubcommand } from "../core/sparringCommand";
 import { listProcesses, processProbeSupported } from "./processProbe";
-import { awaitShellIntegration, executeThroughShell, hostEnv, SHELL_INTEGRATION_TIMEOUT_MS } from "./shellIntegration";
+import { awaitShellIntegration, EXECUTION_START_TIMEOUT_MS, executeThroughShell, hostEnv, SHELL_INTEGRATION_TIMEOUT_MS, watchExecutions } from "./shellIntegration";
 import { collectOutput } from "./terminalOutput";
 import type { TerminalLease, TerminalPool } from "./terminalPool";
 
-export { SHELL_INTEGRATION_TIMEOUT_MS };
+export { EXECUTION_START_TIMEOUT_MS, SHELL_INTEGRATION_TIMEOUT_MS };
 
 const LAUNCHES_KEY = "agentSparring.launches";
 /** After a reload, how long reconnected terminals get to appear before a recorded launch is declared gone. */
@@ -64,7 +64,14 @@ export interface LaunchOptions {
   reveal: boolean;
 }
 
-export type LaunchResult = { ok: true; record: ExecutionRecord; via: "shell" | "terminal" } | { ok: false; error: string; problem: ExecutableProblem };
+/**
+ * Why a command could not be launched. `not-started` is not a configuration
+ * problem and must never be reported as one: the executable was resolved and
+ * the terminal was there — the shell simply never took the command.
+ */
+export type LaunchProblem = ExecutableProblem | "not-started";
+
+export type LaunchResult = { ok: true; record: ExecutionRecord; via: "shell" | "terminal" } | { ok: false; error: string; problem: LaunchProblem };
 
 /** The shell reported that the launched command word does not exist. */
 export interface CommandNotFound {
@@ -231,6 +238,16 @@ export class ExecutionTracker implements vscode.Disposable {
       .map((launch) => ({ runId: launch.runId, state: launch.ended ? ("ended" as const) : ("running" as const) }));
   }
 
+  /**
+   * The name of the terminal hosting this run's live execution, when this
+   * window launched or observed one. Which terminal a runner is in is part of
+   * what the ownership boundary promises, so the integration tests can read
+   * it; nothing in the UI claims anything from it.
+   */
+  hostingTerminal(runId: string): string | undefined {
+    return this.liveItemFor(runId)?.terminal?.name;
+  }
+
   /** Send Ctrl-C to the exact terminal hosting this run's live execution. */
   stop(runId: string): boolean {
     const item = this.liveItemFor(runId);
@@ -296,29 +313,43 @@ export class ExecutionTracker implements vscode.Disposable {
       this.log(`refused to launch ${options.name}: ${configured.error}`);
       return { ok: false, error: configured.error, problem: configured.problem };
     }
-    // This project's terminal, reused when it is idle: a plan run is a long
-    // series of commands and each one used to leave a dead tab behind.
+    // This project's terminal, reused only when its shell is genuinely idle:
+    // a plan run is a long series of commands and each one used to leave a
+    // dead tab behind, but a terminal someone else is using is never written
+    // to (terminalPool.ts).
     const lease = this.terminals.acquire(options.cwd);
     if (options.reveal) {
       lease.terminal.show(true);
     }
     const integration = await awaitShellIntegration(lease.terminal);
     const word = executableWord(configured.plan);
+    // Listening starts before the hand-over: the shell may report the command
+    // as started in the same tick, and that report is the only thing that
+    // distinguishes a launch from a line of text written into a terminal.
+    const watch = integration ? watchExecutions(lease.terminal) : undefined;
     const request = integration ? executeThroughShell(integration, word, options.args) : undefined;
-    if (request) {
-      this.dropEnded(options.runId);
+    if (request && watch) {
       const item = this.track(options, "launched", lease.terminal, request.execution);
       item.word = word;
       item.plan = configured.plan;
       item.lease = lease;
+      // Must be read immediately after the hand-over or output is lost.
       item.output = collectOutput(request.execution);
+      const established = await watch.settle(request.execution);
+      if (established === "never") {
+        return this.launchNeverStarted(item, lease, options, word);
+      }
+      // Only now is there a runner: earlier ended executions of this run may
+      // be dropped, and the record may be shown and persisted as running.
+      this.dropEnded(options.runId, item.record.id);
       this.log(
-        `launched ${options.name} via shell integration (${configured.plan.kind === "shell" ? `'${word}' resolved by the shell` : word}, ${options.args.length} args${request.quotedHere ? ", command line quoted here" : ""}, cwd ${options.cwd})`,
+        `launched ${options.name} via shell integration (${configured.plan.kind === "shell" ? `'${word}' resolved by the shell` : word}, ${options.args.length} args${request.quotedHere ? ", command line quoted here" : ""}, cwd ${options.cwd}; the shell reported it ${established === "started" ? "started" : established})`,
       );
       void this.persistWithPid(item, lease.terminal);
       this.changeEmitter.fire("started");
       return { ok: true, record: item.record, via: "shell" };
     }
+    watch?.cancel();
     if (integration) {
       // The shell is fine, it just cannot carry this command line; keep it.
       this.log(`${options.name}: this shell's quoting cannot be written safely, so the engine is run without a shell`);
@@ -369,12 +400,38 @@ export class ExecutionTracker implements vscode.Disposable {
     return item;
   }
 
-  private dropEnded(runId: string): void {
+  private dropEnded(runId: string, except?: string): void {
     for (const [id, item] of this.tracked) {
-      if (item.record.runId === runId && item.record.state === "ended") {
+      if (item.record.runId === runId && item.record.state === "ended" && id !== except) {
         this.tracked.delete(id);
       }
     }
+  }
+
+  /**
+   * The shell was handed a command line and never reported a command.
+   *
+   * `executeCommand` writes the line into the terminal, so this is what a
+   * shell that was not at a prompt looks like: the text went to whatever was
+   * reading stdin, and nothing was launched. A record here would be the
+   * reported defect — "a runner for this plan is alive in a terminal of this
+   * window" for a process that never existed — so the record is removed
+   * rather than ended: this window watched no execution, and liveness falls
+   * back to what it can actually establish (telemetry, or the process
+   * table).
+   *
+   * The terminal is retired, not closed and not interrupted: whatever is
+   * running in it belongs to the user. The command line may be sitting
+   * unread in it, which is exactly what the message says.
+   */
+  private launchNeverStarted(item: Tracked, lease: TerminalLease, options: LaunchOptions, word: string): LaunchResult {
+    this.tracked.delete(item.record.id);
+    lease.retire();
+    const error = `${word} was written to the terminal "${lease.terminal.name}" but its shell never reported the command as started, so no engine process was launched. That terminal is running something else; check it, then run the command again — Agent Sparring will use a new terminal.`;
+    this.log(`could not launch ${options.name}: the shell in "${lease.terminal.name}" did not start it within ${EXECUTION_START_TIMEOUT_MS} ms; nothing is recorded as running and that terminal will not be used again`);
+    void this.persist();
+    this.changeEmitter.fire("changed");
+    return { ok: false, error, problem: "not-started" };
   }
 
   // ---------------------------------------------------------------- shell integration events

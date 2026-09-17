@@ -36,6 +36,101 @@ export function awaitShellIntegration(terminal: vscode.Terminal, timeoutMs = SHE
   });
 }
 
+/** How long the shell gets to report that a handed-over command actually started. */
+export const EXECUTION_START_TIMEOUT_MS = 5000;
+
+/**
+ * What became of a command line handed to a shell:
+ *
+ *  - `started` — the shell reported it as a command of its own. Only this
+ *    means the engine is running;
+ *  - `ended`   — it had already finished by the time we looked, which is the
+ *    same guarantee arriving late;
+ *  - `closed`  — the terminal went away, which ends it honestly;
+ *  - `never`   — the shell reported nothing. `executeCommand` writes the
+ *    line into the terminal, so this is what a shell that was not at a
+ *    prompt looks like: the text went to whatever was reading stdin. Nothing
+ *    was launched, and nothing may be recorded as running.
+ */
+export type Establishment = "started" | "ended" | "closed" | "never";
+
+export interface ExecutionWatch {
+  /** How the execution handed to the shell settled. */
+  settle(execution: vscode.TerminalShellExecution, timeoutMs?: number): Promise<Establishment>;
+  /** Stop listening without asking about any execution. */
+  cancel(): void;
+}
+
+/**
+ * Start listening for shell-execution events in `terminal` *before* a command
+ * is handed to it, so a start event that arrives immediately is not missed.
+ * `settle` may then be called with the execution the shell was given.
+ */
+export function watchExecutions(terminal: vscode.Terminal): ExecutionWatch {
+  const started = new Set<vscode.TerminalShellExecution>();
+  const ended = new Set<vscode.TerminalShellExecution>();
+  let closed = false;
+  let waiting: { execution: vscode.TerminalShellExecution; resolve: (value: Establishment) => void } | undefined;
+  const settleNow = (value: Establishment) => {
+    const pending = waiting;
+    waiting = undefined;
+    pending?.resolve(value);
+  };
+  const listeners = [
+    vscode.window.onDidStartTerminalShellExecution((event) => {
+      if (event.terminal !== terminal) {
+        return;
+      }
+      started.add(event.execution);
+      if (waiting?.execution === event.execution) {
+        settleNow("started");
+      }
+    }),
+    vscode.window.onDidEndTerminalShellExecution((event) => {
+      if (event.terminal !== terminal) {
+        return;
+      }
+      ended.add(event.execution);
+      if (waiting?.execution === event.execution) {
+        settleNow("ended");
+      }
+    }),
+    vscode.window.onDidCloseTerminal((candidate) => {
+      if (candidate === terminal) {
+        closed = true;
+        settleNow("closed");
+      }
+    }),
+  ];
+  const stop = () => {
+    for (const listener of listeners.splice(0)) {
+      listener.dispose();
+    }
+  };
+  return {
+    cancel: stop,
+    settle: (execution, timeoutMs = EXECUTION_START_TIMEOUT_MS) =>
+      new Promise<Establishment>((resolve) => {
+        if (started.has(execution)) {
+          resolve("started");
+        } else if (ended.has(execution)) {
+          resolve("ended");
+        } else if (closed) {
+          resolve("closed");
+        } else {
+          const timer = setTimeout(() => settleNow("never"), timeoutMs);
+          waiting = {
+            execution,
+            resolve: (value) => {
+              clearTimeout(timer);
+              resolve(value);
+            },
+          };
+        }
+      }).finally(stop),
+  };
+}
+
 /** Resolves with the exit code when `execution` ends (undefined when the shell reported none). */
 export function awaitExecutionEnd(execution: vscode.TerminalShellExecution, terminal: vscode.Terminal): Promise<number | undefined> {
   return new Promise((resolve) => {

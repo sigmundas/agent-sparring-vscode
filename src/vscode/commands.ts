@@ -10,7 +10,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { acceptStage, type AcceptStageResult } from "../core/acceptance";
-import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, readGitBranch, type ExecutableProblem } from "../core/cli";
+import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, readGitBranch } from "../core/cli";
 import {
   BINDING_VERSION,
   adoptionGaps,
@@ -60,7 +60,7 @@ import type { ManifestRepository } from "../core/manifest";
 import { STAGE_MODES_KEY, STAGE_MODE_LABELS, STAGE_MODES, modesForPlan, type StageMode, type StageModes } from "../core/stageModes";
 import { withTemporaryFile } from "../core/tempFile";
 import type { SparringController } from "./controller";
-import type { EngineFailure, LaunchResult } from "./executionTracker";
+import type { EngineFailure, LaunchProblem, LaunchResult } from "./executionTracker";
 import { outputTail } from "./terminalOutput";
 import { currentBranch, knownRepositories, pendingChanges } from "./git";
 import { manifestSupport } from "./engineProbe";
@@ -106,6 +106,10 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     // What a window reload would find: the launches recorded in workspaceState,
     // including the ones already known to have ended.
     vscode.commands.registerCommand("agentSparring._test.persistedLaunches", () => controller.persistedLaunches()),
+    // The terminal-ownership boundary: which terminals the extension owns,
+    // which of them may be written to, and where a run's runner actually is.
+    vscode.commands.registerCommand("agentSparring._test.ownedTerminals", () => controller.ownedTerminals()),
+    vscode.commands.registerCommand("agentSparring._test.hostingTerminal", (runId: string) => controller.hostingTerminal(runId)),
     vscode.commands.registerCommand("agentSparring._test.acceptStage", async () => {
       const run = controller.currentSelection.selected;
       return run?.kind === "stage" ? performAcceptStage(controller, run) : undefined;
@@ -659,7 +663,7 @@ async function performAcceptStage(controller: SparringController, run: Standalon
   const invocation = { stageId: run.stage.stageId, repoRoot, expectedBranch, sparringDir: run.location.sparringDir };
   controller.setAccepting(run.id, true);
   controller.log(`Accept stage ${run.stage.stageId}: freeze-candidate, then accept-candidate (branch ${expectedBranch})`);
-  let problem: { error: string; problem: ExecutableProblem } | undefined;
+  let problem: { error: string; problem: LaunchProblem } | undefined;
   try {
     const result = await acceptStage(async (args) => {
       const outcome = await controller.runCommand({ configured: configuredExecutable(), args, cwd: repoRoot, name: `Accept stage: ${run.stage.stageId}` });
@@ -670,7 +674,7 @@ async function performAcceptStage(controller: SparringController, run: Standalon
       return outcome.outcome;
     }, invocation);
     if (problem) {
-      await explainExecutableProblem(problem.error);
+      await explainCommandProblem(problem.error, problem.problem);
       return undefined;
     }
     if (result.ok) {
@@ -1348,7 +1352,25 @@ function configuredExecutable(): string {
 
 async function explainLaunch(result: LaunchResult): Promise<void> {
   if (!result.ok) {
-    await explainExecutableProblem(result.error);
+    await explainCommandProblem(result.error, result.problem);
+  }
+}
+
+/**
+ * A failed command is reported as what it was. A configuration problem gets
+ * the settings dialog; a command the shell never started is not a
+ * configuration problem at all — the executable was found and the terminal
+ * was there — so it gets the plain reason and the log, and no advice about
+ * PATH.
+ */
+async function explainCommandProblem(error: string, problem: LaunchProblem): Promise<void> {
+  if (problem !== "not-started") {
+    await explainExecutableProblem(error);
+    return;
+  }
+  const choice = await vscode.window.showErrorMessage(`Agent Sparring: ${error}`, "Show Log");
+  if (choice === "Show Log") {
+    await vscode.commands.executeCommand("agentSparring.showLog");
   }
 }
 
@@ -1616,7 +1638,7 @@ async function performStartNextStage(controller: SparringController, overview: O
     }
   }
   controller.log(`Start next stage: sparring new-stage ${proposal.stageId} --brief-file <temporary copy of ${planName} › ${proposal.display}>`);
-  let problem: string | undefined;
+  let problem: { error: string; problem: LaunchProblem } | undefined;
   // The brief travels through a temporary file outside the workspace; the
   // engine reads it and writes brief.md. The file is removed afterwards.
   const result: NewStageResult = await withTemporaryFile(rendered.brief, `${proposal.stageId}.md`, (briefFile) =>
@@ -1624,7 +1646,7 @@ async function performStartNextStage(controller: SparringController, overview: O
       async (args) => {
         const outcome = await controller.runCommand({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: `New stage: ${proposal.stageId}` });
         if (!outcome.ok) {
-          problem = outcome.error;
+          problem = { error: outcome.error, problem: outcome.problem };
           return { exitCode: undefined, output: outcome.error };
         }
         return outcome.outcome;
@@ -1633,8 +1655,8 @@ async function performStartNextStage(controller: SparringController, overview: O
     ),
   );
   if (problem) {
-    await explainExecutableProblem(problem);
-    return { ok: false, reason: "executable", message: problem };
+    await explainCommandProblem(problem.error, problem.problem);
+    return { ok: false, reason: "executable", message: problem.error };
   }
   if (!result.ok) {
     controller.log(`Start next stage: new-stage failed — ${result.message}`);

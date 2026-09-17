@@ -386,12 +386,30 @@ Deleting `activity.jsonl` removes the live decoration and nothing else.
 
 There is **one reusable terminal per project**, `Agent Sparring — <project>`.
 Run stage, Accept stage, run-plan and every resume-plan of a long managed run
-share it, so a plan does not leave a row of dead tabs behind. It is leased for
-the duration of each command: a terminal that is busy is never sent a second
-one (a second terminal is opened instead), a terminal you closed is replaced,
-and projects never share one. Only terminals the extension opened are ever
-written to — a command you type in your own terminal is observed, never
-interrupted.
+share it, so a plan does not leave a row of dead tabs behind. A terminal is
+reused only while its shell is idle, and "idle" is decided from the shell,
+not from the extension's own bookkeeping: every shell execution in the
+terminals the extension owns is watched (`onDidStartTerminalShellExecution` /
+`onDidEndTerminalShellExecution`), whoever started it. So if you start an
+interactive CLI — `claude`, a long test run — in `Agent Sparring — <project>`
+after a command has finished, the next engine command opens
+`Agent Sparring — <project> (2)` instead. Your terminal is not written to and
+your command is not interrupted; the extension never sends it Ctrl-C, and
+never leaves an engine command sitting in your prompt.
+
+The same holds for a terminal whose occupancy cannot be established: one
+whose shell integration never reported, or one VS Code restored after a
+window reload (nothing in the new window saw what has been running in it). A
+fresh terminal is opened rather than an idle shell assumed. A terminal you
+closed is replaced, and projects never share one. Only terminals the
+extension opened are ever written to — a command you type in your own
+terminal is observed, never interrupted.
+
+Handing a command to a shell is not the same as the shell running it. A
+launch is recorded as a runner only once the shell reports the command as
+started (within 5 s); if it never does, nothing is recorded as live, that
+terminal is not used again, and the failure is reported as what it is — not
+as a missing executable.
 
 Terminal identity is not liveness. Every shell execution is tracked
 separately, so a finished command can never keep the Overview `Running`
@@ -572,7 +590,7 @@ Liveness sources, most exact first:
 
 | Source | How it is observed | Ends when |
 | --- | --- | --- |
-| Launched from the extension | This project's integrated terminal (your normal shell, cwd = project) runs `sparring` through the terminal shell-integration API with an argument array (see "Free-text arguments" for the one case that is quoted here instead). | The shell-execution end event fires (normal exit, non-zero exit, Ctrl-C), another command starts in that terminal, or the terminal closes. |
+| Launched from the extension | This project's integrated terminal (your normal shell, cwd = project — only when its shell is idle) runs `sparring` through the terminal shell-integration API with an argument array (see "Free-text arguments" for the one case that is quoted here instead). Recorded as a runner only once the shell reports the command started; a command the shell never took records nothing. | The shell-execution end event fires (normal exit, non-zero exit, Ctrl-C), another command starts in that terminal, or the terminal closes. |
 | Dedicated terminal (fallback) | Only if shell integration does not activate within 5 s: a terminal whose process *is* `sparring` (argument array, no shell). | That terminal closes, which VS Code does as soon as the process exits. |
 | Typed in an integrated terminal | Shell integration reports the command line and cwd; `sparring run-loop <stage>`, `run-plan` and `resume-plan` are recognised and tied to the project by `--repo-root` / `--sparring-dir` / cwd (nested projects match their own root). | Same as a launched command. |
 | Re-found after a window reload | Launches are recorded in `workspaceState`; after a reload the hosting terminal is re-found by process id and, on macOS/Linux, a `ps` probe checks that the runner still runs under it. | The probe no longer finds it, or a shell execution starts/ends in that terminal. On Windows the state stays `unknown`. |
