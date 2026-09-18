@@ -88,6 +88,7 @@ export async function run(): Promise<void> {
     ["launchable", () => launchTargetAssertions(fixtureRoot, reportedRepo)],
     ["declarations", () => declarationScopeAssertions(reportedRepo, fixtureRoot)],
     ["outlives", () => directExecutionOutlivesTheWindowAssertions()],
+    ["settings", () => settingsAssertions(report, reportedRepo)],
   ];
   const only = (process.env.AGENT_SPARRING_IT_ONLY ?? "").split(",").map((name) => name.trim()).filter(Boolean);
   for (const [name, section] of sections) {
@@ -256,6 +257,14 @@ interface ModelReport {
   continueAutomatically?: { label: string; kind: string };
   plan?: { source: string; name: string; current?: string; matched?: string; next?: { display: string; line: number; summary?: string } };
   whatsNext?: { kind: string; heading?: string; summary?: string; text: string; hints?: string[]; start?: { stageId: string; label: string } };
+  agentConfig?: { lines: { role: string; text: string; detail: string }[]; configPath?: string; configExists?: boolean; note?: string; settings: { label: string; detail: string } };
+}
+
+interface SettingsOutcome {
+  opened?: string;
+  offered?: boolean;
+  created?: boolean;
+  problem?: string;
 }
 
 interface StartOutcome {
@@ -2515,6 +2524,75 @@ function gateSparring(): string {
 }
 
 // ---------------------------------------------------------------- helpers
+
+// ---------------------------------------------------------------- Settings: the project's own project.toml, created by the engine
+
+/**
+ * Settings is a door to a file, not a settings editor.
+ *
+ * What this proves end to end: the door points at the repository the
+ * cockpit is actually in; a missing file offers creation rather than
+ * silently doing nothing; the file that appears was written by the engine's
+ * own `init-config` (it shows up in the engine call log, and the extension
+ * has no template of its own to write); and the Agents line the Overview
+ * then shows is the engine's answer about that same file.
+ */
+async function settingsAssertions(report: DiscoveryDiagnostic, reportedRepo: string): Promise<void> {
+  const model = async () => (await vscode.commands.executeCommand("agentSparring._test.overviewModel")) as ModelReport;
+  const settings = async (create?: boolean) => (await vscode.commands.executeCommand("agentSparring._test.openSettings", create)) as SettingsOutcome;
+  const callsLog = path.join(reportedRepo, ".sparring", "fake-calls.log");
+  const configPath = path.join(reportedRepo, ".sparring", "project.toml");
+  await fs.rm(configPath, { force: true });
+
+  const runId = runIdOf(report, reportedRepo, "stage-review-complete");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+
+  // Nothing there yet: creation is offered, and declining writes nothing.
+  await fs.rm(callsLog, { force: true });
+  const declined = await settings(false);
+  assert.deepEqual([declined.offered, declined.opened, declined.created], [true, undefined, undefined]);
+  assert.equal(await fs.readFile(callsLog, "utf8").catch(() => ""), "", "declining runs no engine command");
+  assert.equal(await fs.access(configPath).then(() => true, () => false), false, "and creates no file");
+
+  // Accepting runs the engine's init-config and opens what it wrote.
+  const created = await settings(true);
+  assert.deepEqual([created.offered, created.created, created.opened], [true, true, configPath], `creation outcome: ${JSON.stringify(created)}`);
+  assert.deepEqual((await fs.readFile(callsLog, "utf8")).trim().split("\n"), ["init-config"], "exactly one engine command, and it is the engine's own template command");
+  assert.equal(vscode.window.activeTextEditor?.document.uri.fsPath, configPath, "the file the engine wrote is the file on screen");
+
+  const written = await fs.readFile(configPath, "utf8");
+  assert.match(written, /\[agents\.stage\]/);
+  assert.match(written, /\[agents\.sparring\]/);
+  // The template states no model and no effort: a provider's internal
+  // default must not arrive in the file as if someone had chosen it.
+  assert.doesNotMatch(written, /^\s*model\s*=/m, "no model is invented");
+  assert.doesNotMatch(written, /^\s*effort\s*=/m, "no effort is invented");
+
+  // Opening again with the file present just opens it: no offer, no engine.
+  await fs.rm(callsLog, { force: true });
+  const reopened = await settings();
+  assert.deepEqual([reopened.opened, reopened.offered, reopened.created], [configPath, undefined, undefined]);
+  assert.equal(await fs.readFile(callsLog, "utf8").catch(() => ""), "", "opening an existing file runs nothing");
+
+  // The Overview now reports the engine's answer about that same file.
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  const shown = await model();
+  assert.equal(shown.agentConfig?.settings.label, "Settings");
+  assert.equal(shown.agentConfig?.configPath, configPath, "the configuration shown is this repository's");
+  assert.equal(shown.agentConfig?.configExists, true);
+  assert.deepEqual(
+    shown.agentConfig?.lines.map((line) => [line.role, line.text]),
+    [
+      ["Stage agent", "Claude · provider default"],
+      ["Sparrer", "Codex · provider default"],
+    ],
+    "an unset model reads as the provider's default, never as an invented name",
+  );
+
+  await fs.rm(configPath, { force: true });
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  console.log("integration: Settings opened this repository's project.toml, offered creation when absent, created it with the engine's own init-config and displayed the engine's effective configuration");
+}
 
 function runIdOf(report: DiscoveryDiagnostic, repo: string, stage: string): string {
   const id = report.runs.find((run) => run.id.startsWith(`${repo}|`) && run.id.endsWith(`stage:${stage}`))?.id;

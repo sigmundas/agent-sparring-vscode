@@ -16,7 +16,7 @@
 import { ACTIVE_CONTEXT_HEADLINE, FOLLOW_ACTIVE_LABEL, SELECT_RUN_LABEL } from "./activeRepository";
 import { CHECK_OUTCOMES, isCheckKey, type CheckItem, type CheckOutcome } from "./humanChecks";
 import { checkName, humanTask, splitPassCriteria } from "./humanTask";
-import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type PushAuthorization, type TimelineItem, type WhatsNext } from "./overviewModel";
+import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type AgentConfigSection, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type PushAuthorization, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { MatchSource } from "./planAssociation";
 import type { PromptView, PromptViewSection } from "./promptInspector";
 import type { StageRunAction } from "./runner";
@@ -49,7 +49,8 @@ export type OverviewAction =
   | "dismissSubmissionFailure"
   | "confirmRunnerInactive"
   | "allowPush"
-  | "doNotAllowPush";
+  | "doNotAllowPush"
+  | "openSettings";
 
 /** A Pass / Fail / Can't test click or a note edit on one manual check, posted by the webview as it happens. */
 export interface HumanCheckMessage {
@@ -231,6 +232,7 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "confirmRunnerInactive",
   "allowPush",
   "doNotAllowPush",
+  "openSettings",
 ];
 
 const ACTIONS: ReadonlySet<string> = new Set<string>(OVERVIEW_ACTIONS);
@@ -280,6 +282,7 @@ const ICON: Record<string, string> = {
   pause: '<path d="M5.5 4.5v7M10.5 4.5v7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>',
   lock: '<rect x="3.5" y="7" width="9" height="7" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5.5 7V5a2.5 2.5 0 015 0v2" fill="none" stroke="currentColor" stroke-width="1.4"/>',
   pin: '<path d="M6 1.5h4l-.6 4 2.1 2.4H4.5L6.6 5.5z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 7.9v6.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>',
+  gear: '<circle cx="8" cy="8" r="2.3" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8 1.6v1.8M8 12.6v1.8M1.6 8h1.8M12.6 8h1.8M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>',
 };
 
 function icon(name: keyof typeof ICON, cls = ""): string {
@@ -295,6 +298,7 @@ function renderBody(model: OverviewModel): string {
     return `${renderRepositoryContext(model)}
 <header class="top"><div><h1>Agent Sparring</h1><div class="run muted">${escapeHtml(model.title)}</div></div></header>
 ${(model.emptyLines ?? []).map((line) => `<p class="muted">${escapeHtml(line)}</p>`).join("\n")}
+${model.agentConfig ? renderAgentConfig(model.agentConfig) : ""}
 <div class="actions">${button("runPlan", "Run plan…")}${button("showLog", "Show log")}</div>`;
   }
   if (model.kind === "ambiguous") {
@@ -332,6 +336,9 @@ ${(model.emptyLines ?? []).map((line) => `<p class="muted">${escapeHtml(line)}</
   parts.push(renderStageCard(model));
   if (model.stageAgent && model.sparrer) {
     parts.push(`<section class="actors">${renderActor(model.stageAgent)}${renderActor(model.sparrer)}</section>`);
+  }
+  if (model.agentConfig) {
+    parts.push(renderAgentConfig(model.agentConfig));
   }
   if (model.history && model.history.length > 0) {
     const rows = model.history
@@ -1190,6 +1197,29 @@ function capitalize(word: string): string {
   return word.charAt(0).toUpperCase() + word.slice(1);
 }
 
+/**
+ * What the next provider turn would run with, and the one way to change it.
+ *
+ * Every value here is the engine's answer as reported, down to the words
+ * "provider default": the cockpit does not name a model the engine did not
+ * name. A configuration error is shown as a note and the role lines are
+ * withheld rather than replaced by plausible-looking ones, and the section
+ * still offers Settings, because that is what a person needs at exactly
+ * that moment. There are no inline model or effort controls: the file is
+ * the edit surface.
+ */
+function renderAgentConfig(section: AgentConfigSection): string {
+  const rows = section.lines
+    .map(
+      (line) =>
+        `<div class="agentconfig-role" title="${escapeHtml(line.detail)}"><span class="muted">${escapeHtml(line.role)}</span><span class="agentconfig-value">${escapeHtml(line.text)}</span></div>`,
+    )
+    .join("");
+  const note = section.note ? `<p class="muted note">${escapeHtml(section.note)}</p>` : "";
+  const settings = button("openSettings", section.settings.label, true, section.settings.detail, "quiet");
+  return `<section class="agentconfig"><div class="agentconfig-head"><h3>${icon("gear")}Agents</h3>${settings}</div>${rows}${note}</section>`;
+}
+
 function button(action: OverviewAction, label: string, enabled = true, title?: string, cls = ""): string {
   const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
   const classAttr = cls ? ` class="${cls}"` : "";
@@ -1331,6 +1361,15 @@ pre.engineerror { margin: 6px 0 0; padding: 6px 8px; max-height: 9em; overflow: 
 .pushchoice .toggle { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
 .pushchoice .toggle input { margin: 0; }
 .autopush { display: inline-flex; align-items: center; gap: 6px; margin: 0 0 8px; color: var(--good); font-weight: 600; }
+
+/* What the next turn would run with. Compact by design: the file is the editor. */
+.agentconfig { margin: 10px 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; }
+.agentconfig-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.agentconfig-head h3 { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-size: 0.95em; }
+.agentconfig-role { display: flex; align-items: baseline; gap: 8px; margin-top: 4px; font-size: 0.92em; }
+.agentconfig-role .muted { min-width: 8.5em; }
+.agentconfig-value { font-weight: 600; overflow-wrap: anywhere; }
+.agentconfig .note { margin: 6px 0 0; }
 
 /* The freeform channel: beside the checks, never inside one of them. */
 .feedback { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }

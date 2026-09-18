@@ -38,6 +38,10 @@ import { documentViewColumn } from "../../core/viewColumn";
 import type { SparringController } from "../controller";
 import { gitContext } from "../git";
 import { readHead as readFileHead } from "../fileHead";
+import { configuredExecutable } from "../engineExecutable";
+import { readEffectiveConfig } from "../configProbe";
+import { settingsTarget } from "../../core/settingsTarget";
+import type { EffectiveConfig } from "../../core/effectiveConfig";
 
 const VIEW_TYPE = "agentSparring.overview";
 
@@ -216,7 +220,11 @@ export class OverviewPanelManager implements vscode.Disposable {
    */
   private async gather(): Promise<{ model: OverviewModel; source: ReviewCopySource }> {
     const selection = this.controller.currentSelection;
-    let artifacts: OverviewArtifacts = { handoff: false, sparring: false, brief: false, plan: false };
+    // Asked of the engine for whichever repository the cockpit is in, run or
+    // no run, so the configuration on screen is the configuration of the
+    // project the rest of the screen describes.
+    const agentConfig = await this.agentConfig();
+    let artifacts: OverviewArtifacts = { handoff: false, sparring: false, brief: false, plan: false, agentConfig };
     let sparringText: string | undefined;
     let repository: string | undefined;
     if (selection.selected) {
@@ -256,10 +264,32 @@ export class OverviewPanelManager implements vscode.Disposable {
         existingStageIds: this.existingStageIds(run),
         guardedOperationId: this.controller.guardFor(run.id)?.id,
         autoPushDraft: this.controller.autoPushDraft(run.id),
+        agentConfig,
       };
     }
     const model = buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.executionFor(selection.selected?.id));
     return { model, source: { model, artifacts, sparringText, repository } };
+  }
+
+  /**
+   * What the engine says the next provider turn would run with.
+   *
+   * The extension asks rather than works it out: provider capabilities,
+   * precedence and the meaning of an omitted model all live in the engine
+   * (see core/effectiveConfig.ts). An engine that cannot answer produces a
+   * one-line note, never a crash and never a guess — a failure here must
+   * not take the rest of the Overview with it.
+   */
+  private async agentConfig(): Promise<EffectiveConfig | undefined> {
+    const target = settingsTarget(this.controller.currentSelection);
+    if (!target) {
+      return undefined;
+    }
+    try {
+      return await readEffectiveConfig(configuredExecutable(), target.projectDir, target.sparringDir);
+    } catch (error) {
+      return { kind: "unavailable", reason: `The agent configuration could not be read: ${error instanceof Error ? error.message : String(error)}` };
+    }
   }
 
   /**

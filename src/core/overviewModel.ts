@@ -19,6 +19,7 @@
  */
 
 import { describeRepositoryContext, emptyStateLines, emptyStateTitle, type RepositoryContextView } from "./activeRepository";
+import { agentConfigView, type AgentConfigView, type EffectiveConfig } from "./effectiveConfig";
 import { parseBriefGoal, parseBriefOpening } from "./brief";
 import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
@@ -265,6 +266,13 @@ export interface OverviewArtifacts {
    * when the click arrives.
    */
   guardedOperationId?: string;
+  /**
+   * What the engine says the two roles would run with, from
+   * `sparring show-config --json` (see core/effectiveConfig.ts). Supplied by
+   * the caller that can run the engine; absent when nothing asked. The
+   * extension never derives any of it from project.toml itself.
+   */
+  agentConfig?: EffectiveConfig;
 }
 
 /** The managed plan run the standalone stage on screen is a stage of. */
@@ -554,6 +562,16 @@ export interface PushAuthorization {
   technical: TechnicalDetail[];
 }
 
+/**
+ * The effective provider/model/effort for both roles, plus the one action
+ * that edits it. The values are the engine's answer verbatim; the Settings
+ * button opens the project's own `project.toml`, which remains the edit
+ * surface (there are deliberately no inline model or effort controls).
+ */
+export interface AgentConfigSection extends AgentConfigView {
+  settings: { label: string; detail: string };
+}
+
 export interface OverviewModel {
   kind: "empty" | "ambiguous" | "run";
   /** The plan the stage belongs to (managed run or associated file), for the header. */
@@ -684,7 +702,26 @@ export interface OverviewModel {
   /** Present only for an accepted stage. */
   whatsNext?: WhatsNext;
   actions?: OverviewActions;
+  /** Effective agent configuration and the Settings action; see AgentConfigSection. */
+  agentConfig?: AgentConfigSection;
   facts?: { label: string; value: string }[];
+}
+
+const SETTINGS_ACTION = {
+  label: "Settings",
+  detail: "Open this project's .sparring/project.toml, where the provider, model and effort for both roles are set.",
+};
+
+/**
+ * The section, or nothing at all.
+ *
+ * Nothing is shown when nobody asked the engine. When the engine answered,
+ * the Settings action is offered even if the answer was an error or a
+ * missing file — that is precisely when a person wants to open the file.
+ */
+function agentConfigSection(config: EffectiveConfig | undefined): AgentConfigSection | undefined {
+  const view = agentConfigView(config);
+  return view ? { ...view, settings: SETTINGS_ACTION } : undefined;
 }
 
 const NO_ARTIFACTS: OverviewArtifacts = { handoff: false, sparring: false, brief: false, plan: false };
@@ -706,7 +743,15 @@ export function buildOverviewModel(
         repositoryContext,
       };
     }
-    return { kind: "empty", title: emptyStateTitle(selection), emptyLines: emptyStateLines(selection), repositoryContext };
+    return {
+      kind: "empty",
+      title: emptyStateTitle(selection),
+      emptyLines: emptyStateLines(selection),
+      repositoryContext,
+      // A repository with no run yet is exactly where someone sets this up,
+      // so Settings is reachable before the first stage exists.
+      agentConfig: agentConfigSection(artifacts.agentConfig),
+    };
   }
   const run = selection.selected;
   const stage = currentStageOf(run);
@@ -738,6 +783,7 @@ export function buildOverviewModel(
       matchStage: run.kind === "stage" && plan?.source === "associated" && plan.hasHeadings,
       diff: diffAction(stage),
     },
+    agentConfig: agentConfigSection(artifacts.agentConfig),
     facts: facts(run, stage, artifacts.git, presentation, artifacts.associatedPlan, artifacts.siblingRepositories),
     goal: goal(artifacts, plan),
     activity: activityLine(live, halted, nowMs, uncertain),
