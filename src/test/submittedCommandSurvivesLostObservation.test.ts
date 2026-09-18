@@ -21,9 +21,22 @@
  *     nothing, saw the shell missing, and resolved the operation — admitting a
  *     duplicate run-loop over a live one.
  *
- * So: a closed terminal and a missing shell are loss of observation, the whole
- * process table is searched for the command itself, and a command that cannot
- * be found anywhere stays guarded until a person settles it.
+ * So: a closed terminal and a missing shell are loss of observation, and a
+ * command whose fate cannot be established stays guarded until a person
+ * settles it.
+ *
+ * The first repair of (B) searched the *whole process table* for the command
+ * line once the shell had gone, and adopted whatever matched as this
+ * operation's process. A later review of the same branch struck that out as
+ * unsafe in its own right: a matching command line can belong to another
+ * window, another repository, another invocation or a process older than the
+ * hand-over, and once the wrong process is adopted its exit releases our
+ * guard. So the repair is now the narrower one — ancestry under the live
+ * shell that was given the line is what ties a process to this hand-over, and
+ * an identity bound that way is followed safely afterwards, including through
+ * the shell dying and the engine being reparented. An operation whose process
+ * was never identified waits for a person. That distinction is what the
+ * halves of (B) assert here.
  *
  * And one thing from the same family on the way in: `executeCommand` returning
  * and then its own metadata failing to be read is not a failed hand-over.
@@ -98,6 +111,18 @@ const resolutions = (logged: string[]) => logged.filter((line) => /: resolved as
 
 const cwd = path.join(os.tmpdir(), "agent-sparring-submitted-shell");
 const engineWord = "/venv/bin/sparring";
+
+/**
+ * A birth time in the exact shape `ps -o lstart=` prints (`Thu Sep 18
+ * 11:12:13 2026`). Written from a real instant rather than a literal, because
+ * how a candidate's age compares with the operation's hand-over is part of
+ * what is under test.
+ */
+function psStart(atMs: number): string {
+  const at = new Date(atMs);
+  const [weekday, month, day] = at.toDateString().split(" ");
+  return `${weekday} ${month} ${day} ${at.toTimeString().slice(0, 8)} ${at.getFullYear()}`;
+}
 
 // ---------------------------------------------------------------------------
 // A. a short command over a reload, whose terminal then closes
@@ -197,7 +222,7 @@ describe("a short command handed to a shell keeps its guard when the terminal cl
         logged.some((line) => /may well have read that line before it went/.test(line)),
         `the log says why a missing shell is not an answer, got ${JSON.stringify(logged)}`,
       );
-      assert.ok(logged.some((line) => /no process in the table can be positively attributed/.test(line)), "and that the search for the command itself came back inconclusive");
+      assert.ok(logged.some((line) => /no process in the table can be tied to this hand-over/.test(line)), "and that nothing in the table can be tied to this hand-over any more");
 
       const refused = await runner.run({ configured: engineWord, args, cwd, name: "freeze-candidate (shell gone)", operation: { subcommand: "freeze-candidate", target: stage } });
       assert.equal(refused.ok, false, "a duplicate is refused while it is unknown");
@@ -208,16 +233,18 @@ describe("a short command handed to a shell keeps its guard when the terminal cl
     }
   });
 
-  it("3. the exact recorded invocation, found anywhere once the shell is gone, advances the guard to running", async () => {
+  it("3. the exact recorded invocation, found elsewhere once the shell is gone, is not adopted as this operation", async () => {
     const shellPid = 6400;
     const logged: string[] = [];
     const kept = store({ [OPERATIONS_KEY]: persisted(shellPid) });
-    // The shell ran the line and died; its child was reparented to pid 1. A
-    // short command carries no --repo-root, so the exact argument array
-    // recorded with the intent is the only thing that can recognise it.
-    let processes: ProcessInfo[] = [
+    // A process running byte-identically what this operation was given, with
+    // nothing tying it to this hand-over: the shell that took our line is
+    // gone, so there is no ancestry left to establish, and this may be
+    // another window's freeze-candidate, another invocation of ours, or a
+    // process that predates the line entirely.
+    const processes: ProcessInfo[] = [
       { pid: 1, ppid: 0, command: "/sbin/launchd" },
-      { pid: 6401, ppid: 1, command: `${engineWord} ${args.join(" ")}`, started: "Thu Sep 18 11:12:13 2026" },
+      { pid: 6401, ppid: 1, command: `${engineWord} ${args.join(" ")}`, started: psStart(Date.now() - 2000) },
     ];
     const registry: Registry = new OperationRegistry({ workspaceState: kept } as never, (message: string) => logged.push(message), () => true, async () => processes);
     try {
@@ -225,12 +252,60 @@ describe("a short command handed to a shell keeps its guard when the terminal cl
       await registry.probeAll();
 
       const held = registry.inFlightFor(key());
-      assert.equal(held?.state, "running-shell", "the command was found running, so the guard advances rather than lifting");
-      assert.equal(held?.enginePid, 6401, "anchored to the pid that is the operation");
-      assert.deepEqual(resolutions(logged), [], "nothing was resolved: it is running");
-      assert.ok(logged.some((line) => /no longer under the shell that took it/.test(line)), `the log says where it was found, got ${JSON.stringify(logged)}`);
+      assert.equal(held?.state, "submitted-shell", "a look-alike command line is not this operation's process");
+      assert.equal(held?.enginePid, undefined, "so no pid is bound to it, and no stranger's exit can release it");
+      assert.equal(held?.observationLost, true, "what was lost is the observation, and it stays lost");
+      assert.deepEqual(resolutions(logged), [], "and nothing was resolved either way");
+      assert.ok(
+        logged.some((line) => /no process in the table can be tied to this hand-over/.test(line) && /pid 6401 is running that command line/.test(line)),
+        `the log names the look-alike and says why it is not an answer, got ${JSON.stringify(logged)}`,
+      );
 
-      // From here that pid's own fate settles it, and nothing else does.
+      // Its disappearance is not evidence about our operation either.
+      processes.splice(1, 1);
+      await registry.probeAll();
+      assert.equal(registry.inFlightFor(key())?.state, "submitted-shell", "and that process going does not end ours");
+      assert.deepEqual(resolutions(logged), [], "nothing was resolved by a stranger's exit");
+    } finally {
+      registry.dispose();
+    }
+  });
+
+  it("3b. the same command under the live shell that took it is this operation, and stays bound when that shell dies", async () => {
+    const shellPid = 6450;
+    const logged: string[] = [];
+    const kept = store({ [OPERATIONS_KEY]: persisted(shellPid) });
+    const born = psStart(Date.now() - 1000);
+    // The shell that was given this line is alive, and the command is running
+    // as its child: that ancestry is what ties this process to this
+    // hand-over.
+    let processes: ProcessInfo[] = [
+      { pid: 1, ppid: 0, command: "/sbin/launchd" },
+      { pid: shellPid, ppid: 1, command: "-zsh" },
+      { pid: 6451, ppid: shellPid, command: `${engineWord} ${args.join(" ")}`, started: born },
+    ];
+    const registry: Registry = new OperationRegistry({ workspaceState: kept } as never, (message: string) => logged.push(message), () => true, async () => processes);
+    try {
+      registry.restore();
+      await registry.probeAll();
+
+      const held = registry.inFlightFor(key());
+      assert.equal(held?.state, "running-shell", "positively attributed, so the guard advances rather than lifting");
+      assert.equal(held?.enginePid, 6451, "anchored to the pid that is the operation");
+      assert.deepEqual(resolutions(logged), [], "nothing was resolved: it is running");
+
+      // The shell dies and the engine is reparented to pid 1. The identity was
+      // established before that happened, so it is followed by pid and birth
+      // time — the reparenting changes nothing.
+      processes = [
+        { pid: 1, ppid: 0, command: "/sbin/launchd" },
+        { pid: 6451, ppid: 1, command: `${engineWord} ${args.join(" ")}`, started: born },
+      ];
+      await registry.probeAll();
+      assert.equal(registry.inFlightFor(key())?.state, "running-shell", "a reparented engine that was already identified is still identified");
+      assert.deepEqual(resolutions(logged), []);
+
+      // And from here that pid's own fate settles it, and nothing else does.
       processes = [{ pid: 1, ppid: 0, command: "/sbin/launchd" }];
       await registry.probeAll();
       assert.equal(registry.inFlightFor(key()), undefined, "its process being gone is what ends it");
@@ -245,7 +320,7 @@ describe("a short command handed to a shell keeps its guard when the terminal cl
 // B. a run-loop whose shell died and whose engine was reparented
 // ---------------------------------------------------------------------------
 
-describe("a run-loop submitted to a shell that has since died is found by the whole process table", () => {
+describe("a run-loop submitted to a shell that has since died keeps whatever identity it had", () => {
   beforeEach(() => reset());
 
   const stage = "stage-9";
@@ -262,38 +337,86 @@ describe("a run-loop submitted to a shell that has since died is found by the wh
     reveal: false,
   };
 
-  it("2. the reparented engine is found under pid 1, the guard follows it, and a duplicate is refused", async () => {
+  /** What the previous window left behind, optionally with a pid already bound to it. */
+  const submitted = (shellPid: number, bound?: { enginePid: number; generation: string; state: string }) => [
+    {
+      id: "operation-whose-shell-died",
+      key: runnerKey(runId),
+      state: bound?.state ?? "submitted-shell",
+      transport: "shell",
+      caller: "runner",
+      label: `run-loop ${stage}`,
+      repoRoot: cwd,
+      cwd,
+      subcommand: "run-loop",
+      runId,
+      runnerKind: "run-loop",
+      stageId: stage,
+      word: engineWord,
+      invocation: { word: engineWord, args: launch.args, cwd },
+      submittedAtMs: Date.now() - 6000,
+      terminalPid: shellPid,
+      terminalName: "Agent Sparring — run-loop",
+      enginePid: bound?.enginePid,
+      generation: bound?.generation,
+    },
+  ];
+
+  it("2a. a process identified before the shell died is followed through reparenting, and a duplicate is refused", async () => {
     const shellPid = 6500;
     const logged: string[] = [];
-    const kept = store({
-      [OPERATIONS_KEY]: [
-        {
-          id: "operation-whose-shell-died",
-          key: runnerKey(runId),
-          state: "submitted-shell",
-          transport: "shell",
-          caller: "runner",
-          label: `run-loop ${stage}`,
-          repoRoot: cwd,
-          cwd,
-          subcommand: "run-loop",
-          runId,
-          runnerKind: "run-loop",
-          stageId: stage,
-          word: engineWord,
-          invocation: { word: engineWord, args: launch.args, cwd },
-          submittedAtMs: Date.now() - 6000,
-          terminalPid: shellPid,
-          terminalName: "Agent Sparring — run-loop",
-        },
-      ],
-    });
-    // No shell with that pid anywhere, and the engine it started reparented
-    // to pid 1 — which is exactly where the descendant-only search could
-    // never look.
+    const born = psStart(Date.now() - 5000);
+    // The engine was positively attributed to this operation while the shell
+    // that took the line was still alive, so the record carries its pid and
+    // its birth time. The shell has since died and the engine is reparented
+    // to pid 1 — which is exactly where a descendant-only search could never
+    // look, and does not need to: the question is about a pid now.
     let processes: ProcessInfo[] = [
       { pid: 1, ppid: 0, command: "/sbin/launchd" },
-      { pid: 6501, ppid: 1, command: `${engineWord} run-loop ${stage} --repo-root ${cwd} --expected-branch main`, started: "Thu Sep 18 11:20:00 2026" },
+      { pid: 6501, ppid: 1, command: `${engineWord} run-loop ${stage} --repo-root ${cwd} --expected-branch main`, started: born },
+    ];
+    const kept = store({ [OPERATIONS_KEY]: submitted(shellPid, { enginePid: 6501, generation: born, state: "running-shell" }) });
+    const registry: Registry = new OperationRegistry({ workspaceState: kept } as never, (message: string) => logged.push(message), () => true, async () => processes);
+    const terminals = pool();
+    const tracker: Tracker = new ExecutionTracker({ workspaceState: store() } as never, (message) => logged.push(message), () => [], terminals as never, registry, () => true, async () => processes);
+    try {
+      registry.restore();
+      await registry.probeAll();
+
+      const held = registry.inFlightFor(runnerKey(runId));
+      assert.equal(held?.state, "running-shell", "the identity it already had is still its identity");
+      assert.equal(held?.enginePid, 6501, "on the pid that was bound to it, not on a command line found again");
+      assert.deepEqual(resolutions(logged), [], "and the guard was never released on the way");
+
+      const refused = await tracker.launch({ ...launch, name: "run-loop (after the shell died)" });
+      assert.equal(refused.ok, false, "a second run-loop for that run is refused");
+      assert.match(refused.ok ? "" : refused.error, /same engine operation twice|no longer active/);
+      assert.equal(terminals.acquired.length, 0, "and nothing was prepared for it");
+      assert.equal(stub.window.created.length, 0, "no terminal was created for it either");
+
+      // That pid going is the evidence, and the only evidence.
+      processes = [{ pid: 1, ppid: 0, command: "/sbin/launchd" }];
+      await registry.probeAll();
+      assert.equal(registry.inFlightFor(runnerKey(runId)), undefined);
+      assert.match(resolutions(logged)[0], /resolved as completed \(engine-process-gone\)/);
+    } finally {
+      tracker.dispose();
+      registry.dispose();
+    }
+  });
+
+  it("2b. a process never identified is not adopted after the shell has gone, however well it matches", async () => {
+    const shellPid = 6550;
+    const logged: string[] = [];
+    const kept = store({ [OPERATIONS_KEY]: submitted(shellPid) });
+    // The same table as (2a) — a reparented engine under pid 1 running
+    // exactly this command — but nothing ever tied it to this hand-over. It
+    // may be this operation; it may be another window's run-loop for the same
+    // stage of the same repository. Adopting it would mean its exit releases
+    // our guard.
+    let processes: ProcessInfo[] = [
+      { pid: 1, ppid: 0, command: "/sbin/launchd" },
+      { pid: 6551, ppid: 1, command: `${engineWord} run-loop ${stage} --repo-root ${cwd} --expected-branch main`, started: psStart(Date.now() - 5000) },
     ];
     const registry: Registry = new OperationRegistry({ workspaceState: kept } as never, (message: string) => logged.push(message), () => true, async () => processes);
     const terminals = pool();
@@ -303,21 +426,23 @@ describe("a run-loop submitted to a shell that has since died is found by the wh
       await registry.probeAll();
 
       const held = registry.inFlightFor(runnerKey(runId));
-      assert.equal(held?.state, "running-shell", "the engine is running, so the operation is reconciled as running");
-      assert.equal(held?.enginePid, 6501, "on the pid it was actually found as");
-      assert.deepEqual(resolutions(logged), [], "and the guard was never released on the way");
+      assert.equal(held?.state, "submitted-shell", "unidentified is where it stays");
+      assert.equal(held?.enginePid, undefined, "with no pid bound to it");
+      assert.equal(held?.observationLost, true);
+      assert.deepEqual(resolutions(logged), [], "and nothing was resolved");
 
-      const refused = await tracker.launch({ ...launch, name: "run-loop (after the shell died)" });
+      const refused = await tracker.launch({ ...launch, name: "run-loop (nothing bound to it)" });
       assert.equal(refused.ok, false, "a second run-loop for that run is refused");
-      assert.match(refused.ok ? "" : refused.error, /same engine operation twice/);
-      assert.equal(terminals.acquired.length, 0, "and nothing was prepared for it");
-      assert.equal(stub.window.created.length, 0, "no terminal was created for it either");
+      assert.equal(stub.window.created.length, 0, "and nothing was started for it");
 
-      // That pid going is the evidence, and the only evidence.
+      // That process going settles nothing, because it was never ours to
+      // follow. Only the person can settle this one.
       processes = [{ pid: 1, ppid: 0, command: "/sbin/launchd" }];
       await registry.probeAll();
-      assert.equal(registry.inFlightFor(runnerKey(runId)), undefined);
-      assert.match(resolutions(logged)[0], /resolved as completed \(engine-process-gone\)/);
+      assert.equal(registry.inFlightFor(runnerKey(runId))?.state, "submitted-shell", "a stranger's exit is not our evidence");
+      assert.deepEqual(resolutions(logged), []);
+      assert.equal(registry.override(held.id, "the person checked the terminal").overridden, true, "the person is the way out");
+      assert.match(resolutions(logged)[0], /resolved as human-override/);
     } finally {
       tracker.dispose();
       registry.dispose();

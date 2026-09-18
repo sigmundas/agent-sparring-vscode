@@ -1095,6 +1095,18 @@ async function occupiedTerminalAssertions(report: DiscoveryDiagnostic, reportedR
 // ---------------------------------------------------------------- a command the shell never took must not leave a runner
 
 /** A workspaceState stand-in for a tracker built inside this suite. */
+/**
+ * A birth time in the exact shape `ps -o lstart=` prints (`Thu Sep 18
+ * 11:12:13 2026`). Written from a real instant rather than a literal, because
+ * a candidate process's age relative to an operation's hand-over is part of
+ * what decides whether it can be that operation at all.
+ */
+function psLstart(atMs: number): string {
+  const at = new Date(atMs);
+  const [weekday, month, day] = at.toDateString().split(" ");
+  return `${weekday} ${month} ${day} ${at.toTimeString().slice(0, 8)} ${at.getFullYear()}`;
+}
+
 function memento(): vscode.Memento {
   const values = new Map<string, unknown>();
   return {
@@ -1317,8 +1329,10 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
   // failing safe is not the same as giving up after six seconds: the
   // reconnect grace period says only that VS Code did not bring a terminal
   // back in time, which is no evidence at all about whether a shell is alive.
-  // The submission survives it, and is settled only when the process table
-  // can say that the shell that took it is gone.
+  // The submission survives it, and what can settle it afterwards is a fact
+  // about a process that was positively tied to it — never a command line
+  // that merely matches, which may be another window's, another invocation's,
+  // or older than the hand-over.
   {
     const runId = "reloaded-submission-regression";
     const shellPid = 2147480000; // a pid no process on this machine has
@@ -1416,28 +1430,30 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
       }
     }
 
-    // C2b: the shell is gone and the engine it started is in the table,
-    // reparented to pid 1. The descendant-only search could never find it
-    // there; the whole table can, and the guard follows that pid.
+    // C2b: a process that was positively tied to this operation *before* its
+    // shell was lost. The shell has since gone and the engine has been
+    // reparented to pid 1, and none of that matters: the record carries that
+    // pid and its birth time, so the question is about a process and is
+    // answered correctly wherever in the tree it has ended up.
     {
-      const stored = memento();
-      await stored.update(OPERATIONS_KEY, persisted);
-      const logged: string[] = [];
       const engine = `${executable} run-plan plans/never-executed.md`;
+      const born = psLstart(Date.now() - 4000);
+      const stored = memento();
+      await stored.update(OPERATIONS_KEY, [{ ...persisted[0], state: "running-shell", enginePid: 2147480500, generation: born }]);
+      const logged: string[] = [];
       let table = [
         { pid: 1, ppid: 0, command: "/sbin/launchd" },
-        { pid: 2147480500, ppid: 1, command: engine },
+        { pid: 2147480500, ppid: 1, command: engine, started: born },
       ];
       const registry = new OperationRegistry({ workspaceState: stored } as unknown as vscode.ExtensionContext, (message: string) => logged.push(message), () => true, async () => table);
       const tracker = trackerWith(registry, stored, logged);
       try {
         await tracker.reattach();
-        const running = await waitUntil(() => {
-          const [held] = registry.unresolved();
-          return held?.state === "running-shell" ? held : undefined;
-        }, 15_000, "the reparented engine to be found anywhere in the table and the guard to follow it");
-        assert.equal(running.enginePid, 2147480500, "anchored to the pid it was actually found as");
-        assert.ok(!logged.some((line) => /resolved as cannot-execute/.test(line)), "and nothing was resolved on the way there");
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        const [running] = registry.unresolved();
+        assert.equal(running?.state, "running-shell", "the identity it already had is still its identity after the reparenting");
+        assert.equal(running.enginePid, 2147480500, "on the pid that was bound to it, not on a command line found again");
+        assert.ok(!logged.some((line) => /resolved as/.test(line)), `and nothing was resolved on the way there, got ${JSON.stringify(logged.filter((line) => /resolved as/.test(line)))}`);
         const refused = await tracker.launch({ configured: executable, args: ["run-plan", "plans/never-executed.md"], cwd: reportedRepo, name: "over a live reparented engine", runId, kind: "run-plan", reveal: false });
         assert.equal(refused.ok, false, "a duplicate over a live engine is refused");
 
@@ -1445,6 +1461,46 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
         table = [{ pid: 1, ppid: 0, command: "/sbin/launchd" }];
         await waitUntil(() => (registry.unresolved().length === 0 ? true : undefined), 15_000, "the guard to be released once that process is gone");
         assert.ok(logged.some((line) => /resolved as completed \(engine-process-gone\)/.test(line)), `settled by a fact about that process, got ${JSON.stringify(logged.filter((line) => /resolved as/.test(line)))}`);
+      } finally {
+        tracker.dispose();
+        registry.dispose();
+      }
+    }
+
+    // C2c: the same table, and nothing ever tied any of it to this hand-over.
+    // A process running byte-identically what this operation was given may be
+    // another window's, another invocation's, or older than the line itself,
+    // and adopting it would mean its exit releases our guard. This is what
+    // the whole-table search used to do here.
+    {
+      const engine = `${executable} run-plan plans/never-executed.md`;
+      const stored = memento();
+      await stored.update(OPERATIONS_KEY, persisted);
+      const logged: string[] = [];
+      let table = [
+        { pid: 1, ppid: 0, command: "/sbin/launchd" },
+        { pid: 2147480501, ppid: 1, command: engine, started: psLstart(Date.now() - 4000) },
+      ];
+      const registry = new OperationRegistry({ workspaceState: stored } as unknown as vscode.ExtensionContext, (message: string) => logged.push(message), () => true, async () => table);
+      const tracker = trackerWith(registry, stored, logged);
+      try {
+        await tracker.reattach();
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        const [held] = registry.unresolved();
+        assert.equal(held?.state, "submitted-shell", `an unattributed look-alike is not this operation's process, got ${JSON.stringify(registry.unresolved())}`);
+        assert.equal(held.enginePid, undefined, "so no pid was bound to it");
+        assert.equal(held.observationLost, true, "what was lost is the observation, and it stays lost");
+        assert.ok(!logged.some((line) => /resolved as/.test(line)), "and nothing was resolved");
+
+        // That process ending is not our evidence, because it was never ours.
+        table = [{ pid: 1, ppid: 0, command: "/sbin/launchd" }];
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        assert.equal(registry.unresolved()[0]?.state, "submitted-shell", "a stranger's exit releases nothing");
+        assert.ok(!logged.some((line) => /resolved as/.test(line)), "still nothing resolved");
+        const refused = await tracker.launch({ configured: executable, args: ["run-plan", "plans/never-executed.md"], cwd: reportedRepo, name: "while nothing can identify it", runId, kind: "run-plan", reveal: false });
+        assert.equal(refused.ok, false, "so the duplicate stays refused");
+        assert.equal(registry.override(held.id, "the person checked").overridden, true, "and only the person settles it");
+        assert.ok(logged.some((line) => /resolved as human-override/.test(line)), "recorded as an override, never as evidence");
       } finally {
         tracker.dispose();
         registry.dispose();
@@ -1570,7 +1626,7 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
   }
 
   console.log(
-    "integration: an unconfirmed submission keeps its identity and refuses a second copy; its terminal closing and its shell disappearing both leave it guarded, a reparented engine anywhere in the table is found and followed, an unrelated runner never answers for it, and a stopped shell that runs it later is promoted to a real, persisted, normally-ended runner",
+    "integration: an unconfirmed submission keeps its identity and refuses a second copy; its terminal closing and its shell disappearing both leave it guarded, a process already tied to it is followed through reparenting while a mere look-alike is never adopted, an unrelated runner never answers for it, and a stopped shell that runs it later is promoted to a real, persisted, normally-ended runner",
   );
 }
 
