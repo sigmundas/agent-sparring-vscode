@@ -18,6 +18,7 @@
  * tooltips and the footer.
  */
 
+import { describeRepositoryContext, emptyStateLines, emptyStateTitle, type RepositoryContextView } from "./activeRepository";
 import { parseBriefGoal, parseBriefOpening } from "./brief";
 import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
@@ -25,7 +26,7 @@ import { parseHandoffBranch, type PlanRunState, type SparringOutcome, type Stage
 import type { DeclaredRepository } from "./stageRepositories";
 import { deriveVerification, HUMAN_FEEDBACK_HEADING, parseHumanEvidence, parseHumanFeedback, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
 import { checkNameList } from "./humanTask";
-import { SUBMISSION_PRESERVED, type SubmissionRecord } from "./submission";
+import { SUBMISSION_PRESERVED, SUBMISSION_UNRESOLVED, type SubmissionRecord } from "./submission";
 import { formatTime } from "./logFormat";
 import { deriveLiveness, type ExecutionRecord, type LivenessState, type RunnerLiveness } from "./liveness";
 import { proposeNextStage, type NextStageProposal } from "./nextStage";
@@ -154,6 +155,17 @@ export interface HistoryEntry {
 /** How many recent meaningful events the Overview shows. */
 export const HISTORY_MAX = 4;
 
+/**
+ * What a person is told when a runner's fate could not be established.
+ *
+ * Deliberately in the vocabulary of the thing they can act on — a previous
+ * runner they can go and look at — and deliberately not in the extension's
+ * own lifecycle vocabulary: nobody outside this code needs the words
+ * "attribution", "guard" or "observation lost" to decide whether a process is
+ * still working.
+ */
+export const UNKNOWN_RUNNER_EXPLANATION = "Agent Sparring cannot determine whether the previous runner is still active. Check it before allowing another attempt.";
+
 /** A Markdown plan the user associated with a standalone stage in VS Code (workspace state only). */
 export interface AssociatedPlan {
   path: string;
@@ -221,23 +233,31 @@ export interface OverviewArtifacts {
    */
   manifestStages?: ManifestStageView[];
   /**
-   * The managed plan run that is live in this project while a *standalone*
-   * stage is being shown — the stage a managed run adopted and has since
-   * advanced past. Everything that would sequence this stage by hand is the
-   * live run's business now, so those offers are withdrawn and the Overview
-   * points at it instead.
+   * The managed plan run this *standalone* stage belongs to — the run that
+   * adopted it and has since advanced past it, whether that run is still
+   * going or has finished. Everything that would sequence this stage by hand
+   * is that run's business, so those offers are withdrawn and the Overview
+   * offers the way back to the run instead.
    */
-  activePlanRun?: ActivePlanRun;
+  managedPlanRun?: ManagedPlanRun;
   /**
    * Stage ids the engine has already created in this project. Start next
    * stage is not offered for one of them: `sparring new-stage` refuses an
    * existing stage, and a managed run creates the next stage itself.
    */
   existingStageIds?: readonly string[];
+  /**
+   * The immutable id of the operation holding this run's duplicate guard at
+   * the moment the panel was built, when there is one. It is carried into the
+   * rendered recovery control so a confirmation acts on the record the person
+   * was actually shown, instead of whichever operation holds that run's key
+   * when the click arrives.
+   */
+  guardedOperationId?: string;
 }
 
-/** A managed plan run in the same project as the standalone stage on screen. */
-export interface ActivePlanRun {
+/** The managed plan run the standalone stage on screen is a stage of. */
+export interface ManagedPlanRun {
   runId: string;
   /** The plan's display name, as the run list shows it. */
   planName: string;
@@ -245,8 +265,12 @@ export interface ActivePlanRun {
   stageId: string;
   /** Its plan identity when the manifest gives one (`Stage 4`). */
   stageLabel?: string;
-  /** The engine's recorded status of the run (`running`, `paused`, …). */
+  /** The engine's recorded status of the run (`running`, `paused`, `complete`). */
   status: string;
+  /** The plan's own name for the stage on screen (`Stage 3D`), when the manifest gives one. */
+  memberLabel?: string;
+  /** The plan's own title for the stage on screen, when the manifest gives one. */
+  memberTitle?: string;
 }
 
 export type PlanContinuation = "automatic" | "manual";
@@ -459,6 +483,12 @@ export interface ActionRequired extends VerificationView {
    */
   submissionFailure?: { preserved: string; reason: string; what: string; error?: string };
   /**
+   * A submission nobody could resolve, settled by the person saying the
+   * runner is no longer active. Says what is unknown and what was kept; it
+   * claims neither success nor failure, because neither is known.
+   */
+  submissionUnresolved?: { preserved: string; reason: string; what: string };
+  /**
    * Resume *implementation* without new evidence: the existing Resume stage
    * / Resume plan operation, when one is offered. Deliberately separate from
    * Submit for review — that asks the reviewer to evaluate the unchanged
@@ -480,7 +510,7 @@ export interface OverviewModel {
   /** Reviewer hand-back to the human; present only for NEEDS_YOU / ESCALATE with no turn in progress. */
   actionRequired?: ActionRequired;
   title: string;
-  /** `Plan run` or `Standalone stage`. */
+  /** `Plan run`, `Historical stage` or `Standalone stage`; see RUN_KIND. */
   runKind?: string;
   status?: RunStatus;
   /** The last meaningful event, also while a turn is active. */
@@ -498,14 +528,33 @@ export interface OverviewModel {
    */
   continueAutomatically?: { label: string; detail: string; primary: boolean; kind: "adopt" | "continue" };
   /**
-   * This standalone stage's project has a managed plan run in progress: what
-   * it is at, and the one action that makes sense here — switch to it.
+   * This standalone stage is a stage of a managed plan run: what that run is,
+   * and the one action that makes sense here — Back to plan run, which changes
+   * the cockpit's selection to that run. Never a document action.
    */
   followPlan?: { runId: string; label: string; text: string; detail: string };
   /** An Accept stage operation from this window is in flight. */
   accepting?: { label: string; detail: string };
   /** A runner observed for this run: alive (Stop offered) or stopped. */
   runner?: { alive: boolean; label: string };
+  /**
+   * The way out of a runner whose fate nothing could establish.
+   *
+   * `unknown` used to be a dead end: the runner could not be attributed, so
+   * every action for the run was withheld — including the evidence
+   * submission the person had already typed — with nothing on screen that
+   * could settle it. This is the explicit human statement, and it names one
+   * exact execution so a stale panel cannot settle a newer run's runner.
+   */
+  /**
+   * The explicit way out of `unknown`, with both ids the confirmation acts on
+   * baked into what was rendered: the execution whose liveness it ends, and
+   * the duplicate guard whose release the person is taking responsibility for.
+   * The operation id is carried rather than looked up when the click arrives,
+   * so a panel left open while a newer run starts can only ever settle what it
+   * was showing (`operationId` absent: there was no guard to release).
+   */
+  unknownRunner?: { label: string; detail: string; executionId: string; operationId?: string };
   /**
    * Non-action state shown instead of Run/Resume: `Running` only when a
    * process observation backs it; `Run status unknown` when telemetry alone
@@ -516,6 +565,20 @@ export interface OverviewModel {
   liveness?: { state: LivenessState; source: RunnerLiveness["source"]; detail: string };
   /** For ambiguous: the candidate labels. */
   choices?: string[];
+  /**
+   * Which repository the cockpit is in, and whether it got there by following
+   * this window or by an explicit pin.
+   *
+   * Always present, and rendered at the *top* of the screen rather than in a
+   * footer, because "which repository am I actually looking at" is the
+   * question this whole screen answers. It is also the only place the contract
+   * is stated: VS Code's own repository selector cannot be read by an
+   * extension, so a person must be able to see what Agent Sparring resolved
+   * instead of assuming it followed that selector.
+   */
+  repositoryContext?: RepositoryContextView;
+  /** For empty: the sentences under the title (see activeRepository.emptyStateLines). */
+  emptyLines?: string[];
   /** Plan journey: only for managed plan runs with a readable plan document. */
   timeline?: TimelineItem[];
   timelineNote?: string;
@@ -566,11 +629,17 @@ export function buildOverviewModel(
   nowMs: number = Date.now(),
   execution?: ExecutionRecord,
 ): OverviewModel {
+  const repositoryContext = describeRepositoryContext(selection);
   if (!selection.selected) {
     if (selection.ambiguous.length > 0) {
-      return { kind: "ambiguous", title: "Several runs look active", choices: selection.ambiguous.map((run) => `${run.location.folderName}: ${runLabel(run)}`) };
+      return {
+        kind: "ambiguous",
+        title: "Several runs look active",
+        choices: selection.ambiguous.map((run) => `${run.location.folderName}: ${runLabel(run)}`),
+        repositoryContext,
+      };
     }
-    return { kind: "empty", title: "No active run" };
+    return { kind: "empty", title: emptyStateTitle(selection), emptyLines: emptyStateLines(selection), repositoryContext };
   }
   const run = selection.selected;
   const stage = currentStageOf(run);
@@ -589,6 +658,7 @@ export function buildOverviewModel(
   const model: OverviewModel = {
     kind: "run",
     title: run.kind === "plan" ? runLabel(run) : stageDisplayName(stage),
+    repositoryContext,
     stageAgent: actorCard("stage", stage, live, halted, nowMs, uncertain, artifacts.capturedPrompts),
     sparrer: actorCard("sparrer", stage, live, halted, nowMs, uncertain, artifacts.capturedPrompts),
     actions: {
@@ -605,7 +675,7 @@ export function buildOverviewModel(
     goal: goal(artifacts, plan),
     activity: activityLine(live, halted, nowMs, uncertain),
     history: history(live),
-    runKind: run.kind === "plan" ? "Plan run" : "Standalone stage",
+    runKind: runKindWord(run, artifacts),
     status: fresh ? { label: "Ready to start", tone: "info" } : runStatus(run, presentation, liveness),
     liveness: { state: liveness.state, source: liveness.source, detail: liveness.detail },
     plan,
@@ -620,6 +690,14 @@ export function buildOverviewModel(
     model.runner = { alive: true, label: "Stop (Ctrl-C)" };
   } else if (liveness.interrupted) {
     model.runner = { alive: false, label: "Runner stopped" };
+  }
+  if (liveness.execution && liveness.execution.state === "unknown") {
+    model.unknownRunner = {
+      label: "I checked — runner is no longer active",
+      detail: `${UNKNOWN_RUNNER_EXPLANATION} Confirming records your statement: it releases this run's actions and lets you send your evidence again. It does not claim the engine did, or did not, do anything.`,
+      executionId: liveness.execution.id,
+      operationId: artifacts.guardedOperationId,
+    };
   }
   const loopEligible = run.kind === "plan" || (stage.state?.status !== "accepted" && stage.state?.status !== "frozen");
   if (artifacts.accepting) {
@@ -657,9 +735,15 @@ export function buildOverviewModel(
     // A standalone stage that is matched to a plan section is called what the
     // plan calls it as well; its engine id stays in the tooltip and the
     // footer. `3c cloud schema rpc and sync transport` is a slug read aloud.
+    //
+    // A stage of a managed plan run is named by that run's own manifest, which
+    // is the same authority the plan run's screen uses — so the two screens
+    // call the stage the same thing, and only the run kind differs.
     const matched = plan?.source === "associated" ? plan : undefined;
-    model.stageHeading = matched?.current ?? stageDisplayName(stage);
-    model.stageLabel = matched?.currentLabel ? `Stage ${matched.currentLabel}` : undefined;
+    const managed = artifacts.managedPlanRun;
+    const fromRun = managed?.memberLabel && managed.memberTitle ? `${managed.memberLabel} — ${managed.memberTitle}` : undefined;
+    model.stageHeading = matched?.current ?? fromRun ?? stageDisplayName(stage);
+    model.stageLabel = matched?.currentLabel ? `Stage ${matched.currentLabel}` : managed?.memberLabel;
   }
   model.stageId = stage.stageId;
   if (!stage.exists) {
@@ -690,9 +774,12 @@ export function buildOverviewModel(
   model.continueAutomatically = continueAutomatically(run, plan, artifacts, model, liveness);
   model.followPlan = followPlan(run, artifacts);
   if (model.followPlan) {
-    // The managed run owns the sequencing of this project now. Adopting it a
+    // A managed run owns the sequencing of these stages. Adopting them a
     // second time, or creating a stage it has already created, are both
-    // refusals waiting to happen; the way forward is that run's own screen.
+    // refusals waiting to happen — and when that run is *complete*, offering
+    // to continue the plan from one of its finished stages is worse than
+    // useless, because it would start a second run over work that is done.
+    // The way forward, or back, is that run's own screen.
     delete model.continueAutomatically;
   }
   model.actionRequired = actionRequired(run, presentation, outcome, plan, artifacts, model, branchGuard, liveness);
@@ -838,7 +925,7 @@ function actionRequired(
     const which = names ? `the remaining ${pending === 1 ? "check" : "checks"} (${names})` : pending === 1 ? "the remaining check" : `all ${pending} remaining checks`;
     submitDetail = `Record a result for ${which} first. Submitting asks the reviewer to rule on the evidence, so it goes when the evidence is complete.`;
   } else if (blocked(model)) {
-    submitDetail = "Nothing can run right now (a runner is alive or its status is unknown).";
+    submitDetail = blockedDetail(model);
   } else {
     submitEnabled = true;
     submitDetail = `Records the drafted results under '## Human evidence' and asks the reviewer to rule on them (${command}). The reviewer decides; nothing is marked ready or accepted here.`;
@@ -855,7 +942,7 @@ function actionRequired(
   } else if (!draft) {
     sendDetail = "Describe what you found in the field above first. It goes to the reviewer as it is written, against the unchanged candidate.";
   } else if (blocked(model)) {
-    sendDetail = "Nothing can run right now (a runner is alive or its status is unknown).";
+    sendDetail = blockedDetail(model);
   } else {
     sendEnabled = true;
     sendDetail = `Records this text under '## Human evidence' as '${HUMAN_FEEDBACK_HEADING.replace(/^#+\s*/, "")}' and asks the reviewer to rule again on the unchanged candidate (${command}). It records no check result: ${pending === 0 ? "nothing is claimed about the checks either way" : `the ${pending === 1 ? "outstanding check stays outstanding" : `${pending} outstanding checks stay outstanding`}`}. The reviewer decides what follows — changes, the same checks again, or revised checks.`;
@@ -866,7 +953,10 @@ function actionRequired(
   // having recorded anything, the panel says so above the reviewer's own
   // checks, with every drafted result still where the user left it.
   const submission = artifacts.submission?.runId === run.id ? artifacts.submission : undefined;
-  const inFlight = submission && !submission.failure ? submission : undefined;
+  // A submission a person has settled as unresolved is not in flight: the
+  // engine is not holding it, nobody knows what it did, and the whole point
+  // of that statement is that the evidence may be sent again.
+  const inFlight = submission && !submission.failure && !submission.unresolved ? submission : undefined;
   const submitting = inFlight
     ? {
         label: "Submitting…",
@@ -890,6 +980,14 @@ function actionRequired(
         error: failure.output,
       }
     : undefined;
+  const unresolvedSubmission =
+    submission?.unresolved && !landed
+      ? {
+          preserved: SUBMISSION_UNRESOLVED,
+          reason: submission.unresolved.note,
+          what: submission.results > 0 ? `${submission.results} check result${submission.results === 1 ? "" : "s"} and any notes are still drafted below.` : "Your feedback is still in the field below.",
+        }
+      : undefined;
   if (submitting) {
     submitEnabled = false;
     submitDetail = submitting.detail;
@@ -916,6 +1014,7 @@ function actionRequired(
     feedback: { draft, submitted: parseHumanFeedback(artifacts.notesText), send: { label: "Send feedback for review", enabled: sendEnabled, detail: sendDetail } },
     submitting,
     submissionFailure,
+    submissionUnresolved: unresolvedSubmission,
     resume,
     planSection: Boolean(sectionLine && (run.kind === "plan" ? artifacts.plan : artifacts.associatedPlan?.exists)),
     review: artifacts.sparring,
@@ -1047,24 +1146,67 @@ function continueAutomatically(
 }
 
 /**
- * A standalone stage screen while a managed plan run of the same project is
- * in progress. That happens after a stage is adopted and the managed run
+ * What kind of thing is on screen, in the plainest words there are.
+ *
+ * The vocabulary is the mental model and nothing else: a **plan run** is the
+ * whole job, a **historical stage** is one old stage to inspect, and a **plan
+ * document** is the specification. "Standalone" is the extension's own reason
+ * for a stage record existing on its own, and a label is not the place for
+ * it — the person reading the pill wants to know what they are looking at,
+ * not why the harness has a separate record for it.
+ *
+ * Three kinds, never two: the middle one used to be indistinguishable from
+ * the first — same layout, same pill, no timeline — which is how a complete
+ * plan run looked like it had lost its stages. The third is the odd case, a
+ * stage no plan run claims, and there the word earns its place: it is why
+ * that screen may still offer to adopt the stage into a managed run.
+ */
+export const RUN_KIND = {
+  plan: "Plan run",
+  historicalStage: "Historical stage",
+  standaloneStage: "Standalone stage",
+} as const;
+
+export function runKindWord(run: RunSnapshot, artifacts: OverviewArtifacts): string {
+  if (run.kind === "plan") {
+    return RUN_KIND.plan;
+  }
+  return artifacts.managedPlanRun ? RUN_KIND.historicalStage : RUN_KIND.standaloneStage;
+}
+
+/**
+ * A standalone stage screen for a stage that belongs to a managed plan run of
+ * the same project. That happens after a stage is adopted and the managed run
  * advances: the stage it left behind is an accepted stage of its own again,
  * and everything this screen would offer to sequence it by hand — Continue
- * plan automatically, Start next stage — belongs to the live run. Say where
- * the work actually is, and offer the way there.
+ * plan automatically, Start next stage — belongs to that run. Say where the
+ * work actually is, and offer the one way back.
+ *
+ * It holds for a run that has *finished* too, which is the case that caused
+ * the reported confusion: a complete plan's stages were still being offered
+ * for adoption into a new managed run, and the only route back to the
+ * timeline was the run picker.
+ *
+ * `label` is deliberately not about opening a document: it changes which run
+ * the cockpit follows. Open plan document / Open plan section are the actions
+ * that open Markdown, and the two must never sound alike.
  */
 function followPlan(run: RunSnapshot, artifacts: OverviewArtifacts): OverviewModel["followPlan"] {
-  const active = artifacts.activePlanRun;
-  if (run.kind !== "stage" || !active) {
+  const managed = artifacts.managedPlanRun;
+  if (run.kind !== "stage" || !managed) {
     return undefined;
   }
-  const at = active.stageLabel ? `${active.stageLabel} (${active.stageId})` : active.stageId;
+  const at = managed.stageLabel ? `${managed.stageLabel} (${managed.stageId})` : managed.stageId;
+  const mine = managed.memberLabel ? `${managed.memberLabel} is one of its stages` : "This stage is one of its stages";
+  const text =
+    managed.status === "complete"
+      ? `${managed.planName} is the managed plan run this stage belongs to, and the engine has completed it. ${mine}; this screen shows only that one stage.`
+      : `${managed.planName} is being run by the engine as a managed plan run, now at ${at}. ${mine}, and this screen shows only that one.`;
   return {
-    runId: active.runId,
-    label: "Show running plan",
-    text: `${active.planName} is being run by the engine as a managed plan run, now at ${at}. This stage is part of that run's history.`,
-    detail: `Follow the managed run of ${active.planName} (${active.status}, currently ${at}) instead of this finished stage`,
+    runId: managed.runId,
+    label: "Back to plan run",
+    text,
+    detail: `Follow the managed plan run of ${managed.planName} (${managed.status}, currently ${at}) instead of this single stage. This changes what the Overview shows; it does not open the plan document.`,
   };
 }
 
@@ -1085,6 +1227,21 @@ function reviewFailure(liveness: RunnerLiveness): string | undefined {
 /** Nothing may be launched: a runner is alive, or telemetry claims a turn nothing has observed ending. */
 function blocked(model: OverviewModel): boolean {
   return model.busyState !== undefined || model.runner?.alive === true;
+}
+
+/**
+ * What is said about a withheld action. When the reason is an unknown runner
+ * it names the way out, because "its status is unknown" with nothing to press
+ * is the dead end this panel had.
+ */
+function blockedDetail(model: OverviewModel): string {
+  if (model.unknownRunner) {
+    return `${UNKNOWN_RUNNER_EXPLANATION} Confirm it with "${model.unknownRunner.label}" above and this is offered again, with everything you entered still here.`;
+  }
+  if (model.runner?.alive === true || model.busyState?.state === "running") {
+    return "A runner is alive for this run; wait for it to finish.";
+  }
+  return "Agent Sparring cannot determine whether the previous runner is still active. Check it before allowing another attempt.";
 }
 
 // ---------------------------------------------------------------- pieces
@@ -1180,15 +1337,23 @@ function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveSt
   };
 }
 
-/** The captured prompt for this role's latest turn, as the card's view of it. */
+/**
+ * The captured prompt for this role's latest turn, as the card's view of it.
+ *
+ * The reviewing card falls back to the `reviewer` role: a review-only stage
+ * runs no sparrer, and its independent actor is a fresh reviewer over an
+ * already-accepted candidate set. Showing nothing there would hide the one
+ * thing someone opens this card to check — whether the actor working right
+ * now really is that reviewer and not a stage agent. The view it builds says
+ * `Independent reviewer` rather than `Review turn`, so the two are never
+ * mistaken for each other.
+ */
 function promptView(role: "stage" | "sparrer", captures: CapturedPrompt[] | undefined, busy: boolean): PromptView | undefined {
   if (!captures || captures.length === 0) {
     return undefined;
   }
-  const entry = latestCapture(
-    captures.map((capture) => capture.entry),
-    role,
-  );
+  const indexed = captures.map((capture) => capture.entry);
+  const entry = latestCapture(indexed, role) ?? (role === "sparrer" ? latestCapture(indexed, "reviewer") : undefined);
   if (!entry) {
     return undefined;
   }
@@ -1504,8 +1669,10 @@ function whatsNext(run: RunSnapshot, plan: PlanContext | undefined, artifacts: O
       kind: "next-created",
       heading: next.display,
       summary: next.summary,
-      text: artifacts.activePlanRun
-        ? `${next.display} already exists (${created}); the managed plan run is sequencing it.`
+      text: artifacts.managedPlanRun
+        ? artifacts.managedPlanRun.status === "complete"
+          ? `${next.display} already exists (${created}); the managed plan run that created it is complete.`
+          : `${next.display} already exists (${created}); the managed plan run is sequencing it.`
         : `${next.display} already exists as ${created}, so there is nothing to create. Select that stage to work on it.`,
     };
   }

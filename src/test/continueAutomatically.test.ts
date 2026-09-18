@@ -20,7 +20,7 @@ import { buildResumePlanArgs, buildRunPlanArgs } from "../core/cli";
 import { discoverRuns, selectRun } from "../core/discovery";
 import { renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel, type OverviewArtifacts } from "../core/overviewModel";
-import { commandLineRuns, parseSparringCommand } from "../core/sparringCommand";
+import { commandLineIsOperation, parseSparringCommand } from "../core/sparringCommand";
 import { FOO_PLAN_KEY, FOO_PLAN_LABEL, FOO_STAGE_IDS, Workspace, sparringMarkdown } from "./fixtures";
 
 const NOW = Date.parse("2026-09-14T10:00:00.000Z");
@@ -53,8 +53,12 @@ describe("the engine command the automatic mode issues", () => {
     assert.equal(parsed?.subcommand, "run-plan");
     assert.equal(parsed?.manifest, "/tmp/foo.manifest.json");
     assert.equal(parsed?.planPath, undefined);
-    assert.ok(commandLineRuns("sparring resume-plan --manifest /other/dir/foo.manifest.json --repo-root /r --expected-branch b", { kind: "resume-plan", manifest: "/tmp/foo.manifest.json" }));
-    assert.ok(!commandLineRuns("sparring resume-plan --manifest /tmp/other.manifest.json --repo-root /r --expected-branch b", { kind: "resume-plan", manifest: "/tmp/foo.manifest.json" }));
+    // Matched by its full path. A manifest with the same basename in another
+    // directory is a different manifest, and used to match on the basename
+    // alone — which let one plan's runner resolve another plan's guard.
+    assert.ok(commandLineIsOperation("sparring resume-plan --manifest /tmp/foo.manifest.json --repo-root /r --expected-branch b", { kind: "resume-plan", repoRoot: "/r", manifest: "/tmp/foo.manifest.json" }));
+    assert.ok(!commandLineIsOperation("sparring resume-plan --manifest /other/dir/foo.manifest.json --repo-root /r --expected-branch b", { kind: "resume-plan", repoRoot: "/r", manifest: "/tmp/foo.manifest.json" }));
+    assert.ok(!commandLineIsOperation("sparring resume-plan --manifest /tmp/other.manifest.json --repo-root /r --expected-branch b", { kind: "resume-plan", repoRoot: "/r", manifest: "/tmp/foo.manifest.json" }));
   });
 });
 
@@ -94,8 +98,14 @@ describe("the automatic path is one engine call, not a loop", () => {
     for (const where of ["performContinueAutomatically", "planInvocationFor"]) {
       const body = fn(source, where);
       assert.match(body, /known: await knownStageIds\(/, `${where} carries the project's existing stage ids and briefs`);
-      assert.match(body, /repositories: manifestRepositories\(controller\.stageRepositories\(/, `${where} carries the declared sibling repositories`);
+      assert.match(body, /\.\.\.declarationsFor\(controller, /, `${where} carries the declared sibling repositories and stage modes, from the one place that reads them`);
     }
+    // And that one place is keyed by the worktree, not by the plan alone: a
+    // plan key is shared by every checkout of the same plan path, so reading
+    // declarations without the project directory answers for the wrong one.
+    const helper = fn(source, "declarationsFor");
+    assert.match(helper, /controller\.stageRepositories\(key, location\.projectDir\)/);
+    assert.match(helper, /controller\.stageModes\(key, location\.projectDir\)/);
   });
 
   it("an already-executed stage is briefed from its own brief.md, not from the plan as it now reads", async () => {
@@ -126,7 +136,11 @@ describe("the automatic path is one engine call, not a loop", () => {
     const add = fn(await commandsSource(), "addStageRepository");
     assert.equal((add.match(/showInputBox\(/g) ?? []).length, 2, "exactly two things are asked: the expected branch and the display name");
     assert.ok(!/candidate_?[Ss]ha/.test(add), "no commit is collected");
-    assert.match(add, /controller\.declareStageRepository\(key, label, \{ name: name\.trim\(\), path: chosen\.rootPath, branch: branch\.trim\(\) \}\)/);
+    assert.match(
+      add,
+      /controller\.declareStageRepository\(key, location\.projectDir, label, \{ name: name\.trim\(\), path: chosen\.rootPath, branch: branch\.trim\(\) \}\)/,
+      "and the declaration is scoped to the worktree it was made in, so another checkout of the same plan is unaffected",
+    );
   });
 
   it("one preflight, and only when something is actually wrong", async () => {

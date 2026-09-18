@@ -413,7 +413,7 @@ describe("Overview plan actions", () => {
     assert.equal(working.plan?.currentLabel, "3B");
     assert.deepEqual(working.facts?.[1], { label: "Plan", value: "reported.md (associated in VS Code)" });
     let html = renderOverviewHtml(working, "n", "c");
-    assert.match(html, /<button type="button" data-action="openPlan" [^>]*>Plan<\/button>/);
+    assert.match(html, /<button type="button" data-action="openPlan" [^>]*>Plan document<\/button>/);
     assert.match(html, /data-action="associatePlan" [^>]*>Change plan…<\/button>/);
     // The stage is called what the plan calls it, in the card's own heading;
     // the block below carries how that was decided, not the name again.
@@ -438,7 +438,7 @@ describe("Overview plan actions", () => {
     assert.match(html, /What's next<\/h3><p class="nextstage">Stage 3C — Cloud schema and synchronization<\/p><p class="muted summary">text<\/p>/);
     // Automatic continuation (the default) leads; Start next stage stays as
     // the per-stage alternative right after it.
-    assert.match(html, /<button type="button" class="primary" data-action="continueAutomatically"[^>]*>Continue plan automatically<\/button><button type="button" class="quiet" data-action="startNextStage" title="sparring new-stage stage-3c-cloud-schema-and-synchronization[^"]*">Start next stage<\/button><button type="button" data-action="openNextStage"[^>]*>Open in plan<\/button><button type="button" class="quiet" data-action="matchStage"[^>]*>Change match…<\/button>/);
+    assert.match(html, /<button type="button" class="primary" data-action="continueAutomatically"[^>]*>Continue plan automatically<\/button><button type="button" class="quiet" data-action="startNextStage" title="sparring new-stage stage-3c-cloud-schema-and-synchronization[^"]*">Start next stage<\/button><button type="button" data-action="openNextStage"[^>]*>Open plan section<\/button><button type="button" class="quiet" data-action="matchStage"[^>]*>Change match…<\/button>/);
     assert.match(html, /Current plan stage<\/h3><p class="nextstage">Stage 3B — Reported statistics local schema barrier<\/p><p class="muted matched">Matched automatically<button type="button" class="quiet" data-action="associatePlan"[^>]*>Remove plan association<\/button>/);
     // No managed-run action: the engine has no operation that continues a
     // standalone stage from a plan. (Continue plan *automatically* is a
@@ -462,7 +462,7 @@ describe("Overview plan actions", () => {
       hints: ["Stage 3C — Cloud schema/RPC and sync transport", "Stage 4 — UI"],
     });
     const html = renderOverviewHtml(unmatched, "n", "c");
-    assert.match(html, /<button type="button" class="primary" data-action="matchStage"[^>]*>Match this stage…<\/button><button type="button" data-action="openPlan"[^>]*>Open plan<\/button><button type="button" class="quiet" data-action="associatePlan"[^>]*>Change plan…<\/button>/);
+    assert.match(html, /<button type="button" class="primary" data-action="matchStage"[^>]*>Match this stage…<\/button><button type="button" data-action="openPlan"[^>]*>Open plan document<\/button><button type="button" class="quiet" data-action="associatePlan"[^>]*>Change plan…<\/button>/);
     assert.match(html, /The brief lists later work that is in this plan: <span class="next">Stage 3C — Cloud schema\/RPC and sync transport<\/span>, <span class="next">Stage 4 — UI<\/span>\./);
     assert.ok(!html.includes("was not matched to a heading"));
 
@@ -582,7 +582,7 @@ describe("Overview plan actions", () => {
     assert.equal(model.stageLine, "Stage complete. Continue plan starts the next stage.");
     assert.deepEqual(model.whatsNext, { kind: "continue", heading: "Stage 3 — Device/UI check!", summary: "Manual check.", text: "Continue plan starts it." });
     const html = renderOverviewHtml(model, "n", "c");
-    assert.match(html, /What's next<\/h3><p class="nextstage">Stage 3 — Device\/UI check!<\/p><p class="muted summary">Manual check\.<\/p><p class="muted">Continue plan starts it\.<\/p><div class="actions"><button type="button" class="primary" data-action="continueAutomatically"[^>]*>Continue automatically<\/button><button type="button" data-action="resumePlan" [^>]*>Continue plan<\/button><button type="button" data-action="openNextStage"[^>]*>Open in plan<\/button><\/div>/);
+    assert.match(html, /What's next<\/h3><p class="nextstage">Stage 3 — Device\/UI check!<\/p><p class="muted summary">Manual check\.<\/p><p class="muted">Continue plan starts it\.<\/p><div class="actions"><button type="button" class="primary" data-action="continueAutomatically"[^>]*>Continue automatically<\/button><button type="button" data-action="resumePlan" [^>]*>Continue plan<\/button><button type="button" data-action="openNextStage"[^>]*>Open plan section<\/button><\/div>/);
     assert.equal((html.match(/>Continue plan</g) ?? []).length, 1, "one Continue plan button, in What's next");
     assert.ok(!html.includes('data-action="associatePlan"'));
     assert.ok(!html.includes('data-action="matchStage"'));
@@ -591,7 +591,7 @@ describe("Overview plan actions", () => {
     // Without the document text the engine's heading is still shown; only the summary and line are unavailable.
     const noText = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, ALL, T0);
     assert.deepEqual(noText.plan?.next, { display: "Stage 3 — Device/UI check!", label: "3", line: 0, summary: undefined, defined: true });
-    assert.match(renderOverviewHtml(noText, "n", "c"), /<button type="button" data-action="openPlan"[^>]*>Open in plan<\/button>/);
+    assert.match(renderOverviewHtml(noText, "n", "c"), /<button type="button" data-action="openPlan"[^>]*>Open plan document<\/button>/);
   });
 
   it("a managed run whose last stage is accepted but not yet complete says so; a complete run has no What's next", async () => {

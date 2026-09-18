@@ -4,27 +4,37 @@
  * `../core`; this file only adapts it to the vscode API.
  */
 
+
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { ActivityTailer } from "../core/activityTailer";
+import { FOLLOW_ACTIVE_LABEL } from "../core/activeRepository";
 import { diagnoseDiscovery, renderDiagnostic, type DiscoveryDiagnostic } from "../core/diagnose";
 import {
   DEFAULT_NESTED_SEARCH_DEPTH,
   activityPathFor,
+  canonicalPath,
   currentStageOf,
   discoverRuns,
+  intentForChoosing,
   isNestedLocation,
   locateAll,
   runLabel,
+  samePath,
   selectRun,
   totalStagesOf,
   type Discovery,
   type LocateOptions,
   type RunPreference,
+  type RepositoryScope,
   type RunSelection,
+  type PlanRunSnapshot,
   type RunSnapshot,
   type SparringLocation,
 } from "../core/discovery";
+import { type ManifestStageIdentity } from "../core/manifest";
+import { launchRepositories, type LaunchRepository } from "../core/launchRepositories";
+import { resolveMemberships, stageOwnership, type PlanMembership } from "../core/planMembership";
 import { deriveLiveness, type ExecutionRecord, type RunnerLiveness } from "../core/liveness";
 import { applyEvent, emptyLiveState, type LiveState } from "../core/liveState";
 import {
@@ -43,6 +53,7 @@ import {
 import {
   SUBMISSIONS_KEY,
   submissionFailureReason,
+  withSubmissionUnresolved,
   submissionFor,
   submissionState,
   withSubmission,
@@ -55,6 +66,7 @@ import { LogRenderer } from "../core/logFormat";
 import { PLAN_ASSOCIATIONS_KEY, planAssociationFor, withAssociation, withManualMatch, type HeadingRef, type PlanAssociation, type PlanAssociations } from "../core/planAssociation";
 import {
   STAGE_REPOSITORIES_KEY,
+  migrateStageRepositories,
   repositoriesForPlan,
   repositoriesForStage,
   withStageRepository,
@@ -62,16 +74,52 @@ import {
   type DeclaredRepository,
   type StageRepositories,
 } from "../core/stageRepositories";
+import {
+  STAGE_MODES_KEY,
+  migrateStageModes,
+  modeForStage,
+  modesForPlan,
+  withStageMode,
+  type StageMode,
+  type StageModes,
+} from "../core/stageModes";
 import { deriveStatus } from "../core/status";
 import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
 import { TerminalPool } from "./terminalPool";
 import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult } from "./executionTracker";
+import { OperationRegistry, runnerKey, type OperationView, type OverrideResult } from "./operationRegistry";
+import { ManifestReader, type BoundManifest } from "./manifestReader";
+import { ActiveRepositoryTracker, RealPaths } from "./activeRepository";
+import { describeReadiness } from "../core/gitReadiness";
+import type { DeclarationMigration } from "../core/declarationScope";
 
 const SELECTED_RUN_KEY = "agentSparring.selectedRunId";
 /** When that choice was made, so a managed run that advances afterwards can overtake it. */
 const SELECTED_AT_KEY = "agentSparring.selectedRunAtMs";
 /** The run last shown, whether chosen explicitly or automatically; restores across reloads. */
 const STICKY_RUN_KEY = "agentSparring.lastShownRunId";
+/**
+ * Which pin policy the stored selection was made under.
+ *
+ * An explicit selection used to mean "show this run", full stop; there was no
+ * repository context for it to survive. It now means "keep this run on screen
+ * even when this window is in another repository", which is a stronger and
+ * longer-lived promise than anyone made when they clicked a row in the old
+ * picker. Promoting an old selection to that silently would leave a window
+ * pinned to a foreign repository's run with no memory of having asked, so a
+ * selection stored before this key exists is demoted to the ordinary
+ * remembered run instead: it is still what the cockpit shows while the window
+ * is in its repository, and it lets go as soon as the window is not.
+ */
+const PIN_POLICY_KEY = "agentSparring.pinPolicy";
+const PIN_POLICY = "repository-scoped-pin-v1";
+/**
+ * What the stored pin meant when it was made: `inspect` or `follow` (see
+ * `RunPreference.intent`). Absent — a pin stored before this was recorded — is
+ * read as `inspect`, the reading that cannot move the screen out from under
+ * the person who made it.
+ */
+const PIN_INTENT_KEY = "agentSparring.pinIntent";
 const OUTPUT_CHANNEL_NAME = "Agent Sparring";
 /** How often the process table may be read for one run whose liveness nothing in this window watched. */
 const PROBE_COOLDOWN_MS = 15_000;
@@ -94,11 +142,23 @@ export class SparringController implements vscode.Disposable {
   private readonly commands: SparringCommandRunner;
   /** The integrated terminals this extension owns: one per project, reused. */
   private readonly terminals: TerminalPool;
+  /** Commands handed to a shell that may still execute; the duplicate-prevention authority. */
+  private readonly submissions: OperationRegistry;
+  /** Which repository this window is in; automatic selection is confined to it. */
+  private readonly activeRepository: ActiveRepositoryTracker;
+  /** Symlink resolution for repository roots, so two spellings of one directory are one repository. */
+  private readonly realPaths = new RealPaths();
   private reattached = false;
   /** When the process table was last read for a run id; see resolveUnwatchedRunner. */
   private readonly probed = new Map<string, number>();
   /** Run ids whose Accept stage operation from this window is still in flight. */
   private readonly accepting = new Set<string>();
+  /** Reads execution manifests out of global storage; caches their bytes and never their binding. */
+  private readonly manifests = new ManifestReader();
+  /** The last rejection reported for a manifest file, so a steady refusal is logged once rather than per render. */
+  private readonly manifestRefusals = new Map<string, string>();
+  /** Unscoped declarations already reported, so a steady one is said once rather than per discovery. */
+  private readonly reportedAmbiguousDeclarations = new Set<string>();
 
   private readonly changeEmitter = new vscode.EventEmitter<void>();
   /** Fires after every re-render: selection, authoritative state or live activity changed. */
@@ -121,15 +181,24 @@ export class SparringController implements vscode.Disposable {
     this.statusBar.command = "agentSparring.openOverview";
     this.disposables.push(this.output, this.statusBar, this.changeEmitter);
     this.terminals = new TerminalPool((message) => this.log(message));
+    // The one authority on commands handed to a shell, shared by both
+    // transports so neither can be made safe and the other left behind.
+    this.submissions = new OperationRegistry(context, (message: string) => this.log(message));
     this.tracker = new ExecutionTracker(
       context,
       (message) => this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} ${message}`),
       () => this.locations,
       this.terminals,
+      this.submissions,
     );
     this.onCommandNotFound = this.tracker.onCommandNotFound;
     this.onEngineFailed = this.tracker.onEngineFailed;
-    this.commands = new SparringCommandRunner((message) => this.log(message), this.terminals);
+    this.commands = new SparringCommandRunner((message) => this.log(message), this.terminals, this.submissions);
+    this.disposables.push(this.submissions, this.submissions.onDidChange(() => this.render()));
+    // Moving to another repository re-decides which run the cockpit follows,
+    // so it is a rediscovery like any other authoritative change.
+    this.activeRepository = new ActiveRepositoryTracker((message) => this.log(message));
+    this.disposables.push(this.activeRepository, this.activeRepository.onDidChange(() => this.scheduleRefresh()));
     this.disposables.push(
       this.tracker,
       this.commands,
@@ -173,6 +242,13 @@ export class SparringController implements vscode.Disposable {
       this.watch(folder);
     }
     this.statusBar.show();
+    // Before anything can be admitted: the operations a previous window left
+    // unresolved, and the dedicated-runner guards an older version of this
+    // extension kept somewhere else entirely. Synchronous, and first, because
+    // the user can invoke a command the moment the extension activates and
+    // the admission authority must already know what may still be running.
+    this.submissions.restore();
+    await this.migratePinPolicy();
     await this.refresh();
     this.armPolling();
     if (!this.reattached) {
@@ -188,6 +264,31 @@ export class SparringController implements vscode.Disposable {
 
   private fileFolders(): vscode.WorkspaceFolder[] {
     return (vscode.workspace.workspaceFolders ?? []).filter((folder) => folder.uri.scheme === "file");
+  }
+
+  /**
+   * Demote a selection stored before pins meant what they now mean, and
+   * record which policy later selections were made under. See
+   * {@link PIN_POLICY_KEY}: nobody who clicked a row in the old picker asked
+   * for a run to stay on screen across repositories, so nobody is given one.
+   */
+  private async migratePinPolicy(): Promise<void> {
+    if (this.context.workspaceState.get<string>(PIN_POLICY_KEY) === PIN_POLICY) {
+      return;
+    }
+    const stored = this.context.workspaceState.get<string>(SELECTED_RUN_KEY);
+    if (stored) {
+      this.log(
+        `an explicit run selection was stored before pins survived a change of repository; it is kept as the remembered run rather than becoming a pin. ${FOLLOW_ACTIVE_LABEL} is how the cockpit follows this window, and Select repository / run is how to pin deliberately.`,
+      );
+      await this.context.workspaceState.update(SELECTED_RUN_KEY, undefined);
+      await this.context.workspaceState.update(SELECTED_AT_KEY, undefined);
+      await this.context.workspaceState.update(PIN_INTENT_KEY, undefined);
+      if (!this.context.workspaceState.get<string>(STICKY_RUN_KEY)) {
+        await this.context.workspaceState.update(STICKY_RUN_KEY, stored);
+      }
+    }
+    await this.context.workspaceState.update(PIN_POLICY_KEY, PIN_POLICY);
   }
 
   /** Probe each workspace folder on its own (including nested projects); never merge folders into one root. */
@@ -225,6 +326,10 @@ export class SparringController implements vscode.Disposable {
       ...this.locateOptions(),
       preferredId: this.preference()?.id,
       stickyId: this.attachedRunId ?? this.context.workspaceState.get<string>(STICKY_RUN_KEY),
+      scope: await this.repositoryScope(),
+      gitAttached: this.activeRepository.attached,
+      gitReadiness: this.activeRepository.gitReadiness,
+      manifestStages: (run) => this.manifestStagesFor(run),
     });
     this.output.appendLine("");
     this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} ---- Diagnose Discovery (extension ${String(this.context.extension.packageJSON.version)}) ----`);
@@ -314,8 +419,16 @@ export class SparringController implements vscode.Disposable {
     this.refreshTimer = undefined;
     await this.relocate();
     this.discovery = await discoverRuns(this.locations);
+    await this.migrateDeclarationScopes();
     const sticky = this.attachedRunId ?? this.context.workspaceState.get<string>(STICKY_RUN_KEY);
-    this.selection = selectRun(this.discovery.runs, this.preference(), sticky);
+    // Ownership first: whether a plan run has taken over from a pinned stage
+    // is a question about recorded membership, and answering it any other way
+    // is the guessing that made unrelated stages look like a plan's history.
+    const ownership = stageOwnership(await this.planMemberships());
+    this.selection = selectRun(this.discovery.runs, this.preference(), sticky, await this.repositoryScope(), ownership, this.locations);
+    if (this.selection.released) {
+      await this.retireReleasedPin(this.selection.released);
+    }
     if (this.selection.selected && this.selection.selected.id !== this.context.workspaceState.get<string>(STICKY_RUN_KEY)) {
       await this.context.workspaceState.update(STICKY_RUN_KEY, this.selection.selected.id);
     }
@@ -356,8 +469,64 @@ export class SparringController implements vscode.Disposable {
     }
   }
 
+  /**
+   * The repository automatic selection is confined to, or `undefined` when
+   * this window is in no repository it can name.
+   *
+   * `undefined` is deliberately permissive: the Git extension may be
+   * inactive, the folder may not be a repository at all, or nothing has
+   * focused a repository yet. Scoping on a guess would hide runs; not
+   * scoping only restores the behaviour from before following existed.
+   *
+   * Roots are aligned to the spellings this window's own discovered projects
+   * use (see {@link alignRoots}), because attribution is now strict: a run
+   * that cannot be attributed is not selected, so a `/tmp` versus
+   * `/private/tmp` mismatch would empty the cockpit rather than merely widen
+   * it.
+   */
+  private async repositoryScope(): Promise<RepositoryScope | undefined> {
+    const active = this.activeRepository.activeRepoRoot;
+    if (!active) {
+      return undefined;
+    }
+    const known = this.activeRepository.knownRepoRoots ?? [active];
+    const aligned = await this.alignRoots([active, ...known]);
+    return { repoRoot: aligned[0], knownRoots: aligned };
+  }
+
+  /**
+   * The Git extension's repository roots, re-spelled the way this window's
+   * discovered projects spell the same directories.
+   *
+   * One spelling per root, so two entries never look like two repositories
+   * with the same name — which is what would happen if `/tmp/foo` and
+   * `/private/tmp/foo` were both kept and the context line then tried to
+   * disambiguate them.
+   */
+  private async alignRoots(roots: readonly string[]): Promise<string[]> {
+    const byRealPath = new Map<string, string>();
+    for (const location of this.locations) {
+      for (const dir of [location.repoRoot, location.projectDir]) {
+        byRealPath.set(canonicalPath(await this.realPaths.of(dir)), dir);
+      }
+    }
+    const out: string[] = [];
+    for (const root of roots) {
+      const aligned = byRealPath.get(canonicalPath(await this.realPaths.of(root))) ?? root;
+      if (!out.some((seen) => samePath(seen, aligned))) {
+        out.push(aligned);
+      }
+    }
+    return out;
+  }
+
   get currentSelection(): RunSelection {
     return this.selection;
+  }
+
+  /** The repository this window is in (integration tests and the diagnostic). */
+  get activeRepositoryRoot(): string | undefined {
+    return this.activeRepository.activeRepoRoot;
   }
 
   get currentDiscovery(): Discovery {
@@ -421,6 +590,74 @@ export class SparringController implements vscode.Disposable {
     return this.manifestDirectoryPath;
   }
 
+  /**
+   * The stage identities of the manifest a managed run executes — but only
+   * once that manifest has been bound to *this* run, on this call.
+   *
+   * The file lives in global storage, which is per-user and nothing else, so
+   * finding one there is not evidence that it belongs to the run on screen,
+   * and neither is its name. The manifest is candidate evidence; the authority
+   * is the run's own recorded state plus the worktree identity, and
+   * `bindParsedManifest` checks the lot (manifest.ts): the plan label, the
+   * **executable digest against the `plan_digest` the engine recorded**, the
+   * recorded current stage, and the sidecar record that says which worktree
+   * the file was written for.
+   *
+   * A manifest that fails any check yields `undefined`, and every caller
+   * degrades to "no recorded membership" — a standalone stage stays
+   * standalone, the journey is not drawn, and nothing claims an ownership it
+   * cannot show. The rejection is logged when it changes, because a silent
+   * degradation is the one thing worse than an honest one.
+   *
+   * The read is cached — a manifest is the largest file the Overview touches,
+   * and three surfaces want it on every render — but only its *bytes* are;
+   * `ManifestReader` re-derives the binding from this `RunSnapshot` on every
+   * call, and its header says why a cache must never hold the conclusion.
+   */
+  async manifestStagesFor(run: RunSnapshot): Promise<ManifestStageIdentity[] | undefined> {
+    if (run.kind !== "plan" || run.state.source !== "manifest") {
+      return undefined;
+    }
+    // The other discovered plan runs, so a manifest written before sidecars
+    // existed can be refused when more than one of them could claim it.
+    const peers = this.discovery.runs.filter((candidate): candidate is PlanRunSnapshot => candidate.kind === "plan" && candidate.state.source === "manifest");
+    const bound = await this.manifests.readBound(this.manifestDirectoryPath, run, peers);
+    this.reportManifestBinding(run, bound);
+    return bound.binding.ok ? bound.binding.identity.stages : undefined;
+  }
+
+  /** Say what was decided the first time, and again whenever it changes; never once per render. */
+  private reportManifestBinding(run: PlanRunSnapshot, bound: BoundManifest): void {
+    const key = `${run.id} ${bound.file}`;
+    const signature = bound.binding.ok ? (bound.derived ? "derived" : "bound") : `${bound.binding.reason}: ${bound.binding.detail}`;
+    if (this.manifestRefusals.get(key) === signature) {
+      return;
+    }
+    this.manifestRefusals.set(key, signature);
+    if (!bound.binding.ok) {
+      this.log(`the execution manifest ${bound.file} is not this run's: ${bound.binding.detail}. Its stages are not used, and no stage is attributed to this plan run from it.`);
+      return;
+    }
+    if (bound.derived) {
+      // Never silent: this run's history is being attributed to a file that
+      // does not itself say which worktree wrote it.
+      this.log(
+        `the execution manifest ${bound.file} was written before manifests recorded which worktree they belong to. It is this run's: its executable content digests to the plan_digest the engine recorded, it contains the recorded current stage, and no other discovered plan run could claim it. Its stages are used, and nothing was written to reach that conclusion.`,
+      );
+    }
+  }
+
+  /**
+   * Which managed plan run each standalone stage of the discovery belongs to.
+   *
+   * One answer for the whole window, so the Overview's wording, the run
+   * picker's grouping and the diagnostic can never disagree about whether a
+   * stage is history of a plan run or work of its own.
+   */
+  planMemberships(): Promise<Map<string, PlanMembership>> {
+    return resolveMemberships(this.discovery.runs, (run) => this.manifestStagesFor(run));
+  }
+
   // ---------------------------------------------------------------- acceptance in flight
 
   isAccepting(runId: string | undefined): boolean {
@@ -467,28 +704,127 @@ export class SparringController implements vscode.Disposable {
   // ---------------------------------------------------------------- sibling repositories (declaration, emitted into the manifest)
 
   /** Every stage's declared sibling repositories for one plan, keyed by label (`3D`). Workspace state; never written into engine state. */
-  stageRepositories(planKey: string): Record<string, DeclaredRepository[]> {
-    return repositoriesForPlan(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey);
+  stageRepositories(planKey: string, projectDir: string): Record<string, DeclaredRepository[]> {
+    return repositoriesForPlan(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, projectDir);
   }
 
   /** One stage's declarations. */
-  stageRepositoriesFor(planKey: string, label: string): DeclaredRepository[] {
-    return repositoriesForStage(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, label);
+  stageRepositoriesFor(planKey: string, projectDir: string, label: string): DeclaredRepository[] {
+    return repositoriesForStage(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, projectDir, label);
   }
 
   /** Declare (or re-declare, by name) a sibling repository this stage's candidate spans. No commit is recorded: the engine pins that at the freeze boundary. */
-  async declareStageRepository(planKey: string, label: string, repository: DeclaredRepository): Promise<void> {
-    const next = withStageRepository(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, label, repository);
+  async declareStageRepository(planKey: string, projectDir: string, label: string, repository: DeclaredRepository): Promise<void> {
+    const next = withStageRepository(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, projectDir, label, repository);
     await this.context.workspaceState.update(STAGE_REPOSITORIES_KEY, next);
-    this.log(`Stage ${label}: also reviews ${repository.name} on ${repository.branch} (${repository.path}); it goes into the execution manifest, and the engine pins and re-verifies its commit`);
+    this.log(
+      `Stage ${label} in ${path.basename(path.resolve(projectDir))}: also reviews ${repository.name} on ${repository.branch} (${repository.path}); it goes into the execution manifest built for this worktree, and the engine pins and re-verifies its commit. Another worktree running the same plan is unaffected.`,
+    );
     this.render();
   }
 
-  async undeclareStageRepository(planKey: string, label: string, name: string): Promise<void> {
-    const next = withoutStageRepository(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, label, name);
+  async undeclareStageRepository(planKey: string, projectDir: string, label: string, name: string): Promise<void> {
+    const next = withoutStageRepository(this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY), planKey, projectDir, label, name);
     await this.context.workspaceState.update(STAGE_REPOSITORIES_KEY, next);
-    this.log(`Stage ${label}: no longer declares ${name}; already-recorded pins stay in the stage's state.json until the next run rewrites the declaration`);
+    this.log(
+      `Stage ${label} in ${path.basename(path.resolve(projectDir))}: no longer declares ${name}; already-recorded pins stay in the stage's state.json until the next run rewrites the declaration`,
+    );
     this.render();
+  }
+
+  // ---------------------------------------------------------------- stage modes (declaration, emitted into the manifest)
+
+  /**
+   * Stages of one plan **in one worktree** declared review-only, keyed by
+   * label (`5`). Workspace state; never written into engine state.
+   *
+   * `projectDir` is not optional and is not a detail: a plan key is shared by
+   * every worktree running the same plan path, so without it this answers for
+   * the wrong checkout (stageModes.ts).
+   */
+  stageModes(planKey: string, projectDir: string): Record<string, StageMode> {
+    return modesForPlan(this.context.workspaceState.get<StageModes>(STAGE_MODES_KEY), planKey, projectDir);
+  }
+
+  /** One stage's declared mode in one worktree; `implementation` when nothing was declared. */
+  stageModeFor(planKey: string, projectDir: string, label: string): StageMode {
+    return modeForStage(this.context.workspaceState.get<StageModes>(STAGE_MODES_KEY), planKey, projectDir, label);
+  }
+
+  /**
+   * Declare what kind of stage this is. It reaches the engine through the
+   * execution manifest, never by writing engine state — and because the
+   * engine folds a declared mode into the digest that identifies a recorded
+   * run, changing it for a stage of a run already under way is something the
+   * engine refuses to continue across until its `reset-stage` command
+   * re-records that digest. Said here rather than left to be discovered.
+   */
+  async declareStageMode(planKey: string, projectDir: string, label: string, mode: StageMode): Promise<void> {
+    const next = withStageMode(this.context.workspaceState.get<StageModes>(STAGE_MODES_KEY), planKey, projectDir, label, mode);
+    await this.context.workspaceState.update(STAGE_MODES_KEY, next);
+    const where = path.basename(path.resolve(projectDir));
+    this.log(
+      mode === "independent_review"
+        ? `Stage ${label} in ${where}: declared review-only; the execution manifest built for this worktree will carry mode=independent_review, so no implementation agent runs for it and a fresh reviewer inspects the accepted candidate set. Another worktree running the same plan is unaffected.`
+        : `Stage ${label} in ${where}: back to the implementation lifecycle; the manifest carries no mode for it, which is the engine's default`,
+    );
+    this.render();
+  }
+
+  /**
+   * Move declarations made before they were scoped to a worktree — a stage's
+   * mode, and the sibling repositories its candidate spans — onto the
+   * worktree they were made in.
+   *
+   * Run after every discovery rather than once at startup, because what makes
+   * a legacy declaration attributable is a *discovered plan run* with that
+   * plan key, and the folder holding it may only be opened later. A pass that
+   * can attribute nothing writes nothing, so this is free when there is
+   * nothing to do.
+   *
+   * Both kinds go through the same helper (declarationScope.ts) so they can
+   * never disagree about which worktree a declaration belongs to.
+   */
+  private async migrateDeclarationScopes(): Promise<void> {
+    const plans = this.discovery.runs.filter((run): run is PlanRunSnapshot => run.kind === "plan");
+    const modes = this.context.workspaceState.get<StageModes>(STAGE_MODES_KEY);
+    const repositories = this.context.workspaceState.get<StageRepositories>(STAGE_REPOSITORIES_KEY);
+    let moved = false;
+    if (modes && Object.keys(modes).length > 0) {
+      moved = (await this.applyMigration("stage mode", STAGE_MODES_KEY, migrateStageModes(modes, plans))) || moved;
+    }
+    if (repositories && Object.keys(repositories).length > 0) {
+      moved = (await this.applyMigration("sibling repository", STAGE_REPOSITORIES_KEY, migrateStageRepositories(repositories, plans))) || moved;
+    }
+    if (moved) {
+      this.render();
+    }
+  }
+
+  /** Store what could be attributed, and say once what could not. */
+  private async applyMigration<V>(what: string, key: string, migration: DeclarationMigration<V>): Promise<boolean> {
+    for (const entry of migration.ambiguous) {
+      const reported = `${key} ${entry.planKey}:${entry.labels.join(",")}`;
+      if (this.reportedAmbiguousDeclarations.has(reported)) {
+        continue;
+      }
+      this.reportedAmbiguousDeclarations.add(reported);
+      this.log(
+        `a ${what} declaration made before declarations were scoped to a worktree (plan ${entry.planKey}, stage(s) ${entry.labels.join(", ")}) ${
+          entry.candidates.length > 1
+            ? `could belong to ${entry.candidates.length} discovered worktrees (${entry.candidates.join(", ")})`
+            : "belongs to no plan run discovered in this window"
+        }, so it is kept but not applied. Declare it again in the worktree you mean.`,
+      );
+    }
+    if (migration.migrated.length === 0) {
+      return false;
+    }
+    await this.context.workspaceState.update(key, migration.next);
+    for (const entry of migration.migrated) {
+      this.log(`${what} declaration for plan ${entry.planKey} (stage(s) ${entry.labels.join(", ")}) is now scoped to ${entry.projectDir}, the only worktree with a recorded run of it.`);
+    }
+    return true;
   }
 
   // ---------------------------------------------------------------- manual check drafts (UI state until submitted)
@@ -569,7 +905,7 @@ export class SparringController implements vscode.Disposable {
     const submissions = this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY);
     for (const runId of Object.keys(submissions ?? {})) {
       const record = submissionFor(submissions, runId);
-      if (!record || record.failure) {
+      if (!record || record.failure || record.unresolved) {
         continue; // already reported; the drafts are kept and the panel says so
       }
       const execution = this.tracker.recordById(record.executionId);
@@ -620,8 +956,136 @@ export class SparringController implements vscode.Disposable {
   }
 
   /** What a window reload would find recorded about this window's launches (integration tests). */
-  persistedLaunches(): { runId: string; state: "running" | "ended" }[] {
+  persistedLaunches(): { runId: string; state: "running" | "unknown" | "ended" }[] {
     return this.tracker.persisted();
+  }
+
+  /**
+   * A command handed to a shell that may still execute — for this run, or for
+   * any operation. Never a runner: `executionFor` answers that. This answers
+   * "would running it again risk doing it twice", and it is what every engine
+   * action consults before submitting anything.
+   */
+  unresolvedSubmissionFor(runId: string | undefined): OperationView | undefined {
+    return this.submissions.pendingShellForRun(runId);
+  }
+
+  /** Every unresolved submission in this window, runner and short command alike. */
+  unresolvedSubmissions(): OperationView[] {
+    return this.submissions.unresolved();
+  }
+
+  /**
+   * The operation holding this run's duplicate guard right now, in whatever
+   * state. Read once while a surface is built, so what that surface offers
+   * acts on the record it was built from rather than on a later lookup.
+   */
+  guardFor(runId: string): OperationView | undefined {
+    return this.submissions.inFlightFor(runnerKey(runId));
+  }
+
+  /**
+   * A person's explicit override: they have checked that this exact operation
+   * cannot still run, and accept the risk of a duplicate if they are wrong.
+   * Recorded as an override, never as evidence that it never ran.
+   *
+   * Takes the immutable operation id. A dialog opened about one record and
+   * confirmed later must never clear a *different* operation that has since
+   * taken the same key, so there is deliberately no way to override by key.
+   */
+  overrideSubmission(operationId: string, note: string): OverrideResult {
+    return this.submissions.override(operationId, note);
+  }
+
+  /**
+   * A person's explicit statement that the runner of one exact execution is
+   * no longer active — the way out of `unknown`, which nothing this window
+   * can observe would ever provide.
+   *
+   * Everything it touches is named by an exact id, so a panel rendered before
+   * a newer run started cannot affect that newer run: the execution id for
+   * liveness, and the immutable operation id the panel was rendered from for
+   * the guard. Both come from the caller; neither is looked up again here.
+   * Looking the guard up afresh by runner key was the defect: the panel's
+   * confirmation checked the exact execution id, and then overrode whichever
+   * operation happened to hold that run's key by the time the person clicked
+   * — so confirming a stale panel released a *newer* operation's guard.
+   *
+   * It does four things and deliberately not a fifth:
+   *
+   *  - ends that execution's liveness, recorded as the person's statement.
+   *    If that execution is not the one this run is waiting on any more,
+   *    nothing at all happens and the caller is told so;
+   *  - overrides the duplicate guard for that exact operation, if one is
+   *    still outstanding, as an override and never as evidence;
+   *  - marks a submission that was waiting on that execution as unresolved,
+   *    which makes it retryable with its text intact;
+   *  - claims nothing about whether the engine recorded the evidence. It is
+   *    neither marked delivered nor marked failed to make buttons work.
+   */
+  async confirmRunnerInactive(runId: string, executionId: string, operationId?: string): Promise<{ confirmed: boolean; reason?: "not-found" | "already-ended"; overrode: boolean; submission: boolean }> {
+    const ended = this.tracker.confirmInactive(runId, executionId);
+    const released = releaseGuardOnConfirmedInactive(ended, operationId, (id, note) => this.submissions.override(id, note));
+    if (released.untouched) {
+      this.log(`the duplicate guard was left alone: ${released.untouched}`);
+    }
+    if (!ended.confirmed) {
+      // The execution the panel was rendered from is not the one this run is
+      // waiting on any more. Nothing here is about anything the person
+      // actually looked at, so nothing is touched — least of all a guard,
+      // which by then may belong to a newer operation entirely.
+      this.log(
+        `You confirmed that a runner of ${runId.split("|").pop() ?? runId} is no longer active, but that is no longer the execution this run is waiting on (${ended.reason ?? "no such execution"}). Nothing was changed.`,
+      );
+      this.render();
+      return { ...ended, overrode: false, submission: false };
+    }
+    const overrode = released.overrode;
+    const record = this.submissionFor(runId);
+    let submission = false;
+    if (record && record.executionId === executionId && !record.failure && !record.unresolved) {
+      await this.context.workspaceState.update(
+        SUBMISSIONS_KEY,
+        withSubmissionUnresolved(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), runId, {
+          atMs: Date.now(),
+          note: "You confirmed that the runner this evidence was handed to is no longer active. Whether the engine recorded it is unknown, so nothing is claimed either way.",
+        }),
+      );
+      submission = true;
+    }
+    this.log(
+      `You confirmed that the runner of ${runId.split("|").pop() ?? runId} is no longer active. That is your statement, not an observation: liveness is recorded as ended${
+        overrode ? ", the duplicate guard for that exact operation is released as an override" : ""
+      }${
+        submission ? ", and the evidence you submitted is retryable with its text intact — Agent Sparring does not claim the engine recorded it" : ""
+      }.`,
+    );
+    this.render();
+    return { ...ended, overrode, submission };
+  }
+
+  /** Ask the process table what it can prove about every unresolved submission. */
+  probeSubmissions(): Promise<void> {
+    return this.submissions.probeAll();
+  }
+
+  /** The operation key of a run's submission, for the override action. */
+  submissionKeyForRun(runId: string): string {
+    return runnerKey(runId);
+  }
+
+  /** The terminal hosting this run's live execution, by name (integration tests). */
+  hostingTerminal(runId: string): string | undefined {
+    return this.tracker.hostingTerminal(runId);
+  }
+
+  /**
+   * The terminals in the pool and why each one may not be sent a command
+   * (integration tests); `undefined` means its shell is idle and the next
+   * engine command for that project would reuse it.
+   */
+  ownedTerminals(): { name: string; cwd: string; unavailable?: string }[] {
+    return this.terminals.owned();
   }
 
   /** Live state as presented: turns a runner known to have ended cannot be executing are cleared. */
@@ -633,16 +1097,102 @@ export class SparringController implements vscode.Disposable {
     return this.locations;
   }
 
-  /** The run the user chose, with the moment they chose it (see selectRun). */
-  private preference(): RunPreference | undefined {
-    const id = this.context.workspaceState.get<string>(SELECTED_RUN_KEY);
-    return id ? { id, atMs: this.context.workspaceState.get<number>(SELECTED_AT_KEY) } : undefined;
+  /**
+   * Every repository a plan may be started in: this window's discovered
+   * Agent Sparring projects, plus every repository and worktree the built-in
+   * Git extension has open (launchRepositories.ts).
+   *
+   * The Git extension's API is what supplies a repository with no `.sparring`
+   * yet, so it is awaited rather than merely read: this is a user-initiated
+   * moment, and a window that started before the Git extension would
+   * otherwise offer the incomplete list once and the complete list ever after.
+   */
+  async launchRepositories(): Promise<LaunchRepository[]> {
+    await this.activeRepository.ready();
+    if (!this.activeRepository.repositoriesKnown) {
+      // Said out loud rather than shown as a short list: the repositories
+      // that exist *only* in the Git extension's answer are precisely the
+      // ones with no Agent Sparring state, which is the first-run case.
+      this.log(`the repository list may be incomplete — ${describeReadiness(this.activeRepository.gitReadiness)}. Repositories with no .sparring directory yet cannot be offered.`);
+    }
+    const folders = (vscode.workspace.workspaceFolders ?? []).map((folder) => ({ path: folder.uri.fsPath, name: folder.name }));
+    return launchRepositories(this.locations, this.activeRepository.knownRepoRoots, folders);
   }
 
+  /** The run the user chose, when, and what choosing it meant (see selectRun). */
+  private preference(): RunPreference | undefined {
+    const id = this.context.workspaceState.get<string>(SELECTED_RUN_KEY);
+    if (!id) {
+      return undefined;
+    }
+    const stored = this.context.workspaceState.get<string>(PIN_INTENT_KEY);
+    return {
+      id,
+      atMs: this.context.workspaceState.get<number>(SELECTED_AT_KEY),
+      intent: stored === "follow" || stored === "inspect" ? stored : undefined,
+    };
+  }
+
+  /**
+   * Pin a run, recording what pinning it meant.
+   *
+   * The intent is taken from the run as it is *now*, because that is the only
+   * moment it is knowable: a run that was open when it was chosen is being
+   * followed, and one that was already finished is being inspected. By the
+   * next refresh the first has often become the second, and nothing on disk
+   * remembers which it was.
+   */
   async chooseRun(run: RunSnapshot | undefined): Promise<void> {
+    const intent = run ? intentForChoosing(run) : undefined;
     await this.context.workspaceState.update(SELECTED_RUN_KEY, run?.id);
     await this.context.workspaceState.update(SELECTED_AT_KEY, run ? Date.now() : undefined);
+    await this.context.workspaceState.update(PIN_INTENT_KEY, intent);
+    if (run) {
+      this.log(
+        intent === "inspect"
+          ? `pinned to ${run.location.folderName} · ${runLabel(run)} for inspection; it stays on screen until you choose another run or ${FOLLOW_ACTIVE_LABEL}, whatever the plan it belongs to does next.`
+          : `pinned to ${run.location.folderName} · ${runLabel(run)} while it runs; if the managed plan run that owns it moves on, the cockpit follows that plan. ${FOLLOW_ACTIVE_LABEL} to go back to automatic selection.`,
+      );
+    }
     await this.refresh();
+  }
+
+  /**
+   * Forget a pin the selection has just let go of, so each release happens
+   * once and in one direction.
+   *
+   * Leaving the stored pin in place made a release a condition rather than an
+   * event: a `follow` pin handed over to its owning plan run came back the
+   * instant that plan completed, because handing over needs an *open* owner.
+   * Completing a plan then moved the screen to a stage from before the plan
+   * started — a change nobody asked for, arriving at the least expected
+   * moment. The remembered run is set to whatever is now on screen, so the
+   * cockpit does not jump anywhere else either.
+   */
+  private async retireReleasedPin(released: NonNullable<RunSelection["released"]>): Promise<void> {
+    await this.context.workspaceState.update(SELECTED_RUN_KEY, undefined);
+    await this.context.workspaceState.update(SELECTED_AT_KEY, undefined);
+    await this.context.workspaceState.update(PIN_INTENT_KEY, undefined);
+    const stage = released.id.split("|").pop();
+    this.log(
+      released.reason === "superseded"
+        ? `the pinned stage ${stage} was being followed while it ran, and the plan run that executed it has moved on to ${released.by.currentStage.stageId}; following that plan run. The stage is still in Select repository / run.`
+        : `the pinned run ${stage} is no longer on disk in a project that was scanned; the pin is released and automatic selection applies.`,
+    );
+  }
+
+  /**
+   * Release the pin and go back to automatic selection in whichever
+   * repository this window is in.
+   *
+   * This is the named way out of a pin, offered in the Overview and the run
+   * picker, because a pin is otherwise indistinguishable from the cockpit
+   * simply disagreeing with the Source Control view.
+   */
+  async followActiveRepository(): Promise<void> {
+    const root = this.activeRepository.activeRepoRoot;
+    this.log(root ? `following the active repository again: ${path.basename(root)}` : "following the active repository again; this window is in no repository the Git extension has opened");
+    await this.chooseRun(undefined);
   }
 
   private async attachToSelected(): Promise<void> {
@@ -689,9 +1239,18 @@ export class SparringController implements vscode.Disposable {
     if (!this.tailer || this.polling) {
       return;
     }
+    const tailer = this.tailer;
     this.polling = true;
     try {
-      const result = await this.tailer.poll();
+      const result = await tailer.poll();
+      // Reading the log is I/O, and the selection can move while it is in
+      // flight — following the active repository makes that ordinary rather
+      // than rare. Events read from the run we have since left must not be
+      // folded into the run now on screen, which would show one run's
+      // provider activity under another run's name.
+      if (this.tailer !== tailer) {
+        return;
+      }
       if (result.reset) {
         this.live = emptyLiveState();
         this.logRenderer.reset();
@@ -747,4 +1306,52 @@ function now(): string {
   const date = new Date();
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+/** Why a confirmation did not release any guard. Each one is a truthful "nothing changed". */
+export type GuardUntouched =
+  | "the execution that confirmation was about is not the one this run is waiting on"
+  | "the panel named no operation, so there was nothing to take responsibility for"
+  | "that operation had already been resolved"
+  | "that operation has nothing outstanding for anyone to settle";
+
+/**
+ * Release the duplicate guard a person has taken responsibility for, and
+ * nothing else.
+ *
+ * Two identities have to line up, and both come from the surface the person
+ * was looking at:
+ *
+ *  - the confirmation must have succeeded for the exact execution that surface
+ *    named. A confirmation that found nothing to end is about a runner this
+ *    run is no longer waiting on, and may not release anything;
+ *  - the operation id is the one the surface was rendered from, and is the only
+ *    thing consulted. A record that has since been resolved is reported as such
+ *    rather than searched for again, so whatever holds that operation key *now*
+ *    — a newer run, started while the panel sat open — is untouched.
+ *
+ * Both were missing. The override ran whatever the confirmation answered, and
+ * it ran against a fresh `inFlightFor(runnerKey(runId))` lookup, so confirming
+ * a stale panel released a newer operation's guard.
+ *
+ * Kept as a function over `override` so this identity rule can be exercised
+ * against a real registry without building a controller
+ * (src/test/staleConfirmation.test.ts).
+ */
+export function releaseGuardOnConfirmedInactive(
+  ended: { confirmed: boolean },
+  operationId: string | undefined,
+  override: (operationId: string, note: string) => OverrideResult,
+): { overrode: boolean; untouched?: GuardUntouched } {
+  if (!ended.confirmed) {
+    return { overrode: false, untouched: "the execution that confirmation was about is not the one this run is waiting on" };
+  }
+  if (!operationId) {
+    return { overrode: false, untouched: "the panel named no operation, so there was nothing to take responsibility for" };
+  }
+  const result = override(operationId, "the person confirmed, having checked, that this runner is no longer active; this is an override, not an observation");
+  if (result.overridden) {
+    return { overrode: true };
+  }
+  return { overrode: false, untouched: result.reason === "already-resolved" ? "that operation had already been resolved" : "that operation has nothing outstanding for anyone to settle" };
 }

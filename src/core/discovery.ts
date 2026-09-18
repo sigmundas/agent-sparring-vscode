@@ -22,6 +22,7 @@ import {
   type SparringOutcome,
   type StageState,
 } from "./engineFormats";
+import { planTitle } from "./planAssociation";
 
 export const SPARRING_DIRNAME = ".sparring";
 export const PLANS_DIRNAME = "plans";
@@ -89,6 +90,14 @@ export interface PlanRunSnapshot {
   state: PlanRunState;
   /** Absolute path of the plan document, resolved from the recorded label. */
   planPath: string;
+  /**
+   * The plan document's own `# ` title, when it has one. What a person calls
+   * the job — "Reported statistics and explicit range semantics" — as opposed
+   * to `state.plan`, which is the repo-relative file path the engine records.
+   * Read from the same document as `planStages`, and available even when the
+   * engine-shaped stage parser refuses it.
+   */
+  planDocumentTitle?: string;
   /** Parsed headings, or undefined if the plan is unreadable/malformed. */
   planStages?: PlanStageHeading[];
   planError?: string;
@@ -326,14 +335,25 @@ async function snapshotPlanRun(location: SparringLocation, statePath: string): P
 
   let planStages: PlanStageHeading[] | undefined;
   let planError: string | undefined;
+  let planText: string | undefined;
   try {
-    planStages = parsePlanStages(await fs.readFile(planPath, "utf8"), planKey);
-    if (planStages.length === 0) {
-      planStages = undefined;
-      planError = "plan declares no stages";
-    }
+    planText = await fs.readFile(planPath, "utf8");
   } catch (error) {
     planError = (error as Error).message;
+  }
+  if (planText !== undefined) {
+    // The document's own title is kept whatever the engine-shaped stage parser
+    // makes of the rest of it: a plan that carries handoff records is refused
+    // as a stage list and still has a name a person recognises.
+    try {
+      planStages = parsePlanStages(planText, planKey);
+      if (planStages.length === 0) {
+        planStages = undefined;
+        planError = "plan declares no stages";
+      }
+    } catch (error) {
+      planError = (error as Error).message;
+    }
   }
 
   const stagesRoot = path.join(location.sparringDir, STAGES_DIRNAME);
@@ -363,6 +383,7 @@ async function snapshotPlanRun(location: SparringLocation, statePath: string): P
     stateMtimeMs: stat.mtimeMs,
     state,
     planPath,
+    planDocumentTitle: planText === undefined ? undefined : planTitle(planText),
     planStages,
     planError,
     stages,
@@ -446,6 +467,150 @@ export interface RunSelection {
   selected?: RunSnapshot;
   /** Non-empty when several runs look active and none was explicitly chosen. */
   ambiguous: RunSnapshot[];
+  /**
+   * The repository automatic selection was confined to, when the window is
+   * following one (see {@link RepositoryScope}). Present whether or not a run
+   * was found there, because "no run in this repository" is only an honest
+   * thing to say if we can name the repository.
+   */
+  scope?: RepositoryScopeView;
+  /** True when `selected` is the user's explicit pin rather than automatic selection. */
+  pinned?: boolean;
+  /**
+   * Discovered runs positively attributed to a *different* repository. Never
+   * selected automatically, and never hidden from the picker: they are why the
+   * empty state can say how much work exists elsewhere instead of implying
+   * there is none.
+   */
+  elsewhere?: RunSnapshot[];
+  /**
+   * Discovered runs no known repository root owns — a `.sparring` project in a
+   * folder that is not a git repository, or one the Git extension has not
+   * opened.
+   *
+   * They are kept apart from {@link elsewhere} because the two are different
+   * facts: those are known to be somewhere else, these are not known to be
+   * anywhere. Neither is a candidate for automatic selection while a scope is
+   * in force — showing a run that cannot be attributed to B under the words
+   * "Following the active repository: B" is exactly the claim this cockpit
+   * must not make — and both remain reachable through the explicit picker.
+   */
+  unattributed?: RunSnapshot[];
+  /**
+   * The stored pin stopped applying on this pass, and why. The caller is
+   * expected to **forget it**, which is what makes each release one-way.
+   *
+   * Without that, a release is a state the selection keeps flipping in and out
+   * of. A `follow` pin superseded by its owning plan run came straight back
+   * the moment that plan completed — `supersedingPlanRun` requires an *open*
+   * owner — so finishing a plan resurrected a pin from before it started and
+   * moved the screen for no reason anyone had asked for. A pin that has been
+   * let go is gone; the run is still one click away in the picker.
+   *
+   *  - `superseded` — a `follow` pin whose owning plan run has moved on
+   *    ({@link supersedingPlanRun}). `by` is that run.
+   *  - `gone` — the pinned run is not in this discovery although its project
+   *    still is, so it was deleted rather than merely not scanned yet.
+   */
+  released?: { id: string; reason: "superseded"; by: PlanRunSnapshot } | { id: string; reason: "gone" };
+}
+
+/**
+ * Confine automatic selection to one repository: the one this window is
+ * currently in (see core/activeRepository.ts).
+ *
+ * `knownRoots` is every repository root the window can see, and it matters:
+ * a run is attributed to the *deepest* known root that contains it, so a
+ * nested checkout or a worktree living inside a parent repository belongs to
+ * itself rather than to its container. Repository roots only — a branch name
+ * never identifies a repository, and two worktrees of the same repository are
+ * two repositories here.
+ */
+export interface RepositoryScope {
+  /** Absolute root of the repository the window is following. */
+  repoRoot: string;
+  /** Every repository root the window can see, including `repoRoot`. */
+  knownRoots?: readonly string[];
+}
+
+export interface RepositoryScopeView {
+  /** Absolute, resolved root. */
+  repoRoot: string;
+  /** What to call it: the root directory's own name, disambiguated when another known root shares it. */
+  name: string;
+}
+
+/**
+ * What a person calls a repository: its root directory's name, qualified by
+ * its parent when another known root has the same name.
+ *
+ * Never a branch — a branch never identifies a repository — and never a full
+ * path. Two worktrees both called `republish-media` under different parents
+ * are two different repositories, and naming them both `republish-media` in
+ * the context line is worse than not naming them at all.
+ */
+export function repositoryDisplayName(repoRoot: string, otherRoots: readonly string[] = []): string {
+  const resolved = path.resolve(repoRoot);
+  const base = path.basename(resolved);
+  if (!base) {
+    return resolved;
+  }
+  const clashes = otherRoots.some((other) => !samePath(other, resolved) && path.basename(path.resolve(other)) === base);
+  if (!clashes) {
+    return base;
+  }
+  const parent = path.basename(path.dirname(resolved));
+  return parent ? `${parent}/${base}` : resolved;
+}
+
+/**
+ * Which of `roots` owns this project: the deepest one containing it, or
+ * `undefined` when none does.
+ *
+ * Deepest wins because repository roots nest — a worktree checked out under
+ * its parent repository, a monorepo package that is its own checkout. Matching
+ * shallowest-first would hand every nested project to the container and make
+ * two unrelated repositories look like one.
+ */
+export function repositoryOwning(location: SparringLocation, roots: readonly string[]): string | undefined {
+  return roots
+    .filter((root) => containsProject(location, root))
+    .sort((a, b) => canonicalPath(b).length - canonicalPath(a).length)[0];
+}
+
+function containsProject(location: SparringLocation, root: string): boolean {
+  for (const dir of [location.repoRoot, location.projectDir]) {
+    if (samePath(dir, root) || isInsidePath(dir, root)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** How a run relates to the repository the window is in. */
+export type RunAttribution = "here" | "elsewhere" | "unattributed";
+
+/**
+ * Whether this run belongs to `repoRoot`, to another known repository, or to
+ * none that can be named.
+ *
+ * The third answer is the one that matters: a run no known root owns is
+ * **not** silently adopted by the repository that happens to be active. It
+ * stays out of automatic selection and stays in the explicit picker, because
+ * "Following the active repository: B" has to mean the run really is B's.
+ */
+export function attributeRun(run: RunSnapshot, repoRoot: string, knownRoots: readonly string[] = []): RunAttribution {
+  const roots = [...new Set([repoRoot, ...knownRoots].map((root) => path.resolve(root)))];
+  const owner = repositoryOwning(run.location, roots);
+  if (owner === undefined) {
+    return "unattributed";
+  }
+  return samePath(owner, repoRoot) ? "here" : "elsewhere";
+}
+
+/** The runs positively attributable to one repository; nothing else. */
+export function runsInRepository(runs: readonly RunSnapshot[], repoRoot: string, knownRoots: readonly string[] = []): RunSnapshot[] {
+  return runs.filter((run) => attributeRun(run, repoRoot, knownRoots) === "here");
 }
 
 export function isOpenRun(run: RunSnapshot): boolean {
@@ -456,48 +621,146 @@ export function isOpenRun(run: RunSnapshot): boolean {
 }
 
 /**
- * What the user explicitly chose, and when. The timestamp is what lets an
- * old choice be told from a deliberate one: a managed plan run that has
- * advanced *since* the choice has overtaken it (see `supersedingPlanRun`),
- * while opening a finished stage as history right now is respected.
+ * What an explicit selection *means*, which decides what may release it.
+ *
+ * The two are genuinely different requests and were conflated:
+ *
+ *  - `inspect` — the run was already finished when it was chosen. The person
+ *    asked to look at history, and nothing about the live world is an answer
+ *    to that: only they can end it.
+ *  - `follow` — the run was still open when it was chosen. The person asked to
+ *    watch *that work*, and when the managed plan run that owns it moves on,
+ *    following the plan is the continuation of the same request rather than a
+ *    contradiction of it.
+ */
+export type PinIntent = "inspect" | "follow";
+
+/**
+ * What the user explicitly chose, when, and what choosing it meant.
+ *
+ * `intent` is recorded at the moment of choosing because it cannot be
+ * recovered later: an open run becomes a finished one, and by the time a
+ * selection is being re-evaluated there is nothing left to say whether it was
+ * open when it was picked.
+ *
+ * `atMs` is kept only for a `follow` pin, where it bounds what counts as the
+ * owning plan run having advanced *since* the choice. It is deliberately not
+ * consulted for an `inspect` pin: a state file's modification time says
+ * nothing about whether someone is still reading the stage it belongs to, and
+ * using it as though it did is what silently dropped people out of history.
  */
 export interface RunPreference {
   id: string;
   /** When it was chosen (epoch ms); absent means "long ago", from before this was recorded. */
   atMs?: number;
+  /**
+   * What the selection meant. Absent — a pin stored before this was
+   * recorded — is read as `inspect`, which is the reading that cannot lose
+   * someone's place: the worst it does is keep a pin that its owner could
+   * have released with one click, where the other default silently moves the
+   * screen out from under them.
+   */
+  intent?: PinIntent;
+}
+
+/** The intent a run being chosen *now* implies: history is inspected, live work is followed. */
+export function intentForChoosing(run: RunSnapshot): PinIntent {
+  return isOpenRun(run) ? "follow" : "inspect";
 }
 
 /**
- * The open plan run that has taken over from `run` — undefined when none
- * has. A managed run adopts stages that existed on their own; when it then
- * advances, the stage it has left behind becomes an accepted standalone run
- * again (the plan document's own stage list does not always name it, and
- * only the plan's *current* stage is claimed). Following that stage would
- * show a finished screen offering actions the live plan has already taken.
- *
- * `sinceMs` keeps a deliberate visit to that history: only a plan run whose
- * state was written after that moment counts as having advanced past it.
+ * Which managed plan run owns each standalone stage, keyed by the stage run's
+ * id. Built from recorded execution membership only (planMembership.ts); a
+ * stage with no entry has no owner, and nothing here guesses one.
  */
-export function supersedingPlanRun(run: RunSnapshot, runs: readonly RunSnapshot[], sinceMs = 0): PlanRunSnapshot | undefined {
+export type StageOwnership = ReadonlyMap<string, string>;
+
+/**
+ * The plan run that has taken over from a **followed** stage — undefined when
+ * none has, and always undefined for a stage someone is inspecting.
+ *
+ * The case this exists for: a managed run adopts a stage that existed on its
+ * own, and when it advances, the stage it left behind becomes an accepted
+ * standalone run again (the plan document's own stage list does not always
+ * name it, and only the plan's *current* stage is claimed). Someone who
+ * selected that stage **while it was still running** asked to watch that work,
+ * so following the plan run that continued it is the same request answered;
+ * leaving them on a finished screen offering actions the live plan has already
+ * taken is not.
+ *
+ * ### What this must never do
+ *
+ * Release an explicit visit to history. That is why `intent` is a parameter
+ * and not an inference: the ordinary way to pin a historical stage is to pin
+ * one the plan has *already* moved past, so `owner.currentStage !== run` is
+ * true from the very first moment and every subsequent write to the owner's
+ * state file pushed `stateMtimeMs` past `sinceMs` and released the pin. A plan
+ * that merely re-recorded its position — the engine writes that file on every
+ * transition — silently closed the stage a person was reading. Modification
+ * time is evidence that a file changed and evidence of nothing else; it was
+ * standing in for "the run advanced past the stage you were following", which
+ * it cannot tell you.
+ *
+ * `ownership` is required, and is recorded membership only: the run that takes
+ * over must be the run that **executed this stage**. It used to be any open
+ * plan run in the same project whose current stage differed, so an unrelated
+ * plan merely being open could claim a stage it had never run.
+ *
+ * `sinceMs` bounds the advance to one that happened after the choice.
+ */
+export function supersedingPlanRun(
+  run: RunSnapshot,
+  runs: readonly RunSnapshot[],
+  sinceMs: number,
+  ownership: StageOwnership,
+  intent: PinIntent = "follow",
+): PlanRunSnapshot | undefined {
+  if (intent === "inspect") {
+    return undefined;
+  }
   if (run.kind !== "stage" || isOpenRun(run)) {
     return undefined;
   }
-  return runs.find(
-    (candidate): candidate is PlanRunSnapshot =>
-      candidate.kind === "plan" &&
-      isOpenRun(candidate) &&
-      candidate.location.projectDir === run.location.projectDir &&
-      candidate.stateMtimeMs > sinceMs &&
-      candidate.currentStage.stageId !== run.stage.stageId,
-  );
+  const ownerId = ownership.get(run.id);
+  if (!ownerId) {
+    return undefined;
+  }
+  const owner = runs.find((candidate): candidate is PlanRunSnapshot => candidate.kind === "plan" && candidate.id === ownerId);
+  if (!owner || !isOpenRun(owner) || owner.stateMtimeMs <= sinceMs || owner.currentStage.stageId === run.stage.stageId) {
+    return undefined;
+  }
+  return owner;
 }
+
+/** No stage is known to be owned; every caller that has no membership data passes this. */
+export const NO_STAGE_OWNERSHIP: StageOwnership = new Map<string, string>();
 
 /**
  * Deterministic selection:
+ *  0. when a `scope` is given, automatic selection only ever considers runs
+ *     **positively attributable** to that repository. Runs owned by another
+ *     known repository are reported as `elsewhere`, and runs no known root
+ *     owns as `unattributed`; neither is a candidate. A run in another
+ *     repository is never shown, not even the one shown a moment ago: the
+ *     remembered (`stickyId`) run is only a candidate while it is in scope, so
+ *     switching repository drops the previous repository's run rather than
+ *     leaving it on screen. Switching back finds it again, because the memory
+ *     was kept, only ignored;
  *  1. an explicitly preferred run (by id) that still exists wins, even when
- *     it has become terminal (complete / accepted) — unless a managed plan
- *     run in the same project has advanced past it since it was chosen, in
- *     which case the cockpit follows the plan (`supersedingPlanRun`);
+ *     it has become terminal (complete / accepted), and **regardless of
+ *     scope** — pinning a run is how someone asks to inspect history in
+ *     another repository, so following the active repository must not undo it.
+ *     The selection says so (`pinned`), and the Overview offers the way back.
+ *
+ *     Exactly three things end a pin, and all three are reported in
+ *     `released` so the caller can forget it rather than keep re-deciding it:
+ *     the user pinning something else, the user choosing Follow active
+ *     repository (both of which simply replace or clear the stored pin), and
+ *     the run itself ceasing to exist. A `follow` pin — one made while the run
+ *     was still open — additionally hands over to the managed plan run that
+ *     continued it (`supersedingPlanRun`). An `inspect` pin never does: a
+ *     plan re-recording its position is not a reason to close the history
+ *     someone is reading;
  *  2. exactly one open plan run (status running/paused) is selected;
  *  3. several open plan runs: the remembered (`stickyId`) one if it is among
  *     them, otherwise ambiguous and nothing is selected;
@@ -509,14 +772,69 @@ export function supersedingPlanRun(run: RunSnapshot, runs: readonly RunSnapshot[
  * `stickyId` is what the caller last showed; it is a tie-breaker and a
  * fallback, never a reason to ignore a newly started open run.
  */
-export function selectRun(runs: RunSnapshot[], preferred?: string | RunPreference, stickyId?: string): RunSelection {
+export function selectRun(
+  runs: RunSnapshot[],
+  preferred?: string | RunPreference,
+  stickyId?: string,
+  scope?: RepositoryScope,
+  ownership: StageOwnership = NO_STAGE_OWNERSHIP,
+  /**
+   * The projects this discovery actually scanned. Only used to tell a pinned
+   * run that was *deleted* from one that simply has not been located yet; with
+   * none supplied, a missing pin is never reported as released, which is the
+   * conservative answer.
+   */
+  locations: readonly SparringLocation[] = [],
+): RunSelection {
+  const view: RepositoryScopeView | undefined = scope
+    ? { repoRoot: path.resolve(scope.repoRoot), name: repositoryDisplayName(scope.repoRoot, scope.knownRoots ?? []) }
+    : undefined;
+  const inScope: RunSnapshot[] = [];
+  const elsewhere: RunSnapshot[] = [];
+  const unattributed: RunSnapshot[] = [];
+  for (const run of runs) {
+    if (!scope) {
+      inScope.push(run);
+      continue;
+    }
+    const where = attributeRun(run, scope.repoRoot, scope.knownRoots ?? []);
+    (where === "here" ? inScope : where === "elsewhere" ? elsewhere : unattributed).push(run);
+  }
+  const decorate = (selection: RunSelection): RunSelection => ({
+    ...selection,
+    ...(view ? { scope: view } : {}),
+    ...(elsewhere.length > 0 ? { elsewhere } : {}),
+    ...(unattributed.length > 0 ? { unattributed } : {}),
+  });
+
   const pick = typeof preferred === "string" ? { id: preferred } : preferred;
   if (pick) {
     const chosen = runs.find((run) => run.id === pick.id);
-    if (chosen && !supersedingPlanRun(chosen, runs, pick.atMs ?? 0)) {
-      return { selected: chosen, ambiguous: [] };
+    if (!chosen) {
+      // Absent from the discovery. That is only a *release* when the project
+      // it belongs to was scanned and the run was not there; a project that
+      // has not been located yet (a window still starting, a folder briefly
+      // unreadable) must not cost someone their pin, so the pin is simply not
+      // applied this pass and is kept.
+      const gone = locations.some((location) => runIdBelongsTo(pick.id, location));
+      return decorate({ ...selectAutomatically(inScope, stickyId), ...(gone ? { released: { id: pick.id, reason: "gone" as const } } : {}) });
     }
+    const by = supersedingPlanRun(chosen, runs, pick.atMs ?? 0, ownership, pick.intent ?? "inspect");
+    if (!by) {
+      return decorate({ selected: chosen, ambiguous: [], pinned: true });
+    }
+    return decorate({ ...selectAutomatically(inScope, stickyId), released: { id: pick.id, reason: "superseded", by } });
   }
+  return decorate(selectAutomatically(inScope, stickyId));
+}
+
+/** Whether a run id names a run of this location; run ids are `<projectDir>|<kind>:<key>`. */
+function runIdBelongsTo(runId: string, location: SparringLocation): boolean {
+  const at = runId.lastIndexOf("|");
+  return at > 0 && samePath(runId.slice(0, at), location.projectDir);
+}
+
+function selectAutomatically(runs: RunSnapshot[], stickyId?: string): RunSelection {
   const sticky = stickyId ? runs.find((run) => run.id === stickyId) : undefined;
 
   const openPlans = runs.filter((run): run is PlanRunSnapshot => run.kind === "plan" && isOpenRun(run));
@@ -540,34 +858,36 @@ export function selectRun(runs: RunSnapshot[], preferred?: string | RunPreferenc
   return { selected: terminal[0], ambiguous: [] };
 }
 
-/**
- * Which repository a launch (Run Plan) should target: the selected run's
- * repository first, then the only repository, then the one containing the
- * active document; undefined means the caller must ask.
- */
-export function chooseLaunchLocation(locations: SparringLocation[], selected: RunSnapshot | undefined, activeFile?: string): SparringLocation | undefined {
-  if (selected) {
-    const owner = locations.find((location) => location.projectDir === selected.location.projectDir);
-    if (owner) {
-      return owner;
-    }
-  }
-  if (locations.length === 1) {
-    return locations[0];
-  }
-  if (activeFile) {
-    // A nested project's directory lies inside its parent's too: the deepest
-    // (most specific) match owns the file.
-    return locations
-      .filter((location) => isInsidePath(activeFile, location.repoRoot) || isInsidePath(activeFile, location.projectDir))
-      .sort((a, b) => b.projectDir.length - a.projectDir.length)[0];
-  }
-  return undefined;
+export function isInsidePath(file: string, root: string): boolean {
+  const relative = path.relative(canonicalPath(root), canonicalPath(file));
+  return !!relative && !relative.startsWith("..") && !path.isAbsolute(relative);
 }
 
-export function isInsidePath(file: string, root: string): boolean {
-  const relative = path.relative(root, file);
-  return !!relative && !relative.startsWith("..") && !path.isAbsolute(relative);
+/**
+ * One spelling of a path, for comparison only.
+ *
+ * macOS and Windows default to case-insensitive file systems, so `/Users/x/Repo`
+ * and `/Users/x/repo` are the same directory; the Git extension reports a
+ * repository root in whatever case git recorded, while a workspace folder keeps
+ * whatever case the user opened. Comparing them literally attributed a run to
+ * no repository at all, which — now that an unattributable run is never
+ * selected automatically — would have emptied the cockpit.
+ *
+ * Case is all this can fix. Symlinks (`/tmp` → `/private/tmp` on macOS) need
+ * `fs.realpath`, which is I/O and therefore belongs to the caller: the
+ * extension resolves the Git extension's roots and passes both spellings (see
+ * SparringController.repositoryScope).
+ */
+export function canonicalPath(target: string): string {
+  const resolved = path.resolve(target);
+  return CASE_INSENSITIVE_FS ? resolved.toLowerCase() : resolved;
+}
+
+const CASE_INSENSITIVE_FS = process.platform === "darwin" || process.platform === "win32";
+
+/** Whether two paths name the same location, as far as {@link canonicalPath} can tell. */
+export function samePath(a: string, b: string): boolean {
+  return canonicalPath(a) === canonicalPath(b);
 }
 
 /** The stage whose activity.jsonl should be tailed for a run. */

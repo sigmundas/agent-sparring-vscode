@@ -138,7 +138,17 @@ async function buildFixture(): Promise<{ root: string; workspaceFile: string }> 
       '  printf \'{"base_sha": null, "candidate_sha": "%s", "implementation_session_id": null, "sparring_session_id": null, "status": "accepted"}\\n\' "$sha" > "$dir/state.json"',
       '  echo "accepted candidate: $sha"; exit 0',
       "fi",
-      'now=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)',
+      '# The fake engine writes its telemetry with the second it is in, plus',
+      '# .999: POSIX `date` has no sub-second field, and a *truncated* timestamp',
+      '# is a turn that appears to have begun up to a second before the runner',
+      '# that wrote it. The extension discards such a turn on purpose — a turn',
+      '# older than the runner cannot be that runner\'s, and the engine\'s',
+      '# worktree lock means it is a leftover (core/liveness.ts) — so the section',
+      '# that waits for `turnActive` while the runner runs passed only when the',
+      '# launch happened to land in the previous whole second. Rounding up keeps',
+      '# the one ordering the fixture must not misrepresent: the turn started',
+      '# after the runner did. The real engine writes microseconds.',
+      'now=$(date -u +%Y-%m-%dT%H:%M:%S.999Z)',
       "printf '{\"v\":1,\"ts\":\"%s\",\"actor\":\"loop\",\"event\":\"loop.started\"}\\n' \"$now\" >> \"$dir/activity.jsonl\"",
       "printf '{\"v\":1,\"ts\":\"%s\",\"actor\":\"stage\",\"event\":\"turn.started\",\"provider\":\"claude-cli\",\"session_id\":\"fake\"}\\n' \"$now\" >> \"$dir/activity.jsonl\"",
       "trap 'exit 130' INT TERM",
@@ -149,6 +159,17 @@ async function buildFixture(): Promise<{ root: string; workspaceFile: string }> 
     ].join("\n"),
     { mode: 0o755 },
   );
+
+  // A second worktree of the same repository, with the same plan document at
+  // the same *repo-relative* path — which is what makes both produce the same
+  // plan key, and is the whole reason declarations have to be scoped by
+  // worktree. Deliberately not a workspace folder and with no `.sparring`, so
+  // discovery is untouched: it exists to be the checkout a declaration made
+  // next door must not reach.
+  const uiCleanup = path.join(root, "sporely-py-ui-cleanup");
+  await fs.mkdir(path.join(uiCleanup, "plans"), { recursive: true });
+  await fs.mkdir(path.join(uiCleanup, ".git"), { recursive: true });
+  await fs.writeFile(path.join(uiCleanup, ".git", "HEAD"), "ref: refs/heads/feature/ui-cleanup\n");
 
   // The fake's directory is put on the *integrated shell's* PATH only (never
   // on the extension host's), so the bare-`sparring` scenario exercises the

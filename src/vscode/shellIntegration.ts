@@ -6,7 +6,9 @@
  */
 
 import * as vscode from "vscode";
-import { planShellHandover, shellFamily } from "../core/cli";
+import { planShellHandover, shellFamily, type ShellHandover } from "../core/cli";
+
+export type { ShellHandover };
 
 /** How long a fresh terminal gets to report shell integration before a fallback is used. */
 export const SHELL_INTEGRATION_TIMEOUT_MS = 5000;
@@ -36,6 +38,13 @@ export function awaitShellIntegration(terminal: vscode.Terminal, timeoutMs = SHE
   });
 }
 
+/**
+ * How long the shell gets to report a handed-over command as started before
+ * the caller stops waiting. It is a user-interface deadline and nothing more:
+ * the operation itself outlives it (operationRegistry.ts).
+ */
+export const EXECUTION_START_TIMEOUT_MS = 5000;
+
 /** Resolves with the exit code when `execution` ends (undefined when the shell reported none). */
 export function awaitExecutionEnd(execution: vscode.TerminalShellExecution, terminal: vscode.Terminal): Promise<number | undefined> {
   return new Promise((resolve) => {
@@ -64,29 +73,95 @@ export interface ShellRequest {
   commandLine: string;
   /** Whether this extension quoted it, rather than VS Code's own escaping. */
   quotedHere: boolean;
+  /**
+   * Reading back what the host said it handed over failed, *after* the shell
+   * had already been given the command. The command line above is then this
+   * extension's own description of what it asked for rather than the host's
+   * report of it — and, far more importantly, the hand-over still happened.
+   */
+  metadataError?: Error;
 }
 
 /**
- * Run `word` with `args` in `integration`'s shell.
+ * What one call of `executeCommand` did, with the irreversible boundary in the
+ * type rather than in a comment.
+ *
+ * `handedOver: false` is emitted only from *before* that call — the plan said
+ * this shell cannot be given the command, or the call itself threw. Once
+ * `executeCommand` has returned, the shell has the command line and nothing
+ * that happens afterwards can produce that answer: reading the returned
+ * execution's own metadata is observation, and a failure there is reported as
+ * `metadataError` on a hand-over that did happen.
+ *
+ * This shape exists because the two used to be one `try` block. `executeCommand`
+ * succeeded, `execution.commandLine.value` threw, and the caller classified
+ * the whole thing as "the hand-over threw" — which resolved the operation as
+ * `cannot-execute` while the shell was holding the command.
+ */
+export type HandoverAttempt =
+  | { handedOver: false; error: Error }
+  | { handedOver: true; request: ShellRequest };
+
+/**
+ * Whether, and how, this shell can be given `word` with `args` — decided
+ * *before* anything irreversible happens.
  *
  * VS Code's `executeCommand(executable, args)` escaping is exact for flags
  * and paths but mangles anything a person wrote (see
  * `vscodeQuotingIsFaithful`), so when an argument would not survive it, the
  * command line is built here instead and passed as one already-quoted
- * string. Returns undefined when this shell's quoting is not reproduced in
+ * string. `no-shell` means this shell's quoting is not reproduced in
  * `shellCommandLine` — the caller must then reach the process without a
  * shell rather than send it something it cannot express.
+ *
+ * Deciding this first is what lets a caller record its durable intent to run
+ * the operation only when it really is about to: an operation that can never
+ * be handed to this shell must not be armed for one.
  */
-export function executeThroughShell(integration: vscode.TerminalShellIntegration, word: string, args: string[], shell = vscode.env.shell, platform: NodeJS.Platform = process.platform): ShellRequest | undefined {
-  const handover = planShellHandover(word, args, shellFamily(shell, platform));
+export function shellHandoverFor(word: string, args: string[], shell = vscode.env.shell, platform: NodeJS.Platform = process.platform): ShellHandover {
+  return planShellHandover(word, args, shellFamily(shell, platform));
+}
+
+/**
+ * Hand a planned command over. The first irreversible step of a shell launch,
+ * and the only one: everything the caller must record durably has to be on
+ * disk before this is called.
+ *
+ * The call is structured in three parts, and the order is the whole point:
+ *
+ *  1. **prepare** — anything that can decide "this cannot be handed over" is
+ *     done before the call, and returns `handedOver: false`;
+ *  2. **`executeCommand`** — the irreversible boundary. It is the only thing
+ *     inside its own `try`, so a throw from it, and nothing else, means the
+ *     shell was given nothing;
+ *  3. **observe** — reading the returned execution's metadata. A throw here is
+ *     carried as `metadataError` on a hand-over that *did* happen, never as a
+ *     failure to hand over. The shell has the command line by then, and no
+ *     caller may treat it as never executed.
+ */
+export function performShellHandover(integration: vscode.TerminalShellIntegration, word: string, args: string[], handover: ShellHandover): HandoverAttempt {
+  // 1. prepare
   if (handover.via === "no-shell") {
-    return undefined;
+    return { handedOver: false, error: new Error("performShellHandover was called for a command this shell cannot be given") };
   }
-  if (handover.via === "command-line") {
-    return { execution: integration.executeCommand(handover.commandLine), commandLine: handover.commandLine, quotedHere: true };
+  const quotedHere = handover.via === "command-line";
+  // 2. the irreversible boundary: nothing but this call is in the try
+  let execution: vscode.TerminalShellExecution;
+  try {
+    execution = quotedHere ? integration.executeCommand(handover.commandLine) : integration.executeCommand(word, args);
+  } catch (error) {
+    return { handedOver: false, error: error as Error };
   }
-  const execution = integration.executeCommand(word, args);
-  return { execution, commandLine: execution.commandLine.value, quotedHere: false };
+  // 3. observation. The shell has the command; from here on nothing may
+  //    downgrade that to "it was never handed over".
+  if (quotedHere) {
+    return { handedOver: true, request: { execution, commandLine: handover.commandLine, quotedHere: true } };
+  }
+  try {
+    return { handedOver: true, request: { execution, commandLine: execution.commandLine.value, quotedHere: false } };
+  } catch (error) {
+    return { handedOver: true, request: { execution, commandLine: [word, ...args].join(" "), quotedHere: false, metadataError: error as Error } };
+  }
 }
 
 /** The environment the extension host sees, for host-side PATH fallbacks. */

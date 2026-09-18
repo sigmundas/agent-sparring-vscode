@@ -7,8 +7,11 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { SparringLocation } from "../core/discovery";
+import { isInsidePath, samePath, type PlanRunSnapshot, type RunSnapshot, type SparringLocation, type StageOwnership } from "../core/discovery";
+import type { GitWorkTreeProbe } from "../core/launchRepositories";
 import type { ActivityEvent } from "../core/engineFormats";
+import { BINDING_VERSION, bindManifest, bindingPathFor, manifestExpectationFor, manifestPathFor, parseExecutionManifest, renderBindingRecord, type ManifestStageIdentity } from "../core/manifest";
+import { resolveMemberships, stageOwnership, type PlanMembership } from "../core/planMembership";
 
 /** Real values produced by the engine for `docs/plans/foo.md` (see plan.py: plan_key). */
 export const FOO_PLAN_LABEL = "docs/plans/foo.md";
@@ -159,6 +162,23 @@ export class Workspace {
   }
 }
 
+/**
+ * A launchability probe for tests that are not about launchability: every
+ * directory is inside a git repository.
+ *
+ * Temporary fixture directories are not git repositories, so without this
+ * every candidate would be refused as a launch target and a test about, say,
+ * which nested root owns a file would be testing the wrong thing. A test that
+ * *is* about launchability passes {@link gitWorkTreesIn} or the real
+ * on-disk probe instead.
+ */
+export const everywhereIsAGitRepo: GitWorkTreeProbe = async () => true;
+
+/** A probe that says yes only at or below the given roots — a stand-in for the real `.git` layout. */
+export function gitWorkTreesIn(...roots: string[]): GitWorkTreeProbe {
+  return async (dir) => roots.some((root) => samePath(root, dir) || isInsidePath(dir, root));
+}
+
 let clock = Date.parse("2026-09-12T19:02:13.000Z");
 
 /** Build an engine-shaped event with a monotonically increasing timestamp. */
@@ -198,4 +218,130 @@ export function normalUi(html: string): string {
     .replace(/title="[^"]*"/g, "")
     .replace(/<dl class="facts">[\s\S]*?<\/dl>/g, "")
     .replace(/<details class="tech">[\s\S]*?<\/details>/g, "");
+}
+
+/**
+ * The execution manifests the extension keeps in global storage, as tests
+ * need them.
+ *
+ * Files are written to, and read from, the same paths the extension uses
+ * (`manifestPathFor` / `bindingPathFor`) and are accepted only through the
+ * same binding rules (`bindManifest`). A test therefore cannot accept a
+ * manifest the extension itself would refuse, which is the whole point: these
+ * files decide which historical stage belongs to which plan run.
+ *
+ * Writing one models the whole sequence the extension and the engine perform
+ * together: the manifest is written, the sidecar says which worktree it was
+ * written for, and the engine then records that manifest's executable digest
+ * as the run's `plan_digest`. `bind: false` performs only the first two — a
+ * file overwritten behind a recorded run's back, which is exactly the shape of
+ * attack the binding exists to refuse.
+ */
+export interface ManifestWriteOptions {
+  /** Fields to replace in the manifest payload. */
+  overrides?: Record<string, unknown>;
+  /** false: write the files without the engine recording this manifest's digest for the run. */
+  bind?: boolean;
+  /** Write at another run's paths, forcing the file-name collision the project scope is meant to avoid. */
+  at?: PlanRunSnapshot;
+  /** Claim another project directory in the binding record. */
+  projectDir?: string;
+}
+
+export class ManifestStore {
+  private constructor(readonly dir: string) {}
+
+  static async create(): Promise<ManifestStore> {
+    return new ManifestStore(await fs.mkdtemp(path.join(os.tmpdir(), "agent-sparring-manifests-")));
+  }
+
+  /** The manifest of `run`, written where the extension would write it, with its binding record. */
+  async write(run: PlanRunSnapshot, stages: readonly ManifestStageIdentity[], options: ManifestWriteOptions = {}): Promise<string> {
+    const at = options.at ?? run;
+    const file = manifestPathFor(this.dir, at);
+    const text =
+      JSON.stringify(
+        {
+          version: 1,
+          plan_label: run.state.plan,
+          source_digest: "sha256:" + "0".repeat(64),
+          stages: stages.map((stage) => ({ stage_id: stage.stageId, label: stage.label, title: stage.title, brief: `# ${stage.title}\n` })),
+          ...options.overrides,
+        },
+        null,
+        2,
+      ) + "\n";
+    await fs.writeFile(file, text);
+
+    const parsed = parseExecutionManifest(text);
+    await fs.writeFile(
+      bindingPathFor(this.dir, at),
+      renderBindingRecord({
+        version: BINDING_VERSION,
+        manifestFile: path.basename(file),
+        manifestDigest: parsed?.digest ?? "unreadable",
+        planKey: run.planKey,
+        planLabel: parsed?.identity.planLabel ?? run.state.plan,
+        projectDir: path.resolve(options.projectDir ?? run.location.projectDir),
+      }),
+    );
+    if (options.bind !== false && parsed) {
+      await recordPlanDigest(run, parsed.digest);
+    }
+    return file;
+  }
+
+  /** A manifest at an arbitrary path — for the legacy, unscoped name, and for files that must be refused. */
+  async writeAt(file: string, payload: unknown): Promise<string> {
+    await fs.writeFile(file, JSON.stringify(payload, null, 2) + "\n");
+    return file;
+  }
+
+  fileFor(run: PlanRunSnapshot): string {
+    return manifestPathFor(this.dir, run);
+  }
+
+  bindingFor(run: PlanRunSnapshot): string {
+    return bindingPathFor(this.dir, run);
+  }
+
+  /** The reader the controller passes to `resolveMemberships`, with the same validation. */
+  readonly stagesOf = async (run: PlanRunSnapshot): Promise<ManifestStageIdentity[] | undefined> => {
+    if (run.state.source !== "manifest") {
+      return undefined;
+    }
+    const bound = bindManifest(await readOptional(manifestPathFor(this.dir, run)), await readOptional(bindingPathFor(this.dir, run)), manifestExpectationFor(run));
+    return bound.ok ? bound.identity.stages : undefined;
+  };
+}
+
+/**
+ * What the engine does after a manifest is handed to it: record that
+ * manifest's executable digest as the run's identity, both on disk and in the
+ * snapshot already in memory.
+ */
+export async function recordPlanDigest(run: PlanRunSnapshot, digest: string): Promise<void> {
+  run.state.planDigest = digest;
+  const text = await readOptional(run.statePath);
+  if (text !== undefined) {
+    await fs.writeFile(run.statePath, JSON.stringify({ ...JSON.parse(text), plan_digest: digest }, null, 2) + "\n");
+  }
+}
+
+async function readOptional(file: string): Promise<string | undefined> {
+  try {
+    return await fs.readFile(file, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+/** Recorded membership for a discovery, resolved exactly as the extension resolves it. */
+export async function membershipsOf(runs: readonly RunSnapshot[], store: ManifestStore): Promise<Map<string, PlanMembership>> {
+  return resolveMemberships(runs, store.stagesOf);
+}
+
+/** …and the ownership edges `selectRun` takes. */
+export async function ownershipOf(runs: readonly RunSnapshot[], store: ManifestStore): Promise<StageOwnership> {
+  return stageOwnership(await membershipsOf(runs, store));
 }

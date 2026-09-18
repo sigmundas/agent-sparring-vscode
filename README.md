@@ -36,19 +36,21 @@ navigates.
 | `Agent Sparring: Resume Plan` | Pick a paused/running plan run, optionally record human evidence, launch `resume-plan`. The branch is *not* asked for: the run recorded `expected_branch` when it started and the engine refuses any other, so the checked-out branch is used when it matches and the mismatch is explained when it does not. |
 | `Agent Sparring: Run / Resume Stage` | For the selected standalone stage (or after picking one), launch `sparring run-loop <stage> --repo-root <project> --expected-branch <current branch>` in a terminal. The branch comes from the Git repository owning the project (built-in Git API, then `.git/HEAD`); a detached HEAD is refused, never guessed. Also offered as **Run stage** / **Resume stage** in the Overview. |
 | `Agent Sparring: Accept Stage` | For a stage whose independent review passed (**Review complete**): one action that runs the engine's `freeze-candidate` and, only if that succeeds, `accept-candidate` for the selected stage, project and current branch. Refusals are translated (uncommitted changes, not pushed, wrong branch, code changed after the review); the engine's own output goes to the Output Channel. Also offered as **Accept stage** in the Overview. |
-| `Agent Sparring: Choose Plan for Stage…` | Associate a Markdown plan file (any location, ordinary file picker) with the selected standalone stage. Stored in VS Code workspace state per repository + stage id, never in engine state; gives the Overview a **Plan** button, this stage's place in the document and, once accepted, **What's next**. Change or remove it the same way. |
+| `Agent Sparring: Choose Plan for Stage…` | Associate a Markdown plan file (any location, ordinary file picker) with the selected standalone stage. Stored in VS Code workspace state per repository + stage id, never in engine state; gives the Overview a **Plan document** button, this stage's place in the document and, once accepted, **What's next**. Change or remove it the same way. |
 | `Agent Sparring: Match Stage to Plan Section…` | When the Overview cannot tell which stage of the associated plan the selected stage is, pick it from the plan's stages (also **Match this stage…** / **Change match…** in the Overview). It remaps **only the stage on screen**, and the dialog is titled with that stage's name so it cannot be mistaken for another. Stored with the association in VS Code workspace state, never in engine state. |
 | `Agent Sparring: Review Stage Matches…` | The plan-level view: every stage this project has and which section of the plan it resolves to, with the ones nothing could place — and any two stages claiming the same section — first. Pick one to say which section *it* is. Use this to fix a historical stage; **Change match…** would remap the current one instead. When nothing needs placing the list says so — *All stages are matched. Select one only if you want to change it.* — and fixing the last unplaced stage closes it rather than reopening. Also **All stage matches…** in the Overview. |
 | `Agent Sparring: Start Next Stage from Plan…` | For an accepted standalone stage with an associated plan: create the stage that follows it (by stage label) with the engine's own `sparring new-stage <id>`, after a confirmation naming the title, the proposed id and the plan section. The Overview switches to the new stage, the plan association follows it, and its fresh `brief.md` opens beside the plan section for you to fill in before **Run stage**. Also **Start next stage** in the Overview. |
 | `Agent Sparring: Continue Plan Automatically` | Build the execution manifest for the plan of the selected run and start (or resume) the engine's managed plan run against it: `sparring run-plan --manifest … [--adopt]` / `sparring resume-plan --manifest …`. The engine then sequences the stages itself. One confirmation before the first stage; none between stages. Also **Continue automatically** in the Overview. |
-| `Agent Sparring: Sibling Repositories for a Plan Stage…` | Declare which *other* repositories a plan stage's reviewed candidate spans, so acceptance pins and verifies the complete set instead of the primary commit alone. Pick the stage, pick a repository this window knows (or browse to one) and confirm the branch its candidate must be on; no commit is ever asked for. Stored in VS Code workspace state per plan and stage label, emitted into the execution manifest, and shown quietly in the Overview. Removing a declaration is the same command. |
+| `Agent Sparring: Sibling Repositories for a Plan Stage…` | Declare which *other* repositories a plan stage's reviewed candidate spans, so acceptance pins and verifies the complete set instead of the primary commit alone. Pick the stage, pick a repository this window knows (or browse to one) and confirm the branch its candidate must be on; no commit is ever asked for. Stored in VS Code workspace state per worktree, plan and stage label, emitted into the execution manifest, and shown quietly in the Overview. Removing a declaration is the same command. |
+| `Agent Sparring: Stage Mode for a Plan Stage…` | Declare that a plan stage is a *review* of work rather than work: no implementation agent runs for it, and a fresh independent reviewer inspects the candidates the earlier stages accepted. Nothing is inferred from a stage's title or its brief's prose — this command is the only way to say it. Stored in VS Code workspace state per worktree, plan and stage label, and emitted into the execution manifest as `mode`. Setting it back to *Implementation* removes the declaration. |
 | `Agent Sparring: Copy Review Context for Chat` | For a stage the reviewer handed back to you: put the whole review on the clipboard as plain Markdown — the stage and its goal, the routing state, the reviewer's summary and note, every human-gate check with its instruction and pass criteria verbatim, the concrete names the review refers to, the latest handoff claims, the reviewer's findings and the stage's plan section — so it can be pasted into ChatGPT/Claude, an issue or a message and asked about. No provider prompts, model reasoning, command output or activity log. Also **Copy context for chat** in the Overview, beside **Open detailed review**, with **Copy this check** under each outstanding check. |
 | `Agent Sparring: Choose sparring Executable…` | Pick the `sparring` CLI with a file dialog and store it as `agentSparring.executable`. |
-| `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / finalizing / future stages), the current stage as primary content (the stage as the plan names it — `Stage 3D — title`, with `6 of 8` as secondary metadata — a human state word with one explaining sentence, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), latest sparring result, small Stage Agent / Sparrer cards, Brief / Handoff / Sparring report / Diff / Plan / Log buttons, and quiet metadata (where the engine's own words live). Never auto-opens; updates in place. |
+| `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / finalizing / future stages), the current stage as primary content (the stage as the plan names it — `Stage 3D — title`, with `6 of 8` as secondary metadata — a human state word with one explaining sentence, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), latest sparring result, small Stage Agent / Sparrer cards, Brief / Handoff / Sparring report / Diff / Plan document / Log buttons, and quiet metadata (where the engine's own words live). Never auto-opens; updates in place. |
 | `Agent Sparring: Show Log` | Focus the Output Channel. |
-| `Agent Sparring: Select Run` | Choose explicitly when several runs look active; the choice is remembered per workspace. |
+| `Agent Sparring: Follow Active Repository` | Release the pin and go back to automatic selection in whichever repository this window is in. Also the last group of Select Repository / Run, and a **Follow active repository** control at the top of the Overview whenever a pin is in force. |
+| `Agent Sparring: Select Run` | Choose explicitly when several runs look active; the choice *pins* that run, so it is kept even when the window moves to another repository, and the Overview says so. The choice is remembered per workspace. The list is grouped — *Plan runs* first, then *Standalone / historical stages* — and each row is labelled by what a person calls it (the plan document's title, the plan's own `Stage 3D — …` name for a stage), with the repository and the raw stage id in the detail line. |
 | `Agent Sparring: Rediscover State` | Re-scan `.sparring` from disk. |
-| `Agent Sparring: Diagnose Discovery` | Trace discovery for every workspace folder into the Output Channel: scheme, path, the `.sparring` probed, nested projects, stage/plan files and whether they parsed (lifecycle status only), runs produced, what Select Repository / Run would list, and why nothing is selected. Never logs file contents. |
+| `Agent Sparring: Diagnose Discovery` | Trace discovery for every workspace folder into the Output Channel: scheme, path, the `.sparring` probed, nested projects, stage/plan files and whether they parsed (lifecycle status only), runs produced, whether the built-in Git extension's API is attached, the active repository and the roots runs were attributed against, the runs in other repositories — and the runs no known root owns — that automatic selection therefore did not consider, what Select Repository / Run would list (group, label, description and the raw stage id), and why nothing is selected. Never logs file contents. |
 
 ## Settings
 
@@ -220,6 +222,52 @@ repositories are listed quietly at the bottom of the Overview, each said only
 as far as the data goes — *declared in VS Code*, *recorded for this stage*, or
 *pinned by the engine* with the commit.
 
+**Review-only stages.** A plan's last stage is often not work: a fresh
+independent reviewer verifies the candidates the earlier stages accepted,
+checks every gate, and the activation decision is taken on that. Run through
+the ordinary lifecycle, such a stage gets an implementation agent with
+nothing to implement — one that opens a session, reads around, and sooner or
+later writes something to try an idea out, at which point the reviewer of the
+work is also its author.
+
+**Agent Sparring: Stage Mode for a Plan Stage…** says so instead: pick the
+stage, pick *Independent review (review only)*. Nothing is inferred — a stage
+titled "Independent final review and activation decision" runs the
+implementation lifecycle until someone declares otherwise, because which
+agent runs is not a thing to read off a heading. The declaration is workspace
+state per worktree, plan and stage label, exactly like a sibling repository,
+and it reaches the engine as `"mode": "independent_review"` in the execution
+manifest. The engine then runs that stage as one fresh reviewer over the
+accepted candidate set with no implementation turn at all, treats a defect it
+finds as a stop rather than as work to do, and completes the stage over the
+commit it reviewed instead of manufacturing one. Nothing is merged.
+
+Both kinds of declaration are scoped to the **worktree** they were made in, as
+well as to the plan and the stage. A plan key is a hash of the plan's
+repo-relative path, so every checkout of the same plan shares one, and keying
+by plan alone meant a declaration made in one worktree changed what another
+worktree executed — and, through the run digest the engine folds it into,
+whether that worktree's in-flight run could continue at all. Declarations made
+before this move to the worktree they belong to when exactly one discovered
+plan run can be shown to own them; when two could, or none is open, they are
+kept, left unapplied, and said so in the Output Channel rather than guessed at.
+
+Two consequences worth knowing before declaring one. A declared mode is part
+of what the engine digests to identify a recorded run, so declaring it
+mid-run changes that digest and the engine refuses to continue across the
+change — deliberately. And a stage that has *already run* under the other
+mode cannot simply be relabelled: the engine refuses to adopt an
+implementation session into a review meant to be independent of it, and names
+`sparring reset-stage`, which archives that attempt as history, verifies the
+repository is at the preceding accepted candidate, and restarts the stage with
+a fresh reviewer. Both refusals arrive in the terminal with the command to
+run.
+
+In the Overview, the reviewing actor card reads **Independent reviewer** for
+such a stage rather than *Review turn*, and its instructions are the captured
+`prompts/0001-reviewer-original.md` — which is how you check that the actor
+working right now really is a fresh reviewer.
+
 **Pause after each stage** (`manual`) keeps the per-stage checkpoints below
 unchanged, for when you want to look before every provider turn. In automatic
 mode those actions are still there, just no longer the obvious path.
@@ -227,15 +275,15 @@ mode those actions are still there, just no longer the obvious path.
 ## Plans: managed runs and associated files
 
 - A **managed plan run** is the engine's `.sparring/plans/<key>.json`. It is
-  authoritative: the Overview shows the journey, **Plan** opens the recorded
-  document, and after the current stage is accepted **Continue plan** calls
+  authoritative: the Overview shows the journey, **Plan document** opens the
+  recorded Markdown, and after the current stage is accepted **Continue plan** calls
   `sparring resume-plan`, which advances past the accepted stage and starts
   the next one (paused runs get **Resume plan**).
 - A **standalone stage** has no machine-readable plan. **Choose plan…** lets
   you pick any Markdown file (no directory convention is assumed). The
   association is VS Code workspace state keyed by repository + stage id;
-  the engine never sees it. The Overview then shows **Plan** and this
-  stage's place in the document. Because the engine has no operation that
+  the engine never sees it. The Overview then shows **Plan document** and
+  this stage's place in the document. Because the engine has no operation that
   starts a standalone stage from a plan, nothing here offers to; the next
   section is information you read, not a button that runs something.
 
@@ -277,12 +325,12 @@ line and a **What's next** block:
 
 | Situation | What's next shows |
 | --- | --- |
-| Managed plan run, a stage follows | the engine's next stage, its opening paragraph from the plan, **Continue plan** (`resume-plan`), **Open in plan** |
+| Managed plan run, a stage follows | the engine's next stage, its opening paragraph from the plan, **Continue plan** (`resume-plan`), **Open plan section** |
 | Managed plan run, last stage | *No stage follows this one in the plan.* and **Continue plan** |
-| Standalone stage, plan linked and matched, next stage defined | `Stage 3C — title`, its opening paragraph, **Start next stage**, **Open in plan**, **Change match…** |
-| Standalone stage, next stage ambiguous or only mentioned historically | the label and why it cannot be started; **Open in plan** |
-| Standalone stage, no later label / plan without labels | *No later stage is defined in …* / the plan has no "Stage …" labels; **Open plan** |
-| Standalone stage, plan linked but not matched | *The plan is linked, but Agent Sparring doesn't yet know where this stage belongs in it.* **Match this stage…**, **Open plan**; plan stages the brief lists as later work are shown as a hint |
+| Standalone stage, plan linked and matched, next stage defined | `Stage 3C — title`, its opening paragraph, **Start next stage**, **Open plan section**, **Change match…** |
+| Standalone stage, next stage ambiguous or only mentioned historically | the label and why it cannot be started; **Open plan section** |
+| Standalone stage, no later label / plan without labels | *No later stage is defined in …* / the plan has no "Stage …" labels; **Open plan document** |
+| Standalone stage, plan linked but not matched | *The plan is linked, but Agent Sparring doesn't yet know where this stage belongs in it.* **Match this stage…**, **Open plan document**; plan stages the brief lists as later work are shown as a hint |
 | Standalone stage, no plan | *This stage has been accepted. Choose a plan to see what comes next.* **Choose plan…** |
 
 **Start next stage** (the per-stage path) proposes `stage-<label>-<slug>`
@@ -338,23 +386,92 @@ Deleting `activity.jsonl` removes the live decoration and nothing else.
 
 There is **one reusable terminal per project**, `Agent Sparring — <project>`.
 Run stage, Accept stage, run-plan and every resume-plan of a long managed run
-share it, so a plan does not leave a row of dead tabs behind. It is leased for
-the duration of each command: a terminal that is busy is never sent a second
-one (a second terminal is opened instead), a terminal you closed is replaced,
-and projects never share one. Only terminals the extension opened are ever
-written to — a command you type in your own terminal is observed, never
-interrupted.
+share it, so a plan does not leave a row of dead tabs behind. A terminal is
+reused only while its shell is idle, and "idle" is decided from the shell,
+not from the extension's own bookkeeping: every shell execution in the
+terminals the extension owns is watched (`onDidStartTerminalShellExecution` /
+`onDidEndTerminalShellExecution`), whoever started it. So if you start an
+interactive CLI — `claude`, a long test run — in `Agent Sparring — <project>`
+after a command has finished, the next engine command opens
+`Agent Sparring — <project> (2)` instead. Your terminal is not written to and
+your command is not interrupted; the extension never sends it Ctrl-C, and
+never leaves an engine command sitting in your prompt.
 
-Terminal identity is not liveness. Every shell execution is tracked
-separately, so a finished command can never keep the Overview `Running`
-because its terminal is still open, and Stop still reaches exactly the
-terminal hosting the live execution.
+The same holds for a terminal whose occupancy cannot be established: one
+whose shell integration never reported, or one VS Code restored after a
+window reload (nothing in the new window saw what has been running in it). A
+fresh terminal is opened rather than an idle shell assumed. A terminal you
+closed is replaced, and projects never share one. Only terminals the
+extension opened are ever written to — a command you type in your own
+terminal is observed, never interrupted.
+
+### Submitting a command is not running it
+
+Handing a command line to shell integration submits it. The shell may run it
+at once, later (a stopped or busy shell runs the line when it continues), or
+never. So every engine command — `run-plan`, `resume-plan`, `run-loop` and the
+short ones, `freeze-candidate`, `accept-candidate`, `new-stage` — goes through
+one submission registry, and a submission becomes a runner only when the shell
+reports **that exact execution** as started:
+
+| State | What it means | What the extension does |
+| --- | --- | --- |
+| Submitted, waiting | the start report is being waited for (5 s) | nothing is `Running`, nothing is persisted as a live launch, no runner is claimed |
+| Submitted, uncertain | that wait expired with no start report | the same, plus: the terminal is quarantined (never reused, never closed or signalled — your command may be what is holding it), and the extension keeps looking for evidence |
+| Running | the shell reported that execution as started | an ordinary tracked runner: persisted, shown, stopped with Ctrl-C, ended by its own end event |
+
+**The invariant.** Once a command has been handed to a shell and nothing has
+*proved* that it can no longer execute, that submission keeps refusing a second
+copy of the same operation — a second `run-plan` for that run, a second
+`freeze-candidate` for that stage. The check happens before the executable is
+resolved, before a terminal is acquired and before anything is sent. The
+wording says what is known — "Agent Sparring handed this command to the
+terminal and has not been able to confirm whether it started" — and never that
+a runner is alive.
+
+**What resolves a submission.** Only evidence:
+
+| Evidence | What it proves |
+| --- | --- |
+| the shell reports that exact execution started | it ran (a runner is then tracked as usual, however late the start) |
+| the shell reports that exact execution finished | the shell only reports an end for a command it ran |
+| its terminal was closed | the pty and the shell reading it are gone, so a queued line can never be read |
+| `ps` no longer lists the shell process that took it | the same conclusion, for a submission this window can no longer identify |
+| `ps` lists *this exact command* (same subcommand, stage / plan / manifest) | it started |
+| the command line was never handed over (this shell's quoting could not be written) | there is no submitted line at all |
+
+**What never resolves one:** a timer of any kind, the terminal-reconnect grace
+period after a reload, and *any other* runner turning up in the project's
+process table. "There is a runner in this project" is not "the command I queued
+started": a probed runner and an unresolved submission coexist, and the probed
+runner ending does not settle the submission either.
+
+**The human override.** Agent Sparring cannot cancel a line a shell already
+has, so there is no "cancel". What there is, on the refusal, is
+**I checked — allow retry**: a modal confirmation stating that you have looked
+at that terminal and the command cannot start any more, and that retrying while
+it can could run the operation twice. It is recorded in the log as your
+override, never as evidence that the command did not run.
+
+**After a reload.** Submissions are persisted separately from the launches, so
+a reload never turns one into a live runner. VS Code cannot hand a
+`TerminalShellExecution` back, so a restored submission cannot be recognised by
+identity: it stays uncertain and keeps refusing a duplicate until its terminal
+closes, until `ps` shows the shell that took it is gone or shows the exact
+command running, or until you override it. A terminal that merely does not
+reconnect proves nothing. On a platform without a process probe, an unresolved
+submission stays unresolved until a terminal event or your override — the log
+says so.
 
 ### Which run the Overview follows
 
 In order:
 
-1. the run you chose explicitly, while that choice still holds;
+0. **the repository this window is in** — automatic selection only ever
+   considers runs there (see below);
+1. the run you chose explicitly, while that choice still holds — *regardless*
+   of repository, because pinning a run is how you inspect history somewhere
+   else;
 2. the active managed plan run of the project;
 3. the active standalone stage;
 4. otherwise the remembered run, then the most recent finished one.
@@ -362,14 +479,147 @@ In order:
 A choice stops holding when a managed plan run of the same project has
 **advanced past** the finished stage you had chosen — which is what happens
 when a stage you adopted is accepted and the engine moves to the next one.
-The Overview then follows the managed run to its current stage. The stage it
-came from stays discoverable as history, and opening it deliberately is
-respected (the plan has not advanced since you opened it); that screen then
-says which run has taken over, offers **Show running plan**, and withholds
-what the live run already owns — Continue plan automatically, and Start next
-stage for a stage the engine has already created. Every "a runner is already
-alive" message offers **Show running plan** too, rather than leaving you on a
-screen whose buttons cannot work.
+The Overview then follows the managed run to its current stage. Every "a
+runner is already alive" message offers **Show running plan** too, rather
+than leaving you on a screen whose buttons cannot work.
+
+### The repository context: following, and pinning
+
+A VS Code window is often several repositories, so the cockpit states which
+one it is in — at the **top of the Overview**, before anything about the run:
+
+> Following repository: **sporely-py-inaturalist-republish-media**
+
+The contract is exactly this, and nothing else:
+
+```
+Agent Sparring repository context =
+    the explicitly pinned Agent Sparring repository/run, if one is pinned
+    otherwise the repository of the active editor / Source Control focus
+```
+
+Move to another repository and the run from the previous one is dropped
+rather than left on screen looking current. If the repository you have moved
+to has no `.sparring` run, you get
+
+> **No Agent Sparring run for sporely-py-inaturalist-republish-media**
+> This repository has no .sparring plan run or stage on disk. Nothing has been
+> started or created for it.
+
+and, when work exists elsewhere, a line naming where: *Agent Sparring has also
+discovered 1 in sporely-py-reported-statistics.* Nothing is started, adopted
+or created on your behalf.
+
+**Pinning.** Picking a row in **Select repository / run…** *pins* it. A pin is
+kept even when the window moves to another repository — that is what makes
+inspecting a finished run in another checkout possible — and both repositories
+are then named at the top, with the way out beside them:
+
+> 📌 Viewing pinned run from: **sporely-py-reported-statistics**
+> Active repository context: **sporely-py-inaturalist-republish-media**
+> \[ Select repository / run… ] \[ Follow active repository ]
+
+Both lines appear whenever a pin is in force, including when the pin is in the
+repository you are already in, so the policy reads the same way every time.
+**Select repository / run…** is on every Overview screen — with a run, without
+one, and while several look active — and `Agent Sparring: Follow Active
+Repository` is in the Command Palette. Switching context never depends on a
+gesture this extension cannot observe.
+
+A selection stored by a version of this extension from before pins survived a
+change of repository is **not** silently promoted to one: on first start it is
+demoted to the ordinary remembered run, which still shows while the window is
+in its repository and lets go as soon as it is not.
+
+**What "the repository of the active editor / Source Control focus" means, and
+what it deliberately does not.** VS Code's lower-left repository selector
+cannot be read through any public extension API: `vscode.scm` exposes only
+`createSourceControl`, the selector's command (`scm.setActiveProvider`) sets an
+internal pin no extension is told about, and core publishes the answer solely
+as `when`-clause context keys an extension cannot read as values. Emulating it
+would mean reaching into private commands or internals, so **Agent Sparring
+does not claim to follow it.** What it follows is the two public signals the
+built-in Git extension's stable API version 1 does offer:
+
+- `Repository.ui.selected` / `Repository.ui.onDidChange` — which repository the
+  Source Control view has focused;
+- `API.getRepository(uri)` with `window.onDidChangeActiveTextEditor` — which
+  repository owns the document you are looking at.
+
+Whichever was observed most recently wins. An editor that belongs to no
+repository (a Settings tab, the Output panel) says nothing rather than
+emptying the answer, and a *re-read* — caused by a repository opening or
+closing, or by the Git extension only just becoming available — re-resolves
+what was already observed without counting as a new selection. No private
+command is intercepted and no context key is read.
+
+The consequence worth knowing: **using the lower-left selector alone is not
+visible to this extension.** Opening a file in the repository you switched to
+is, as is focusing it in the Source Control view — and the resolved repository
+is named at the top of the Overview precisely so a disagreement is visible
+rather than silent. **Select repository / run…** overrides it.
+
+If the built-in Git extension is disabled, not installed, or has not activated
+yet, nothing is scoped at all and every discovered run is a candidate, exactly
+as before following existed. Agent Sparring can activate before the Git
+extension does; it then awaits that extension's activation and retries from
+every later editor or Source Control signal, so following starts working
+without a reload. `Agent Sparring: Diagnose Discovery` reports whether the API
+is attached.
+
+**Attribution is strict.** Repositories are told apart by **root path only**,
+never by branch name; two worktrees of the same repository are two
+repositories, a worktree checked out inside its parent belongs to itself (a
+run is attributed to the *deepest* repository root that contains it), and two
+roots with the same directory name are qualified by their parent
+(`worktrees/republish-media`). A run that **no** known repository root owns — a
+`.sparring` project in a folder that is not a git repository, or one the Git
+extension has not opened — is never selected automatically, because showing it
+under the words *Following the active repository: B* would be a claim that it
+is B's. It stays in **Select repository / run…**, and the empty state names it.
+
+### Plan run, historical stage, plan document
+
+Three things, and the UI keeps them apart:
+
+| | What it is | How to get to it |
+| --- | --- | --- |
+| **Plan run** | the whole job: the engine sequences its stages, records where it is, and the Overview draws the timeline | the *Plan runs* group of Select Repository / Run; **Back to plan run** from one of its stages |
+| **Historical stage** | one finished stage of a plan run — good for inspecting its brief, handoff, review, diff and log | the *Standalone / historical stages* group |
+| **Plan document** | the Markdown specification | **Plan document** / **Open plan section**, which open an editor and change nothing about which run is selected |
+
+A stage is known to belong to a plan run only through **recorded execution**:
+the execution manifest that run executes lists its id, or the run's own
+recorded current stage is it, or — for a run started from a Markdown plan — the
+plan document's stage list, which is what the engine itself executes for such
+a run. That is why a stage of a plan whose document the engine's
+`## Stage <n>` parser refuses — one carrying `## Stage 3D handoff — …`
+records — is still named `Stage 3D` and still knows where it came from, and
+why nothing is claimed when no recorded run lists it. A stage id that merely
+*looks* like one of a plan's, and a plan run that merely happens to be open in
+the same project, are not records of anything and claim nothing.
+
+A manifest is only believed once it is bound to the run it is claimed to
+describe. It lives in the extension's global storage, which is per-user and
+nothing else, so its file name is scoped to the run's project directory as
+well as to the plan — two worktrees running `docs/plans/foo.md` no longer share
+one file — and its contents are checked against what the engine recorded: the
+plan label it executes, and the presence of the run's current stage. A
+manifest that fails either check, or that is missing, attributes nothing; the
+stage keeps its own screen rather than being handed to a run that cannot be
+shown to have executed it.
+
+Such a stage reads *Historical stage*, is named as its own run
+names it, and offers **Back to plan run** as its primary action; that button
+changes the selected run, so the timeline comes back. What the plan run owns
+is withheld there: **Continue plan automatically** is not offered (whether
+that run is still going or complete — adopting stages a managed run already
+owns could only be refused, or start a second run over finished work), and
+neither is **Start next stage** for a stage the engine has already created.
+The refusal is in the command, not only in the screen: invoking
+`Agent Sparring: Continue Plan Automatically` from the Command Palette or a
+keybinding on a stage an existing plan run owns is refused with that run
+named, and offers **Back to plan run**.
 
 ### Runner lifecycle
 
@@ -387,7 +637,7 @@ Liveness sources, most exact first:
 
 | Source | How it is observed | Ends when |
 | --- | --- | --- |
-| Launched from the extension | This project's integrated terminal (your normal shell, cwd = project) runs `sparring` through the terminal shell-integration API with an argument array (see "Free-text arguments" for the one case that is quoted here instead). | The shell-execution end event fires (normal exit, non-zero exit, Ctrl-C), another command starts in that terminal, or the terminal closes. |
+| Launched from the extension | This project's integrated terminal (your normal shell, cwd = project — only when its shell is idle) runs `sparring` through the terminal shell-integration API with an argument array (see "Free-text arguments" for the one case that is quoted here instead). Recorded as a runner only once the shell reports that exact execution started; a submission the shell has not started is kept apart from the launches and is never a runner (see "Submitting a command is not running it"). | The shell-execution end event fires (normal exit, non-zero exit, Ctrl-C), another command starts in that terminal, or the terminal closes. |
 | Dedicated terminal (fallback) | Only if shell integration does not activate within 5 s: a terminal whose process *is* `sparring` (argument array, no shell). | That terminal closes, which VS Code does as soon as the process exits. |
 | Typed in an integrated terminal | Shell integration reports the command line and cwd; `sparring run-loop <stage>`, `run-plan` and `resume-plan` are recognised and tied to the project by `--repo-root` / `--sparring-dir` / cwd (nested projects match their own root). | Same as a launched command. |
 | Re-found after a window reload | Launches are recorded in `workspaceState`; after a reload the hosting terminal is re-found by process id and, on macOS/Linux, a `ps` probe checks that the runner still runs under it. | The probe no longer finds it, or a shell execution starts/ends in that terminal. On Windows the state stays `unknown`. |
@@ -458,6 +708,22 @@ B. Developer: Reload Window
    targets the right terminal.
 6. If it did not survive: **Resume stage** is offered.
 
+C. Declarations across a reload
+
+The one check the integration harness cannot make for itself (see "What the
+integration harness cannot test"), because a test host never writes its
+workspace storage to disk.
+
+1. In a worktree with a plan, run **Agent Sparring: Sibling Repositories for a
+   Plan Stage…** and declare one for a stage, then **Agent Sparring: Stage Mode
+   for a Plan Stage…** and set that stage to *Independent review*.
+2. Run `Developer: Reload Window`.
+3. Re-open both commands: the stage still shows the sibling under its label and
+   *review only* beside it.
+4. If a second worktree of the same repository with the same plan path is open,
+   both commands must show it as declaring **nothing** — the two share a plan
+   key, and that is exactly what the worktree scope exists to separate.
+
 ## Develop
 
 ```sh
@@ -469,6 +735,87 @@ npm run test:integration   # downloads VS Code once, opens a generated multi-roo
 ```
 
 Press F5 in VS Code to launch an Extension Development Host.
+
+### Keeping the manifest contract in step with the engine
+
+`src/core/manifest.ts` reimplements the engine's `parse_manifest` and
+`manifest_digest` in TypeScript, because the digest it produces is compared
+against the `plan_digest` the engine recorded for a run. The two are therefore
+one contract with two authors, and a divergence is silent and expensive: it
+either refuses a run's real manifest — costing that run its stage list, its
+journey and the membership of every stage it executed — or accepts one the
+engine never ran.
+
+So the engine is the oracle, and it is asked rather than read. The inputs are
+in `src/test/manifestVectors.ts`, what a live engine answered for them is
+generated into `src/test/manifestParityPins.ts`, and
+`src/test/manifestParity.test.ts` checks both directions:
+
+```sh
+npm test                                  # the TypeScript side against the pins — no Python needed
+
+# and the pins themselves against a live engine:
+AGENT_SPARRING_SRC=../agent-sparring/src PYTHON=/path/to/venv/bin/python3 \
+  npm run compile-tests && node --test out/test/manifestParity.test.js
+```
+
+When the engine's manifest contract changes on purpose, regenerate the pins and
+review the diff — that diff *is* the review of the change:
+
+```sh
+npm run compile-tests
+AGENT_SPARRING_SRC=../agent-sparring/src PYTHON=/path/to/venv/bin/python3 \
+  node scripts/generate-manifest-pins.js
+```
+
+Three divergences this found, none of them visible by reading the two
+implementations side by side: Python's `str.strip()` removes U+0085 and
+U+001C–U+001F while JavaScript's `trim()` does not, and `trim()` removes U+FEFF
+while `str.strip()` does not; `version != 1` in Python accepts `true`, because
+`True == 1`; and `str.encode("utf-8")` raises on an unpaired surrogate where
+Node substitutes U+FFFD, so the extension used to hand a confident digest to a
+manifest the engine cannot digest at all.
+
+### What the integration harness cannot test
+
+VS Code run under `--extensionTestsPath` keeps its storage **in memory**. With
+a shared `--user-data-dir` across two launches the same workspace-storage
+directory is created (`User/workspaceStorage/<hash>/`) and no `state.vscdb` is
+ever written to it — not after a settling delay, and not after a graceful
+`workbench.action.quit`. A second window therefore always starts with an empty
+store, so no assertion here can show that a value written in one window is read
+back in the next: it would be testing the harness.
+
+Anything kept in `workspaceState` — plan associations, stage-mode and
+sibling-repository declarations, the pin, manual check drafts — is therefore
+verified two ways instead, and neither claims VS Code's own durability:
+
+- the stored values are taken out and used to rebuild the result from cold,
+  through the same readers and builders production uses, so a stored shape that
+  was missing or ambiguous would fail (`declarations` in the integration
+  suite);
+- every accessor reads the Memento on the call and holds no in-process copy, so
+  whatever VS Code restores is what the extension uses. That is asserted
+  against the source.
+
+A real reload remains a manual check; see "Manual verification".
+
+### Known follow-ups
+
+Recorded rather than fixed, so they are visible without being smuggled into an
+unrelated change:
+
+- **A file cache keyed on size and mtime can serve a stale parse** if a file's
+  contents are replaced while both are preserved (`src/vscode/fileHead.ts`).
+- **Symlink aliases** are resolved for repository roots (`RealPaths`) but not
+  everywhere a path is compared; `/tmp` and `/private/tmp` on macOS are the
+  usual way to meet this.
+- **`repositoryOwning` ranks candidate roots by string length** rather than by
+  path depth, unlike `repositoryForFile` and `repositoryOfPath`, which were
+  corrected to count segments.
+- **Case sensitivity is assumed per platform, not per volume**
+  (`canonicalPath`): a case-sensitive volume on macOS is treated as
+  case-insensitive.
 
 ## Install locally
 

@@ -10,40 +10,59 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { acceptStage, type AcceptStageResult } from "../core/acceptance";
-import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, readGitBranch, type ExecutableProblem } from "../core/cli";
-import { adoptionGaps, buildManifest, carriedForward, manifestFileName, renderManifest, type ExecutionManifest, type KnownStage } from "../core/manifest";
+import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, readGitBranch } from "../core/cli";
+import {
+  BINDING_VERSION,
+  adoptionGaps,
+  bindingPathFor,
+  buildManifest,
+  carriedForward,
+  manifestDigest,
+  manifestPathFor,
+  previousManifestFileNames,
+  renderBindingRecord,
+  renderManifest,
+  type ExecutionManifest,
+  type KnownStage,
+  type ManifestBindingRecord,
+  type ManifestOwner,
+} from "../core/manifest";
 import {
   BRIEF_FILENAME,
   HANDOFF_FILENAME,
   NOTES_FILENAME,
   SPARRING_FILENAME,
-  chooseLaunchLocation,
   currentStageOf,
   isInsidePath,
   runIdFor,
-  supersedingPlanRun,
   type PlanRunSnapshot,
   type RunSnapshot,
   type SparringLocation,
   type StageSnapshot,
   type StandaloneStageSnapshot,
 } from "../core/discovery";
+import { FOLLOW_ACTIVE_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
 import { parseHandoffBranch, parsePlanStages } from "../core/engineFormats";
 import { appendHumanEvidence, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
 import { blocksLaunch } from "../core/liveness";
 import type { OverviewAction } from "../core/overviewHtml";
+import { UNKNOWN_RUNNER_EXPLANATION } from "../core/overviewModel";
 import { createStage, proposeNextStage, renderNextStageBrief, type NewStageResult } from "../core/nextStage";
 import { buildStageIndex, locateStage, parsePlanHeadings, sectionSummary, type HeadingRef, type PlanHeading, type StageEntry } from "../core/planAssociation";
 import { stageMatchRows, type StageMatchRow, type StageToMatch } from "../core/stageMatches";
-import { buildRunPickItems, describeRun } from "../core/runPick";
+import { buildRunPickGroups, describeRun } from "../core/runPick";
 import { stageDisplayName } from "../core/presentation";
 import { stageActions, stageRunAction } from "../core/runner";
 import { planKey, planLabel, planRunId, type SparringSubcommand } from "../core/sparringCommand";
-import { manifestRepositories, relativeRepositoryPath, type DeclaredRepository } from "../core/stageRepositories";
+import { chooseLaunchRepository, launchTargets } from "../core/launchRepositories";
+import { STAGE_REPOSITORIES_KEY, manifestRepositories, relativeRepositoryPath, repositoriesForPlan, type DeclaredRepository, type StageRepositories } from "../core/stageRepositories";
+import type { ManifestRepository } from "../core/manifest";
+import { STAGE_MODES_KEY, STAGE_MODE_LABELS, STAGE_MODES, modesForPlan, type StageMode, type StageModes } from "../core/stageModes";
 import { withTemporaryFile } from "../core/tempFile";
 import type { SparringController } from "./controller";
-import type { EngineFailure, LaunchResult } from "./executionTracker";
+import type { EngineFailure, LaunchProblem, LaunchResult } from "./executionTracker";
+import type { OperationView } from "./operationRegistry";
 import { outputTail } from "./terminalOutput";
 import { currentBranch, knownRepositories, pendingChanges } from "./git";
 import { manifestSupport } from "./engineProbe";
@@ -55,8 +74,10 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
   context.subscriptions.push(
     overview,
     vscode.commands.registerCommand("agentSparring.showLog", () => controller.showLog()),
+    vscode.commands.registerCommand("agentSparring.confirmRunnerInactive", () => confirmRunnerInactiveCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.refresh", () => controller.refresh()),
     vscode.commands.registerCommand("agentSparring.selectRun", () => selectRunCommand(controller)),
+    vscode.commands.registerCommand("agentSparring.followActiveRepository", () => controller.followActiveRepository()),
     vscode.commands.registerCommand("agentSparring.diagnoseDiscovery", () => controller.diagnoseDiscovery()),
     vscode.commands.registerCommand("agentSparring.openOverview", () => openOverviewCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.runPlan", () => runPlanCommand(controller, overview)),
@@ -69,6 +90,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.startNextStage", () => startNextStageCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.continueAutomatically", () => void performContinueAutomatically(controller, overview, { confirm: true })),
     vscode.commands.registerCommand("agentSparring.stageRepositories", () => stageRepositoriesCommand(controller)),
+    vscode.commands.registerCommand("agentSparring.stageMode", () => stageModeCommand(controller)),
     vscode.commands.registerCommand("agentSparring.copyReviewContext", () => overview.copyReviewContext()),
     vscode.commands.registerCommand("agentSparring.chooseExecutable", () => chooseExecutableCommand()),
     controller.onCommandNotFound((event) => void explainCommandNotFound(event.word)),
@@ -87,6 +109,37 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     // What a window reload would find: the launches recorded in workspaceState,
     // including the ones already known to have ended.
     vscode.commands.registerCommand("agentSparring._test.persistedLaunches", () => controller.persistedLaunches()),
+    // The terminal-ownership boundary: which terminals the extension owns,
+    // which of them may be written to, and where a run's runner actually is.
+    vscode.commands.registerCommand("agentSparring._test.ownedTerminals", () => controller.ownedTerminals()),
+    vscode.commands.registerCommand("agentSparring._test.hostingTerminal", (runId: string) => controller.hostingTerminal(runId)),
+    // Submitted commands whose start has not been observed: never runners,
+    // and the reason a second command for the same run is refused.
+    vscode.commands.registerCommand("agentSparring._test.unresolvedSubmissions", () => controller.unresolvedSubmissions()),
+    // The one record holding a run's duplicate guard, in whatever state —
+    // including the states this window is itself watching, which `unresolved`
+    // deliberately leaves out because nobody can tell it anything about them.
+    vscode.commands.registerCommand("agentSparring._test.guardFor", (runId: string) => controller.guardFor(runId)),
+    // Takes the immutable operation id, exactly as the dialog does: an
+    // override never searches for another record with the same key.
+    vscode.commands.registerCommand("agentSparring._test.overrideSubmission", (operationId: string, note: string) => controller.overrideSubmission(operationId, note ?? "confirmed by the person in a test").overridden),
+    vscode.commands.registerCommand("agentSparring._test.probeSubmissions", () => controller.probeSubmissions()),
+    // The explicit human recovery from `unknown`, driven exactly as the
+    // Overview drives it: both ids come from the model that was built, never
+    // from a lookup made when the click arrives. With no ids given, the ones
+    // the panel would currently carry are used; passing a stale pair is how a
+    // test reproduces a panel left open while a newer run started.
+    vscode.commands.registerCommand("agentSparring._test.confirmRunnerInactive", async (executionId?: string, operationId?: string) => {
+      const run = controller.currentSelection.selected;
+      if (!run) {
+        return undefined;
+      }
+      const unknown = executionId === undefined ? ((await overview.buildModel()) as { unknownRunner?: { executionId: string; operationId?: string } }).unknownRunner : { executionId, operationId };
+      if (!unknown) {
+        return undefined;
+      }
+      return controller.confirmRunnerInactive(run.id, unknown.executionId, unknown.operationId);
+    }),
     vscode.commands.registerCommand("agentSparring._test.acceptStage", async () => {
       const run = controller.currentSelection.selected;
       return run?.kind === "stage" ? performAcceptStage(controller, run) : undefined;
@@ -114,13 +167,86 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring._test.declareStageRepository", async (label: string, repository: DeclaredRepository | undefined) => {
       const run = controller.currentSelection.selected;
       const key = run ? await planKeyFor(controller, run) : undefined;
-      if (!key) {
+      if (!run || !key) {
         return undefined;
       }
       if (repository) {
-        await controller.declareStageRepository(key, label, repository);
+        await controller.declareStageRepository(key, run.location.projectDir, label, repository);
       }
-      return controller.stageRepositoriesFor(key, label);
+      return controller.stageRepositoriesFor(key, run.location.projectDir, label);
+    }),
+    // What a *given* worktree sees declared for a plan stage, so the
+    // integration suite can ask the same question of two worktrees and prove
+    // they are independent through real workspace state — where the scope key
+    // has to survive being a JSON key containing a path.
+    // The manifest a *given* worktree would hand the engine for a plan,
+    // built through the same `declarationsFor` the launcher uses — so the
+    // suite compares what would actually execute, not a restatement of it.
+    // Nothing is launched and nothing is written.
+    vscode.commands.registerCommand("agentSparring._test.manifestFor", async (projectDir: string, planPath: string) => {
+      const markdown = await readOptional(planPath);
+      if (markdown === undefined) {
+        return undefined;
+      }
+      const location: SparringLocation = { sparringDir: path.join(projectDir, ".sparring"), projectDir, repoRoot: projectDir, workspaceFolder: projectDir, folderName: path.basename(projectDir) };
+      const label = planLabel(planPath, projectDir);
+      const built = buildManifest({ markdown, planLabel: label, planName: path.basename(planPath), ...declarationsFor(controller, planKey(label), location) });
+      if (!built.ok) {
+        return { ok: false, reason: built.problems[0]?.reason };
+      }
+      return { ok: true, planKey: planKey(label), text: renderManifest(built.manifest), digest: manifestDigest(built.manifest) };
+    }),
+    // Exactly the values VS Code holds for the declaration keys — what it
+    // would restore into a new window, and all it would restore.
+    vscode.commands.registerCommand("agentSparring._test.storedDeclarations", () => ({
+      modes: context.workspaceState.get(STAGE_MODES_KEY),
+      repositories: context.workspaceState.get(STAGE_REPOSITORIES_KEY),
+    })),
+    // The manifest a worktree would build from *supplied* stored values
+    // instead of from the live workspace state: a cold read of the persisted
+    // shape, through the same readers and the same builder production uses.
+    vscode.commands.registerCommand(
+      "agentSparring._test.manifestFromStored",
+      async (stored: { modes?: StageModes; repositories?: StageRepositories }, projectDir: string, planPath: string) => {
+        const markdown = await readOptional(planPath);
+        if (markdown === undefined) {
+          return undefined;
+        }
+        const label = planLabel(planPath, projectDir);
+        const key = planKey(label);
+        const built = buildManifest({
+          markdown,
+          planLabel: label,
+          planName: path.basename(planPath),
+          repositories: manifestRepositories(repositoriesForPlan(stored.repositories, key, projectDir), projectDir),
+          modes: modesForPlan(stored.modes, key, projectDir),
+        });
+        if (!built.ok) {
+          return { ok: false, reason: built.problems[0]?.reason };
+        }
+        return { ok: true, planKey: key, text: renderManifest(built.manifest), digest: manifestDigest(built.manifest) };
+      },
+    ),
+    vscode.commands.registerCommand("agentSparring._test.declareStageMode", async (label: string, mode: StageMode) => {
+      const run = controller.currentSelection.selected;
+      const key = run ? await planKeyFor(controller, run) : undefined;
+      if (!run || !key) {
+        return undefined;
+      }
+      await controller.declareStageMode(key, run.location.projectDir, label, mode);
+      return controller.stageModeFor(key, run.location.projectDir, label);
+    }),
+    vscode.commands.registerCommand("agentSparring._test.stageDeclarations", async (projectDir: string, label: string) => {
+      const run = controller.currentSelection.selected;
+      const key = run ? await planKeyFor(controller, run) : undefined;
+      if (!key) {
+        return undefined;
+      }
+      return {
+        planKey: key,
+        repositories: controller.stageRepositoriesFor(key, projectDir, label),
+        mode: controller.stageModeFor(key, projectDir, label),
+      };
     }),
     vscode.commands.registerCommand("agentSparring._test.lastCommandNotFound", () => lastCommandNotFound),
     controller.onCommandNotFound((event) => {
@@ -146,6 +272,19 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     }),
     vscode.commands.registerCommand("agentSparring._test.manifestDirectory", () => controller.manifestDirectoryPath),
     vscode.commands.registerCommand("agentSparring._test.lastEngineFailure", () => lastEngineFailure),
+    // What `Run plan…` would have to choose from, after the same wait it
+    // performs: the integration suite checks in a real window both that the
+    // wait is for repository *discovery* and not merely for the Git API, and
+    // that a `.sparring` directory outside a repository is not offered.
+    vscode.commands.registerCommand("agentSparring._test.launchCandidates", async () =>
+      (await controller.launchRepositories()).map((candidate) => ({
+        repoRoot: candidate.location.repoRoot,
+        folderName: candidate.location.folderName,
+        established: candidate.established,
+        launchable: candidate.launchable,
+        blocked: candidate.blocked,
+      })),
+    ),
     controller.onEngineFailed((event) => {
       lastEngineFailure = event;
     }),
@@ -173,9 +312,34 @@ async function selectRunCommand(controller: SparringController): Promise<void> {
     }
     return;
   }
-  const items: RunItem[] = buildRunPickItems(runs, controller.currentSelection.selected?.id);
-  items.push({ label: "$(sync) Automatic selection", description: "clear the explicit choice", run: undefined });
-  const picked = await vscode.window.showQuickPick(items, { placeHolder: "Which repository / run should Agent Sparring follow?" });
+  // Grouped, because the two kinds answer different questions: a plan run is
+  // the whole job with its timeline, a standalone stage is one old stage to
+  // inspect. They used to sit in one dense list, which is how a completed
+  // plan's own history came to look like the thing to pick.
+  const groups = buildRunPickGroups(runs, { selectedId: controller.currentSelection.selected?.id, memberships: await controller.planMemberships() });
+  const items: RunItem[] = [];
+  for (const group of groups) {
+    items.push({ label: group.title, kind: vscode.QuickPickItemKind.Separator });
+    for (const item of group.items) {
+      items.push({ label: item.label, description: item.description, detail: item.detail, run: item.run });
+    }
+  }
+  // Picking a row *pins* it: it is kept even when this window moves to
+  // another repository, which is the point of opening history there. The way
+  // back is the same list, so the two modes are named next to each other
+  // rather than one of them being a command you have to already know about.
+  const selection = controller.currentSelection;
+  const context = describeRepositoryContext(selection);
+  items.push({ label: "REPOSITORY CONTEXT", kind: vscode.QuickPickItemKind.Separator });
+  items.push({
+    label: `${context.mode === "pinned" ? "" : "$(check) "}$(sync) ${FOLLOW_ACTIVE_LABEL}`,
+    description: selection.scope ? `automatic selection in ${selection.scope.name}` : "automatic selection; no active repository resolved",
+    detail: context.mode === "pinned" ? "Releases the pin above." : "Already following; every row above pins instead.",
+    run: undefined,
+  });
+  const picked = await vscode.window.showQuickPick(items, {
+    placeHolder: `Pin a run, or follow the active repository. ${context.text}`,
+  });
   if (!picked) {
     return;
   }
@@ -278,6 +442,10 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       await selectRunCommand(controller);
       await overview.update();
       return;
+    case "followActiveRepository":
+      await controller.followActiveRepository();
+      await overview.update();
+      return;
     case "runPlan":
       return runPlanCommand(controller, overview);
     case "resumePlan":
@@ -335,6 +503,9 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
     case "sendFeedbackForReview":
       await sendFeedbackForReviewCommand(controller, overview);
       return;
+    case "confirmRunnerInactive":
+      await confirmRunnerInactiveCommand(controller, overview);
+      return;
     case "dismissSubmissionFailure":
       if (run) {
         // Only the report goes. The drafts it was reporting about are the
@@ -343,11 +514,18 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
         await overview.update();
       }
       return;
-    case "showRunningPlan": {
-      // The stage on screen is history; its project's managed run is live.
-      const plan = run ? supersedingPlanRun(run, controller.currentDiscovery.runs) : undefined;
+    case "openPlanRun": {
+      // The stage on screen is one stage of a managed plan run: select that
+      // run, so the Overview shows the whole job and its timeline. This is the
+      // one action here that changes the selection; it opens no document.
+      //
+      // The run is taken from the model the button was rendered from, so what
+      // is selected is exactly what the screen named — and it works for a
+      // complete run as well as a live one.
+      const model = await overview.buildModel();
+      const plan = model.followPlan ? controller.currentDiscovery.runs.find((candidate) => candidate.id === model.followPlan?.runId) : undefined;
       if (!plan) {
-        void vscode.window.showInformationMessage("Agent Sparring: no managed plan run is in progress for this project any more.");
+        void vscode.window.showInformationMessage("Agent Sparring: the managed plan run for this stage is no longer discoverable.");
         await overview.update();
         return;
       }
@@ -456,7 +634,7 @@ async function launchStageLoop(controller: SparringController, run: StandaloneSt
   }
   const args = buildRunLoopArgs({ stageId: run.stage.stageId, repoRoot, expectedBranch, sparringDir: run.location.sparringDir });
   const result = await controller.launch({ configured: configuredExecutable(), args, cwd: repoRoot, name: `${label}: ${run.stage.stageId}`, runId: run.id, kind: "run-loop", stageId: run.stage.stageId, reveal: false });
-  await explainLaunch(result);
+  await explainLaunch(controller, result);
 }
 
 // ---------------------------------------------------------------- accept stage (freeze, then accept)
@@ -518,18 +696,18 @@ async function performAcceptStage(controller: SparringController, run: Standalon
   const invocation = { stageId: run.stage.stageId, repoRoot, expectedBranch, sparringDir: run.location.sparringDir };
   controller.setAccepting(run.id, true);
   controller.log(`Accept stage ${run.stage.stageId}: freeze-candidate, then accept-candidate (branch ${expectedBranch})`);
-  let problem: { error: string; problem: ExecutableProblem } | undefined;
+  let problem: { error: string; problem: LaunchProblem; submission?: OperationView } | undefined;
   try {
     const result = await acceptStage(async (args) => {
       const outcome = await controller.runCommand({ configured: configuredExecutable(), args, cwd: repoRoot, name: `Accept stage: ${run.stage.stageId}` });
       if (!outcome.ok) {
-        problem = { error: outcome.error, problem: outcome.problem };
+        problem = { error: outcome.error, problem: outcome.problem, submission: outcome.submission };
         return { exitCode: undefined, output: outcome.error };
       }
       return outcome.outcome;
     }, invocation);
     if (problem) {
-      await explainExecutableProblem(problem.error);
+      await explainCommandProblem(controller, problem);
       return undefined;
     }
     if (result.ok) {
@@ -572,6 +750,62 @@ async function performAcceptStage(controller: SparringController, run: Standalon
  *
  * Nothing is frozen or accepted: the reviewer rules on the next turn.
  */
+/**
+ * The way out of a runner nothing could establish anything about.
+ *
+ * It is an assertion, and it is asked for as one: the person is told what is
+ * unknown, what confirming does and what it deliberately does not claim. It
+ * targets the exact execution the panel was rendered from, so a stale panel
+ * cannot settle a newer run's runner, and it invents no exit code — the
+ * evidence submission becomes retryable, with its text intact, and is
+ * reported as neither delivered nor failed.
+ */
+async function confirmRunnerInactiveCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
+  const run = controller.currentSelection.selected;
+  if (!run) {
+    return;
+  }
+  const model = await overview.buildModel();
+  const unknown = model.kind === "run" ? model.unknownRunner : undefined;
+  if (!unknown) {
+    void vscode.window.showInformationMessage("Agent Sparring: the status of this run's runner is not in question, so there is nothing to confirm.");
+    return;
+  }
+  const liveness = controller.livenessFor(run.id);
+  const confirmed = await vscode.window.showWarningMessage(
+    "Is the previous runner no longer active?",
+    {
+      modal: true,
+      detail: [
+        UNKNOWN_RUNNER_EXPLANATION,
+        "",
+        liveness.detail,
+        "",
+        "Confirming records that as your statement. It releases this run's actions and lets you send any evidence you drafted again; it claims nothing about whether the engine recorded anything.",
+        "If that runner is in fact still working, starting another one would do the same engine operation twice.",
+      ].join("\n"),
+    },
+    "Yes — it is no longer active",
+  );
+  if (confirmed !== "Yes — it is no longer active") {
+    return;
+  }
+  // Both ids come from the model this dialog was built from, and neither is
+  // looked up again: the execution whose liveness is ended, and the exact
+  // operation whose guard the person is taking responsibility for. A newer run
+  // that started while this dialog was open holds the same runner key, and
+  // must be left exactly as it is.
+  const result = await controller.confirmRunnerInactive(run.id, unknown.executionId, unknown.operationId);
+  await overview.update();
+  if (!result.confirmed) {
+    void vscode.window.showInformationMessage("Agent Sparring: that runner is no longer the one this run is waiting on — the panel has been refreshed. Nothing was changed.");
+    return;
+  }
+  void vscode.window.showInformationMessage(
+    `Agent Sparring: recorded that you checked and the runner is no longer active.${result.submission ? " Your evidence is still here and can be sent again; whether the engine recorded it is unknown." : ""}`,
+  );
+}
+
 async function submitForReviewCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
   const run = controller.currentSelection.selected;
   if (!run) {
@@ -755,7 +989,7 @@ async function askReviewerAgain(controller: SparringController, run: RunSnapshot
     stageId: run.stage.stageId,
     reveal: false,
   });
-  await explainLaunch(result);
+  await explainLaunch(controller, result);
   return result.ok ? { launched: true, executionId: result.record.id } : { launched: false };
 }
 
@@ -1044,23 +1278,62 @@ async function collectStageMatches(controller: SparringController, run: RunSnaps
 
 // ---------------------------------------------------------------- launching
 
+/**
+ * Which repository a launch targets.
+ *
+ * The candidates are every project Agent Sparring has state in *plus* every
+ * repository and worktree the Git extension has open
+ * (`controller.launchRepositories`), because the moment a repository most
+ * needs to be offered is before it has any Agent Sparring state — starting the
+ * first plan is exactly when that matters, and the engine creates what it
+ * needs under `--sparring-dir` on its first write.
+ *
+ * Roots nest, so the deepest one containing the active file wins
+ * (launchRepositories.ts). A file in `sporely/sporely-py/` belongs to
+ * `sporely-py`, never to the container folder above it that happens to hold a
+ * `.sparring` directory of its own.
+ *
+ * And a candidate is only offered when the engine could actually run there:
+ * `.sparring` in a directory that is not inside a git repository is history,
+ * not a place to start work (see `launchable` in launchRepositories.ts). Such
+ * a location stays discovered and inspectable; it is named here as excluded,
+ * with the reason, rather than silently dropped — a repository going missing
+ * from this list without explanation is the failure that produced the list in
+ * the first place.
+ */
 async function pickLocation(controller: SparringController): Promise<SparringLocation | undefined> {
-  const locations = controller.sparringLocations;
-  if (locations.length === 0) {
-    void vscode.window.showErrorMessage("Agent Sparring: no `.sparring` directory in any workspace folder.");
+  const candidates = await controller.launchRepositories();
+  const targets = launchTargets(candidates);
+  if (targets.length === 0) {
+    const excluded = candidates.filter((candidate) => !candidate.launchable);
+    void vscode.window.showErrorMessage(
+      excluded.length > 0
+        ? `Agent Sparring: no repository to run a plan in. ${excluded[0].blocked} Open the repository you mean, or set [repo] root in its .sparring/project.toml.`
+        : "Agent Sparring: no repository to run a plan in — no Git repository is open, and no workspace folder has a `.sparring` directory.",
+    );
     return undefined;
   }
   const active = vscode.window.activeTextEditor?.document;
   const activeFile = active?.uri.scheme === "file" ? active.uri.fsPath : undefined;
-  const chosen = chooseLaunchLocation(locations, controller.currentSelection.selected, activeFile);
+  const chosen = chooseLaunchRepository(candidates, controller.currentSelection.selected, activeFile);
   if (chosen) {
-    return chosen;
+    return chosen.location;
+  }
+  for (const candidate of candidates.filter((entry) => !entry.launchable)) {
+    controller.log(`Run plan…: ${candidate.location.folderName} is not offered. ${candidate.blocked}`);
   }
   const picked = await vscode.window.showQuickPick(
-    locations.map((location) => ({ label: location.folderName, description: location.repoRoot, location })),
+    targets.map((candidate) => ({
+      label: candidate.location.folderName,
+      description: candidate.location.repoRoot,
+      // Said rather than implied: an offered repository with no history must
+      // not look like one Agent Sparring has already run in.
+      detail: candidate.established ? undefined : "No Agent Sparring state yet — this would be its first plan run here.",
+      candidate,
+    })),
     { placeHolder: "Which repository?" },
   );
-  return picked?.location;
+  return picked?.candidate.location;
 }
 
 const isInside = isInsidePath;
@@ -1166,10 +1439,92 @@ function configuredExecutable(): string {
   return vscode.workspace.getConfiguration("agentSparring").get<string>("executable", "");
 }
 
-async function explainLaunch(result: LaunchResult): Promise<void> {
-  if (!result.ok) {
-    await explainExecutableProblem(result.error);
+async function explainLaunch(controller: SparringController, result: LaunchResult): Promise<void> {
+  if (result.ok) {
+    return;
   }
+  if (result.problem !== "unconfirmed") {
+    await explainExecutableProblem(result.error);
+    return;
+  }
+  await explainUnconfirmed(controller, result.error, result.submission);
+}
+
+/**
+ * A command whose fate nobody can establish.
+ *
+ * The only way out, other than evidence, is a person stating that the command
+ * cannot still run — and that is an override, not a cancellation: nothing here
+ * can stop a line already sitting in a shell's input. So it is asked for
+ * modally, in those words, and what it permits is a retry.
+ */
+async function explainUnconfirmed(controller: SparringController, error: string, submission: OperationView | undefined): Promise<void> {
+  const choices = submission ? ["Show Log", "I checked — allow retry"] : ["Show Log"];
+  const choice = await vscode.window.showWarningMessage(`Agent Sparring: ${error}`, ...choices);
+  if (choice === "Show Log") {
+    await vscode.commands.executeCommand("agentSparring.showLog");
+    return;
+  }
+  if (choice !== "I checked — allow retry" || !submission) {
+    return;
+  }
+  // A command a shell holds and a process started before a reload are two
+  // different things to be asked about, and are asked about as themselves.
+  const direct = submission.state === "running-direct" || submission.state === "running-dedicated";
+  const detail = (
+    direct
+      ? [
+          "Agent Sparring started this operation as a process of its own, in a window that has since reloaded, and cannot see that process in the process table from here.",
+          "",
+          `Started: ${submission.label}`,
+          `As process: ${submission.directPid ?? "unknown"}`,
+          "",
+          "Only confirm this if that process is really over. If it is still running, running the operation again would do it twice.",
+        ]
+      : [
+          "Agent Sparring cannot cancel a command a shell has already been given, and it has no evidence about this one either way.",
+          "",
+          `Submitted: ${submission.label}`,
+          `To: ${submission.terminalName ?? "a terminal of this window"}`,
+          "",
+          "Only confirm this if you have looked at that terminal and that command cannot start any more. If it can, running the operation again may run it twice.",
+        ]
+  ).join("\n");
+  const confirmed = await vscode.window.showWarningMessage("Allow this operation to be run again?", { modal: true, detail }, "Allow retry");
+  if (confirmed !== "Allow retry") {
+    return;
+  }
+  // The exact record the dialog was about, by its immutable id. If that
+  // record has been resolved while the dialog was open — the shell reported
+  // it, its terminal closed, the process table settled it — and a *new*
+  // operation has since taken the same key, confirming this dialog must not
+  // touch that new one.
+  const result = controller.overrideSubmission(
+    submission.id,
+    direct
+      ? "the person confirmed that the process started before the reload is over; this is an override, not an observation"
+      : "the person confirmed, having checked the terminal, that this command cannot still run; this is an override, not an observation",
+  );
+  if (result.overridden) {
+    void vscode.window.showInformationMessage(`Agent Sparring: ${submission.label} may be run again. Its earlier submission was cleared by you, not by evidence.`);
+    return;
+  }
+  void vscode.window.showInformationMessage(
+    `Agent Sparring: that submission of ${submission.label} has already been resolved or replaced since you were asked about it, so nothing was overridden. Try the operation again; if something is still in flight you will be told about that one.`,
+  );
+}
+
+/**
+ * A failed short command is reported as what it was: a configuration problem
+ * gets the settings dialog, a command whose fate is unknown gets the same
+ * treatment as an unconfirmed launch.
+ */
+async function explainCommandProblem(controller: SparringController, problem: { error: string; problem: LaunchProblem; submission?: OperationView }): Promise<void> {
+  if (problem.problem !== "unconfirmed") {
+    await explainExecutableProblem(problem.error);
+    return;
+  }
+  await explainUnconfirmed(controller, problem.error, problem.submission);
 }
 
 /** Configuration errors: the honest message plus the two ways to fix it. */
@@ -1248,7 +1603,7 @@ async function launch(controller: SparringController, location: SparringLocation
   // this same route (controller.launch / controller.runCommand): nothing
   // here builds a command line or starts a process of its own.
   const result = await controller.launch({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: kind, runId: planRunId(location, planPath), kind, planPath, manifest, reveal: true });
-  await explainLaunch(result);
+  await explainLaunch(controller, result);
   return result;
 }
 
@@ -1436,7 +1791,7 @@ async function performStartNextStage(controller: SparringController, overview: O
     }
   }
   controller.log(`Start next stage: sparring new-stage ${proposal.stageId} --brief-file <temporary copy of ${planName} › ${proposal.display}>`);
-  let problem: string | undefined;
+  let problem: { error: string; problem: LaunchProblem; submission?: OperationView } | undefined;
   // The brief travels through a temporary file outside the workspace; the
   // engine reads it and writes brief.md. The file is removed afterwards.
   const result: NewStageResult = await withTemporaryFile(rendered.brief, `${proposal.stageId}.md`, (briefFile) =>
@@ -1444,7 +1799,7 @@ async function performStartNextStage(controller: SparringController, overview: O
       async (args) => {
         const outcome = await controller.runCommand({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: `New stage: ${proposal.stageId}` });
         if (!outcome.ok) {
-          problem = outcome.error;
+          problem = { error: outcome.error, problem: outcome.problem, submission: outcome.submission };
           return { exitCode: undefined, output: outcome.error };
         }
         return outcome.outcome;
@@ -1453,8 +1808,8 @@ async function performStartNextStage(controller: SparringController, overview: O
     ),
   );
   if (problem) {
-    await explainExecutableProblem(problem);
-    return { ok: false, reason: "executable", message: problem };
+    await explainCommandProblem(controller, problem);
+    return { ok: false, reason: "executable", message: problem.error };
   }
   if (!result.ok) {
     controller.log(`Start next stage: new-stage failed — ${result.message}`);
@@ -1504,14 +1859,108 @@ async function performStartNextStage(controller: SparringController, overview: O
  * produced, in which case the caller must not launch.
  */
 /**
- * Write the manifest, keeping the provenance of the one already there when
- * the new one executes the same thing (manifest.ts: `carriedForward`). The
- * engine's run identity includes `source_digest`, so rebuilding it from an
- * edited plan document — even one where only a handoff record changed — would
- * otherwise end the recorded run.
+ * Write the manifest and the binding record that says which worktree it was
+ * written for, and return the manifest's path.
+ *
+ * Provenance first: the manifest keeps the `source_digest` of the one already
+ * there when the new one executes the same thing (manifest.ts:
+ * `carriedForward`). The engine's run identity includes `source_digest`, so
+ * rebuilding it from an edited plan document — even one where only a handoff
+ * record changed — would otherwise end the recorded run. When this run has no
+ * file at its current name, the names manifests were written under before
+ * (`previousManifestFileNames`) are read for that provenance and nothing else;
+ * they are never authority and never written again.
+ *
+ * Then the binding record. The manifest itself cannot say which worktree it
+ * belongs to — the engine refuses a manifest carrying a field it does not
+ * know, and nothing in the payload it *does* know identifies the primary
+ * repository — so the statement goes in a sidecar next to it, naming the
+ * resolved project directory, the manifest file and its executable digest.
+ * Without it a reader has no way to tell two worktrees of one repository
+ * apart, and degrades to no membership; so the two files are written together,
+ * the manifest first.
  */
-async function writeManifestFile(file: string, manifest: ExecutionManifest): Promise<void> {
-  await fs.writeFile(file, renderManifest(carriedForward(manifest, await readOptional(file))), "utf8");
+async function writeManifestFile(controller: SparringController, owner: ManifestOwner, manifest: ExecutionManifest): Promise<string> {
+  const directory = controller.manifestDirectoryPath;
+  const file = manifestPathFor(directory, owner);
+  let previous = await readOptional(file);
+  for (const name of previousManifestFileNames(owner.planKey, owner.location.projectDir)) {
+    if (previous !== undefined) {
+      break;
+    }
+    previous = await readOptional(path.join(directory, name));
+    if (previous !== undefined) {
+      controller.log(`carrying the execution manifest provenance of ${name} forward into ${path.basename(file)}, which is scoped to this worktree.`);
+    }
+  }
+  const written = carriedForward(manifest, previous);
+  await fs.writeFile(file, renderManifest(written), "utf8");
+
+  const digest = manifestDigest(written);
+  if (digest === undefined) {
+    controller.log(`the execution manifest ${path.basename(file)} could not be read back under the engine's own rules, so no binding record was written; this run's historical stages will not be attributed to it.`);
+    return file;
+  }
+  const record: ManifestBindingRecord = {
+    version: BINDING_VERSION,
+    manifestFile: path.basename(file),
+    manifestDigest: digest,
+    planKey: owner.planKey,
+    planLabel: written.plan_label,
+    projectDir: path.resolve(owner.location.projectDir),
+  };
+  const bindingFile = bindingPathFor(directory, owner);
+  await fs.writeFile(bindingFile, renderBindingRecord(record), "utf8");
+  return file;
+}
+
+/**
+ * The managed plan run that already owns this stage, when one does.
+ *
+ * Recorded membership only (planMembership.ts): the run's validated execution
+ * manifest, or its own recorded stage list. A plan run merely being open in
+ * the same project is not ownership and must not block anything, so nothing
+ * here falls back to that.
+ */
+async function ownedByPlanRun(
+  controller: SparringController,
+  run: RunSnapshot,
+): Promise<{ runId: string; planName: string; status: string; stage: string } | undefined> {
+  if (run.kind !== "stage") {
+    return undefined;
+  }
+  const membership = (await controller.planMemberships()).get(run.id);
+  if (!membership) {
+    return undefined;
+  }
+  return {
+    runId: membership.planRunId,
+    planName: membership.planName,
+    status: membership.planStatus,
+    stage: membership.stageLabel ? `${membership.stageLabel} (${run.stage.stageId})` : `This stage (${run.stage.stageId})`,
+  };
+}
+
+/**
+ * The declarations a plan's manifest carries for one **worktree**: its stages'
+ * sibling repositories and their modes.
+ *
+ * One place, because every caller has to agree. Starting a run and resuming it
+ * must produce byte-identical manifests from an unchanged plan — the engine
+ * refuses a run whose digest moved — so `performContinueAutomatically` and
+ * `planInvocationFor` may not know different things; and anything that reports
+ * what *would* be built must read the same state, or it would be reporting on
+ * a manifest nothing executes.
+ *
+ * `projectDir` is not a detail: a plan key is shared by every worktree running
+ * the same plan path, so without it these answer for the wrong checkout
+ * (declarationScope.ts).
+ */
+function declarationsFor(controller: SparringController, key: string, location: SparringLocation): { repositories: Record<string, ManifestRepository[]>; modes: Record<string, StageMode> } {
+  return {
+    repositories: manifestRepositories(controller.stageRepositories(key, location.projectDir), location.repoRoot),
+    modes: controller.stageModes(key, location.projectDir),
+  };
 }
 
 async function planInvocationFor(controller: SparringController, run: PlanRunSnapshot): Promise<{ planPath: string } | { manifest: string } | undefined> {
@@ -1528,16 +1977,15 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
     planLabel: run.state.plan,
     planName: path.basename(run.planPath),
     known: await knownStageIds(controller, run, markdown),
-    repositories: manifestRepositories(controller.stageRepositories(run.planKey), run.location.repoRoot),
+    ...declarationsFor(controller, run.planKey, run.location),
   });
   if (!built.ok) {
     void vscode.window.showWarningMessage(`Agent Sparring: the execution manifest for ${path.basename(run.planPath)} could not be rebuilt: ${built.problems[0]?.reason ?? "the plan changed."}`);
     return undefined;
   }
   try {
-    const file = path.join(await controller.manifestDirectory(), manifestFileName(run.planKey));
-    await writeManifestFile(file, built.manifest);
-    return { manifest: file };
+    await controller.manifestDirectory();
+    return { manifest: await writeManifestFile(controller, run, built.manifest) };
   } catch (error) {
     void vscode.window.showErrorMessage(`Agent Sparring: could not write the execution manifest: ${(error as Error).message}. Nothing was started.`);
     return undefined;
@@ -1548,7 +1996,7 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
 
 export type ContinueAutomaticallyOutcome =
   | { ok: true; runId: string; manifest: string; kind: "run-plan" | "resume-plan"; adopt: boolean; stages: number }
-  | { ok: false; reason: "no-plan" | "unreadable" | "manifest" | "preflight" | "branch" | "complete" | "running" | "cancelled" | "write"; message?: string };
+  | { ok: false; reason: "no-plan" | "unreadable" | "manifest" | "preflight" | "branch" | "complete" | "running" | "cancelled" | "write" | "owned"; message?: string };
 
 /**
  * Hand the whole plan to the engine and let it run until it needs a human.
@@ -1572,6 +2020,26 @@ async function performContinueAutomatically(controller: SparringController, over
   if (!run) {
     return { ok: false, reason: "no-plan" };
   }
+  // Ownership is enforced here, in the command, and not only by withholding
+  // the button in the Overview. This path is reachable from the Command
+  // Palette and from a keybinding, and what it would do to a stage a managed
+  // run already executed is create or adopt a *second* plan run over work that
+  // run owns — the duplicate-run failure that started this. The refusal is the
+  // same whichever route arrives.
+  const owner = await ownedByPlanRun(controller, run);
+  if (owner) {
+    void vscode.window.showInformationMessage(
+      `Agent Sparring: ${owner.stage} is a stage of the managed plan run ${owner.planName} (${owner.status}). Continue that run instead of starting a second one over the same work.`,
+      "Back to plan run",
+    ).then(async (choice) => {
+      if (choice === "Back to plan run") {
+        await controller.chooseRun(controller.currentDiscovery.runs.find((candidate) => candidate.id === owner.runId));
+        await overview.update();
+      }
+    });
+    controller.log(`Continue automatically: refused — ${owner.stage} is already owned by the managed plan run ${owner.planName} (${owner.status}).`);
+    return { ok: false, reason: "owned", message: `${owner.stage} belongs to ${owner.planName}` };
+  }
   const location = run.location;
   const planPath = planDocumentFor(controller, run);
   if (!planPath) {
@@ -1590,7 +2058,7 @@ async function performContinueAutomatically(controller: SparringController, over
     planLabel: label,
     planName: path.basename(planPath),
     known: await knownStageIds(controller, run, markdown),
-    repositories: manifestRepositories(controller.stageRepositories(planKey(label)), location.repoRoot),
+    ...declarationsFor(controller, planKey(label), location),
   });
   if (!built.ok) {
     const detail = built.problems.map((problem) => `• ${problem.reason}`).join("\n");
@@ -1678,8 +2146,8 @@ async function performContinueAutomatically(controller: SparringController, over
 
   let manifestPath: string;
   try {
-    manifestPath = path.join(await controller.manifestDirectory(), manifestFileName(planKey(label)));
-    await writeManifestFile(manifestPath, built.manifest);
+    await controller.manifestDirectory();
+    manifestPath = await writeManifestFile(controller, { planKey: planKey(label), location }, built.manifest);
   } catch (error) {
     void vscode.window.showErrorMessage(`Agent Sparring: could not write the execution manifest: ${(error as Error).message}. Nothing was started.`);
     return { ok: false, reason: "write", message: (error as Error).message };
@@ -1705,7 +2173,7 @@ async function performContinueAutomatically(controller: SparringController, over
     manifest: manifestPath,
     reveal: true,
   });
-  await explainLaunch(result);
+  await explainLaunch(controller, result);
   await overview.update();
   if (!result.ok) {
     return { ok: false, reason: "write", message: result.error };
@@ -2022,17 +2490,89 @@ async function stageRepositoriesCommand(controller: SparringController): Promise
     void vscode.window.showInformationMessage(`Agent Sparring: ${path.basename(planPath)} defines no labelled stages.`);
     return;
   }
-  const label = await pickStageLabel(controller, key, entries);
+  const label = await pickStageLabel(controller, run.location, key, entries);
   if (!label) {
     return;
   }
   await editStageRepositories(controller, run.location, key, label);
 }
 
-async function pickStageLabel(controller: SparringController, key: string, entries: StageEntry[]): Promise<string | undefined> {
+/**
+ * Declare what kind of stage a plan stage is: work, or a review of work.
+ *
+ * The engine will not infer this. A stage called "Independent final review
+ * and activation decision" runs the implementation lifecycle — a stage agent
+ * that writes code, with a sparrer behind it — unless something says
+ * otherwise, because which agent runs is not a thing to read off a heading.
+ * Saying otherwise is this command: the choice is recorded per plan and
+ * stage label and emitted into the execution manifest, and the engine then
+ * runs that stage as one fresh independent reviewer over the candidates the
+ * earlier stages already accepted, with no implementation turn at all.
+ *
+ * Nothing here writes engine state, and nothing here changes a stage that
+ * has already run: the engine refuses to continue a stage under a mode other
+ * than the one it ran under, and its `reset-stage` command is the supported
+ * way to restart one. This command is told so, and says so.
+ */
+async function stageModeCommand(controller: SparringController): Promise<void> {
+  const run = controller.currentSelection.selected;
+  if (!run) {
+    void vscode.window.showInformationMessage("Agent Sparring: select a run first.");
+    return;
+  }
+  const planPath = planDocumentFor(controller, run);
+  const key = await planKeyFor(controller, run);
+  if (!planPath || !key) {
+    void vscode.window.showInformationMessage("Agent Sparring: choose a plan for this stage first; a stage's mode is declared per plan stage.");
+    return;
+  }
+  const markdown = await readOptional(planPath);
+  if (markdown === undefined) {
+    void vscode.window.showWarningMessage(`Agent Sparring: the plan document ${path.basename(planPath)} could not be read.`);
+    return;
+  }
+  const entries = buildStageIndex(parsePlanHeadings(markdown)).filter((entry) => entry.label);
+  if (entries.length === 0) {
+    void vscode.window.showInformationMessage(`Agent Sparring: ${path.basename(planPath)} defines no labelled stages.`);
+    return;
+  }
+
+  const stage = await vscode.window.showQuickPick(
+    entries.map((entry) => ({
+      label: entry.display,
+      description: controller.stageModeFor(key, run.location.projectDir, entry.label) === "independent_review" ? "review only" : "",
+      value: entry.label,
+    })),
+    { title: "Stage mode", placeHolder: "Which stage is a review of work rather than work?" },
+  );
+  if (!stage) {
+    return;
+  }
+
+  const current = controller.stageModeFor(key, run.location.projectDir, stage.value);
+  const mode = await vscode.window.showQuickPick(
+    STAGE_MODES.map((candidate) => ({
+      label: `${candidate === current ? "$(check) " : "$(blank) "}${STAGE_MODE_LABELS[candidate].label}`,
+      detail: STAGE_MODE_LABELS[candidate].detail,
+      value: candidate as StageMode,
+    })),
+    { title: `Stage ${stage.value} — mode`, placeHolder: "What kind of stage is this?" },
+  );
+  if (!mode || mode.value === current) {
+    return;
+  }
+  await controller.declareStageMode(key, run.location.projectDir, stage.value, mode.value);
+  void vscode.window.showInformationMessage(
+    mode.value === "independent_review"
+      ? `Agent Sparring: Stage ${stage.value} is now review-only. If its stage has already run under the other mode, the engine will refuse to continue it and tell you to run sparring reset-stage, which archives that attempt and restarts the stage with a fresh reviewer.`
+      : `Agent Sparring: Stage ${stage.value} runs the implementation lifecycle again.`,
+  );
+}
+
+async function pickStageLabel(controller: SparringController, location: SparringLocation, key: string, entries: StageEntry[]): Promise<string | undefined> {
   const picked = await vscode.window.showQuickPick(
     entries.map((entry) => {
-      const declared = controller.stageRepositoriesFor(key, entry.label);
+      const declared = controller.stageRepositoriesFor(key, location.projectDir, entry.label);
       return {
         label: entry.display,
         description: declared.length === 0 ? "" : `also reviews ${declared.map((repository) => repository.name).join(", ")}`,
@@ -2046,7 +2586,7 @@ async function pickStageLabel(controller: SparringController, key: string, entri
 
 /** The declarations for one stage: what is there, plus adding one and removing one. */
 async function editStageRepositories(controller: SparringController, location: SparringLocation, key: string, label: string): Promise<void> {
-  const declared = controller.stageRepositoriesFor(key, label);
+  const declared = controller.stageRepositoriesFor(key, location.projectDir, label);
   const add = { label: "$(add) Add a repository…", value: undefined as string | undefined };
   const picked = await vscode.window.showQuickPick(
     [
@@ -2064,7 +2604,7 @@ async function editStageRepositories(controller: SparringController, location: S
     return;
   }
   if (picked.value) {
-    await controller.undeclareStageRepository(key, label, picked.value);
+    await controller.undeclareStageRepository(key, location.projectDir, label, picked.value);
     return;
   }
   await addStageRepository(controller, location, key, label);
@@ -2121,7 +2661,7 @@ async function addStageRepository(controller: SparringController, location: Spar
   if (!name?.trim()) {
     return;
   }
-  await controller.declareStageRepository(key, label, { name: name.trim(), path: chosen.rootPath, branch: branch.trim() });
+  await controller.declareStageRepository(key, location.projectDir, label, { name: name.trim(), path: chosen.rootPath, branch: branch.trim() });
   void vscode.window.showInformationMessage(
     `Agent Sparring: Stage ${label} also reviews ${name.trim()} on ${branch.trim()}. Acceptance will pin that repository's reviewed commit and refuse if it moved.`,
   );
@@ -2134,8 +2674,8 @@ async function addStageRepository(controller: SparringController, location: Spar
  */
 async function explainNextStageProblem(controller: SparringController, overview: OverviewPanelManager, run: StandaloneStageSnapshot, planPath: string, message: string, line: number | undefined): Promise<void> {
   controller.log(`Start next stage: nothing created — ${message}`);
-  const choice = await vscode.window.showWarningMessage(`Agent Sparring: ${message}`, "Open in plan", "Change match…");
-  if (choice === "Open in plan") {
+  const choice = await vscode.window.showWarningMessage(`Agent Sparring: ${message}`, "Open plan section", "Change match…");
+  if (choice === "Open plan section") {
     await openDocument(planPath, `the plan document ${path.basename(planPath)} is missing.`, overview.documentColumn, line);
   } else if (choice === "Change match…") {
     if (controller.currentSelection.selected?.id === run.id) {

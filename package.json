@@ -6,6 +6,10 @@
   "publisher": "sintef",
   "private": true,
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sigmundas/agent-sparring-vscode.git"
+  },
   "engines": {
     "vscode": "^1.90.0",
     "node": ">=20"
@@ -42,6 +46,11 @@
         "category": "Agent Sparring"
       },
       {
+        "command": "agentSparring.confirmRunnerInactive",
+        "title": "Confirm Previous Runner Is No Longer Active",
+        "category": "Agent Sparring"
+      },
+      {
         "command": "agentSparring.showLog",
         "title": "Show Log",
         "category": "Agent Sparring"
@@ -49,6 +58,11 @@
       {
         "command": "agentSparring.selectRun",
         "title": "Select Repository / Run",
+        "category": "Agent Sparring"
+      },
+      {
+        "command": "agentSparring.followActiveRepository",
+        "title": "Follow Active Repository",
         "category": "Agent Sparring"
       },
       {
@@ -99,6 +113,11 @@
       {
         "command": "agentSparring.stageRepositories",
         "title": "Sibling Repositories for a Plan Stage…",
+        "category": "Agent Sparring"
+      },
+      {
+        "command": "agentSparring.stageMode",
+        "title": "Stage Mode for a Plan Stage…",
         "category": "Agent Sparring"
       },
       {
@@ -156,11 +175,12 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "compile-tests": "tsc -p tsconfig.test.json",
     "test": "npm run compile-tests && node --test \"out/test/**/*.test.js\"",
+    "test:parity": "npm run compile-tests && node --test out/test/manifestParity.test.js",
     "compile-integration": "tsc -p tsconfig.integration.json",
     "test:integration": "npm run bundle && npm run compile-integration && node out/integration/runTests.js",
     "lint": "eslint src",
     "vscode:prepublish": "npm run build",
-    "package:vsix": "vsce package --no-dependencies --allow-missing-repository"
+    "package:vsix": "vsce package --no-dependencies"
   },
   "devDependencies": {
     "@eslint/js": "^9.9.0",

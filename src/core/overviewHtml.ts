@@ -13,9 +13,10 @@
  * meaningful event on the right); provider cards; recent events; metadata.
  */
 
+import { ACTIVE_CONTEXT_HEADLINE, FOLLOW_ACTIVE_LABEL, SELECT_RUN_LABEL } from "./activeRepository";
 import { CHECK_OUTCOMES, isCheckKey, type CheckItem, type CheckOutcome } from "./humanChecks";
 import { checkName, humanTask, splitPassCriteria } from "./humanTask";
-import { TIMELINE_STATE_WORD, type ActionRequired, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type TimelineItem, type WhatsNext } from "./overviewModel";
+import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { MatchSource } from "./planAssociation";
 import type { PromptView, PromptViewSection } from "./promptInspector";
 import type { StageRunAction } from "./runner";
@@ -29,6 +30,7 @@ export type OverviewAction =
   | "openDiff"
   | "showLog"
   | "selectRun"
+  | "followActiveRepository"
   | "runPlan"
   | "resumePlan"
   | "runStage"
@@ -39,12 +41,13 @@ export type OverviewAction =
   | "clearMatch"
   | "startNextStage"
   | "continueAutomatically"
-  | "showRunningPlan"
+  | "openPlanRun"
   | "stopRunner"
   | "openPlanSection"
   | "submitForReview"
   | "sendFeedbackForReview"
-  | "dismissSubmissionFailure";
+  | "dismissSubmissionFailure"
+  | "confirmRunnerInactive";
 
 /** A Pass / Fail / Can't test click or a note edit on one manual check, posted by the webview as it happens. */
 export interface HumanCheckMessage {
@@ -187,6 +190,7 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "openDiff",
   "showLog",
   "selectRun",
+  "followActiveRepository",
   "runPlan",
   "resumePlan",
   "runStage",
@@ -197,12 +201,13 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "clearMatch",
   "startNextStage",
   "continueAutomatically",
-  "showRunningPlan",
+  "openPlanRun",
   "stopRunner",
   "openPlanSection",
   "submitForReview",
   "sendFeedbackForReview",
   "dismissSubmissionFailure",
+  "confirmRunnerInactive",
 ];
 
 const ACTIONS: ReadonlySet<string> = new Set<string>(OVERVIEW_ACTIONS);
@@ -251,6 +256,7 @@ const ICON: Record<string, string> = {
   arrow: '<path d="M3 8h9M8.5 4.5L12 8l-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>',
   pause: '<path d="M5.5 4.5v7M10.5 4.5v7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>',
   lock: '<rect x="3.5" y="7" width="9" height="7" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5.5 7V5a2.5 2.5 0 015 0v2" fill="none" stroke="currentColor" stroke-width="1.4"/>',
+  pin: '<path d="M6 1.5h4l-.6 4 2.1 2.4H4.5L6.6 5.5z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/><path d="M8 7.9v6.6" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>',
 };
 
 function icon(name: keyof typeof ICON, cls = ""): string {
@@ -261,18 +267,23 @@ function icon(name: keyof typeof ICON, cls = ""): string {
 
 function renderBody(model: OverviewModel): string {
   if (model.kind === "empty") {
-    return `<header class="top"><h1>Agent Sparring</h1></header>
-<p class="muted">No recorded plan run or stage in this workspace.</p>
+    // The title names the repository, so an empty screen cannot be mistaken
+    // for the cockpit still looking at the repository just left behind.
+    return `${renderRepositoryContext(model)}
+<header class="top"><div><h1>Agent Sparring</h1><div class="run muted">${escapeHtml(model.title)}</div></div></header>
+${(model.emptyLines ?? []).map((line) => `<p class="muted">${escapeHtml(line)}</p>`).join("\n")}
 <div class="actions">${button("runPlan", "Run plan…")}${button("showLog", "Show log")}</div>`;
   }
   if (model.kind === "ambiguous") {
-    return `<header class="top"><h1>Agent Sparring</h1></header>
+    return `${renderRepositoryContext(model)}
+<header class="top"><h1>Agent Sparring</h1></header>
 <p>${escapeHtml(model.title)}:</p>
 <ul>${(model.choices ?? []).map((choice) => `<li>${escapeHtml(choice)}</li>`).join("")}</ul>
-<div class="actions">${button("selectRun", "Select run…")}${button("showLog", "Show log")}</div>`;
+<div class="actions">${button("showLog", "Show log")}</div>`;
   }
 
   const parts: string[] = [];
+  parts.push(renderRepositoryContext(model));
   parts.push(renderHeader(model));
   if (model.branchGuard) {
     parts.push(renderBranchGuard(model.branchGuard));
@@ -300,13 +311,66 @@ function renderBody(model: OverviewModel): string {
   if (model.facts && model.facts.length > 0) {
     parts.push(`<dl class="facts">${model.facts.map((fact) => `<dt>${escapeHtml(fact.label)}</dt><dd>${escapeHtml(fact.value)}</dd>`).join("")}</dl>`);
   }
-  return parts.join("\n");
+  return parts.filter(Boolean).join("\n");
+}
+
+/**
+ * Which repository Agent Sparring is in, at the top of the screen, before
+ * anything about the run.
+ *
+ * This is the contract made visible. VS Code's own repository selector in the
+ * status bar cannot be read by an extension, so what the cockpit resolved has
+ * to be stated rather than assumed — a person must never be able to think it
+ * silently followed a selector it cannot see. Two shapes:
+ *
+ *  - following: one line, `Following repository: <name>`;
+ *  - pinned: the pinned repository *and* the repository this window is in,
+ *    on separate lines, with Follow active repository next to them. Both names
+ *    appear even when they are the same, so the policy reads the same way
+ *    every time and a pin never hides where the window actually is.
+ *
+ * Agent Sparring's own chooser sits here too. Switching context must not
+ * depend on a VS Code gesture this extension cannot observe, so the way to do
+ * it is where the person already is rather than only in the Command Palette.
+ */
+function renderRepositoryContext(model: OverviewModel): string {
+  const context = model.repositoryContext;
+  if (!context) {
+    return "";
+  }
+  const pinned = context.mode === "pinned";
+  const lines = [contextLine(context.headline, context.repository, pinned)];
+  if (pinned && context.activeRepository) {
+    lines.push(contextLine(ACTIVE_CONTEXT_HEADLINE, context.activeRepository, false));
+  }
+  const controls = [
+    button("selectRun", SELECT_RUN_LABEL, true, "Pin an Agent Sparring repository or run explicitly", "quiet"),
+    pinned ? button("followActiveRepository", FOLLOW_ACTIVE_LABEL, true, context.explanation) : "",
+  ].join("");
+  return `<section class="repocontext${pinned ? " pinned" : ""}${context.away ? " away" : ""}" title="${escapeHtml(context.explanation)}">
+<div class="names">${lines.join("")}</div>
+<div class="actions">${controls}</div>
+</section>`;
+}
+
+function contextLine(headline: string, repository: string | undefined, pinned: boolean): string {
+  const name = repository ?? "not resolved";
+  return `<div class="line"><span class="headline">${pinned ? icon("pin", "pin") : ""}${escapeHtml(headline)}:</span><span class="name">${escapeHtml(name)}</span></div>`;
 }
 
 function renderHeader(model: OverviewModel): string {
   const pills: string[] = [];
   if (model.runKind) {
-    pills.push(`<span class="hpill" title="${escapeHtml(model.title)}">${escapeHtml(model.runKind)}</span>`);
+    // The kind pill is the first thing read, and the three kinds must not look
+    // alike: a historical stage is toned down and says, in the pill itself,
+    // that the whole job lives elsewhere.
+    const historical = model.runKind === RUN_KIND.historicalStage;
+    const explain = historical
+      ? "One finished stage of a managed plan run, shown on its own. Back to plan run shows the whole job and its timeline."
+      : model.runKind === RUN_KIND.plan
+        ? "The whole job: the engine sequences its stages and records where it is."
+        : "A stage that was run on its own; no managed plan run claims it.";
+    pills.push(`<span class="hpill${historical ? " history" : ""}" title="${escapeHtml(explain)}">${escapeHtml(model.runKind)}</span>`);
   }
   if (model.stageLabel) {
     // What a person calls this stage. Where it sits in the run is secondary
@@ -387,7 +451,7 @@ function renderActionRequired(model: OverviewModel, panel: ActionRequired): stri
   // be able to see that there is somewhere for it to go.
   buttons.push(button("sendFeedbackForReview", panel.feedback.send.label, panel.feedback.send.enabled, panel.feedback.send.detail));
   if (panel.planSection) {
-    buttons.push(button("openPlanSection", "Open plan section", true, `Open ${model.planName ?? "the plan"} at this stage's section`));
+    buttons.push(button("openPlanSection", "Open plan section", true, `Open the document ${model.planName ?? "the plan"} at this stage's section`));
   }
   buttons.push(button("openSparring", "Open detailed review", panel.review, "Open sparring.md — the reviewer's full findings, in their own words"));
   // Asking someone else what a check means is a normal step, and it should not
@@ -475,6 +539,17 @@ const FEEDBACK_PLACEHOLDER = "What you found, and how to reproduce it if it is a
 function renderSubmissionState(panel: ActionRequired): string {
   if (panel.submitting) {
     return `<p class="submitting" title="${escapeHtml(panel.submitting.detail)}">${icon("dot", "accent")}${escapeHtml(panel.submitting.label)}</p>`;
+  }
+  const unresolved = panel.submissionUnresolved;
+  if (unresolved) {
+    // Neither success nor failure, and it says so: nobody knows what the
+    // engine did with this evidence, and the panel must not invent an answer
+    // in either direction to make its buttons work.
+    return `<div class="subfail">
+<p class="preserved">${icon("warn", "escalate")}${escapeHtml(unresolved.preserved)}</p>
+<p class="muted small">${escapeHtml(unresolved.reason)} ${escapeHtml(unresolved.what)}</p>
+<div class="actions">${button("dismissSubmissionFailure", "Dismiss", true, "Hide this report. Nothing you entered is changed by dismissing it.", "quiet small")}</div>
+</div>`;
   }
   const failed = panel.submissionFailure;
   if (!failed) {
@@ -705,7 +780,7 @@ function renderStageCard(model: OverviewModel): string {
   // While the Action required panel is up it carries the offer instead, so
   // the same button is never in two places.
   if (model.followPlan) {
-    buttons.push(button("showRunningPlan", model.followPlan.label, true, model.followPlan.detail, "primary"));
+    buttons.push(button("openPlanRun", model.followPlan.label, true, model.followPlan.detail, "primary"));
   }
   const auto = model.actionRequired ? undefined : model.continueAutomatically;
   if (auto && !handedOver) {
@@ -729,6 +804,11 @@ function renderStageCard(model: OverviewModel): string {
   if (model.runner?.alive) {
     buttons.push(button("stopRunner", model.runner.label, true, "Send Ctrl-C to the terminal running this stage", "danger"));
   }
+  if (model.unknownRunner) {
+    // The only way out of an unknown runner, and it is here — next to the
+    // state it settles — rather than in the Command Palette alone.
+    buttons.push(button("confirmRunnerInactive", model.unknownRunner.label, true, model.unknownRunner.detail, "quiet"));
+  }
   const actions = model.actions;
   if (actions) {
     buttons.push(button("openBrief", "Brief", actions.brief, "Open brief.md"));
@@ -738,7 +818,7 @@ function renderStageCard(model: OverviewModel): string {
       buttons.push(button("openDiff", actions.diff.label, true, actions.diff.detail));
     }
     if (actions.plan) {
-      buttons.push(button("openPlan", "Plan", true, model.plan ? `${model.plan.name} — ${model.plan.note}` : "Open the plan document"));
+      buttons.push(button("openPlan", "Plan document", true, model.plan ? `Open the Markdown document ${model.plan.name} — ${model.plan.note}` : "Open the plan document"));
     } else if (actions.choosePlan && !accepted) {
       buttons.push(button("associatePlan", "Choose plan…", true, CHOOSE_PLAN_TITLE));
     }
@@ -866,7 +946,13 @@ function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
   const hints = next.hints && next.hints.length > 0 ? `<p class="muted">The brief lists later work that is in this plan: ${next.hints.map((hint) => `<span class="next">${escapeHtml(hint)}</span>`).join(", ")}.</p>` : "";
   const buttons: string[] = [];
   const planName = plan?.name ?? "the plan";
-  const openNext = (label: string, cls = "") => button(plan?.next?.line ? "openNextStage" : "openPlan", label, true, plan?.next?.line ? `Open ${planName} at ${plan.next.display}` : `Open ${planName}`, cls);
+  // Opening Markdown, and nothing else. The label says "document" or
+  // "section" precisely so it can never be read as switching the cockpit to
+  // the plan *run* — that is Back to plan run, and it is a different act.
+  const openNext = (cls = "") =>
+    plan?.next?.line
+      ? button("openNextStage", "Open plan section", true, `Open the document ${planName} at ${plan.next.display}`, cls)
+      : button("openPlan", "Open plan document", true, `Open the document ${planName}`, cls);
   // In automatic mode the rest of the plan goes to the engine in one step;
   // the per-stage operation stays as the quieter alternative.
   const auto = model.continueAutomatically;
@@ -880,7 +966,7 @@ function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
         buttons.push(button("resumePlan", model.planAction.label, true, model.planAction.detail, auto ? "" : "primary"));
       }
       if (model.actions?.plan) {
-        buttons.push(openNext("Open in plan"));
+        buttons.push(openNext());
       }
       break;
     case "next-stage":
@@ -893,29 +979,29 @@ function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
           auto ? "quiet" : "primary",
         ),
       );
-      buttons.push(openNext("Open in plan"));
+      buttons.push(openNext());
       buttons.push(button("matchStage", "Change match…", true, MATCH_TITLE, "quiet"));
       break;
     case "next-created":
       if (model.followPlan) {
-        buttons.push(button("showRunningPlan", model.followPlan.label, true, model.followPlan.detail, "primary"));
+        buttons.push(button("openPlanRun", model.followPlan.label, true, model.followPlan.detail, "primary"));
       }
-      buttons.push(openNext("Open in plan", model.followPlan ? "" : "primary"));
+      buttons.push(openNext(model.followPlan ? "" : "primary"));
       break;
     case "next-unclear":
-      buttons.push(openNext("Open in plan", "primary"));
+      buttons.push(openNext("primary"));
       buttons.push(button("matchStage", "Change match…", true, MATCH_TITLE, "quiet"));
       break;
     case "last-stage":
     case "no-labels":
-      buttons.push(button("openPlan", "Open plan", true, `Open ${planName}`));
+      buttons.push(button("openPlan", "Open plan document", true, `Open the document ${planName}`));
       buttons.push(button("matchStage", "Change match…", true, MATCH_TITLE, "quiet"));
       break;
     case "match":
       if (model.actions?.matchStage) {
         buttons.push(button("matchStage", "Match this stage…", true, MATCH_TITLE, "primary"));
       }
-      buttons.push(button("openPlan", "Open plan", true, `Open ${planName}`));
+      buttons.push(button("openPlan", "Open plan document", true, `Open the document ${planName}`));
       buttons.push(button("associatePlan", "Change plan…", true, "Choose another plan file or remove the association", "quiet"));
       break;
     case "missing-plan":
@@ -1098,6 +1184,8 @@ h1 { font-size: 1.35em; font-weight: 600; margin: 0; }
    theme, and the warning tone is carried by its border and its dot. */
 .hpill.warn { color: var(--vscode-foreground); border-color: var(--warn-border); background: var(--warn-surface); font-weight: 600; }
 .hpill.warn .icon { color: var(--warn); }
+/* A historical stage is not the live thing: dashed, quiet, unmistakably a record. */
+.hpill.history { color: var(--vscode-descriptionForeground); border-style: dashed; background: none; }
 
 .run .plan { font-family: var(--vscode-font-family); font-weight: 600; color: var(--vscode-foreground); }
 .run .sep { margin: 0 6px; }
@@ -1340,6 +1428,19 @@ button.quiet { background: transparent; color: var(--vscode-descriptionForegroun
 .facts { display: grid; grid-template-columns: max-content 1fr; gap: 1px 12px; margin: 0; padding-top: 8px; border-top: 1px solid var(--line); font-size: 0.82em; color: var(--vscode-descriptionForeground); }
 .facts dt { color: var(--vscode-descriptionForeground); }
 .facts dd { margin: 0; font-family: var(--vscode-editor-font-family); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The repository context, above everything. Quiet while following; stated
+   plainly, with a left rule, while a pin is in force. */
+.repocontext { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 0 0 12px; padding-bottom: 8px; border-bottom: 1px solid var(--line); font-size: 0.86em; }
+.repocontext .names { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.repocontext .line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.repocontext .headline { display: inline-flex; align-items: center; gap: 4px; color: var(--vscode-descriptionForeground); }
+.repocontext .name { font-weight: 600; color: var(--vscode-foreground); overflow-wrap: anywhere; }
+.repocontext .actions { margin: 0; gap: 6px; }
+.repocontext.pinned { padding-left: 8px; border-left: 2px solid var(--vscode-textLink-foreground); }
+/* A pin holding the cockpit away from the repository this window is in is the
+   one state where the screen can disagree with the Source Control view. */
+.repocontext.away { border-left-color: var(--warn-border); }
+.repocontext .pin { flex: none; opacity: 0.85; }
 
 @media (max-width: 640px) {
   .columns { grid-template-columns: 1fr; }

@@ -22,7 +22,7 @@ import { describe, it } from "node:test";
 import { discoverRuns, selectRun } from "../core/discovery";
 import { HUMAN_GATE_MARKER } from "../core/engineFormats";
 import { humanTask, sentences, splitPassCriteria } from "../core/humanTask";
-import { readManifestStages } from "../core/manifest";
+import { parseExecutionManifest } from "../core/manifest";
 import { renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel, type ManifestStageView, type OverviewArtifacts } from "../core/overviewModel";
 import { Workspace, normalUi } from "./fixtures";
@@ -265,21 +265,45 @@ describe("a stage is called what the plan calls it", () => {
 
   it("reading a manifest back is strict about what it will believe", () => {
     const good = JSON.stringify({ version: 1, plan_label: "p.md", source_digest: "sha256:x", stages: [{ stage_id: "s1", label: "Stage 1", title: "One", brief: "…" }] });
-    assert.deepEqual(readManifestStages(good), [{ stageId: "s1", label: "Stage 1", title: "One" }]);
-    assert.equal(readManifestStages(undefined), undefined);
-    assert.equal(readManifestStages("{ not json"), undefined);
-    assert.equal(readManifestStages(JSON.stringify({ version: 2, stages: [{ stage_id: "s", label: "l", title: "t" }] })), undefined, "a later shape is not guessed at");
-    assert.equal(readManifestStages(JSON.stringify({ version: 1, stages: [] })), undefined);
-    assert.equal(readManifestStages(JSON.stringify({ version: 1, stages: [{ stage_id: "s", title: "t" }] })), undefined, "a stage without a label is a half-read journey");
+    assert.deepEqual(parseExecutionManifest(good)?.identity.stages, [{ stageId: "s1", label: "Stage 1", title: "One" }]);
+    assert.equal(parseExecutionManifest(undefined), undefined);
+    assert.equal(parseExecutionManifest("{ not json"), undefined);
+    assert.equal(parseExecutionManifest(JSON.stringify({ version: 2, plan_label: "p.md", source_digest: "x", stages: [{ stage_id: "s", label: "l", title: "t", brief: "b" }] })), undefined, "a later shape is not guessed at");
+    assert.equal(parseExecutionManifest(JSON.stringify({ version: 1, plan_label: "p.md", source_digest: "x", stages: [] })), undefined);
+    assert.equal(parseExecutionManifest(JSON.stringify({ version: 1, plan_label: "p.md", source_digest: "x", stages: [{ stage_id: "s", title: "t", brief: "b" }] })), undefined, "a stage without a label is a half-read journey");
+    assert.equal(parseExecutionManifest(JSON.stringify({ version: 1, stages: [{ stage_id: "s", label: "l", title: "t", brief: "b" }] })), undefined, "and one without the fields that say whose it is");
   });
 
-  it("the Overview panel reads that file for the run it is showing", async () => {
-    const source = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "overview", "overviewPanel.ts"), "utf8");
-    const body = /private async manifestStages[\s\S]*?\n {2}}\n/.exec(source)?.[0] ?? "";
+  it("the Overview panel reads that file for the run it is showing, through the one cached reader", async () => {
+    const panel = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "overview", "overviewPanel.ts"), "utf8");
+    const body = /private async manifestStages[\s\S]*?\n {2}}\n/.exec(panel)?.[0] ?? "";
     assert.ok(body, "manifestStages exists");
-    assert.match(body, /run\.state\.source !== "manifest"/, "only a manifest run has one");
-    assert.match(body, /manifestFileName\(run\.planKey\)/);
+    assert.match(body, /this\.controller\.manifestStagesFor\(run\)/, "the identities come from the controller's cached read");
     assert.match(body, /recordedStatus\(path\.join\(run\.location\.sparringDir, STAGES_DIRNAME, stage\.stageId, STATE_FILENAME\)\)/, "each status is the stage's own state.json");
+
+    // The controller owns that read because the run picker needs it too (plan
+    // membership), and a manifest is the largest file either surface touches.
+    const controller = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "controller.ts"), "utf8");
+    const reader = /async manifestStagesFor[\s\S]*?\n {2}}\n/.exec(controller)?.[0] ?? "";
+    assert.ok(reader, "manifestStagesFor exists");
+    assert.match(reader, /run\.state\.source !== "manifest"/, "only a manifest run has one");
+    assert.match(reader, /this\.manifests\.readBound\(this\.manifestDirectoryPath, run, peers\)/, "through the one reader that binds a manifest to the run asking for it");
+
+    // The reader caches the bytes and re-derives the binding every call, so a
+    // cache can never become an authority of its own.
+    const manifestReader = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "manifestReader.ts"), "utf8");
+    assert.match(manifestReader, /manifestPathFor\(directory, run\)/, "the file is the one scoped to this run's own project");
+    assert.match(manifestReader, /readCached\(this\.manifests, current, \(text\) => parseExecutionManifest\(text\)\)/, "the parse is cached, because a manifest is the largest file either surface reads");
+    assert.match(
+      manifestReader,
+      /const expect = manifestExpectationFor\(run\);/,
+      "and what the manifest must match is derived from this run, on this call, before any of it is believed",
+    );
+    assert.ok(!/CachedFile<Manifest(Binding|Stage)/.test(manifestReader.replace(/ManifestBindingRecord/g, "")), "nothing bound is ever what is cached");
+    // A sidecar that exists is still the only thing that can satisfy the
+    // strict path: the legacy derivation is opened by its *absence*, never by
+    // its disagreeing.
+    assert.match(manifestReader, /if \(binding\) \{\n\s*return \{ binding: bindParsedManifest\(parsed, binding, expect\)/, "a present sidecar goes through the unchanged strict binding");
   });
 });
 

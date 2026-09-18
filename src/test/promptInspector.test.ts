@@ -188,4 +188,65 @@ describe("the Stage 5 case", () => {
     assert.equal(framing.length, 2);
     assert.match(framing[0].text, /your own implementation/);
   });
+
+  it("names an independent reviewer as one, and not as a sparring turn", () => {
+    /**
+     * The other half of the same case, once the stage is declared
+     * review-only: the actor is a fresh independent reviewer over an
+     * already-accepted candidate set, with no stage agent beside it. Reading
+     * `Review turn` here would say the reviewer is paired with an
+     * implementation agent that does not exist — which is exactly the fact
+     * this view is opened to check.
+     */
+    const { prompt, line } = reviewerCapture();
+    const entries = parseCaptureIndex(line);
+    assert.equal(entries.length, 1, "the reviewer role is read, not dropped");
+    const view = buildPromptView(entries[0], prompt, { live: true });
+
+    assert.equal(view.turn, "Independent reviewer");
+    assert.equal(view.detail, "original review of the accepted candidate set");
+    assert.equal(view.sections[0].origin, "engine");
+    assert.match(view.sections[0].text, /Accepted candidate set/);
+  });
+
+  it("finds the reviewer's latest turn independently of the other two roles", () => {
+    const entries = [
+      { seq: 1, role: "reviewer" },
+      { seq: 2, role: "reviewer" },
+    ].map((partial) => ({ ...partial, turnKind: "original", resumed: false, ts: "", stageId: "s", file: "f", chars: -1, sections: [] })) as CaptureEntry[];
+    assert.equal(latestCapture(entries, "reviewer")?.seq, 2);
+    assert.equal(latestCapture(entries, "sparrer"), undefined);
+    assert.equal(latestCapture(entries, "stage"), undefined);
+  });
+
+  it("shows an unrecognised reviewer turn kind as a reviewer, plainly", () => {
+    const { prompt, line } = reviewerCapture();
+    const entry = { ...parseCaptureIndex(line)[0], turnKind: "some_future_kind" };
+    const view = buildPromptView(entry, prompt, { live: false });
+
+    assert.equal(view.turn, "Independent reviewer");
+    assert.equal(view.detail, "engine turn kind: some_future_kind");
+  });
 });
+
+/** One captured independent-review turn, in the shape the engine writes it. */
+function reviewerCapture(): { prompt: string; line: string } {
+  const candidateSet =
+    "## Accepted candidate set\n\nThis stage reviews work that is already accepted. Its candidate is `" +
+    "e3c2ddcd3966a9237280645dfcb63cdd6eaacb1c`.";
+  const prompt = `${candidateSet}\n`;
+  const line = JSON.stringify({
+    v: 1,
+    seq: 1,
+    ts: "2026-09-15T13:40:00.000Z",
+    role: "reviewer",
+    stage_id: "stage-5-independent-final-review-and-activation-decision",
+    turn_kind: "original",
+    resumed: false,
+    expected_branch: "feature/reported-statistics-contract",
+    file: "0001-reviewer-original.md",
+    chars: prompt.length,
+    sections: [{ heading: "Accepted candidate set", origin: "engine", source: null, start: 0, end: candidateSet.length }],
+  });
+  return { prompt, line };
+}

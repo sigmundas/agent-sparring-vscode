@@ -270,10 +270,25 @@ describe("one launcher for every engine action", () => {
   it("both of those hand the arguments over through the one shared function", async () => {
     for (const file of ["vscode/executionTracker.ts", "vscode/commandRunner.ts"]) {
       const source = await read(file);
-      assert.match(source, /executeThroughShell\(/, `${file} uses the shared shell handover`);
+      // Two halves of the one shared hand-over: deciding whether this shell
+      // can be given the command (before anything durable is written), then
+      // performing it (the first irreversible step).
+      assert.match(source, /shellHandoverFor\(/, `${file} decides the shell hand-over through the shared function`);
+      // Performing it is the shared race-safe step: the final occupancy check
+      // and `executeCommand` with nothing awaited in between. Neither
+      // launcher may keep a copy of that ordering, and neither calls
+      // `executeCommand` itself at all.
+      assert.match(source, /handOverToIdleShell\(/, `${file} performs it through the shared, race-safe hand-over`);
+      assert.ok(!/performShellHandover\(/.test(source), `${file} does not perform the hand-over outside the idle-terminal check`);
       assert.ok(!/integration\.executeCommand\(/.test(source), `${file} does not call executeCommand itself`);
     }
     const shared = await read("vscode/shellIntegration.ts");
     assert.match(shared, /planShellHandover\(word, args, shellFamily\(/, "and it decides by the one rule in core, not by a second copy of it");
+    // The one place the final check and the hand-over meet, and they meet
+    // with no `await` between them.
+    const handover = await read("vscode/shellHandover.ts");
+    const critical = handover.slice(handover.indexOf("if (handover.via !== \"no-shell\" && lease.idle())"), handover.indexOf("if (handover.via === \"no-shell\")"));
+    assert.ok(critical.includes("performShellHandover("), "the shared hand-over performs it right after the idle check");
+    assert.ok(!/await/.test(critical), `nothing is awaited between the occupancy check and the hand-over, got ${critical}`);
   });
 });

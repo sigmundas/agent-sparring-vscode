@@ -8,43 +8,87 @@
  *    lifetime; the executions in it are tracked one by one and a finished
  *    one never keeps the UI running;
  *  - launches in a dedicated terminal whose process is the runner, used only
- *    when shell integration never becomes available; ended when that
- *    terminal closes (VS Code closes it as soon as the process exits);
+ *    when shell integration never becomes available; ended when the pty host
+ *    reports that process's exit code. A terminal that merely closes without
+ *    one is not an ending: such a process can survive the hangup, so liveness
+ *    becomes `unknown` and is settled by the process table or by the person;
  *  - commands typed by the user in any integrated terminal, recognised from
  *    the shell-integration start event's command line and cwd;
  *  - launches recorded in workspaceState before a window reload, re-found by
  *    their terminal's process id and, on POSIX, confirmed alive by a
- *    process-table probe; without a probe they stay `unknown`;
+ *    process-table probe; without a probe they stay `unknown`, and so does a
+ *    launch whose terminal has not reappeared — a reconnect deadline is a
+ *    fact about VS Code's timing and never evidence about a process;
  *  - and, for a run none of the above ever saw, the process table read
  *    directly for its project (`probeProject`). That is the only way to
  *    answer for a runner whose terminal was closed before a reload, or one
  *    started outside VS Code entirely.
  *
- * Any shell execution starting or ending in a terminal that hosts a tracked
- * runner, and the terminal closing, end that runner: a shell runs one
- * foreground command at a time. Ended records are kept (until the next
+ * A runner's record ends when *its own* execution ends, or when the pty host
+ * reports the exit code of a dedicated terminal's process. Everything else
+ * that used to end one — the terminal closing, another command taking the
+ * foreground there, a process the matcher cannot recognise — is a loss of
+ * observation, and leaves liveness `unknown` with a sentence saying so: a
+ * suspended engine put in the background, or one that survives the hangup,
+ * goes on working. The duplicate guard for such an operation stays with the
+ * registry, which accepts none of those as evidence either. Ended records are
+ * kept (until the next
  * launch for the same run) so a stale `turn.started` can be presented as
  * "interrupted" instead of "running" — and they are persisted across a
  * window reload for the same reason, since a reload does not un-observe a
  * runner's death.
+ *
+ * ## Liveness here, admission there
+ *
+ * Handing a command line to `shellIntegration.executeCommand` submits it. The
+ * shell may run it at once, or much later — a stopped shell (SIGSTOP) takes
+ * the line and runs it when it continues — or never. Whether an operation may
+ * be started at all therefore lives in one authority, the OperationRegistry
+ * (operationRegistry.ts): every transport in this file claims there first,
+ * records its intent durably there before invoking anything, and resolves
+ * there only on evidence.
+ *
+ * This file answers a different question — what is running, in which
+ * terminal, with which output and exit code — and it holds no duplicate
+ * guard of its own. It used to hold one for the dedicated-terminal fallback,
+ * which meant the same fact lived in two places and each reload had to
+ * recreate it in the other; the guard is now the registry's for all four
+ * transports, and what is kept here is liveness.
+ *
+ * Nothing submitted is a runner here. A `Tracked` execution is created only
+ * when the registry reports that the shell started (or finished) that exact
+ * execution, whether that is in the same tick or a quarter of an hour later.
+ * `executionFor`, `recordById` and the persisted launches therefore keep
+ * meaning observed executions.
  */
 
 import * as vscode from "vscode";
 import { executableWord, planExecutable, wasCommandNotFound, type ExecutablePlan, type ExecutableProblem } from "../core/cli";
 import type { SparringLocation } from "../core/discovery";
 import type { ExecutionRecord, ExecutionSource } from "../core/liveness";
-import { findDescendant } from "../core/processTree";
+import { findDescendant, findSelfOrDescendant, processExists, processGenerationVerdict, type ProcessInfo } from "../core/processTree";
 import { probeRunnerProcesses, type RunnerProbe } from "../core/runnerProcesses";
-import { commandLineRuns, matchSparringCommand, parseSparringCommand, type SparringSubcommand } from "../core/sparringCommand";
+import { commandLineIsOperation, matchSparringCommand, parseSparringCommand, targetIsAttributable, type SparringSubcommand } from "../core/sparringCommand";
+import { admissionRefusal, outstanding, runnerKey, operationRefusal, type Establishment, type OperationRegistry, type OperationView } from "./operationRegistry";
 import { listProcesses, processProbeSupported } from "./processProbe";
-import { awaitShellIntegration, executeThroughShell, hostEnv, SHELL_INTEGRATION_TIMEOUT_MS } from "./shellIntegration";
+import { handOverToIdleShell } from "./shellHandover";
+import { awaitShellIntegration, EXECUTION_START_TIMEOUT_MS, hostEnv, shellHandoverFor, SHELL_INTEGRATION_TIMEOUT_MS } from "./shellIntegration";
+import type { TerminalLease } from "./terminalPool";
 import { collectOutput } from "./terminalOutput";
-import type { TerminalLease, TerminalPool } from "./terminalPool";
+import type { TerminalPool } from "./terminalPool";
 
-export { SHELL_INTEGRATION_TIMEOUT_MS };
+export { EXECUTION_START_TIMEOUT_MS, SHELL_INTEGRATION_TIMEOUT_MS };
 
 const LAUNCHES_KEY = "agentSparring.launches";
-/** After a reload, how long reconnected terminals get to appear before a recorded launch is declared gone. */
+/**
+ * After a reload, how long this window waits for VS Code to bring persistent
+ * terminal sessions back before it stops watching for them.
+ *
+ * A user-interface deadline and nothing more. It decides when `reattach`
+ * returns; it decides nothing about any runner or any operation. A launch
+ * whose terminal has not reappeared by then is `unknown`, not ended, and its
+ * operation guard is untouched.
+ */
 export const RECONNECT_GRACE_MS = 6000;
 const PROBE_INTERVAL_MS = 4000;
 
@@ -61,10 +105,30 @@ export interface LaunchOptions {
   planPath?: string;
   /** The execution manifest a plan command was launched with, when it was (`--manifest`). */
   manifest?: string;
+  /**
+   * The repository or worktree this operation acts on, as a full path. Part
+   * of the operation's identity: a process in the table is attributed to this
+   * operation only if its command line names this same project, so a stage id
+   * that also exists in another repository can never resolve this one.
+   * Defaults to `cwd`, which every call site already sets to the project root.
+   */
+  repoRoot?: string;
+  /** The engine's sparring directory, when it is not `<repoRoot>/.sparring`. */
+  sparringDir?: string;
   reveal: boolean;
 }
 
-export type LaunchResult = { ok: true; record: ExecutionRecord; via: "shell" | "terminal" } | { ok: false; error: string; problem: ExecutableProblem };
+/**
+ * Why a command could not be launched. `unconfirmed` is not a configuration
+ * problem and must never be reported as one: the executable was resolved, the
+ * terminal was there and the command was submitted — the shell simply has not
+ * (yet) reported it as started. Nor is it a claim that nothing ran.
+ */
+export type LaunchProblem = ExecutableProblem | "unconfirmed";
+
+export type LaunchResult =
+  | { ok: true; record: ExecutionRecord; via: "shell" | "terminal" }
+  | { ok: false; error: string; problem: LaunchProblem; submission?: OperationView };
 
 /** The shell reported that the launched command word does not exist. */
 export interface CommandNotFound {
@@ -97,8 +161,19 @@ interface Tracked {
   stageId?: string;
   planPath?: string;
   manifest?: string;
+  /** The repository this execution acts on, for attributing a process to it. */
+  repoRoot?: string;
+  sparringDir?: string;
   terminal?: vscode.Terminal;
   terminalPid?: number;
+  /**
+   * The engine process positively attributed to this run, and the birth time
+   * it had when it was found. Once known, the absence of that pid — or the
+   * same pid with a different birth time — is real evidence that this run's
+   * process is over; nothing else in a process table is.
+   */
+  enginePid?: number;
+  generation?: string;
   execution?: vscode.TerminalShellExecution;
   probeTimer?: ReturnType<typeof setInterval>;
   /** The command word or path this window launched (undefined for observed / reattached runs). */
@@ -109,6 +184,19 @@ interface Tracked {
   output?: Promise<string>;
   /** The project terminal this command holds until it ends. */
   lease?: TerminalLease;
+  /**
+   * This launch *is* a process of ours: a dedicated terminal whose shell is
+   * the engine, started because no shell integration was available. Such a
+   * process is owned by VS Code's pty host, not by the extension host, and
+   * survives a window reload (integration suite, section `outlives`).
+   *
+   * Read from the persisted `transport`, never from the observed `source`,
+   * so it survives any number of reloads. What it decides here is liveness —
+   * the terminal exists only while the process does, and the process itself
+   * (not only its descendants) is what a probe must look for. The duplicate
+   * guard for it belongs to the registry.
+   */
+  dedicated?: boolean;
 }
 
 interface PersistedLaunch {
@@ -118,10 +206,36 @@ interface PersistedLaunch {
   stageId?: string;
   planPath?: string;
   manifest?: string;
+  repoRoot?: string;
+  sparringDir?: string;
+  /**
+   * How the engine was reached — immutable, and deliberately separate from
+   * `source`, which is an *observation* and changes (`terminal` →
+   * `reattached`) as the window reloads and reconnects. Conflating the two
+   * meant a dedicated-terminal runner was no longer known to be one after the
+   * second reload, and lost the handling that depends on it.
+   */
+  transport?: "dedicated-terminal" | "shell";
   source: ExecutionSource;
   startedAtMs: number;
   terminalPid: number;
   terminalName: string;
+  /**
+   * The liveness this window last had for a launch that has *not* ended.
+   *
+   * `unknown` used to be dropped from persistence altogether, because only a
+   * launch that still had a terminal object was written down. A reload then
+   * found nothing, the evidence submission tied to it stayed pending for
+   * ever, and the buttons that would have let the person retry were disabled
+   * with no way back. An unknown launch is a fact worth keeping: it is the
+   * one the person is asked to settle.
+   */
+  state?: "running" | "unknown";
+  /** Why that state is what it is, so the sentence survives the reload too. */
+  detail?: string;
+  /** The engine process attributed to this run, and its birth time, when one was found. */
+  enginePid?: number;
+  generation?: string;
   /**
    * Present only for a launch that had already ended when the window
    * reloaded. That a runner was seen to die is as much an observation as
@@ -156,11 +270,17 @@ export class ExecutionTracker implements vscode.Disposable {
     private readonly log: (message: string) => void,
     private readonly locations: () => SparringLocation[],
     private readonly terminals: TerminalPool,
+    /** The one authority on engine operations in flight (operationRegistry.ts). */
+    private readonly operations: OperationRegistry,
+    /** Whether this platform can be asked about processes at all. */
+    private readonly probeSupported: () => boolean = processProbeSupported,
+    private readonly probeProcesses: () => Promise<ProcessInfo[]> = listProcesses,
   ) {
     this.disposables.push(
       this.changeEmitter,
       this.notFoundEmitter,
       this.engineFailedEmitter,
+      this.operations.onDidEstablish((event) => this.onEstablished(event)),
       vscode.window.onDidStartTerminalShellExecution((event) => this.onExecutionStarted(event)),
       vscode.window.onDidEndTerminalShellExecution((event) => this.onExecutionEnded(event)),
       vscode.window.onDidCloseTerminal((terminal) => this.onTerminalClosed(terminal)),
@@ -225,10 +345,47 @@ export class ExecutionTracker implements vscode.Disposable {
   }
 
   /** What a window reload would find in workspaceState, reduced to run id and state. */
-  persisted(): { runId: string; state: "running" | "ended" }[] {
+  persisted(): { runId: string; state: "running" | "unknown" | "ended" }[] {
     return this.context.workspaceState
       .get<PersistedLaunch[]>(LAUNCHES_KEY, [])
-      .map((launch) => ({ runId: launch.runId, state: launch.ended ? ("ended" as const) : ("running" as const) }));
+      .map((launch) => ({ runId: launch.runId, state: launch.ended ? ("ended" as const) : launch.state === "unknown" ? ("unknown" as const) : ("running" as const) }));
+  }
+
+  /**
+   * The name of the terminal hosting this run's live execution, when this
+   * window launched or observed one. Which terminal a runner is in is part of
+   * what the ownership boundary promises, so the integration tests can read
+   * it; nothing in the UI claims anything from it.
+   */
+  hostingTerminal(runId: string): string | undefined {
+    return this.liveItemFor(runId)?.terminal?.name;
+  }
+
+  /**
+   * A person has stated that the runner of one exact execution is no longer
+   * active.
+   *
+   * This exists because `unknown` must not be a resting place: a runner
+   * nothing could attribute leaves liveness unknown, and without a way out
+   * every action for that run stays withheld for ever. It is deliberately an
+   * assertion and not an observation — the detail says so, and no exit code
+   * is invented for it, so nothing downstream can read it as the engine
+   * having succeeded or failed.
+   *
+   * It targets the execution id, not the run, so a panel rendered before a
+   * newer execution started cannot end that newer one.
+   */
+  confirmInactive(runId: string, executionId: string): { confirmed: boolean; reason?: "not-found" | "already-ended" } {
+    const item = [...this.tracked.values()].find((candidate) => candidate.record.id === executionId && candidate.record.runId === runId);
+    if (!item) {
+      return { confirmed: false, reason: "not-found" };
+    }
+    if (item.record.state === "ended") {
+      return { confirmed: false, reason: "already-ended" };
+    }
+    this.stopProbe(item);
+    this.end(item, undefined, "You confirmed that this runner is no longer active. Agent Sparring could not establish that itself, so this is recorded as your statement rather than as an observation.");
+    return { confirmed: true };
   }
 
   /** Send Ctrl-C to the exact terminal hosting this run's live execution. */
@@ -291,33 +448,108 @@ export class ExecutionTracker implements vscode.Disposable {
    * from this process, or the launch fails with a configuration message.
    */
   async launch(options: LaunchOptions): Promise<LaunchResult> {
+    // Before anything else — before the executable is resolved, before a
+    // terminal is acquired, before a byte is sent — the operation is claimed.
+    // That claim is what forbids a second command for this run, whether the
+    // first one is still being prepared, has been given to a shell, is
+    // executing in a shell, or is running as a process of ours. There is one
+    // authority for all of those (operationRegistry.ts); this launcher does
+    // not keep a second opinion about any of them.
+    const key = runnerKey(options.runId);
+    const label = `${options.kind} ${options.stageId ?? options.planPath ?? options.manifest ?? ""}`.trim();
+    const admission = this.operations.claim({
+      key,
+      caller: "runner",
+      label,
+      repoRoot: options.repoRoot ?? options.cwd,
+      sparringDir: options.sparringDir,
+      cwd: options.cwd,
+      subcommand: options.kind,
+      runId: options.runId,
+      runnerKind: options.kind,
+      stageId: options.stageId,
+      planPath: options.planPath,
+      manifest: options.manifest,
+    });
+    if (!admission.admitted) {
+      const blocked = admission.blocked;
+      this.log(`refused to launch ${options.name}: ${blocked.label} is ${describeHold(blocked)}; a second command for this run is not submitted`);
+      // Only something a person could actually tell us about is offered for
+      // an override; work this window is watching is not.
+      return { ok: false, error: admissionRefusal(blocked), problem: "unconfirmed", submission: outstanding(blocked) ? blocked : undefined };
+    }
+    const claim = admission.claim;
     const configured = await planExecutable(options.configured, hostEnv(options.cwd), true);
     if (!configured.ok) {
       this.log(`refused to launch ${options.name}: ${configured.error}`);
+      this.operations.release(claim, "the executable could not be resolved, so nothing was ever submitted");
       return { ok: false, error: configured.error, problem: configured.problem };
     }
-    // This project's terminal, reused when it is idle: a plan run is a long
-    // series of commands and each one used to leave a dead tab behind.
+    // This project's terminal, reused only when its shell is genuinely idle:
+    // a plan run is a long series of commands and each one used to leave a
+    // dead tab behind, but a terminal someone else is using is never written
+    // to (terminalPool.ts).
     const lease = this.terminals.acquire(options.cwd);
     if (options.reveal) {
       lease.terminal.show(true);
     }
     const integration = await awaitShellIntegration(lease.terminal);
     const word = executableWord(configured.plan);
-    const request = integration ? executeThroughShell(integration, word, options.args) : undefined;
-    if (request) {
-      this.dropEnded(options.runId);
-      const item = this.track(options, "launched", lease.terminal, request.execution);
-      item.word = word;
-      item.plan = configured.plan;
-      item.lease = lease;
-      item.output = collectOutput(request.execution);
+    // Whether this shell can be given the command at all is decided before
+    // anything durable is written, so an operation that must take the
+    // shell-less route is never armed for a shell.
+    const handover = integration ? shellHandoverFor(word, options.args) : undefined;
+    if (integration && handover && handover.via !== "no-shell") {
+      // The durable execution intent, on disk before the hand-over. A crash
+      // between the two then leaves a record that blocks conservatively
+      // rather than nothing at all; a failed write means nothing is handed
+      // over, because a started operation with no record is the one outcome
+      // that cannot be recovered from.
+      const armed = await this.operations.arm(claim, "shell", { word, plan: configured.plan, args: options.args });
+      if (!armed.ok) {
+        lease.release();
+        this.operations.release(claim, "the durable record of the intent could not be written, so the command was never handed to the shell");
+        return { ok: false, error: armed.error, problem: "unconfirmed" };
+      }
+      // The final occupancy check and the hand-over are one step with nothing
+      // awaited in between (shellHandover.ts). Between acquiring an idle
+      // terminal and getting here, shell integration and the durable record
+      // were both awaited, and the person can start their own command in that
+      // terminal while they are: writing into it then would type the engine's
+      // command line into their foreground process. Such a terminal is left
+      // untouched and another idle one is used; the operation stays armed
+      // while one is looked for, because nothing has executed.
+      const handed = await handOverToIdleShell({ pool: this.terminals, cwd: options.cwd, lease, integration, word, args: options.args, reveal: options.reveal, log: this.log });
+      if (!handed.ok) {
+        if (handed.reason === "threw") {
+          this.operations.handoverFailed(armed.armed, `handing the command line to the shell threw (${handed.error.message}), so nothing was submitted`);
+          lease.discard();
+          return { ok: false, error: `Agent Sparring could not hand ${label} to the terminal: ${handed.error.message}`, problem: "unconfirmed" };
+        }
+        this.operations.handoverNotInvoked(armed.armed, handed.detail);
+        return {
+          ok: false,
+          error: `Agent Sparring did not start ${label}: ${handed.detail}. Nothing was written into any terminal, so nothing ran — try again when a terminal is free.`,
+          problem: "unconfirmed",
+        };
+      }
+      const request = handed.request;
+      const leased = handed.lease;
+      // The output must be read immediately after the hand-over or it is lost.
+      this.operations.submittedToShell(armed.armed, leased, request.execution, collectOutput(request.execution));
       this.log(
-        `launched ${options.name} via shell integration (${configured.plan.kind === "shell" ? `'${word}' resolved by the shell` : word}, ${options.args.length} args${request.quotedHere ? ", command line quoted here" : ""}, cwd ${options.cwd})`,
+        `submitted ${options.name} to the shell in "${leased.terminal.name}" (${configured.plan.kind === "shell" ? `'${word}' resolved by the shell` : word}, ${options.args.length} args${request.quotedHere ? ", command line quoted here" : ""}, cwd ${options.cwd}); waiting for the shell to report it started`,
       );
-      void this.persistWithPid(item, lease.terminal);
-      this.changeEmitter.fire("started");
-      return { ok: true, record: item.record, via: "shell" };
+      const settled = await this.operations.waitForStart(armed.armed, EXECUTION_START_TIMEOUT_MS);
+      if (settled.established) {
+        // onEstablished has already tracked it; hand the caller that record.
+        const record = this.executionFor(options.runId);
+        if (record) {
+          return { ok: true, record, via: "shell" };
+        }
+      }
+      const view = this.operations.pendingShellFor(key) ?? this.operations.inFlightFor(key);
+      return { ok: false, error: view ? operationRefusal(view) : "The command could not be confirmed as started.", problem: "unconfirmed", submission: view && outstanding(view) ? view : undefined };
     }
     if (integration) {
       // The shell is fine, it just cannot carry this command line; keep it.
@@ -331,30 +563,60 @@ export class ExecutionTracker implements vscode.Disposable {
     const direct = await planExecutable(options.configured, hostEnv(options.cwd), false);
     if (!direct.ok) {
       this.log(`could not launch ${options.name}: shell integration unavailable and ${direct.error}`);
+      this.operations.release(claim, "no executable could be resolved without a shell either, so nothing was started");
       return { ok: false, error: direct.error, problem: direct.problem };
     }
-    this.dropEnded(options.runId);
     const path = executableWord(direct.plan);
-    const dedicated = vscode.window.createTerminal({
-      name: `Agent Sparring — ${options.name}`,
-      shellPath: path,
-      shellArgs: options.args,
-      cwd: options.cwd,
-      iconPath: new vscode.ThemeIcon("debug-alt"),
-    });
-    if (options.reveal) {
-      dedicated.show(true);
+    // Same ordering for the transport that spawns a process of its own: the
+    // intent is durable before `createTerminal`, which is irreversible.
+    const armed = await this.operations.arm(claim, "dedicated-terminal", { word: path, plan: direct.plan, args: options.args });
+    if (!armed.ok) {
+      this.operations.release(claim, "the durable record of the intent could not be written, so no dedicated terminal was created");
+      return { ok: false, error: armed.error, problem: "unconfirmed" };
     }
-    const item = this.track(options, "terminal", dedicated, undefined);
+    this.dropEnded(options.runId);
+    let dedicatedTerminal: vscode.Terminal;
+    try {
+      dedicatedTerminal = vscode.window.createTerminal({
+        name: `Agent Sparring — ${options.name}`,
+        shellPath: path,
+        shellArgs: options.args,
+        cwd: options.cwd,
+        iconPath: new vscode.ThemeIcon("debug-alt"),
+      });
+    } catch (error) {
+      this.operations.handoverFailed(armed.armed, `creating the dedicated terminal threw (${(error as Error).message}), so no process was started`);
+      return { ok: false, error: `Agent Sparring could not start ${label} without a shell: ${(error as Error).message}`, problem: "unconfirmed" };
+    }
+    if (options.reveal) {
+      dedicatedTerminal.show(true);
+    }
+    const item = this.track(options, "terminal", dedicatedTerminal, undefined);
     item.word = path;
     item.plan = direct.plan;
+    item.dedicated = true;
+    // This terminal's process *is* the runner, so the operation is under way
+    // for as long as that terminal lives. The guard stays with the registry
+    // — which persists the transport as `dedicated-terminal`, so however
+    // many reloads follow, this is still known to be a dedicated runner —
+    // and is released by evidence about that process: its terminal closing,
+    // or the process table saying the pid is gone or is no longer this
+    // operation. This launch record carries the liveness the Overview shows;
+    // it is not a second admission authority.
+    // Nothing here treats that terminal closing as the end of the operation.
+    // Real testing showed the process can survive `terminal.dispose()`, so
+    // the registry loses its *observation* and keeps the guard, settling it
+    // from the process table or from a person. This file's launch record ends
+    // with the terminal because that is all liveness can honestly say about a
+    // runner it can no longer see; it is not an admission authority.
+    this.operations.runningDedicated(armed.armed, dedicatedTerminal, `it runs as the process of a dedicated terminal "${dedicatedTerminal.name}"`);
     this.log(`launched ${options.name} in a dedicated terminal (shell integration unavailable; ${path}, ${options.args.length} args, cwd ${options.cwd})`);
-    void this.persistWithPid(item, dedicated);
+    void this.persistWithPid(item, dedicatedTerminal);
     this.changeEmitter.fire("started");
     return { ok: true, record: item.record, via: "terminal" };
   }
 
-  private track(options: Pick<LaunchOptions, "runId" | "kind" | "stageId" | "planPath" | "manifest">, source: ExecutionSource, terminal: vscode.Terminal | undefined, execution: vscode.TerminalShellExecution | undefined, startedAtMs = Date.now()): Tracked {
+  private track(options: Pick<LaunchOptions, "runId" | "kind" | "stageId" | "planPath" | "manifest" | "repoRoot" | "sparringDir">, source: ExecutionSource, terminal: vscode.Terminal | undefined, execution: vscode.TerminalShellExecution | undefined, startedAtMs = Date.now()): Tracked {
     const id = `${startedAtMs}-${++this.counter}`;
     const item: Tracked = {
       record: { id, runId: options.runId, kind: options.kind, source, state: "running", startedAtMs },
@@ -362,6 +624,8 @@ export class ExecutionTracker implements vscode.Disposable {
       stageId: options.stageId,
       planPath: options.planPath,
       manifest: options.manifest,
+      repoRoot: options.repoRoot,
+      sparringDir: options.sparringDir,
       terminal,
       execution,
     };
@@ -369,11 +633,46 @@ export class ExecutionTracker implements vscode.Disposable {
     return item;
   }
 
-  private dropEnded(runId: string): void {
+  private dropEnded(runId: string, except?: string): void {
     for (const [id, item] of this.tracked) {
-      if (item.record.runId === runId && item.record.state === "ended") {
+      if (item.record.runId === runId && item.record.state === "ended" && id !== except) {
         this.tracked.delete(id);
       }
+    }
+  }
+
+  // ---------------------------------------------------------------- establishment
+
+  /**
+   * The registry reports that the shell started (or finished) a command this
+   * window submitted. That is the first moment there is a runner, so — and
+   * only then — it becomes an ordinary tracked execution: persisted,
+   * announced, ended by its own end event. A late start is no different from
+   * a prompt one except in the log.
+   */
+  private onEstablished(event: Establishment): void {
+    const submitted = event.operation;
+    if (submitted.caller !== "runner" || !submitted.runId || !submitted.runnerKind) {
+      return; // a short engine command: the command runner owns that one
+    }
+    this.dropEnded(submitted.runId);
+    const item = this.track(
+      { runId: submitted.runId, kind: submitted.runnerKind, stageId: submitted.stageId, planPath: submitted.planPath, manifest: submitted.manifest, repoRoot: submitted.repoRoot },
+      "launched",
+      event.terminal,
+      event.execution,
+    );
+    item.word = submitted.word;
+    item.plan = submitted.plan;
+    item.lease = submitted.lease;
+    item.output = submitted.output ?? collectOutput(event.execution);
+    this.log(`${submitted.label} is running in "${event.terminal.name}"`);
+    void this.persistWithPid(item, event.terminal);
+    this.changeEmitter.fire("started");
+    if (event.ended) {
+      // The shell told us about the end before we saw a start: it ran, and it
+      // is over. Both halves are recorded, in that order.
+      this.end(item, event.ended.exitCode, undefined);
     }
   }
 
@@ -382,12 +681,23 @@ export class ExecutionTracker implements vscode.Disposable {
   private onExecutionStarted(event: vscode.TerminalShellExecutionStartEvent): void {
     const own = this.itemForExecution(event.execution);
     if (own) {
-      return; // our own launch; already tracked as running
+      return; // our own launch; the registry established it and it is tracked
     }
-    // A shell runs one foreground command at a time: anything else starting
-    // in a terminal that hosts a tracked runner means that runner has ended.
+    // Another command starting in a terminal that hosts a tracked runner
+    // means the foreground relationship there changed. It does not mean the
+    // runner ended: `^Z` then `bg` leaves it running while the shell takes
+    // the next command. So what this window can watch is over — which is
+    // `unknown`, not "Stopped", and the person's confirmation is the way out.
     for (const item of this.itemsHostedIn(event.terminal)) {
-      this.end(item, undefined, "Another command started in its terminal, so the runner had already ended.");
+      item.record = {
+        ...item.record,
+        state: "unknown",
+        detail:
+          "Another command has taken the foreground in the terminal this run was started in. That changes what can be watched there, not what is running — a suspended engine put in the background leaves exactly this trace. Agent Sparring cannot determine whether the previous runner is still active.",
+      };
+      this.log(`${describe(item)}: another command took the foreground in its terminal; that settles nothing, so liveness stays unknown`);
+      void this.persist();
+      this.changeEmitter.fire("changed");
     }
     const parsed = parseSparringCommand(event.execution.commandLine.value);
     if (!parsed) {
@@ -400,7 +710,7 @@ export class ExecutionTracker implements vscode.Disposable {
       return;
     }
     this.dropEnded(match.runId);
-    const item = this.track({ runId: match.runId, kind: match.kind, stageId: match.stageId, planPath: match.planPath }, "observed", event.terminal, event.execution);
+    const item = this.track({ runId: match.runId, kind: match.kind, stageId: match.stageId, planPath: match.planPath, repoRoot: match.location.repoRoot, sparringDir: match.location.sparringDir }, "observed", event.terminal, event.execution);
     this.log(`observed ${describe(item)} start in terminal "${event.terminal.name}"`);
     void this.persistWithPid(item, event.terminal);
     this.changeEmitter.fire("started");
@@ -413,17 +723,56 @@ export class ExecutionTracker implements vscode.Disposable {
       return;
     }
     // An in-flight command from before a reload finishing: VS Code may report
-    // its end without our ever having seen it start.
+    // its end without our ever having seen it start, and then this is the
+    // only end event there will be.
+    //
+    // Only for a record that holds no execution identity of its own. One
+    // that does is a different execution, and another command finishing in
+    // the same terminal says nothing about it — ending it here is how a
+    // trivial `true`, typed after the engine was backgrounded, used to be
+    // read as the engine finishing.
     for (const item of this.itemsHostedIn(event.terminal)) {
-      this.end(item, event.exitCode, undefined);
+      if (item.execution === undefined) {
+        this.end(item, event.exitCode, undefined);
+      }
     }
   }
 
+  /**
+   * The terminal hosting a tracked execution has closed.
+   *
+   * An exit *status* from the pty host for a dedicated terminal is the
+   * engine's own exit code, and ends the record. A terminal that merely went
+   * away is not: a process that ignores or survives the hangup goes on
+   * working, which real testing in VS Code confirmed, so liveness becomes
+   * `unknown` — with a sentence saying why and the person's confirmation as
+   * the way out — rather than "Stopped", which would be a claim nothing here
+   * can make and would invite a second runner.
+   */
   private onTerminalClosed(terminal: vscode.Terminal): void {
     for (const item of this.itemsHostedIn(terminal)) {
-      const code = item.record.source === "terminal" ? terminal.exitStatus?.code : undefined;
-      this.end(item, code, item.record.source === "terminal" ? undefined : "Its terminal was closed.");
+      const code = item.dedicated ? terminal.exitStatus?.code : undefined;
+      if (code !== undefined) {
+        this.end(item, code, undefined);
+        continue;
+      }
+      item.terminal = undefined;
+      item.record = {
+        ...item.record,
+        state: "unknown",
+        detail: `The terminal that was running this closed without reporting an exit code. That is the end of what this window can watch, not the end of a process — one that ignores or survives the hangup keeps working. Agent Sparring cannot determine whether the previous runner is still active.`,
+      };
+      this.log(`${describe(item)}: its terminal closed without an exit code; that settles nothing, so liveness stays unknown`);
+      if (item.terminalPid !== undefined && this.probeSupported()) {
+        void this.probe(item, false);
+      } else {
+        this.stopProbe(item);
+      }
+      void this.persist();
+      this.changeEmitter.fire("changed");
     }
+    // A submission whose terminal has closed is settled by the registry,
+    // which watches the same event and applies the same distinction.
   }
 
   private itemForExecution(execution: vscode.TerminalShellExecution): Tracked | undefined {
@@ -506,18 +855,32 @@ export class ExecutionTracker implements vscode.Disposable {
         stageId: item.stageId,
         planPath: item.planPath,
         manifest: item.manifest,
+        repoRoot: item.repoRoot,
+        sparringDir: item.sparringDir,
+        // The transport, not the observation: what this launch *is* never
+        // changes, however often the window reloads and re-finds it.
+        transport: (item.dedicated ? "dedicated-terminal" : "shell") as "dedicated-terminal" | "shell",
         source: item.record.source,
         startedAtMs: item.record.startedAtMs,
         terminalPid: item.terminalPid ?? 0,
         terminalName: item.terminal?.name ?? "",
+        enginePid: item.enginePid,
+        generation: item.generation,
       };
       if (item.record.state === "ended") {
         ended.push({ ...common, ended: { atMs: item.record.endedAtMs ?? Date.now(), exitCode: item.record.exitCode, detail: item.record.detail } });
-      } else if (item.terminalPid !== undefined && item.terminal) {
-        live.push(common);
+      } else {
+        // Both running and unknown are kept, and an unknown one is kept even
+        // though its terminal never came back: that a runner's fate could not
+        // be established is exactly the fact the next window needs, and
+        // dropping it stranded the person's evidence submission with no way
+        // to retry it.
+        live.push({ ...common, state: item.record.state === "running" ? "running" : "unknown", detail: item.record.detail });
       }
     }
     await this.context.workspaceState.update(LAUNCHES_KEY, [...live, ...newestEndedPerRun(ended)]);
+    // Submissions are persisted by the registry, under their own key: a
+    // reload must never find one among the launches.
   }
 
   /**
@@ -533,8 +896,9 @@ export class ExecutionTracker implements vscode.Disposable {
    * a reload does not un-make it.
    */
   async reattach(): Promise<void> {
+    const restored = this.operations.restore();
     const launches = this.context.workspaceState.get<PersistedLaunch[]>(LAUNCHES_KEY, []);
-    if (launches.length === 0) {
+    if (launches.length === 0 && restored.length === 0) {
       return;
     }
     const pending = new Map<string, PersistedLaunch>();
@@ -547,13 +911,22 @@ export class ExecutionTracker implements vscode.Disposable {
           source: launch.source,
           state: "unknown",
           startedAtMs: launch.startedAtMs,
-          detail: "The window reloaded; looking for the terminal that hosted this run.",
+          detail: launch.state === "unknown" && launch.detail ? launch.detail : "The window reloaded; looking for the terminal that hosted this run.",
         },
         kind: launch.kind,
         stageId: launch.stageId,
         planPath: launch.planPath,
         manifest: launch.manifest,
+        repoRoot: launch.repoRoot,
+        sparringDir: launch.sparringDir,
         terminalPid: launch.terminalPid,
+        enginePid: launch.enginePid,
+        generation: launch.generation,
+        // The immutable transport decides this, with the old `source` read
+        // only for records written before that field existed. A dedicated
+        // runner whose source had already become `reattached` used to be
+        // forgotten here on the second reload.
+        dedicated: launch.transport ? launch.transport === "dedicated-terminal" : launch.source === "terminal",
       };
       if (launch.ended) {
         item.record = { ...item.record, state: "ended", endedAtMs: launch.ended.atMs, exitCode: launch.ended.exitCode, detail: launch.ended.detail };
@@ -565,10 +938,9 @@ export class ExecutionTracker implements vscode.Disposable {
     this.changeEmitter.fire("changed");
     const reviving = launches.length - pending.size;
     this.log(`window reloaded with ${launches.length} recorded launch(es)${reviving > 0 ? ` (${reviving} already ended before the reload)` : ""}; re-establishing runner liveness`);
-    if (pending.size === 0) {
+    if (pending.size === 0 && restored.length === 0) {
       return;
     }
-
     const tryTerminal = async (terminal: vscode.Terminal) => {
       let pid: number | undefined;
       try {
@@ -582,30 +954,68 @@ export class ExecutionTracker implements vscode.Disposable {
           await this.reattachTo(this.tracked.get(id) as Tracked, terminal);
         }
       }
+      // A terminal coming back is told to the registry, which re-ties any
+      // submission that terminal took. It settles nothing: the execution
+      // identity is gone, so only that terminal closing, its shell turning
+      // out to be dead, or the command itself appearing in the process table
+      // can.
+      if (pid !== undefined) {
+        this.operations.reconnect(pid, terminal);
+      }
     };
     const opened = vscode.window.onDidOpenTerminal((terminal) => void tryTerminal(terminal));
     await Promise.all(vscode.window.terminals.map(tryTerminal));
     await new Promise((resolve) => setTimeout(resolve, RECONNECT_GRACE_MS));
     opened.dispose();
+    // Nothing is concluded here about a launch whose terminal did not come
+    // back, and nothing about the operation guard either.
+    //
+    // The reconnect grace period is about VS Code's timing and nothing else.
+    // A terminal that has not reappeared within six seconds is not a dead
+    // runner: it may be a persistent session still being restored, or a
+    // window that reloaded while the process kept running under the pty
+    // host. Declaring such a launch ended used to look tidy and was simply
+    // wrong — it turned a live runner into "Stopped" and offered a second
+    // one. Liveness stays `unknown`, the guard stays with the registry, and
+    // both are settled only by evidence: the terminal closing, the process
+    // table proving that pid is gone or is no longer this operation, or a
+    // person's explicit override.
     for (const id of pending.keys()) {
       const item = this.tracked.get(id);
       if (item && item.record.state !== "ended") {
-        this.end(item, undefined, "The terminal that hosted this run was not found after the window reloaded, so the runner cannot still be alive.");
+        item.record = {
+          ...item.record,
+          state: "unknown",
+          detail: `The terminal that hosted this run has not reappeared since the window reloaded. That is a timing fact about VS Code, not evidence about the runner, so nothing is concluded: ${
+            this.probeSupported() ? "the process table is being asked whether its process is still there." : `no process probe is available on ${process.platform}, so this stays unknown until you say otherwise.`
+          }`,
+        };
+        this.log(`${describe(item)}: its terminal did not reappear after the reload; that settles nothing, so liveness stays unknown and the operation stays guarded`);
+        if (item.terminalPid !== undefined && this.probeSupported()) {
+          await this.probe(item, true);
+          if (item.record.state === "running") {
+            item.probeTimer = setInterval(() => void this.probe(item, false), PROBE_INTERVAL_MS);
+          }
+        }
       }
     }
+    this.changeEmitter.fire("changed");
     await this.persist();
   }
 
   private async reattachTo(item: Tracked, terminal: vscode.Terminal): Promise<void> {
     item.terminal = terminal;
-    if (item.record.source === "terminal") {
-      // The terminal's process is the runner: present means alive.
+    if (item.dedicated) {
+      // The terminal's process *is* the runner: present means alive. Read
+      // from the immutable transport, so the third and tenth reload know
+      // this as well as the first did — `source` becomes `reattached` here,
+      // which is an observation and must not decide what this launch is.
       item.record = { ...item.record, state: "running", source: "reattached", detail: undefined };
       this.log(`${describe(item)}: its dedicated terminal survived the reload; runner alive`);
       this.changeEmitter.fire("changed");
       return;
     }
-    if (!processProbeSupported()) {
+    if (!this.probeSupported()) {
       item.record = {
         ...item.record,
         state: "unknown",
@@ -621,30 +1031,104 @@ export class ExecutionTracker implements vscode.Disposable {
     }
   }
 
+  /**
+   * One round of process evidence for a reattached launch.
+   *
+   * The distinction that matters, and that this used to get wrong: a strict
+   * command matcher that finds nothing answers "I cannot attribute any
+   * process to this run", which is not "this run's process has ended".
+   * Ending the launch on it turned a live runner — one launched with a
+   * relative `--repo-root .`, or through a wrapper that `ps` reports
+   * differently — into "Stopped", and offered a second one.
+   *
+   * So a launch is ended here only by a fact about a *process*: a pid that
+   * was once positively attributed to this run and is now gone, or is now a
+   * different process carrying the same number. Until such a pid is known,
+   * failure to attribute leaves liveness `unknown`, and the person's explicit
+   * confirmation is the way out of it.
+   */
   private async probe(item: Tracked, first: boolean): Promise<void> {
     if (item.record.state === "ended" || item.terminalPid === undefined) {
       this.stopProbe(item);
       return;
     }
-    let found = false;
+    let processes: ProcessInfo[];
     try {
-      const processes = await listProcesses();
-      found = findDescendant(processes, item.terminalPid, (commandLine) => commandLineRuns(commandLine, { kind: item.kind, stageId: item.stageId, planPath: item.planPath, manifest: item.manifest })) !== undefined;
+      processes = await this.probeProcesses();
     } catch (error) {
       item.record = { ...item.record, state: "unknown", detail: `The terminal that hosted this run survived the reload, but the process probe failed: ${(error as Error).message}` };
       this.stopProbe(item);
       this.changeEmitter.fire("changed");
       return;
     }
-    if (found) {
-      if (item.record.state !== "running") {
-        item.record = { ...item.record, state: "running", source: "reattached", detail: undefined };
-        this.log(`${describe(item)}: process found under its reconnected terminal; runner alive`);
-        this.changeEmitter.fire("changed");
-      }
+    const target = { kind: item.kind, repoRoot: item.repoRoot, sparringDir: item.sparringDir, stageId: item.stageId, planPath: item.planPath, manifest: item.manifest };
+    const matches = (commandLine: string) => targetIsAttributable(target) && commandLineIsOperation(commandLine, target);
+    // A dedicated terminal's process *is* the runner, so that pid's absence
+    // from the table is a fact about the runner itself — positive evidence,
+    // unlike a command line that merely cannot be matched.
+    if (item.dedicated && item.enginePid === undefined && !processExists(processes, item.terminalPid)) {
+      this.end(item, undefined, `The dedicated terminal's process (pid ${item.terminalPid}), which is this runner, is no longer in the process table.`);
       return;
     }
-    this.end(item, undefined, first ? "The terminal that hosted this run survived the reload, but no runner process is running under it any more." : "Its process is no longer running under the reconnected terminal.");
+    // A pid already attributed to this run: its fate is this run's fate, and
+    // a birth time recorded with it is what catches a reused pid.
+    if (item.enginePid !== undefined) {
+      const verdict = processGenerationVerdict(processes, item.enginePid, item.generation);
+      if (verdict === "gone") {
+        this.end(item, undefined, `The process that was running this run (pid ${item.enginePid}) is no longer in the process table.`);
+        return;
+      }
+      if (verdict === "alive" || matches(processes.find((process) => process.pid === item.enginePid)?.command ?? "")) {
+        this.markRunning(item, `process ${item.enginePid} is still running this run`);
+        return;
+      }
+      item.record = {
+        ...item.record,
+        state: "unknown",
+        detail: `The process recorded for this run (pid ${item.enginePid}) is still in the process table, but nothing positively identifies it as this run any more and no birth time was recorded to tell a reused pid from the original. Agent Sparring cannot determine whether the previous runner is still active.`,
+      };
+      this.changeEmitter.fire("changed");
+      return;
+    }
+    if (!targetIsAttributable(target)) {
+      // Nothing in a command line could prove this is the operation, so the
+      // probe has no question to ask and `unknown` is the honest answer.
+      item.record = { ...item.record, state: "unknown", detail: "This run cannot be recognised in the process table by its command line alone, so whether it is still running cannot be established here." };
+      this.stopProbe(item);
+      this.changeEmitter.fire("changed");
+      return;
+    }
+    // A dedicated terminal's process is the engine itself, so the root of
+    // the tree must be considered and not only its descendants; a shell's
+    // is one of its children. Looking only at descendants declared every
+    // live dedicated runner dead.
+    const found = item.dedicated ? findSelfOrDescendant(processes, item.terminalPid, matches) : findDescendant(processes, item.terminalPid, matches);
+    if (found) {
+      item.enginePid = found.pid;
+      item.generation = found.started;
+      this.markRunning(item, `process ${found.pid} was found under its reconnected terminal`);
+      void this.persist();
+      return;
+    }
+    // Nothing could be attributed, and no pid for this run was ever
+    // established, so there is nothing whose absence could mean anything.
+    item.record = {
+      ...item.record,
+      state: "unknown",
+      detail: `${first ? "The terminal that hosted this run survived the reload, but no" : "No"} process in the table can be positively attributed to this run. That is an attribution failure, not proof that it ended — a runner launched with a relative repository path, or through a wrapper, looks exactly like this while it works. Agent Sparring cannot determine whether the previous runner is still active.`,
+    };
+    this.log(`${describe(item)}: no process in the table could be attributed to it. A matcher that cannot recognise a process has not established that anything ended, so liveness stays unknown and the operation stays guarded.`);
+    this.stopProbe(item);
+    this.changeEmitter.fire("changed");
+  }
+
+  private markRunning(item: Tracked, detail: string): void {
+    if (item.record.state === "running") {
+      return;
+    }
+    item.record = { ...item.record, state: "running", source: "reattached", detail: undefined };
+    this.log(`${describe(item)}: ${detail}; runner alive`);
+    this.changeEmitter.fire("changed");
   }
 
   private stopProbe(item: Tracked): void {
@@ -671,12 +1155,12 @@ export class ExecutionTracker implements vscode.Disposable {
    * must not be offered on a guess. Returns whether anything was recorded.
    */
   async probeProject(location: SparringLocation, runId: string, kind: SparringSubcommand): Promise<boolean> {
-    if (this.watchedExecutionFor(runId) || !processProbeSupported()) {
+    if (this.watchedExecutionFor(runId) || !this.probeSupported()) {
       return false;
     }
     let probe: RunnerProbe;
     try {
-      probe = probeRunnerProcesses(await listProcesses(), location);
+      probe = probeRunnerProcesses(await this.probeProcesses(), location);
     } catch (error) {
       this.log(`could not read the process table for ${location.projectDir}: ${(error as Error).message}`);
       return false;
@@ -694,6 +1178,11 @@ export class ExecutionTracker implements vscode.Disposable {
     }
     const item = this.track({ runId, kind }, "probed", undefined, undefined);
     if (probe.kind === "alive") {
+      // This says there is *a* runner in this project. It does not say that a
+      // command submitted for this run started: a `run-loop` for some other
+      // stage is a different process entirely. Attribution — whether the
+      // process is this exact command — belongs to the registry, which
+      // matches command lines itself and leaves everything else unresolved.
       this.log(`no execution of ${kind} was watched from this window, but a sparring runner for ${location.projectDir} is running (pid ${probe.process.pid})`);
       // Nothing will tell us when it ends: there is no terminal behind it and
       // no shell execution to fire an end event. Keep asking the process
@@ -721,7 +1210,7 @@ export class ExecutionTracker implements vscode.Disposable {
     }
     let probe: RunnerProbe;
     try {
-      probe = probeRunnerProcesses(await listProcesses(), location);
+      probe = probeRunnerProcesses(await this.probeProcesses(), location);
     } catch {
       return; // A transient `ps` failure is not evidence that anything ended.
     }
@@ -742,4 +1231,22 @@ function newestEndedPerRun(ended: PersistedLaunch[]): PersistedLaunch[] {
 
 function describe(item: Tracked): string {
   return `${item.kind} ${item.stageId ?? item.planPath ?? item.manifest ?? ""}`.trim();
+}
+
+/** Why an operation key was already held, for the log. */
+function describeHold(blocked: OperationView): string {
+  switch (blocked.state) {
+    case "reserved":
+      return "already being prepared for a terminal";
+    case "armed":
+      return "already recorded as about to run, so it may have started";
+    case "submitted-shell":
+      return "already submitted to a shell and may still execute";
+    case "running-shell":
+      return "already running in the shell it was given to";
+    case "running-direct":
+      return "already running as a process of this window";
+    case "running-dedicated":
+      return "already running as the process of a dedicated terminal";
+  }
 }

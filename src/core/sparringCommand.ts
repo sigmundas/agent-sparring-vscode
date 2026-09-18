@@ -325,19 +325,107 @@ function deepestContaining(locations: SparringLocation[], dir: string): Sparring
     .sort((a, b) => path.resolve(b.repoRoot).length - path.resolve(a.repoRoot).length)[0];
 }
 
-/** Whether a process command line is the runner for `match` (used by the post-reload process probe). */
-export function commandLineRuns(commandLine: string, match: { kind: SparringSubcommand; stageId?: string; planPath?: string; manifest?: string }): boolean {
-  const parsed = parseSparringCommand(commandLine);
-  if (!parsed || parsed.subcommand !== match.kind) {
+// ---------------------------------------------------------------------------
+// attributing a process in the table to one exact operation
+// ---------------------------------------------------------------------------
+
+/**
+ * One engine operation, as strongly as a process command line can identify
+ * it: which repository (or worktree) it acts on, and which stage or plan.
+ *
+ * Every path here is absolute. `ps` reports a command line and nothing else
+ * — no working directory — so a relative `--repo-root`, plan path or manifest
+ * in a process's command line cannot be resolved by anyone reading the table,
+ * and a relative one in the operation's own identity could not be compared
+ * against it either. Such a target is *not attributable*, and the honest
+ * answer about it is "no evidence", never "close enough".
+ */
+export interface OperationTarget {
+  kind: SparringSubcommand;
+  /** Absolute repository / worktree root the operation was launched against. */
+  repoRoot?: string;
+  /** Absolute sparring directory, when the engine was given one explicitly. */
+  sparringDir?: string;
+  stageId?: string;
+  /** Absolute plan path. */
+  planPath?: string;
+  /** Absolute execution manifest path. */
+  manifest?: string;
+}
+
+/**
+ * Whether a process command line could ever be proved to be this operation.
+ *
+ * The three things that make it possible: the target names its project by
+ * full path, it names what it acts on, and what it acts on is itself a full
+ * path (or a stage id, which is exact by construction — but only *within* a
+ * project, which is why the project is required too).
+ */
+export function targetIsAttributable(target: OperationTarget): boolean {
+  if (!target.repoRoot && !target.sparringDir) {
     return false;
   }
-  if (match.kind === "run-loop" || match.kind === "run-sparring") {
-    return parsed.stageId === match.stageId;
+  if (target.kind === "run-loop" || target.kind === "run-sparring") {
+    return Boolean(target.stageId);
   }
-  if (match.manifest) {
-    return Boolean(parsed.manifest && path.basename(parsed.manifest) === path.basename(match.manifest));
+  const plan = target.manifest ?? target.planPath;
+  return Boolean(plan && path.isAbsolute(plan));
+}
+
+/**
+ * Whether a process command line is *this exact operation*.
+ *
+ * Deliberately strict, because this predicate is what may remove duplicate
+ * protection. A `stage-4` in another repository, and a `plan.md` at another
+ * full path, are different operations that used to satisfy it: the stage id
+ * was compared on its own, and plan and manifest paths were compared by
+ * basename. Both are now refused.
+ *
+ * The rule is: same subcommand, same project by full path, and the same
+ * target by full path (or the same stage id inside that same project).
+ * Anything that cannot be resolved from the command line alone — a relative
+ * `--repo-root`, a relative plan path, a command line that names no project
+ * at all — is not a match, so the caller keeps whatever guard it holds.
+ */
+export function commandLineIsOperation(commandLine: string, target: OperationTarget): boolean {
+  if (!targetIsAttributable(target)) {
+    return false;
   }
-  return Boolean(parsed.planPath && match.planPath && path.basename(parsed.planPath) === path.basename(match.planPath));
+  const parsed = parseSparringCommand(commandLine);
+  if (!parsed || parsed.subcommand !== target.kind) {
+    return false;
+  }
+  if (!namesTheSameProject(parsed, target)) {
+    return false;
+  }
+  if (target.kind === "run-loop" || target.kind === "run-sparring") {
+    return parsed.stageId !== undefined && parsed.stageId === target.stageId;
+  }
+  return target.manifest ? sameAbsolutePath(parsed.manifest, target.manifest) : sameAbsolutePath(parsed.planPath, target.planPath);
+}
+
+/**
+ * Whether the command line's own project identity is the target's. A
+ * `--sparring-dir` wins where it is given, exactly as the engine treats it;
+ * otherwise the `--repo-root`. A command line that names neither by absolute
+ * path proves nothing.
+ */
+function namesTheSameProject(parsed: ParsedSparringCommand, target: OperationTarget): boolean {
+  if (parsed.sparringDir !== undefined) {
+    if (!path.isAbsolute(parsed.sparringDir)) {
+      return false;
+    }
+    const expected = target.sparringDir ?? (target.repoRoot ? path.join(target.repoRoot, ".sparring") : undefined);
+    return expected !== undefined && same(parsed.sparringDir, expected);
+  }
+  if (parsed.repoRoot !== undefined) {
+    return path.isAbsolute(parsed.repoRoot) && target.repoRoot !== undefined && same(parsed.repoRoot, target.repoRoot);
+  }
+  return false;
+}
+
+function sameAbsolutePath(a: string | undefined, b: string | undefined): boolean {
+  return a !== undefined && b !== undefined && path.isAbsolute(a) && path.isAbsolute(b) && same(a, b);
 }
 
 export type { RunSnapshot };

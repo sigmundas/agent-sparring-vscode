@@ -10,9 +10,10 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { diagnoseDiscovery, renderDiagnostic } from "../core/diagnose";
-import { chooseLaunchLocation, discoverRuns, isNestedLocation, locateAll, locateSparringDirs, runIdFor, selectRun } from "../core/discovery";
+import { discoverRuns, isNestedLocation, locateAll, locateSparringDirs, runIdFor, selectRun } from "../core/discovery";
+import { chooseLaunchRepository, launchRepositories } from "../core/launchRepositories";
 import { buildRunPickItems } from "../core/runPick";
-import { Workspace } from "./fixtures";
+import { Workspace, everywhereIsAGitRepo } from "./fixtures";
 
 const STAGES = ["stage-reported-statistics-contract", "stage-reported-statistics-local-schema-barrier", "stage-reported-statistics-typed-parser"];
 
@@ -61,10 +62,13 @@ describe("reported-statistics multi-root shape (sibling workspace folders)", () 
     const items = buildRunPickItems(discovery.runs, selection.selected?.id);
     assert.deepEqual(
       items.map((item) => item.label),
-      [`$(check) ${STAGES[2]}`, STAGES[1], STAGES[0]].map((label) => label),
-      "Select Repository / Run lists every stage, open first, then newest",
+      ["$(check) Reported statistics typed parser", "Reported statistics local schema barrier", "Reported statistics contract"],
+      "Select Repository / Run lists every stage by its readable name, open first, then newest",
     );
-    assert.ok(items.every((item) => item.detail.startsWith("sporely-py-reported-statistics · ")));
+    assert.ok(
+      items.every((item, at) => item.detail === `sporely-py-reported-statistics · ${[STAGES[2], STAGES[1], STAGES[0]][at]}`),
+      "the repository and the raw stage id stay in the detail line, where an identifier belongs",
+    );
   });
 
   it("all stages accepted: still recorded, the newest is selected as the terminal fallback", async () => {
@@ -200,8 +204,8 @@ describe("nested project inside a workspace folder (the shape in VS Code's saved
   it("Run Plan targets the nested project for a file inside it, and the parent otherwise", async () => {
     const { sporely, reported } = await nestedWindow();
     const locations = await locateSparringDirs(sporely.root, "sporely");
-    assert.equal(chooseLaunchLocation(locations, undefined, path.join(reported.root, "main.py"))?.projectDir, reported.root);
-    assert.equal(chooseLaunchLocation(locations, undefined, path.join(sporely.root, "README.md"))?.projectDir, sporely.root);
+    assert.equal(chooseLaunchRepository(await launchRepositories(locations, [], [], everywhereIsAGitRepo), undefined, path.join(reported.root, "main.py"))?.location.projectDir, reported.root);
+    assert.equal(chooseLaunchRepository(await launchRepositories(locations, [], [], everywhereIsAGitRepo), undefined, path.join(sporely.root, "README.md"))?.location.projectDir, sporely.root);
   });
 
   it("a non-file workspace folder is reported as skipped, not probed", async () => {
