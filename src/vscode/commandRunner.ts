@@ -23,9 +23,13 @@
  *
  * Submitting is not running here either, and this transport carries the same
  * risk of doing an engine operation twice as the runner launcher does. So it
- * submits through the same authority (submissionRegistry.ts): an earlier
- * freeze-candidate that may still execute refuses the next one, before the
- * executable is resolved and before a terminal is acquired. A command the
+ * submits through the same authority (submissionRegistry.ts), and claims the
+ * operation there before it does anything at all: an earlier freeze-candidate
+ * that is being prepared, that may still execute, or that is running as a
+ * child process of this window all refuse the next one, before the executable
+ * is resolved and before a terminal is acquired. Two clicks in the same
+ * instant cannot both get past that claim, and the direct-process fallback
+ * holds it until the child has exited. A command the
  * shell has not reported as started is not treated as run and — unlike the
  * missing-integration case — is deliberately *not* retried through the
  * direct-process transport, because the submitted line may still be read.
@@ -36,7 +40,7 @@ import type { CommandOutcome } from "../core/acceptance";
 import { executableWord, planExecutable, type ExecutablePlan } from "../core/cli";
 import type { LaunchProblem } from "./executionTracker";
 import { awaitExecutionEnd, awaitShellIntegration, EXECUTION_START_TIMEOUT_MS, executeThroughShell, hostEnv } from "./shellIntegration";
-import { commandKey, submissionRefusal, type SubmissionRegistry, type SubmissionView } from "./submissionRegistry";
+import { admissionRefusal, commandKey, submissionRefusal, type SubmissionRegistry, type SubmissionView } from "./submissionRegistry";
 import { collectOutput } from "./terminalOutput";
 import type { TerminalPool } from "./terminalPool";
 
@@ -75,15 +79,20 @@ export class SparringCommandRunner {
     const subcommand = options.operation?.subcommand ?? options.args[0] ?? "command";
     const target = options.operation?.target ?? options.args[1];
     const key = commandKey(options.cwd, subcommand, target);
-    // Before the executable is resolved and before a terminal is acquired: an
-    // earlier copy of this operation that may still execute forbids another.
-    const unresolved = this.submissions.unresolvedFor(key);
-    if (unresolved) {
-      this.log(`refused to run ${options.name}: ${unresolved.label} was submitted to a shell and may still execute; it is not run a second time`);
-      return { ok: false, error: submissionRefusal(unresolved), problem: "unconfirmed", submission: unresolved };
+    const label = `${subcommand}${target ? ` ${target}` : ""}`;
+    // The first thing that happens, and the only synchronous one: while this
+    // operation is claimed, no other invocation can resolve an executable,
+    // acquire a terminal or send anything for it.
+    const admission = this.submissions.claim({ key, transport: "command", label, cwd: options.cwd, subcommand, stageId: target });
+    if (!admission.admitted) {
+      const blocked = admission.blocked;
+      this.log(`refused to run ${options.name}: ${blocked.label} is already in flight (${blocked.state}); it is not run a second time`);
+      return { ok: false, error: admissionRefusal(blocked), problem: "unconfirmed", submission: blocked.state === "waiting" || blocked.state === "uncertain" ? blocked : undefined };
     }
+    const claim = admission.claim;
     const configured = await planExecutable(options.configured, hostEnv(options.cwd), true);
     if (!configured.ok) {
+      this.submissions.release(claim, "the executable could not be resolved, so nothing was ever submitted");
       return { ok: false, error: configured.error, problem: configured.problem };
     }
     // The project's own terminal, for as long as this command runs — and only
@@ -91,9 +100,7 @@ export class SparringCommandRunner {
     const lease = this.terminals.acquire(options.cwd);
     const integration = await awaitShellIntegration(lease.terminal);
     const word = executableWord(configured.plan);
-    const submission = integration
-      ? this.submissions.open({ key, transport: "command", label: `${subcommand}${target ? ` ${target}` : ""}`, cwd: options.cwd, subcommand, stageId: target, word, plan: configured.plan }, lease)
-      : undefined;
+    const submission = integration ? this.submissions.submit(claim, lease, { word, plan: configured.plan }) : undefined;
     const request = integration ? executeThroughShell(integration, word, options.args) : undefined;
     if (request && submission) {
       lease.terminal.show(true);
@@ -115,8 +122,9 @@ export class SparringCommandRunner {
       return { ok: true, outcome: { exitCode, output: text, resolvedBy: configured.plan.kind === "shell" ? "shell" : "path" }, via: "shell", plan: configured.plan };
     }
     if (submission) {
-      // Nothing was handed over, so nothing can still execute.
-      this.submissions.withdraw(key, "the command line was never handed to the shell, so nothing was submitted");
+      // Nothing was handed over, so nothing can still execute — but this
+      // operation is still about to be run, and stays claimed.
+      this.submissions.unsubmit(claim, "the command line was never handed to the shell, so nothing was submitted");
     }
     if (integration) {
       lease.release();
@@ -127,10 +135,20 @@ export class SparringCommandRunner {
     // here): fall back to this process's view and an argument array.
     const direct = await planExecutable(options.configured, hostEnv(options.cwd), false);
     if (!direct.ok) {
+      this.submissions.release(claim, "no executable could be resolved without a shell either, so nothing was started");
       return { ok: false, error: direct.error, problem: direct.problem };
     }
     const path = executableWord(direct.plan);
-    const outcome = await runProcess(path, options.args, options.cwd);
+    // The child process is started under the claim and the claim is given up
+    // only when it has ended: there is no instant between "about to spawn"
+    // and "spawned" in which a second invocation could spawn another one.
+    this.submissions.runningDirectly(claim, "it runs as a child process of this window, without a shell");
+    let outcome: CommandOutcome;
+    try {
+      outcome = await runProcess(path, options.args, options.cwd);
+    } finally {
+      this.submissions.release(claim, "the process that ran it has ended");
+    }
     this.log(`ran ${options.name} as a direct process (${path}, ${options.args.length} args, cwd ${options.cwd}; shell integration unavailable); exit ${outcome.exitCode === undefined ? "unknown" : outcome.exitCode}`);
     return { ok: true, outcome, via: "process", plan: direct.plan };
   }

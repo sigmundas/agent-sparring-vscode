@@ -5,5 +5,5 @@
     "rootDir": "src",
     "types": ["node"]
   },
-  "include": ["src/core/**/*.ts", "src/test/**/*.ts"]
+  "include": ["src/core/**/*.ts", "src/vscode/**/*.ts", "src/test/**/*.ts"]
 }

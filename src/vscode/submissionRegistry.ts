@@ -22,7 +22,12 @@
  *    command* (same subcommand and same stage / plan / manifest), so it
  *    started;
  *  - `not-submitted` — the command line was never handed over at all (this
- *    shell's quoting could not be written), so there is nothing to run;
+ *    shell's quoting could not be written), so there is nothing to run. The
+ *    record then drops back to a reservation (`unsubmit`) while the caller
+ *    runs the operation another way, and is `release`d if it cannot;
+ *  - `released` — the operation never reached a shell at all, or the process
+ *    this window ran instead of one has ended. Nothing was ever queued
+ *    anywhere, so there is nothing to be afraid of;
  *  - `overridden` — a person stated that it cannot still run. That is an
  *    override, not evidence, and is recorded as such.
  *
@@ -50,6 +55,38 @@
  * Liveness stays separate: `ExecutionTracker.executionFor` answers "is there
  * an observed runner", this answers "may an earlier command still execute".
  * Neither substitutes for the other.
+ *
+ * ## Admission is atomic, and it is here
+ *
+ * Checking for an unresolved submission and then submitting is two steps, and
+ * both transports had asynchronous work in between — resolving the
+ * executable, acquiring a terminal, waiting for shell integration. Two clicks
+ * in that window both found nothing and both went on to submit, which is the
+ * duplicate the record was built to prevent. A caller-local boolean would not
+ * have fixed it either: there are two callers, and the operation is one.
+ *
+ * So the record is taken *first*, by `claim`, which is synchronous and
+ * therefore atomic against anything that can interleave in this host: one
+ * operation key, at most one record, from the first instant of a launch:
+ *
+ *     free
+ *       → reserved   `claim` — nothing can execute yet, nothing is persisted
+ *       → waiting    `submit` — handed to a shell; durable from here on
+ *       → uncertain  the wait expired; still durable, still blocking
+ *       → direct     `runningDirectly` — another transport really started it
+ *       → gone       resolved by evidence, withdrawn, released, or overridden
+ *
+ * A second caller that finds *any* of those states for its key is refused
+ * before it resolves an executable, acquires a terminal or sends a byte.
+ *
+ * `reserved` and `direct` are this window's own in-flight work: they are not
+ * persisted, because a reload cannot leave either of them able to execute —
+ * a reservation never reached a shell, and a direct child process does not
+ * outlive the extension host that spawned it. Only what a *shell* was given
+ * is written down, which is the durable semantics that was there before.
+ *
+ * Because a key holds one record, `override` and `withdraw` act on that exact
+ * record rather than picking one of several with the same key.
  */
 
 import * as vscode from "vscode";
@@ -65,10 +102,24 @@ const PID_PROBE_INTERVAL_MS = 5000;
 /** Which transport submitted it: a runner command, or a short engine command. */
 export type SubmissionTransport = "runner" | "command";
 
-export type SubmissionState = "waiting" | "uncertain";
+/**
+ * Where an operation stands.
+ *
+ *  - `reserved` — admitted, nothing handed over yet. Blocks a second caller;
+ *    never persisted, because nothing can execute;
+ *  - `waiting` — handed to a shell, which has not reported it yet;
+ *  - `uncertain` — the caller's wait expired; unchanged in substance;
+ *  - `direct` — not a shell submission at all: a dedicated terminal or a
+ *    child process this window started really is running it. Blocks for that
+ *    operation's lifetime; never persisted.
+ */
+export type SubmissionState = "reserved" | "waiting" | "uncertain" | "direct";
+
+/** The states in which a command was handed to a shell and may still execute on its own. */
+const SUBMITTED: ReadonlySet<SubmissionState> = new Set<SubmissionState>(["waiting", "uncertain"]);
 
 /** How a submission's fate was established. Only `overridden` is not evidence. */
-export type SubmissionResolution = "started" | "ended" | "terminal-closed" | "shell-gone" | "attributed" | "not-submitted" | "overridden";
+export type SubmissionResolution = "started" | "ended" | "terminal-closed" | "shell-gone" | "attributed" | "not-submitted" | "overridden" | "released";
 
 /** What a submission is, from the outside. Never an execution record. */
 export interface SubmissionView {
@@ -126,6 +177,18 @@ export interface SubmissionIdentity {
   plan?: ExecutablePlan;
 }
 
+/**
+ * A held operation key. Every transition after admission is made against
+ * this, so a caller can only ever move its own record.
+ */
+export interface OperationClaim {
+  readonly id: string;
+  readonly key: string;
+}
+
+/** What `claim` answers: the key is now ours, or it is someone else's and this is who. */
+export type Admission = { admitted: true; claim: OperationClaim } | { admitted: false; blocked: SubmissionView };
+
 export type SubmissionWait =
   | { established: true; terminal: vscode.Terminal; execution: vscode.TerminalShellExecution; ended?: { exitCode: number | undefined } }
   | { established: false; view: SubmissionView };
@@ -176,6 +239,8 @@ export function commandKey(cwd: string, subcommand: string, target?: string): st
 
 export class SubmissionRegistry implements vscode.Disposable {
   private readonly submissions = new Map<string, Submission>();
+  /** Operation key → the one record that holds it. The whole invariant, in one map. */
+  private readonly byKey = new Map<string, string>();
   private readonly disposables: vscode.Disposable[] = [];
   private readonly establishedEmitter = new vscode.EventEmitter<Establishment>();
   /** A submitted command was reported by its shell as started (or as finished). */
@@ -212,10 +277,28 @@ export class SubmissionRegistry implements vscode.Disposable {
 
   // ---------------------------------------------------------------- queries
 
-  /** The unresolved submission for an operation, if any. The one thing a caller must check. */
+  /**
+   * The unresolved *submission* for an operation: a command a shell was given
+   * and which may still execute. A reservation or a running direct process is
+   * not one of those and is deliberately not reported here — nothing is
+   * queued in a shell for it, and there is nothing for a person to override.
+   * Use `claim` to find out whether an operation may be started.
+   */
   unresolvedFor(key: string): SubmissionView | undefined {
-    const found = [...this.submissions.values()].filter((submission) => submission.key === key).sort((a, b) => b.submittedAtMs - a.submittedAtMs)[0];
+    const found = this.recordFor(key);
+    return found && SUBMITTED.has(found.state) ? view(found) : undefined;
+  }
+
+  /** Anything in flight for this key, in any state, including a reservation. */
+  inFlightFor(key: string): SubmissionView | undefined {
+    const found = this.recordFor(key);
     return found ? view(found) : undefined;
+  }
+
+  /** The one record a key can have. */
+  private recordFor(key: string): Submission | undefined {
+    const id = this.byKey.get(key);
+    return id ? this.submissions.get(id) : undefined;
   }
 
   /** The unresolved submission for a run, whatever operation it was. */
@@ -223,32 +306,130 @@ export class SubmissionRegistry implements vscode.Disposable {
     return runId ? this.unresolvedFor(runnerKey(runId)) : undefined;
   }
 
+  /** Every command a shell has been given and that is not accounted for. */
   unresolved(): SubmissionView[] {
-    return [...this.submissions.values()].map(view);
+    return [...this.submissions.values()].filter((submission) => SUBMITTED.has(submission.state)).map(view);
+  }
+
+  // ---------------------------------------------------------------- admission
+
+  /**
+   * Take the operation key, or say who holds it.
+   *
+   * Synchronous by design: the check and the record happen in one turn of the
+   * event loop, so two callers cannot both be admitted however much
+   * asynchronous work each of them does afterwards. Everything a launch does
+   * — resolving the executable, acquiring a terminal, waiting for shell
+   * integration — happens *after* this, under the claim.
+   *
+   * The claim must be settled: `submit` when a shell takes the command,
+   * `runningDirectly` when another transport starts it, `release` when
+   * preparation fails before anything could execute.
+   */
+  claim(identity: SubmissionIdentity): Admission {
+    const held = this.recordFor(identity.key);
+    if (held) {
+      return { admitted: false, blocked: view(held) };
+    }
+    const atMs = Date.now();
+    const submission: Submission = {
+      ...identity,
+      id: `submission-${atMs}-${++this.counter}`,
+      submittedAtMs: atMs,
+      state: "reserved",
+      restored: false,
+    };
+    this.submissions.set(submission.id, submission);
+    this.byKey.set(submission.key, submission.id);
+    return { admitted: true, claim: { id: submission.id, key: submission.key } };
   }
 
   // ---------------------------------------------------------------- submitting
 
   /**
-   * Record a submission *before* the command line is handed to the shell, so
-   * a start event that arrives in the same tick finds it, and so a crash
-   * between the two cannot lose it.
+   * The claimed operation is being handed to a shell. Called *before* the
+   * command line is given to it, so a start event that arrives in the same
+   * tick finds it, and so a crash between the two cannot lose it. This is the
+   * transition that makes the record durable.
    */
-  open(identity: SubmissionIdentity, lease: TerminalLease): Submission {
-    const submittedAtMs = Date.now();
-    const submission: Submission = {
-      ...identity,
-      id: `submission-${submittedAtMs}-${++this.counter}`,
-      submittedAtMs,
-      state: "waiting",
-      terminal: lease.terminal,
-      terminalName: lease.terminal.name,
-      lease,
-      restored: false,
-    };
-    this.submissions.set(submission.id, submission);
+  submit(claim: OperationClaim, lease: TerminalLease, details?: Pick<SubmissionIdentity, "word" | "plan">): Submission {
+    const submission = this.held(claim, "reserved");
+    submission.state = "waiting";
+    submission.submittedAtMs = Date.now();
+    submission.terminal = lease.terminal;
+    submission.terminalName = lease.terminal.name;
+    submission.lease = lease;
+    if (details) {
+      submission.word = details.word;
+      submission.plan = details.plan;
+    }
     void this.remember(submission);
     this.changeEmitter.fire();
+    return submission;
+  }
+
+  /**
+   * The command line was not handed over after all (this shell's quoting
+   * could not be written), and the caller is going on to another transport.
+   * Nothing was submitted, so the durable record goes — but the claim stays,
+   * because the operation is still about to happen and a second copy of it
+   * must still be refused.
+   */
+  unsubmit(claim: OperationClaim, detail: string): void {
+    const submission = this.held(claim, "waiting");
+    submission.state = "reserved";
+    submission.terminal = undefined;
+    submission.terminalName = undefined;
+    submission.lease = undefined;
+    submission.execution = undefined;
+    clearTimeout(submission.waitTimer);
+    submission.waitTimer = undefined;
+    this.log(`${submission.label}: ${detail}; the operation stays claimed while it is run another way`);
+    void this.persist();
+    this.changeEmitter.fire();
+  }
+
+  /**
+   * The operation is not going through a shell: this window started it
+   * itself, in a dedicated terminal or as a child process. There is nothing
+   * to wait for evidence about — it is running, observably — but a second
+   * copy must be refused for as long as it runs, so the claim is held until
+   * the caller `release`s it.
+   */
+  runningDirectly(claim: OperationClaim, detail: string): void {
+    const submission = this.held(claim, "reserved");
+    submission.state = "direct";
+    this.log(`${submission.label}: ${detail}; a second copy of this operation is refused until it ends`);
+  }
+
+  /**
+   * Give the claim back. Only for an operation that never reached a shell: a
+   * reservation whose preparation failed, or a direct process that has ended.
+   * A command a shell was given is never released — that needs evidence
+   * (`withdraw` when it was never handed over, `override` when a person
+   * takes responsibility).
+   */
+  release(claim: OperationClaim, detail: string): void {
+    const submission = this.submissions.get(claim.id);
+    if (!submission) {
+      return;
+    }
+    if (SUBMITTED.has(submission.state)) {
+      this.log(`${submission.label}: not released — it was handed to a shell, and only evidence or an override can settle that`);
+      return;
+    }
+    this.resolve(submission, "released", detail);
+  }
+
+  /** The claimed record, asserted to be in the state this transition comes from. */
+  private held(claim: OperationClaim, from: SubmissionState): Submission {
+    const submission = this.submissions.get(claim.id);
+    if (!submission || this.byKey.get(claim.key) !== claim.id) {
+      throw new Error(`the claim on ${claim.key} is no longer held`);
+    }
+    if (submission.state !== from) {
+      throw new Error(`${claim.key} is ${submission.state}, not ${from}`);
+    }
     return submission;
   }
 
@@ -299,35 +480,31 @@ export class SubmissionRegistry implements vscode.Disposable {
    * one, and logged as theirs.
    */
   override(key: string, note: string): boolean {
-    const submission = [...this.submissions.values()].find((candidate) => candidate.key === key);
-    if (!submission) {
+    const submission = this.recordFor(key);
+    if (!submission || !SUBMITTED.has(submission.state)) {
+      // Nothing was given to a shell for this operation, so there is nothing
+      // for a person to take responsibility for.
       return false;
     }
     this.resolve(submission, "overridden", note);
     return true;
   }
 
-  /**
-   * The command line was never handed to the shell, so nothing can run. This
-   * is the one settlement that needs no evidence about a shell: there is no
-   * submitted line to be afraid of.
-   */
-  withdraw(key: string, detail: string): boolean {
-    const submission = [...this.submissions.values()].find((candidate) => candidate.key === key);
-    if (!submission) {
-      return false;
-    }
-    this.resolve(submission, "not-submitted", detail);
-    return true;
-  }
-
   private resolve(submission: Submission, resolution: SubmissionResolution, detail: string): void {
     this.submissions.delete(submission.id);
+    if (this.byKey.get(submission.key) === submission.id) {
+      this.byKey.delete(submission.key);
+    }
     clearTimeout(submission.waitTimer);
     clearInterval(submission.probeTimer);
     submission.waitTimer = undefined;
     submission.probeTimer = undefined;
     this.log(`${submission.label}: resolved as ${resolution} — ${detail}`);
+    // A caller may still be waiting for the shell to report this one (an
+    // override or a closed terminal can settle it mid-wait). It is settled,
+    // and settled is not established: the caller is told so rather than left
+    // holding a promise nothing will ever resolve.
+    submission.announce?.({ established: false, view: view(submission) });
     void this.persist();
     this.changeEmitter.fire();
   }
@@ -353,7 +530,7 @@ export class SubmissionRegistry implements vscode.Disposable {
 
   private onTerminalClosed(terminal: vscode.Terminal): void {
     for (const submission of [...this.submissions.values()]) {
-      if (submission.terminal === terminal) {
+      if (submission.terminal === terminal && SUBMITTED.has(submission.state)) {
         this.resolve(submission, "terminal-closed", `the terminal "${terminal.name}" that took it was closed, so its shell and the line it was given are gone`);
       }
     }
@@ -361,6 +538,10 @@ export class SubmissionRegistry implements vscode.Disposable {
 
   private establish(submission: Submission, terminal: vscode.Terminal, execution: vscode.TerminalShellExecution, ended: { exitCode: number | undefined } | undefined): void {
     const late = submission.state === "uncertain";
+    // Taken before the record is settled: this waiter is being told the one
+    // thing that *is* an establishment, not the generic settlement.
+    const announce = submission.announce;
+    submission.announce = undefined;
     this.resolve(
       submission,
       ended ? "ended" : "started",
@@ -369,7 +550,7 @@ export class SubmissionRegistry implements vscode.Disposable {
         : `the shell in "${terminal.name}" ${ended ? "reported it finished" : "started it"}`,
     );
     const establishment: Establishment = { submission: { ...view(submission), runnerKind: submission.runnerKind, stageId: submission.stageId, planPath: submission.planPath, manifest: submission.manifest, word: submission.word, plan: submission.plan, output: submission.output, lease: submission.lease }, terminal, execution, ended };
-    submission.announce?.({ established: true, terminal, execution, ended });
+    announce?.({ established: true, terminal, execution, ended });
     this.establishedEmitter.fire(establishment);
   }
 
@@ -381,7 +562,7 @@ export class SubmissionRegistry implements vscode.Disposable {
    */
   private forExecution(execution: vscode.TerminalShellExecution, terminal: vscode.Terminal): Submission | undefined {
     for (const submission of this.submissions.values()) {
-      if (submission.execution === execution) {
+      if (submission.execution === execution && SUBMITTED.has(submission.state)) {
         return submission;
       }
     }
@@ -415,7 +596,7 @@ export class SubmissionRegistry implements vscode.Disposable {
 
   /** Run one round of process evidence for every unresolved submission. */
   async probeAll(): Promise<void> {
-    for (const submission of [...this.submissions.values()]) {
+    for (const submission of [...this.submissions.values()].filter((item) => SUBMITTED.has(item.state))) {
       await this.probeOnce(submission);
     }
   }
@@ -425,7 +606,9 @@ export class SubmissionRegistry implements vscode.Disposable {
       clearInterval(submission.probeTimer);
       return;
     }
-    if (!this.probeSupported()) {
+    if (!this.probeSupported() || !SUBMITTED.has(submission.state)) {
+      // A reservation and a direct process are not questions for the process
+      // table: nothing was queued in a shell for either.
       return;
     }
     let processes: { pid: number; command: string }[];
@@ -461,7 +644,9 @@ export class SubmissionRegistry implements vscode.Disposable {
   }
 
   private async persist(): Promise<void> {
-    const stored: PersistedSubmission[] = [...this.submissions.values()].map((submission) => ({
+    // Only what a shell was actually given: a reservation and a direct
+    // process cannot outlive this window, so neither is written down.
+    const stored: PersistedSubmission[] = [...this.submissions.values()].filter((submission) => SUBMITTED.has(submission.state)).map((submission) => ({
       id: submission.id,
       key: submission.key,
       transport: submission.transport,
@@ -495,15 +680,31 @@ export class SubmissionRegistry implements vscode.Disposable {
    */
   restore(): SubmissionView[] {
     const stored = this.context.workspaceState.get<PersistedSubmission[]>(SUBMISSIONS_KEY, []);
-    const restored = stored.map((item) => {
+    const restored: Submission[] = [];
+    for (const item of stored) {
       const submission: Submission = {
         ...item,
         state: "uncertain",
         restored: true,
       };
+      const held = this.recordFor(submission.key);
+      if (held) {
+        // A record written by a version that allowed two of them, or a
+        // corrupted store. They are the same operation: the newest is kept,
+        // which is the one whose shell is worth probing, and the operation
+        // stays blocked either way.
+        if (held.submittedAtMs >= submission.submittedAtMs) {
+          this.log(`window reloaded with two records for ${submission.key}; the older one is folded into the newer, which keeps blocking it`);
+          continue;
+        }
+        this.submissions.delete(held.id);
+        restored.splice(restored.indexOf(held), 1);
+        this.log(`window reloaded with two records for ${submission.key}; the older one is folded into the newer, which keeps blocking it`);
+      }
       this.submissions.set(submission.id, submission);
-      return submission;
-    });
+      this.byKey.set(submission.key, submission.id);
+      restored.push(submission);
+    }
     if (restored.length > 0) {
       this.log(`window reloaded with ${restored.length} command(s) submitted to a shell whose fate is unknown; no runner is claimed for them, and a second copy of each is refused until evidence settles it`);
       for (const submission of restored) {
@@ -559,6 +760,22 @@ export function submissionRefusal(submission: SubmissionView): string {
       : "A shell that is stopped or busy can still run it later, so running it again could run the same operation twice.",
     "Check that terminal. If that command cannot run any more, confirm it and Agent Sparring will let you try again.",
   ].join(" ");
+}
+
+/**
+ * What a person is told when an operation is refused admission, whatever the
+ * holder's state. A shell submission has its own wording, because that is the
+ * one case where nobody can say what is happening; the others are simply this
+ * window already doing the thing.
+ */
+export function admissionRefusal(blocked: SubmissionView): string {
+  if (blocked.state === "waiting" || blocked.state === "uncertain") {
+    return submissionRefusal(blocked);
+  }
+  if (blocked.state === "direct") {
+    return `Agent Sparring is already running ${blocked.label}. Wait for it to finish before running it again.`;
+  }
+  return `Agent Sparring is already starting ${blocked.label}. Wait for that to be handed to a terminal before running it again.`;
 }
 
 export { SUBMISSIONS_KEY };

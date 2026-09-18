@@ -55,7 +55,7 @@ import { probeRunnerProcesses, type RunnerProbe } from "../core/runnerProcesses"
 import { commandLineRuns, matchSparringCommand, parseSparringCommand, type SparringSubcommand } from "../core/sparringCommand";
 import { listProcesses, processProbeSupported } from "./processProbe";
 import { awaitShellIntegration, EXECUTION_START_TIMEOUT_MS, executeThroughShell, hostEnv, SHELL_INTEGRATION_TIMEOUT_MS } from "./shellIntegration";
-import { runnerKey, submissionRefusal, type Establishment, type SubmissionRegistry, type SubmissionView } from "./submissionRegistry";
+import { admissionRefusal, runnerKey, submissionRefusal, type Establishment, type SubmissionRegistry, type SubmissionView } from "./submissionRegistry";
 import type { TerminalLease } from "./terminalPool";
 import { collectOutput } from "./terminalOutput";
 import type { TerminalPool } from "./terminalPool";
@@ -334,17 +334,35 @@ export class ExecutionTracker implements vscode.Disposable {
    */
   async launch(options: LaunchOptions): Promise<LaunchResult> {
     // Before anything else — before the executable is resolved, before a
-    // terminal is acquired, before a byte is sent — an earlier command for
-    // this run that may still execute forbids a second one.
+    // terminal is acquired, before a byte is sent — the operation is claimed.
+    // That claim is what forbids a second command for this run, whether the
+    // first one is still being prepared, has been given to a shell, or is
+    // running as a process of ours.
     const key = runnerKey(options.runId);
-    const unresolved = this.submissions.unresolvedFor(key);
-    if (unresolved) {
-      this.log(`refused to launch ${options.name}: ${unresolved.label} was submitted to a shell and may still execute; a second command for this run is not submitted`);
-      return { ok: false, error: submissionRefusal(unresolved), problem: "unconfirmed", submission: unresolved };
+    const label = `${options.kind} ${options.stageId ?? options.planPath ?? options.manifest ?? ""}`.trim();
+    const admission = this.submissions.claim({
+      key,
+      transport: "runner",
+      label,
+      cwd: options.cwd,
+      subcommand: options.kind,
+      runId: options.runId,
+      runnerKind: options.kind,
+      stageId: options.stageId,
+      planPath: options.planPath,
+      manifest: options.manifest,
+    });
+    if (!admission.admitted) {
+      const blocked = admission.blocked;
+      this.log(`refused to launch ${options.name}: ${blocked.label} is ${describeHold(blocked)}; a second command for this run is not submitted`);
+      // Only a shell submission is something a person can be asked about.
+      return { ok: false, error: admissionRefusal(blocked), problem: "unconfirmed", submission: blocked.state === "waiting" || blocked.state === "uncertain" ? blocked : undefined };
     }
+    const claim = admission.claim;
     const configured = await planExecutable(options.configured, hostEnv(options.cwd), true);
     if (!configured.ok) {
       this.log(`refused to launch ${options.name}: ${configured.error}`);
+      this.submissions.release(claim, "the executable could not be resolved, so nothing was ever submitted");
       return { ok: false, error: configured.error, problem: configured.problem };
     }
     // This project's terminal, reused only when its shell is genuinely idle:
@@ -361,25 +379,7 @@ export class ExecutionTracker implements vscode.Disposable {
     // arrives in the same tick must find something to establish, and that
     // report is the only thing that distinguishes a launch from a line of
     // text written into a terminal.
-    const submission = integration
-      ? this.submissions.open(
-          {
-            key,
-            transport: "runner",
-            label: `${options.kind} ${options.stageId ?? options.planPath ?? options.manifest ?? ""}`.trim(),
-            cwd: options.cwd,
-            subcommand: options.kind,
-            runId: options.runId,
-            runnerKind: options.kind,
-            stageId: options.stageId,
-            planPath: options.planPath,
-            manifest: options.manifest,
-            word,
-            plan: configured.plan,
-          },
-          lease,
-        )
-      : undefined;
+    const submission = integration ? this.submissions.submit(claim, lease, { word, plan: configured.plan }) : undefined;
     const request = integration ? executeThroughShell(integration, word, options.args) : undefined;
     if (request && submission) {
       // The output must be read immediately after the hand-over or it is lost.
@@ -399,8 +399,9 @@ export class ExecutionTracker implements vscode.Disposable {
       return { ok: false, error: view ? submissionRefusal(view) : "The command could not be confirmed as started.", problem: "unconfirmed", submission: view };
     }
     if (submission) {
-      // Nothing was handed over, so there is nothing that could still run.
-      this.submissions.withdraw(key, "the command line was never handed to the shell, so nothing was submitted");
+      // Nothing was handed over, so there is nothing that could still run —
+      // but this launch is not over, and the claim stays ours.
+      this.submissions.unsubmit(claim, "the command line was never handed to the shell, so nothing was submitted");
     }
     if (integration) {
       // The shell is fine, it just cannot carry this command line; keep it.
@@ -414,6 +415,7 @@ export class ExecutionTracker implements vscode.Disposable {
     const direct = await planExecutable(options.configured, hostEnv(options.cwd), false);
     if (!direct.ok) {
       this.log(`could not launch ${options.name}: shell integration unavailable and ${direct.error}`);
+      this.submissions.release(claim, "no executable could be resolved without a shell either, so nothing was started");
       return { ok: false, error: direct.error, problem: direct.problem };
     }
     this.dropEnded(options.runId);
@@ -431,6 +433,18 @@ export class ExecutionTracker implements vscode.Disposable {
     const item = this.track(options, "terminal", dedicated, undefined);
     item.word = path;
     item.plan = direct.plan;
+    // This terminal's process *is* the runner, so the operation is under way
+    // for as long as that terminal lives. The claim is held until it closes,
+    // which is also how this launch's liveness ends — there is no instant in
+    // between where a second command could get in.
+    this.submissions.runningDirectly(claim, `it runs as the process of a dedicated terminal "${dedicated.name}"`);
+    const released = vscode.window.onDidCloseTerminal((closed) => {
+      if (closed === dedicated) {
+        released.dispose();
+        this.submissions.release(claim, "the dedicated terminal that ran it has closed, so the operation is over");
+      }
+    });
+    this.disposables.push(released);
     this.log(`launched ${options.name} in a dedicated terminal (shell integration unavailable; ${path}, ${options.args.length} args, cwd ${options.cwd})`);
     void this.persistWithPid(item, dedicated);
     this.changeEmitter.fire("started");
@@ -882,4 +896,16 @@ function newestEndedPerRun(ended: PersistedLaunch[]): PersistedLaunch[] {
 
 function describe(item: Tracked): string {
   return `${item.kind} ${item.stageId ?? item.planPath ?? item.manifest ?? ""}`.trim();
+}
+
+/** Why an operation key was already held, for the log. */
+function describeHold(blocked: SubmissionView): string {
+  switch (blocked.state) {
+    case "reserved":
+      return "already being prepared for a terminal";
+    case "direct":
+      return "already running as a process of this window";
+    default:
+      return "already submitted to a shell and may still execute";
+  }
 }
