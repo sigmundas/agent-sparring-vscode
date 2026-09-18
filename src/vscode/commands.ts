@@ -67,6 +67,8 @@ import { outputTail } from "./terminalOutput";
 import { currentBranch, knownRepositories, pendingChanges } from "./git";
 import { manifestSupport } from "./engineProbe";
 import { openCandidateDiff } from "./overview/gitDiff";
+import { configuredExecutable } from "./engineExecutable";
+import { settingsTarget } from "../core/settingsTarget";
 import { OverviewPanelManager } from "./overview/overviewPanel";
 
 export function registerCommands(context: vscode.ExtensionContext, controller: SparringController): void {
@@ -94,6 +96,10 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.stageMode", () => stageModeCommand(controller)),
     vscode.commands.registerCommand("agentSparring.copyReviewContext", () => overview.copyReviewContext()),
     vscode.commands.registerCommand("agentSparring.chooseExecutable", () => chooseExecutableCommand()),
+    vscode.commands.registerCommand("agentSparring.openSettings", () => openSettingsCommand(controller)),
+    // The same command with the create question already answered, so the
+    // integration suite can drive both branches without a dialog.
+    vscode.commands.registerCommand("agentSparring._test.openSettings", (create?: boolean) => openSettingsCommand(controller, create)),
     controller.onCommandNotFound((event) => void explainCommandNotFound(event.word)),
     controller.onEngineFailed((event) => void explainEngineFailure(controller, event)),
     // Not contributed in package.json (never in the palette): hooks for the
@@ -381,6 +387,92 @@ async function openStageFile(controller: SparringController, overview: OverviewP
   await openDocument(path.join(currentStageOf(run).dir, filename), `${filename} does not exist yet for this stage.`, overview.documentColumn);
 }
 
+
+// ---------------------------------------------------------------- settings (project.toml)
+
+/**
+ * Open the project's own `.sparring/project.toml`, creating it first if the
+ * person asks.
+ *
+ * The file is the settings surface. There is deliberately no form here: the
+ * engine owns the schema, `project.toml` is human-owned configuration that a
+ * managed run never rewrites, and an editor that let the extension author
+ * TOML would be a second, drifting opinion about what the schema is.
+ *
+ * Creation goes through the engine's own `init-config` for the same reason:
+ * the template belongs to the engine, so the extension has no copy of it to
+ * fall behind.
+ */
+/** What an invocation did, so the integration suite can assert on it. */
+export interface SettingsOutcome {
+  /** Absolute path of the file that was opened, when one was. */
+  opened?: string;
+  /** The file did not exist and creation was offered. */
+  offered?: boolean;
+  /** The engine's init-config ran and produced the file. */
+  created?: boolean;
+  /** Why nothing was opened. */
+  problem?: string;
+}
+
+/**
+ * `create` answers the "create it?" question without a dialog. `undefined`
+ * asks the person, which is what the real command does; the test seam
+ * supplies an explicit answer so both branches can be exercised for real.
+ */
+async function openSettingsCommand(controller: SparringController, create?: boolean): Promise<SettingsOutcome> {
+  const target = settingsTarget(controller.currentSelection);
+  if (!target) {
+    const problem = "no repository is selected, so there are no project settings to open.";
+    void vscode.window.showInformationMessage(`Agent Sparring: ${problem}`);
+    return { problem };
+  }
+  if (await exists(target.configPath)) {
+    await vscode.window.showTextDocument(vscode.Uri.file(target.configPath), { preview: false, preserveFocus: false });
+    return { opened: target.configPath };
+  }
+  const label = "Create project settings";
+  const answer =
+    create ??
+    (await vscode.window.showInformationMessage(`Agent Sparring: ${target.repository} has no .sparring/project.toml yet.`, label)) === label;
+  if (!answer) {
+    return { offered: true };
+  }
+  const result = await controller.runCommand({
+    configured: configuredExecutable(),
+    args: ["--sparring-dir", target.sparringDir, "init-config"],
+    cwd: target.projectDir,
+    name: `Create project settings: ${target.repository}`,
+    repoRoot: target.projectDir,
+    sparringDir: target.sparringDir,
+  });
+  if (!result.ok) {
+    const problem = `the engine could not create project settings: ${result.error}`;
+    void vscode.window.showErrorMessage(`Agent Sparring: ${problem}`);
+    return { offered: true, problem };
+  }
+  if (!(await exists(target.configPath))) {
+    // The engine ran and the file is still not there: say so rather than
+    // opening an editor on nothing, and leave the log as the evidence.
+    const problem = "the engine did not create .sparring/project.toml; see the log.";
+    void vscode.window.showErrorMessage(`Agent Sparring: ${problem}`);
+    controller.showLog();
+    return { offered: true, problem };
+  }
+  await vscode.window.showTextDocument(vscode.Uri.file(target.configPath), { preview: false, preserveFocus: false });
+  await controller.refresh();
+  return { offered: true, created: true, opened: target.configPath };
+}
+
+async function exists(file: string): Promise<boolean> {
+  try {
+    await fs.access(file);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Open a document as a normal preview tab in the Overview's own editor
  * group. showTextDocument reveals an already-open tab for the same URI
@@ -447,6 +539,9 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       await openCandidateDiff(run.location.repoRoot, base, stage.state?.candidateSha ?? undefined, stage.title ?? stage.stageId);
       return;
     }
+    case "openSettings":
+      await openSettingsCommand(controller);
+      return;
     case "showLog":
       controller.showLog();
       return;
@@ -1548,10 +1643,6 @@ async function askBranch(suggestion?: string): Promise<string | undefined> {
 }
 
 // ---------------------------------------------------------------- executable configuration
-
-function configuredExecutable(): string {
-  return vscode.workspace.getConfiguration("agentSparring").get<string>("executable", "");
-}
 
 async function explainLaunch(controller: SparringController, result: LaunchResult): Promise<void> {
   if (result.ok) {

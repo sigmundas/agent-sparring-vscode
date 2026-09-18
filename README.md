@@ -45,6 +45,7 @@ navigates.
 | `Agent Sparring: Sibling Repositories for a Plan Stage…` | Declare which *other* repositories a plan stage's reviewed candidate spans, so acceptance pins and verifies the complete set instead of the primary commit alone. Pick the stage, pick a repository this window knows (or browse to one) and confirm the branch its candidate must be on; no commit is ever asked for. Stored in VS Code workspace state per worktree, plan and stage label, emitted into the execution manifest, and shown quietly in the Overview. Removing a declaration is the same command. |
 | `Agent Sparring: Stage Mode for a Plan Stage…` | Declare that a plan stage is a *review* of work rather than work: no implementation agent runs for it, and a fresh independent reviewer inspects the candidates the earlier stages accepted. Nothing is inferred from a stage's title or its brief's prose — this command is the only way to say it. Stored in VS Code workspace state per worktree, plan and stage label, and emitted into the execution manifest as `mode`. Setting it back to *Implementation* removes the declaration. |
 | `Agent Sparring: Copy Review Context for Chat` | For a stage the reviewer handed back to you: put the whole review on the clipboard as plain Markdown — the stage and its goal, the routing state, the reviewer's summary and note, every human-gate check with its instruction and pass criteria verbatim, the concrete names the review refers to, the latest handoff claims, the reviewer's findings and the stage's plan section — so it can be pasted into ChatGPT/Claude, an issue or a message and asked about. No provider prompts, model reasoning, command output or activity log. Also **Copy context for chat** in the Overview, beside **Open detailed review**, with **Copy this check** under each outstanding check. |
+| `Agent Sparring: Open Project Settings` | Open the active repository's `.sparring/project.toml` — where the provider, model and effort for the stage agent and the sparrer are set. If the file does not exist yet, offers **Create project settings**, which runs the engine's own `sparring init-config` and opens what it wrote. There is deliberately no settings form: the engine owns the schema, the file is human-owned configuration a managed run never rewrites, and a second template here would be free to drift from the one the engine validates against. Also **Settings** in the Overview's **Agents** section. |
 | `Agent Sparring: Choose sparring Executable…` | Pick the `sparring` CLI with a file dialog and store it as `agentSparring.executable`. |
 | `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / finalizing / future stages), the current stage as primary content (the stage as the plan names it — `Stage 3D — title`, with `6 of 8` as secondary metadata — a human state word with one explaining sentence, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), latest sparring result, small Stage Agent / Sparrer cards, Brief / Handoff / Sparring report / Diff / Plan document / Log buttons, and quiet metadata (where the engine's own words live). Never auto-opens; updates in place. |
 | `Agent Sparring: Show Log` | Focus the Output Channel. |
@@ -52,6 +53,43 @@ navigates.
 | `Agent Sparring: Select Run` | Choose explicitly when several runs look active; the choice *pins* that run, so it is kept even when the window moves to another repository, and the Overview says so. The choice is remembered per workspace. The list is grouped — *Plan runs* first, then *Standalone / historical stages* — and each row is labelled by what a person calls it (the plan document's title, the plan's own `Stage 3D — …` name for a stage), with the repository and the raw stage id in the detail line. |
 | `Agent Sparring: Rediscover State` | Re-scan `.sparring` from disk. |
 | `Agent Sparring: Diagnose Discovery` | Trace discovery for every workspace folder into the Output Channel: scheme, path, the `.sparring` probed, nested projects, stage/plan files and whether they parsed (lifecycle status only), runs produced, whether the built-in Git extension's API is attached, the active repository and the roots runs were attributed against, the runs in other repositories — and the runs no known root owns — that automatic selection therefore did not consider, what Select Repository / Run would list (group, label, description and the raw stage id), and why nothing is selected. Never logs file contents. |
+
+## Which model and effort the agents run at
+
+That is project configuration, not a VS Code setting. It lives in the
+repository's own `.sparring/project.toml` under `[agents.stage]` and
+`[agents.sparring]`, and this extension deliberately adds **no** setting
+that could override it — a hidden per-window preference silently changing
+what a managed run costs is exactly the surprise worth avoiding.
+
+The Overview's **Agents** section shows what the *next* provider turn would
+run with, for example:
+
+```text
+Stage agent   Claude · opus · high
+Sparrer       Codex · provider default
+```
+
+Every one of those values is the engine's own answer, obtained by running
+`sparring show-config --json`. The extension does not parse TOML, does not
+know which providers or effort levels exist, and does not work out what an
+omitted model means for a given provider: that resolution (an explicit CLI
+flag, then `project.toml`, then the provider's own default) belongs to the
+engine, and a second opinion about what is about to run would be worse than
+none. An unset model therefore reads *provider default* rather than a
+guessed name, and an effort that is unset — or that the provider has no
+concept of — is simply absent from the line rather than rendered as
+nothing-in-particular. Hovering a role says where each value came from.
+
+If the engine cannot answer (an older engine without `show-config`, or one
+this window cannot resolve), the section says so in one line and the rest of
+the Overview is unaffected. If the engine reports the configuration as
+invalid, its own sentence is shown and no role values are displayed — an
+invalid configuration has no effective values, and plausible-looking ones
+beside an error are how a person ends up trusting the wrong thing.
+
+**Settings**, beside that section, opens the file. The file is the edit
+surface; there are no inline model or effort controls.
 
 ## Settings
 
@@ -437,6 +475,7 @@ run them.
 | What sending feedback does | records the text verbatim under `## Human evidence` in a `### Additional human feedback` block — dated, never summarised or classified — and asks the **reviewer** to rule again on the unchanged candidate, by the same route a check result takes (`resume-plan --evidence` in a managed run, `run-sparring <stage>` standalone). The reviewer then decides: `SEND_BACK` if the feedback is an implementation defect, `NEEDS_YOU` again if the original checks still stand, revised or replaced checks if the feedback invalidated their assumptions, `READY` only where its own acceptance rules already allow it. Human feedback is evidence for that decision, not an instruction to the implementing agent — the prose is never handed to the stage agent, and this extension never routes on it. Each submission appends its own entry rather than replacing the last, and a block under that sub-heading is never matched as evidence *for a check*, however much of a check's wording it repeats |
 | **Resume stage (implementation)** | the separate action, behind the panel's `…` disclosure: `run-loop`, which starts the stage agent again. Use it when there is work to do, not to hand over evidence — it is never the answer to a review |
 | **Copy context for chat**, and **Copy this check** under each outstanding check | the same recorded artifacts, assembled as plain Markdown on the clipboard so the review can be pasted into a chat assistant, an issue or a message and asked about. The whole-review copy carries the repository, the plan, the stage and its goal, the routing state and the reviewer's summary and note, every gate check with its `instruction` and `pass_criteria` verbatim and the recorded result so far, the concrete names the review refers to (the gate's category, each check's stable id, the source the reviewer named), the stage agent's `## Claims` from `handoff.md`, the reviewer's `## Finding / discussion` from `sparring.md`, and the stage's own plan section. Freeform human feedback is carried too, and the workflow state it is in is never blurred: what has been sent to the reviewer appears as `## Additional human feedback` (from `notes.md`, verbatim), and what is still sitting in the field as `## Draft human feedback — not yet submitted`. A per-check copy is that check plus enough of the stage to make sense outside the extension, and carries no unrelated feedback. Nothing is composed or summarised, long quotes are cut at a line boundary and name the file they came from, and provider prompts, model reasoning, command transcripts, the self-contained handoff's embedded diff and the activity log are never included. Also `Agent Sparring: Copy Review Context for Chat` |
+| **Agents** — the effective provider, model and effort per role, and where each value came from | `sparring show-config --json` for the repository the cockpit is in. Never `project.toml` read directly: precedence, provider capabilities and the meaning of an omitted value are the engine's, and the extension displays its answer verbatim, down to the words *provider default*. A configuration error is shown as the engine's own sentence with no role values beside it |
 | **Show instructions** on the Claude or Codex card | the engine's captured prompt for that actor's latest turn: `.sparring/stages/<id>/prompts/index.jsonl` names the current capture per role, and the `.md` file beside it is the exact text the provider was handed, written at the moment it was handed over. Nothing is reconstructed and nothing is re-parsed — each section's character span comes from the engine, so what the sections show is a slice of the captured bytes. The card opens to the full width of the panel and leads with the role and the turn kind (**Implementation turn · first turn of this stage**, **Commit turn**, **Review turn · judging the evidence you recorded**, …), because that line alone is usually enough to see a stage running the wrong kind of turn. **This turn** and **Last turn** come from the same liveness as the card's own Working/Waiting word. Each section names where it came from: a file section offers to open it (`brief.md`, `PROJECT.md`, `sparring.md`, `handoff.md`, `notes.md`), and text Agent Sparring itself wrote — the branch constraint, the self-check, the scope reminder, the finalization instruction, the sparrer's verdict instruction — is labelled **Agent Sparring** rather than left looking like part of the plan. Sections over 2 000 characters start collapsed. Everything is escaped text, never rendered Markdown. A stage last run by an engine without prompt capture simply has no disclosure |
 | **View exact generated prompt** and **Copy prompt** | the captured file verbatim. This is the one place the extension exports a provider prompt on purpose; **Copy context for chat** still excludes prompts entirely, because that artifact is the review and this one is the prompt |
 | Plan button, this stage's section, the next stage label and "What's next" for a standalone stage | the Markdown file you associated and, when you picked one, the stage you matched (VS Code workspace state; display only) |
