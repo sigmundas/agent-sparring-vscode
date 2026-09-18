@@ -1866,7 +1866,7 @@ function trackerWith(registry: OperationRegistry, stored: vscode.Memento, logged
 function bypassLease(terminal: vscode.Terminal): { lease: TerminalLease; retired: () => boolean } {
   let retired = false;
   return {
-    lease: { terminal, release: () => undefined, discard: () => undefined, retire: () => { retired = true; } },
+    lease: { terminal, idle: () => true, release: () => undefined, discard: () => undefined, retire: () => { retired = true; } },
     retired: () => retired,
   };
 }

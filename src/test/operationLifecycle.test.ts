@@ -105,17 +105,25 @@ function storeFailingFrom(nth: number): Store & { writes: number } {
   return failing;
 }
 
-function pool(): { acquire: (cwd: string) => unknown; acquired: FakeTerminal[]; retired: FakeTerminal[] } {
+/**
+ * The production pool's contract, as much of it as these tests need: a lease
+ * over a terminal, and `idle()` — the synchronous occupancy check the
+ * hand-over makes with nothing awaited after it. `occupied` is how a test
+ * makes a terminal the person's while the launcher is mid-flight.
+ */
+function pool(): { acquire: (cwd: string) => unknown; acquired: FakeTerminal[]; retired: FakeTerminal[]; occupied: Set<FakeTerminal> } {
   const acquired: FakeTerminal[] = [];
   const retired: FakeTerminal[] = [];
+  const occupied = new Set<FakeTerminal>();
   return {
     acquired,
     retired,
+    occupied,
     acquire: () => {
       const terminal = new FakeTerminal(`Agent Sparring — test ${acquired.length + 1}`, 7100 + acquired.length);
       acquired.push(terminal);
       stub.window.terminals.push(terminal);
-      return { terminal, release: () => undefined, discard: () => undefined, retire: () => retired.push(terminal) };
+      return { terminal, idle: () => !occupied.has(terminal), release: () => undefined, discard: () => undefined, retire: () => retired.push(terminal) };
     },
   };
 }
@@ -576,10 +584,25 @@ describe("a dedicated-terminal runner is known to be one for as long as it exist
       await registry.probeAll();
       assert.equal(registry.unresolved()[0]?.state, "running-dedicated", "a live dedicated runner is not declared dead by its own probe");
 
-      // The pid is still there, but it is something else now.
+      // The pid is still there and its command line is now something this
+      // extension cannot attribute. That is the matcher saying "I cannot
+      // recognise this", which is not "the operation ended" — and it used to
+      // be read as the latter.
       processes = [{ pid: 1, ppid: 0, command: "/sbin/launchd" }, { pid: 500, ppid: 1, command: "/bin/zsh" }];
       await registry.probeAll();
-      assert.deepEqual(registry.unresolved(), [], "a pid that no longer runs this operation ends it");
+      assert.equal(registry.unresolved()[0]?.state, "running-dedicated", "a pid that cannot be attributed leaves the guard exactly where it was");
+      assert.deepEqual(resolutions(logged), [], "nothing was resolved by a failure to recognise a command line");
+      assert.ok(
+        logged.some((line) => /cannot be attributed|positively identifies/.test(line)),
+        `and the log says the answer was inconclusive, got ${JSON.stringify(logged)}`,
+      );
+
+      // A birth time for that pid, recorded while the operation was alive,
+      // is what turns a live pid into evidence: the same number with a
+      // different birth time is a different process.
+      processes = [{ pid: 1, ppid: 0, command: "/sbin/launchd" }];
+      await registry.probeAll();
+      assert.deepEqual(registry.unresolved(), [], "its process being gone from the table is what ends it");
       assert.match(resolutions(logged)[0], /resolved as completed \(dedicated-process-gone\)/);
     } finally {
       registry.dispose();

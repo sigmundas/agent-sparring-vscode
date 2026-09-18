@@ -47,6 +47,7 @@ import { parseHandoffBranch, parsePlanStages } from "../core/engineFormats";
 import { appendHumanEvidence, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
 import { blocksLaunch } from "../core/liveness";
 import type { OverviewAction } from "../core/overviewHtml";
+import { UNKNOWN_RUNNER_EXPLANATION } from "../core/overviewModel";
 import { createStage, proposeNextStage, renderNextStageBrief, type NewStageResult } from "../core/nextStage";
 import { buildStageIndex, locateStage, parsePlanHeadings, sectionSummary, type HeadingRef, type PlanHeading, type StageEntry } from "../core/planAssociation";
 import { stageMatchRows, type StageMatchRow, type StageToMatch } from "../core/stageMatches";
@@ -73,6 +74,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
   context.subscriptions.push(
     overview,
     vscode.commands.registerCommand("agentSparring.showLog", () => controller.showLog()),
+    vscode.commands.registerCommand("agentSparring.confirmRunnerInactive", () => confirmRunnerInactiveCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.refresh", () => controller.refresh()),
     vscode.commands.registerCommand("agentSparring.selectRun", () => selectRunCommand(controller)),
     vscode.commands.registerCommand("agentSparring.followActiveRepository", () => controller.followActiveRepository()),
@@ -481,6 +483,9 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
     case "sendFeedbackForReview":
       await sendFeedbackForReviewCommand(controller, overview);
       return;
+    case "confirmRunnerInactive":
+      await confirmRunnerInactiveCommand(controller, overview);
+      return;
     case "dismissSubmissionFailure":
       if (run) {
         // Only the report goes. The drafts it was reporting about are the
@@ -725,6 +730,57 @@ async function performAcceptStage(controller: SparringController, run: Standalon
  *
  * Nothing is frozen or accepted: the reviewer rules on the next turn.
  */
+/**
+ * The way out of a runner nothing could establish anything about.
+ *
+ * It is an assertion, and it is asked for as one: the person is told what is
+ * unknown, what confirming does and what it deliberately does not claim. It
+ * targets the exact execution the panel was rendered from, so a stale panel
+ * cannot settle a newer run's runner, and it invents no exit code — the
+ * evidence submission becomes retryable, with its text intact, and is
+ * reported as neither delivered nor failed.
+ */
+async function confirmRunnerInactiveCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
+  const run = controller.currentSelection.selected;
+  if (!run) {
+    return;
+  }
+  const model = await overview.buildModel();
+  const unknown = model.kind === "run" ? model.unknownRunner : undefined;
+  if (!unknown) {
+    void vscode.window.showInformationMessage("Agent Sparring: the status of this run's runner is not in question, so there is nothing to confirm.");
+    return;
+  }
+  const liveness = controller.livenessFor(run.id);
+  const confirmed = await vscode.window.showWarningMessage(
+    "Is the previous runner no longer active?",
+    {
+      modal: true,
+      detail: [
+        UNKNOWN_RUNNER_EXPLANATION,
+        "",
+        liveness.detail,
+        "",
+        "Confirming records that as your statement. It releases this run's actions and lets you send any evidence you drafted again; it claims nothing about whether the engine recorded anything.",
+        "If that runner is in fact still working, starting another one would do the same engine operation twice.",
+      ].join("\n"),
+    },
+    "Yes — it is no longer active",
+  );
+  if (confirmed !== "Yes — it is no longer active") {
+    return;
+  }
+  const result = await controller.confirmRunnerInactive(run.id, unknown.executionId);
+  await overview.update();
+  if (!result.confirmed && result.reason === "not-found") {
+    void vscode.window.showInformationMessage("Agent Sparring: that runner is no longer the one this run is waiting on — the panel has been refreshed. Nothing was changed.");
+    return;
+  }
+  void vscode.window.showInformationMessage(
+    `Agent Sparring: recorded that you checked and the runner is no longer active.${result.submission ? " Your evidence is still here and can be sent again; whether the engine recorded it is unknown." : ""}`,
+  );
+}
+
 async function submitForReviewCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
   const run = controller.currentSelection.selected;
   if (!run) {

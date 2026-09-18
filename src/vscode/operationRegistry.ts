@@ -46,21 +46,45 @@
  *  |-----------------|----------------------------|----------------|
  *  | reserved        | `never-executed`           | cannot-execute |
  *  | armed           | `handover-threw`           | cannot-execute |
+ *  | armed           | `never-handed-over`        | cannot-execute |
  *  | submitted-shell | `terminal-closed`          | cannot-execute |
  *  | submitted-shell | `shell-process-gone`       | cannot-execute |
  *  | running-shell   | `shell-execution-ended`    | completed      |
- *  | running-shell   | `shell-superseded`         | completed      |
- *  | running-shell   | `terminal-closed`          | completed      |
  *  | running-shell   | `engine-process-gone`      | completed      |
  *  | running-direct  | `direct-process-ended`     | completed      |
  *  | running-direct  | `direct-process-gone`      | completed      |
- *  | running-dedicated | `terminal-closed`        | completed      |
+ *  | running-dedicated | `terminal-process-exited` | completed     |
  *  | running-dedicated | `dedicated-process-gone` | completed      |
  *  | any guard       | `human-override`           | human-override |
  *
  * `reserved` is the only state that is not persisted, and it is the only one
  * for which "nothing could have executed" is true by construction: no
  * transport has been invoked, and a reload has nothing to duplicate.
+ *
+ * ## Loss of observation is not termination evidence
+ *
+ * The distinction the table above turns on, stated once:
+ *
+ *  - a **submitted-shell** operation that was never observed started is
+ *    ended by its *shell* disappearing — the process that held the queued
+ *    line is gone, so that line can never be read. This is the one place a
+ *    closed terminal is evidence, and it is evidence about the shell, not
+ *    about any engine process;
+ *  - an operation **known to have started** is a process, and a process is
+ *    ended only by facts about that process. Its terminal closing, another
+ *    foreground command starting in that terminal, a command line that
+ *    cannot be recognised, an unavailable probe: every one of those is a
+ *    change in what can be *observed*, and none of them is a change in what
+ *    is *running*. Real VS Code testing settled this: a HUP- and
+ *    TERM-resistant engine process survives `terminal.dispose()` and goes on
+ *    doing work, and a suspended engine that is put in the background leaves
+ *    its shell free to run the next foreground command while it runs on.
+ *
+ * When observation is lost, the record keeps its guard, its terminal
+ * attachment is dropped so nothing is written to a terminal that is gone or
+ * no longer ours, and process-specific reconciliation continues. If no
+ * definitive probe is possible, the operation stays unknown and guarded until
+ * a person overrides that exact operation id.
  *
  * ## What is not evidence, and may never end a guard
  *
@@ -71,6 +95,13 @@
  *  - **the terminal-reconnect grace period after a window reload.** That a
  *    terminal did not come back within six seconds says nothing about whether
  *    its shell, or the process it hosts, is alive;
+ *  - **a terminal closing under a started operation.** The pty goes; the
+ *    process need not. A process that ignores or survives the hangup keeps
+ *    running, which is exactly the case a guard exists for;
+ *  - **another foreground command in the same terminal.** It proves that the
+ *    previous foreground relationship changed — a `bg` after a `^Z` does that
+ *    while the engine runs on — and nothing else. It updates occupancy and
+ *    observation here, and releases no operation key;
  *  - **"started".** A shell reporting an execution as started proves that it
  *    is now executing — which is precisely why a second copy must still be
  *    refused. Short commands (freeze-candidate, accept-candidate, new-stage)
@@ -79,13 +110,34 @@
  *  - **some runner existing, or ceasing to exist, in this project.** "There
  *    is a runner in this project" is not "my operation started"; runner
  *    liveness and operation fate are different questions;
+ *  - **a matcher that cannot attribute a process.** A matcher answers "can I
+ *    positively attribute this process?"; a `false` from it means "I cannot
+ *    attribute it", never "the old operation ended". A relative
+ *    `--repo-root .`, a configured wrapper executable, a basename mismatch, a
+ *    command line `ps` reports differently, an argument vector that cannot be
+ *    parsed: each of those makes a *live* process unattributable, and an
+ *    unattributable live process leaves the guard exactly where it was;
  *  - **a matching basename, or a matching stage id on its own.** A `stage-4`
  *    in another repository is a different operation, and so is a `plan.md` at
  *    another full path. Attribution is by full project path plus full target
- *    path (core/sparringCommand.ts, `commandLineIsOperation`), and a process
- *    that cannot be attributed leaves the guard exactly where it was;
+ *    path (core/sparringCommand.ts, `commandLineIsOperation`) or, for a short
+ *    command, by the exact recorded invocation (core/processInvocation.ts);
  *  - **the absence of a process probe.** A question that cannot be asked has
  *    not been answered.
+ *
+ * ## What *is* positive process evidence
+ *
+ *  - the recorded pid is not in the process table at all;
+ *  - the recorded pid is there, a birth-time fingerprint was recorded for it,
+ *    and the pid's birth time is now a different one — so this is a reused
+ *    pid and the recorded process is gone (core/processTree.ts,
+ *    `processGenerationVerdict`);
+ *  - the shell reported the end of that exact execution;
+ *  - the pty host reported an exit *status* for a dedicated terminal whose
+ *    process is the engine: an exit code is a fact about that process, unlike
+ *    the terminal merely being disposed of;
+ *  - a person confirmed, for that exact operation id, that it is no longer
+ *    active. That is an override, and is recorded as one.
  *
  * ## Why one authority
  *
@@ -152,7 +204,8 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import type { ExecutablePlan } from "../core/cli";
-import { findSelfOrDescendant, processExists, type ProcessInfo } from "../core/processTree";
+import { commandLineIsInvocation, type RecordedInvocation } from "../core/processInvocation";
+import { findSelfOrDescendant, processExists, processGenerationVerdict, type ProcessInfo } from "../core/processTree";
 import { commandLineIsOperation, targetIsAttributable, type OperationTarget, type SparringSubcommand } from "../core/sparringCommand";
 import { listProcesses, processProbeSupported } from "./processProbe";
 import type { TerminalLease } from "./terminalPool";
@@ -162,7 +215,25 @@ import type { TerminalLease } from "./terminalPool";
  * only shell submissions, so an extension update never loses a safety record
  * that a running operation is relying on.
  */
-const OPERATIONS_KEY = "agentSparring.submissions";
+const OPERATIONS_KEY = "agentSparring.operations";
+/**
+ * Where these records used to live — under a name they shared, byte for byte,
+ * with the evidence submissions in core/submission.ts (`SUBMISSIONS_KEY`).
+ * Two subsystems wrote one `workspaceState` entry with two different shapes,
+ * so each one's write destroyed the other's: arming an operation deleted a
+ * person's in-flight evidence submission, and recording a submission deleted
+ * every duplicate guard. Operations moved to a key of their own; anything
+ * left under the old one is read once, and only when it still has the array
+ * shape these records have.
+ */
+const LEGACY_OPERATIONS_KEY = "agentSparring.submissions";
+/**
+ * Where earlier versions kept the dedicated-runner safety record, before
+ * there was one admission authority. A launch recorded there and never ended
+ * is imported as a guarded operation during restore; otherwise the first
+ * command after an upgrade would be admitted over a live runner.
+ */
+const LEGACY_LAUNCHES_KEY = "agentSparring.launches";
 /** How often an unresolved shell operation is looked for in the process table. */
 const SHELL_PROBE_INTERVAL_MS = 5000;
 /** How often a direct or dedicated process recorded before a reload is looked for. */
@@ -200,10 +271,11 @@ export type OperationOutcome = "completed" | "cannot-execute" | "human-override"
 export type OperationEvidence =
   | "never-executed"
   | "handover-threw"
+  | "never-handed-over"
   | "terminal-closed"
   | "shell-process-gone"
   | "shell-execution-ended"
-  | "shell-superseded"
+  | "terminal-process-exited"
   | "engine-process-gone"
   | "direct-process-ended"
   | "direct-process-gone"
@@ -214,10 +286,11 @@ export type OperationEvidence =
 const OUTCOME_OF: Readonly<Record<OperationEvidence, OperationOutcome>> = {
   "never-executed": "cannot-execute",
   "handover-threw": "cannot-execute",
+  "never-handed-over": "cannot-execute",
   "terminal-closed": "cannot-execute",
   "shell-process-gone": "cannot-execute",
   "shell-execution-ended": "completed",
-  "shell-superseded": "completed",
+  "terminal-process-exited": "completed",
   "engine-process-gone": "completed",
   "direct-process-ended": "completed",
   "direct-process-gone": "completed",
@@ -234,16 +307,35 @@ const OUTCOME_OF: Readonly<Record<OperationEvidence, OperationOutcome>> = {
 export const OPERATION_RESOLUTIONS: readonly { from: OperationState; evidence: OperationEvidence; outcome: OperationOutcome; proves: string }[] = [
   { from: "reserved", evidence: "never-executed", outcome: "cannot-execute", proves: "no transport was invoked at all, and nothing durable was ever written" },
   { from: "armed", evidence: "handover-threw", outcome: "cannot-execute", proves: "the call that would have started it threw, so nothing was handed to a shell or spawned" },
-  { from: "submitted-shell", evidence: "terminal-closed", outcome: "cannot-execute", proves: "the pty and the shell reading it are gone, so a queued line can never be read" },
+  {
+    from: "armed",
+    evidence: "never-handed-over",
+    outcome: "cannot-execute",
+    proves: "no idle shell could be found for it, so `executeCommand` was never called at all and no process was spawned — known from this window's own instruction stream, not inferred",
+  },
+  { from: "submitted-shell", evidence: "terminal-closed", outcome: "cannot-execute", proves: "the shell process that held the queued line is gone with its pty, so that line can never be read by anything" },
   { from: "submitted-shell", evidence: "shell-process-gone", outcome: "cannot-execute", proves: "the exact shell process that took the line no longer exists" },
   { from: "running-shell", evidence: "shell-execution-ended", outcome: "completed", proves: "the shell reported that exact execution finishing" },
-  { from: "running-shell", evidence: "shell-superseded", outcome: "completed", proves: "another execution started in that terminal, and a shell runs one foreground command at a time" },
-  { from: "running-shell", evidence: "terminal-closed", outcome: "completed", proves: "the terminal hosting that execution closed, taking its foreground process with it" },
-  { from: "running-shell", evidence: "engine-process-gone", outcome: "completed", proves: "the process table no longer holds a process attributable to this exact operation" },
+  {
+    from: "running-shell",
+    evidence: "engine-process-gone",
+    outcome: "completed",
+    proves: "the engine process that was positively attributed to this operation is no longer in the process table, or its pid now holds a process with a different birth time",
+  },
   { from: "running-direct", evidence: "direct-process-ended", outcome: "completed", proves: "the child process this window spawned exited in front of us" },
-  { from: "running-direct", evidence: "direct-process-gone", outcome: "completed", proves: "the recorded pid is gone, or now belongs to something else" },
-  { from: "running-dedicated", evidence: "terminal-closed", outcome: "completed", proves: "the dedicated terminal exists only while its process does, and it closed" },
-  { from: "running-dedicated", evidence: "dedicated-process-gone", outcome: "completed", proves: "the recorded terminal process is gone, or is no longer this operation" },
+  { from: "running-direct", evidence: "direct-process-gone", outcome: "completed", proves: "the recorded pid is absent from the process table, or its birth time is not the one recorded for the process we started" },
+  {
+    from: "running-dedicated",
+    evidence: "terminal-process-exited",
+    outcome: "completed",
+    proves: "the pty host reported the exit status of the dedicated terminal's process, which is the engine itself, so that process has exited",
+  },
+  {
+    from: "running-dedicated",
+    evidence: "dedicated-process-gone",
+    outcome: "completed",
+    proves: "the recorded process of the dedicated terminal is absent from the process table, or its birth time is not the one recorded for it",
+  },
   { from: "armed", evidence: "human-override", outcome: "human-override", proves: "a person took responsibility for this exact operation id" },
   { from: "submitted-shell", evidence: "human-override", outcome: "human-override", proves: "a person took responsibility for this exact operation id" },
   { from: "running-shell", evidence: "human-override", outcome: "human-override", proves: "a person took responsibility for this exact operation id" },
@@ -303,6 +395,14 @@ export interface OperationView {
   restored: boolean;
   /** The child process running it, for a direct operation whose pid is known. */
   directPid?: number;
+  /**
+   * The terminal that was hosting it is gone, or has been taken over by
+   * another foreground command, while the operation may still be running. The
+   * guard is unchanged; this is what a person is told about.
+   */
+  observationLost?: boolean;
+  /** The engine process positively attributed to it, when one was found. */
+  enginePid?: number;
 }
 
 /** Everything the runner launcher needs to promote a started operation into a tracked execution. */
@@ -365,7 +465,29 @@ interface Operation extends OperationIdentity {
   /** The child process this window spawned for a direct operation. */
   directPid?: number;
   /** Exactly what was spawned, so the pid can be confirmed to still be it after a reload. */
-  directCommand?: { word: string; args: string[] };
+  directCommand?: RecordedInvocation;
+  /**
+   * The engine process positively attributed to this operation: the child of
+   * the shell that was found running it, or the dedicated terminal's own
+   * process. Once this is known, its absence is real death evidence — which
+   * is why it is recorded rather than re-derived from a command line each
+   * time.
+   */
+  enginePid?: number;
+  /**
+   * The birth time of the process this record names, as `ps` printed it when
+   * that process was last seen alive. A pid whose birth time has changed is a
+   * different process, which is the only way a live pid can prove a death.
+   */
+  generation?: string;
+  /**
+   * The terminal this operation was in has gone, or has been taken over by
+   * something else, while the operation itself may still be running. A
+   * presentation and routing flag: it settles nothing.
+   */
+  observationLost?: boolean;
+  /** The last inconclusive probe answer logged for it, so a steady one is said once. */
+  inconclusive?: string;
   terminal?: vscode.Terminal;
   terminalName?: string;
   terminalPid?: number;
@@ -399,8 +521,43 @@ interface PersistedOperation {
   waitExpired?: boolean;
   terminalPid?: number;
   terminalName?: string;
-  /** Present only for a direct child process: its pid and exactly what was spawned. */
-  direct?: { pid: number; word: string; args: string[] };
+  /**
+   * Present only for a direct child process: its pid and exactly what was
+   * spawned — the executable word, the argument array verbatim and the
+   * working directory it was spawned in. Semantic fields are deliberately
+   * absent: several subcommands identify their repository by cwd and are
+   * given no `--repo-root` at all, and demanding one of those in the command
+   * line declared live processes gone.
+   */
+  direct?: { pid: number; word: string; args: string[]; cwd?: string };
+  /** The engine process attributed to this operation, when one was positively found. */
+  enginePid?: number;
+  /** That process's birth time as `ps` printed it, which is what distinguishes it from a reused pid. */
+  generation?: string;
+  /** Whether the terminal that was hosting it is gone or is someone else's now. */
+  observationLost?: boolean;
+}
+
+/**
+ * A launch record written by a version that kept the dedicated runner's
+ * safety in `agentSparring.launches`. Only the fields the import needs, all
+ * optional: this is foreign data from an older branch and is read defensively.
+ */
+interface LegacyLaunch {
+  id?: string;
+  runId: string;
+  kind?: SparringSubcommand;
+  stageId?: string;
+  planPath?: string;
+  manifest?: string;
+  repoRoot?: string;
+  sparringDir?: string;
+  transport?: "dedicated-terminal" | "shell";
+  source?: string;
+  startedAtMs?: number;
+  terminalPid?: number;
+  terminalName?: string;
+  ended?: unknown;
 }
 
 /** The operation key for a runner command: one guard per run. */
@@ -429,6 +586,8 @@ export class OperationRegistry implements vscode.Disposable {
   /** Any change to the guarded set, so the cockpit can re-render. */
   readonly onDidChange = this.changeEmitter.event;
   private counter = 0;
+  /** What `restore` answered, so calling it twice cannot duplicate a record. */
+  private restored: OperationView[] | undefined;
 
   constructor(
     private readonly context: vscode.ExtensionContext,
@@ -603,14 +762,39 @@ export class OperationRegistry implements vscode.Disposable {
    * command line go on the same record, because such a child outlives a
    * window reload and the next window must recognise it.
    */
-  runningDirect(armed: ArmedOperation, process: { pid: number; word: string; args: string[] }, detail: string): void {
+  runningDirect(armed: ArmedOperation, process: { pid: number; word: string; args: string[]; cwd?: string }, detail: string): void {
     const operation = this.held(armed, "armed");
     operation.state = "running-direct";
     operation.directPid = process.pid;
-    operation.directCommand = { word: process.word, args: process.args };
+    // The actual invocation, verbatim: the executable word, the argument
+    // array as passed, and the working directory it was spawned in. Nothing
+    // semantic is derived from it, because several subcommands carry no
+    // `--repo-root` at all and are identified by their cwd alone.
+    operation.directCommand = { word: process.word, args: [...process.args], cwd: process.cwd };
+    operation.enginePid = process.pid;
     this.log(`${operation.label}: ${detail}; a second copy of this operation is refused until it ends`);
     this.persistQuietly();
+    // Its birth time, so a later window can tell this process from another
+    // one that has since been given the same pid.
+    void this.captureGeneration(operation, process.pid);
     this.changeEmitter.fire();
+  }
+
+  /**
+   * No shell could be given the command at all: every terminal of this
+   * project turned out to be in use by someone else, so `executeCommand` was
+   * never called and nothing was spawned.
+   *
+   * That is positive knowledge, not an inference — this window knows which
+   * calls it made — and it is the same fact `handoverFailed` records for a
+   * call that threw. The record is settled, because keeping it would block
+   * the operation for ever over a busy terminal.
+   */
+  handoverNotInvoked(armed: ArmedOperation, detail: string): void {
+    const operation = this.operations.get(armed.id);
+    if (operation && operation.state === "armed") {
+      this.resolve(operation, "never-handed-over", detail);
+    }
   }
 
   /**
@@ -626,8 +810,44 @@ export class OperationRegistry implements vscode.Disposable {
     operation.terminal = terminal;
     operation.terminalName = terminal.name;
     this.log(`${operation.label}: ${detail}; a second copy of this operation is refused until that process is gone`);
-    this.rememberQuietly(operation);
+    void this.remember(operation)
+      .then(() => {
+        if (operation.terminalPid !== undefined && operation.terminalPid > 0) {
+          operation.enginePid = operation.terminalPid;
+          return this.captureGeneration(operation, operation.terminalPid);
+        }
+        return undefined;
+      })
+      .catch((error: Error) => this.log(`${operation.label}: its record could not be updated: ${error.message}`));
     this.changeEmitter.fire();
+  }
+
+  /**
+   * Record the birth time of the process this operation is, while it is
+   * certainly still alive.
+   *
+   * This is the fingerprint that later lets a live pid prove a death: a pid
+   * that is still in the table with a *different* birth time is a different
+   * process, so the one that was started is gone. Without it a live,
+   * unrecognisable pid can only stay unresolved — which is the conservative
+   * answer, and the one a platform without `ps -o lstart` gets.
+   */
+  private async captureGeneration(operation: Operation, pid: number): Promise<void> {
+    if (!this.probeSupported() || operation.generation !== undefined) {
+      return;
+    }
+    let processes: ProcessInfo[];
+    try {
+      processes = await this.probe();
+    } catch {
+      return;
+    }
+    const found = processes.find((item) => item.pid === pid);
+    if (!found?.started || !this.operations.has(operation.id)) {
+      return;
+    }
+    operation.generation = found.started;
+    this.persistQuietly();
   }
 
   /**
@@ -684,14 +904,6 @@ export class OperationRegistry implements vscode.Disposable {
       return;
     }
     this.resolve(operation, "direct-process-ended", detail);
-  }
-
-  /** A dedicated terminal this window created has closed, so its process is gone. */
-  dedicatedTerminalClosed(armed: ArmedOperation, detail: string): void {
-    const operation = this.operations.get(armed.id);
-    if (operation && operation.state === "running-dedicated") {
-      this.resolve(operation, "terminal-closed", detail);
-    }
   }
 
   /** The claimed record, asserted to be in the state this transition comes from. */
@@ -797,13 +1009,20 @@ export class OperationRegistry implements vscode.Disposable {
     if (operation) {
       this.advanceToRunning(operation, event.terminal, event.execution, undefined);
     }
-    // A shell runs one foreground command at a time. Another execution
-    // starting in a terminal that hosts one of our running executions is
-    // evidence that ours is over — the same rule the execution tracker uses
-    // for liveness, applied to the guard so the two cannot disagree.
+    // Another execution starting in a terminal that hosts one of ours changes
+    // the foreground relationship, and nothing else. `^Z` followed by `bg`
+    // leaves the engine running and the shell free to take the next command;
+    // a plain `true` typed there is then the next foreground command while
+    // the engine works on. So this updates what is being observed and
+    // releases no operation key — it used to resolve the guard outright, on a
+    // "a shell runs one foreground command at a time" argument that a
+    // backgrounded process simply does not obey.
     for (const other of [...this.operations.values()]) {
       if (other.state === "running-shell" && other.terminal === event.terminal && other.execution !== event.execution) {
-        this.resolve(other, "shell-superseded", `another command started in "${event.terminal.name}", and a shell runs one foreground command at a time, so that execution had already finished`);
+        this.loseObservation(
+          other,
+          `another command started in "${event.terminal.name}". That changes which process is in the foreground there — a suspended engine that was put in the background leaves exactly this trace — and says nothing about whether ${other.label} is still running, so its guard remains.`,
+        );
       }
     }
   }
@@ -832,13 +1051,61 @@ export class OperationRegistry implements vscode.Disposable {
         continue;
       }
       if (operation.state === "submitted-shell") {
-        this.resolve(operation, "terminal-closed", `the terminal "${terminal.name}" that took it was closed, so its shell and the line it was given are gone`);
-      } else if (operation.state === "running-shell") {
-        this.resolve(operation, "terminal-closed", `the terminal "${terminal.name}" hosting that execution was closed, so the command it was running is gone with the pty`);
-      } else if (operation.state === "running-dedicated") {
-        this.resolve(operation, "terminal-closed", `the dedicated terminal "${terminal.name}" whose process was running it has closed, so that process is gone`);
+        // The one case in which a closed terminal is evidence, and it is
+        // evidence about the *shell*: this operation was never observed
+        // started, and the process that held its queued line is gone with the
+        // pty, so nothing can ever read that line.
+        this.resolve(operation, "terminal-closed", `the terminal "${terminal.name}" that took it was closed before anything reported it as started, so the shell that held that line is gone with it`);
+      } else if (operation.state === "running-dedicated" && terminal.exitStatus?.code !== undefined) {
+        // The pty host reported an exit *status* for the process that is the
+        // engine. That is not "the terminal went away": it is the process's
+        // own exit code, which is as positive as evidence gets.
+        this.resolve(operation, "terminal-process-exited", `the process of the dedicated terminal "${terminal.name}" — which is the engine itself — exited with code ${terminal.exitStatus.code}`);
+      } else if (operation.state === "running-shell" || operation.state === "running-dedicated") {
+        // An operation that is already running is a process, and closing a
+        // terminal does not end a process that survives the hangup. Real
+        // testing in VS Code proved it: the engine went on working after
+        // `terminal.dispose()`. Observation is lost; the guard is not.
+        this.loseObservation(
+          operation,
+          operation.state === "running-dedicated"
+            ? `the dedicated terminal "${terminal.name}" has closed. Its process may well have gone with it, but a process that ignores or survives the hangup does not, so this is not treated as the end of the operation: the guard remains and the process table is asked about that pid.`
+            : `the terminal "${terminal.name}" hosting that execution has closed. A process that survives the hangup keeps running without its pty, so this settles nothing: the guard remains and reconciliation continues.`,
+        );
       }
     }
+  }
+
+  /**
+   * The terminal this operation was being watched through is gone, or is
+   * someone else's now.
+   *
+   * Everything that identified *how* it was being observed is dropped, so
+   * nothing is ever written to that terminal again and no stale execution
+   * identity can be matched. Everything that identifies *what* the operation
+   * is stays, the guard stays, and process-specific reconciliation is started
+   * (or continues) so the question can still be answered by the one thing
+   * that can answer it.
+   */
+  private loseObservation(operation: Operation, detail: string): void {
+    if (operation.observationLost && operation.terminal === undefined) {
+      return;
+    }
+    operation.observationLost = true;
+    operation.terminal = undefined;
+    // The execution identity is deliberately kept: if that exact execution
+    // does report an end later, that is real evidence and must still be able
+    // to resolve this record. What is dropped is the terminal, which is what
+    // could otherwise be written to.
+    //
+    // The lease is retired rather than released: this terminal must never be
+    // written to again, and whatever is in it is left running.
+    operation.lease?.retire();
+    operation.lease = undefined;
+    this.log(`${operation.label}: ${detail}`);
+    this.startProbing(operation);
+    this.persistQuietly();
+    this.changeEmitter.fire();
   }
 
   /**
@@ -982,13 +1249,60 @@ export class OperationRegistry implements vscode.Disposable {
     }
   }
 
+  /**
+   * A direct child process, reconciled against the invocation it actually
+   * received.
+   *
+   * Three answers, and only one of them releases the guard:
+   *
+   *  - the pid is absent, or its birth time is not the recorded one: that
+   *    process is gone, positively;
+   *  - the pid is there and the exact recorded invocation is recognisable in
+   *    its command line: it is still running;
+   *  - the pid is there and nothing can decide: unknown, and the guard stays.
+   *    A live `sparring new-stage stage-5` used to be declared gone here,
+   *    because the reconciliation demanded a `--repo-root` that command never
+   *    takes.
+   */
   private probeDirect(operation: Operation, processes: ProcessInfo[]): void {
-    const running = processes.find((item) => item.pid === operation.directPid);
-    if (!running) {
-      this.resolve(operation, "direct-process-gone", `the process ${operation.directPid} this window started for it is no longer in the process table, so that operation is over`);
-    } else if (!isRecordedProcess(operation, running.command)) {
-      this.resolve(operation, "direct-process-gone", `the pid ${operation.directPid} recorded for it now belongs to something else (${running.command.slice(0, 60)}), so that operation is over`);
+    const pid = operation.directPid;
+    if (pid === undefined) {
+      return; // nothing to ask about
     }
+    const verdict = processGenerationVerdict(processes, pid, operation.generation);
+    if (verdict === "gone") {
+      this.resolve(
+        operation,
+        "direct-process-gone",
+        processExists(processes, pid)
+          ? `the pid ${pid} is still in the process table but was born at a different time than the process this window started, so it is a reused pid and that process is gone`
+          : `the process ${pid} this window started for it is no longer in the process table, so that operation is over`,
+      );
+      return;
+    }
+    if (verdict === "alive") {
+      return; // the same process, still running
+    }
+    const running = processes.find((item) => item.pid === pid) as ProcessInfo;
+    if (operation.directCommand && commandLineIsInvocation(running.command, operation.directCommand)) {
+      return; // positively this invocation: still running
+    }
+    this.unresolvedProbe(
+      operation,
+      `the pid ${pid} recorded for it is still in the process table, but its command line (${running.command.slice(0, 60)}) cannot be positively recognised as the invocation this window started and no birth time was recorded to tell a reused pid from the original. That is "I cannot attribute it", not "it ended": the operation stays guarded until its process is gone or you confirm it is over.`,
+    );
+  }
+
+  /**
+   * An answer that settles nothing, said once per distinct answer rather than
+   * every few seconds. The record is untouched.
+   */
+  private unresolvedProbe(operation: Operation, detail: string): void {
+    if (operation.inconclusive === detail) {
+      return;
+    }
+    operation.inconclusive = detail;
+    this.log(`${operation.label}: ${detail}`);
   }
 
   /**
@@ -997,20 +1311,40 @@ export class OperationRegistry implements vscode.Disposable {
    * what a live dedicated runner used to be declared dead for.
    */
   private probeDedicated(operation: Operation, processes: ProcessInfo[]): void {
-    if (operation.terminalPid === undefined || operation.terminalPid <= 0) {
-      return; // nothing to ask about
+    const pid = operation.enginePid ?? operation.terminalPid;
+    if (pid === undefined || pid <= 0) {
+      // A dedicated runner restored from before this pid was recorded. There
+      // is nothing to ask the process table about, and nothing that could be
+      // read as an answer: it stays guarded for a person to settle.
+      this.unresolvedProbe(operation, "no process id was recorded for the dedicated terminal that was running it, so nothing here can establish whether that process is still alive; it stays guarded until you confirm it is over");
+      return;
     }
-    if (!processExists(processes, operation.terminalPid)) {
-      this.resolve(operation, "dedicated-process-gone", `the process ${operation.terminalPid} of the dedicated terminal that was running it is no longer in the process table, so that operation is over`);
+    const verdict = processGenerationVerdict(processes, pid, operation.generation);
+    if (verdict === "gone") {
+      this.resolve(
+        operation,
+        "dedicated-process-gone",
+        processExists(processes, pid)
+          ? `the pid ${pid} is still in the process table but was born at a different time than the dedicated process that was running it, so it is a reused pid and that process is gone`
+          : `the process ${pid} of the dedicated terminal that was running it is no longer in the process table, so that operation is over`,
+      );
+      return;
+    }
+    if (verdict === "alive") {
       return;
     }
     const target = this.targetOf(operation);
-    if (!target || !targetIsAttributable(target)) {
-      return; // present, and nothing more can be asked
+    if (target && targetIsAttributable(target) && findSelfOrDescendant(processes, pid, (commandLine) => commandLineIsOperation(commandLine, target))) {
+      return; // positively this operation, still running
     }
-    if (!findSelfOrDescendant(processes, operation.terminalPid, (commandLine) => commandLineIsOperation(commandLine, target))) {
-      this.resolve(operation, "dedicated-process-gone", `the process ${operation.terminalPid} recorded for it is no longer running this operation, so that operation is over`);
-    }
+    // The pid is there and cannot be attributed. That is a matcher's "I
+    // cannot say", and it used to end the operation: a dedicated runner whose
+    // command line `ps` reports in a form the parser does not recognise — a
+    // wrapper, a relative `--repo-root` — was declared dead while it worked.
+    this.unresolvedProbe(
+      operation,
+      `the process ${pid} recorded for the dedicated terminal is still in the process table, but nothing in its command line positively identifies it as this operation and no birth time was recorded to tell a reused pid from the original. The operation stays guarded until that pid is gone or you confirm it is over.`,
+    );
   }
 
   /**
@@ -1046,20 +1380,73 @@ export class OperationRegistry implements vscode.Disposable {
    * either in the table or it is over.
    */
   private probeRunningShell(operation: Operation, processes: ProcessInfo[]): void {
+    // The strong case: an engine pid was positively attributed to this
+    // operation at some point, so its fate is a fact about that pid.
+    if (operation.enginePid !== undefined) {
+      const verdict = processGenerationVerdict(processes, operation.enginePid, operation.generation);
+      if (verdict === "gone") {
+        this.resolve(
+          operation,
+          "engine-process-gone",
+          processExists(processes, operation.enginePid)
+            ? `the pid ${operation.enginePid} that was running this operation is still in the process table but was born at a different time, so it is a reused pid and that process is gone`
+            : `the engine process ${operation.enginePid} that was positively attributed to this operation is no longer in the process table, so it is over`,
+        );
+        return;
+      }
+      if (verdict === "alive") {
+        return;
+      }
+      const running = processes.find((item) => item.pid === operation.enginePid) as ProcessInfo;
+      const target = this.targetOf(operation);
+      if (target && targetIsAttributable(target) && commandLineIsOperation(running.command, target)) {
+        return;
+      }
+      this.unresolvedProbe(
+        operation,
+        `the pid ${operation.enginePid} that was running this operation is still in the process table but can no longer be positively recognised as it, and no birth time was recorded to tell a reused pid from the original; the operation stays guarded`,
+      );
+      return;
+    }
     const target = this.targetOf(operation);
     if (!target || !targetIsAttributable(target)) {
-      return; // not attributable: only a person can settle this one
+      // Nothing in a command line could ever prove this is the operation — a
+      // relative `--repo-root .`, a command that names no project. The
+      // matcher has no question to ask, so it certainly has no answer, and a
+      // guard is never removed by a question that was not asked.
+      this.unresolvedProbe(
+        operation,
+        "it was reported as started, but nothing in a process command line could positively identify it — the project or the target it was launched with cannot be compared against what `ps` reports. Whether it is still running cannot be established here, so it stays guarded until you confirm it is over.",
+      );
+      return;
     }
     const anywhere = processes.find((item) => commandLineIsOperation(item.command, target));
-    if (!anywhere) {
-      this.resolve(operation, "engine-process-gone", `it was reported as started before the window reloaded, and no process in the table is this operation any more, so it is over`);
+    if (anywhere) {
+      // Now there is a pid, and from here on its absence is real evidence.
+      operation.enginePid = anywhere.pid;
+      operation.generation = anywhere.started ?? operation.generation;
+      this.log(`${operation.label}: the process running it is pid ${anywhere.pid}; from now on that pid's fate is what settles this operation`);
+      this.persistQuietly();
+      return;
     }
+    // It was observed running, and no process in the table can be attributed
+    // to it. Without a pid that was once attributed, that is an attribution
+    // failure and not a death: `ps` may report the command line in a form the
+    // parser cannot recognise, or it may be running under a wrapper.
+    this.unresolvedProbe(
+      operation,
+      "it was reported as started before the window reloaded, and no process in the table can be positively attributed to it. That is an attribution failure, not proof that it ended, so the operation stays guarded until its own process is identified and gone, or you confirm it is over.",
+    );
   }
 
   /** A submitted command found running under its own shell: the same record, now running. */
   private advanceToProbedRunning(operation: Operation, running: ProcessInfo): void {
     operation.state = "running-shell";
     operation.observation = "probed";
+    // The pid that *is* this operation, with its birth time. From here on the
+    // question is about this process and no longer about a command line.
+    operation.enginePid = running.pid;
+    operation.generation = running.started ?? operation.generation;
     clearInterval(operation.probeTimer);
     operation.probeTimer = undefined;
     this.log(`${operation.label}: this exact command is running under the shell ${operation.terminalPid} that took it (pid ${running.pid}), so it started; the operation stays guarded until that process is gone`);
@@ -1120,7 +1507,13 @@ export class OperationRegistry implements vscode.Disposable {
         waitExpired: operation.waitExpired,
         terminalPid: operation.terminalPid,
         terminalName: operation.terminalName,
-        direct: operation.directPid !== undefined ? { pid: operation.directPid, word: operation.directCommand?.word ?? "", args: operation.directCommand?.args ?? [] } : undefined,
+        direct:
+          operation.directPid !== undefined
+            ? { pid: operation.directPid, word: operation.directCommand?.word ?? "", args: operation.directCommand?.args ?? [], cwd: operation.directCommand?.cwd }
+            : undefined,
+        enginePid: operation.enginePid,
+        generation: operation.generation,
+        observationLost: operation.observationLost,
       }));
     await this.context.workspaceState.update(OPERATIONS_KEY, stored);
   }
@@ -1138,7 +1531,14 @@ export class OperationRegistry implements vscode.Disposable {
    * them.
    */
   restore(): OperationView[] {
-    const stored = this.context.workspaceState.get<PersistedOperation[]>(OPERATIONS_KEY, []);
+    if (this.restored) {
+      // Restoring is what makes admission safe, so it is called as early as
+      // activation can call it — and then again by the reattach that used to
+      // be its only caller. Doing it twice must not manufacture a second
+      // record for one operation, so the first answer is the answer.
+      return this.restored;
+    }
+    const stored = this.storedOperations();
     const restored: Operation[] = [];
     for (const item of stored) {
       const transport = item.transport ?? (item.direct ? "direct-process" : "shell");
@@ -1153,7 +1553,10 @@ export class OperationRegistry implements vscode.Disposable {
         waitExpired: item.waitExpired ?? true,
         observation: "reattached",
         directPid: item.direct?.pid,
-        directCommand: item.direct ? { word: item.direct.word, args: item.direct.args } : undefined,
+        directCommand: item.direct ? { word: item.direct.word, args: item.direct.args ?? [], cwd: item.direct.cwd } : undefined,
+        enginePid: item.enginePid ?? item.direct?.pid,
+        generation: item.generation,
+        observationLost: item.observationLost,
         restored: true,
       };
       if (operation.state === "reserved") {
@@ -1179,6 +1582,7 @@ export class OperationRegistry implements vscode.Disposable {
       this.byKey.set(operation.key, operation.id);
       restored.push(operation);
     }
+    restored.push(...this.importLegacyLaunches());
     if (restored.length > 0) {
       const counted = new Map<OperationState, number>();
       for (const operation of restored) {
@@ -1190,9 +1594,118 @@ export class OperationRegistry implements vscode.Disposable {
       for (const operation of restored) {
         this.startProbing(operation);
       }
+      this.persistQuietly();
       this.changeEmitter.fire();
     }
-    return restored.map(view);
+    this.restored = restored.map(view);
+    return this.restored;
+  }
+
+  /**
+   * The persisted records, moved off the key they used to share with the
+   * evidence submissions.
+   *
+   * The old key is read only when what is under it is an array, which is the
+   * shape these records have; a submissions object left there by the version
+   * that overwrote this key is not an operation and is left alone. The old
+   * entry is cleared only in that array case, so nothing else is destroyed by
+   * the migration.
+   */
+  private storedOperations(): PersistedOperation[] {
+    const current = this.context.workspaceState.get<PersistedOperation[]>(OPERATIONS_KEY, []);
+    if (Array.isArray(current) && current.length > 0) {
+      return current;
+    }
+    const legacy = this.context.workspaceState.get<unknown>(LEGACY_OPERATIONS_KEY);
+    if (!Array.isArray(legacy) || legacy.length === 0) {
+      return Array.isArray(current) ? current : [];
+    }
+    this.log(
+      `${legacy.length} operation record(s) were kept under the key this extension also used for evidence submissions, where each subsystem's write destroyed the other's. They are moved to their own key and keep blocking a duplicate.`,
+    );
+    void this.context.workspaceState
+      .update(LEGACY_OPERATIONS_KEY, undefined)
+      .then(undefined, (error: Error) => this.log(`the old operation record could not be cleared: ${error.message}`));
+    return legacy as PersistedOperation[];
+  }
+
+  /**
+   * Dedicated runners recorded by a version that kept their safety record in
+   * `agentSparring.launches` alone.
+   *
+   * That key is a liveness record, and the new admission authority does not
+   * read it. So an upgrade over a live dedicated runner used to admit the
+   * next run-plan for that run immediately: the guard simply was not there.
+   * Each launch that was never observed ending becomes a guarded
+   * `running-dedicated` operation under `runnerKey(runId)` — the strongest
+   * identity the old record supports, which is its run, its kind, its target
+   * and its terminal's pid.
+   *
+   * Idempotent by construction: an operation key that already holds a record
+   * is left alone, and once the import has happened the record lives under
+   * the operations key, so the next reload finds it there and imports
+   * nothing.
+   */
+  private importLegacyLaunches(): Operation[] {
+    const launches = this.context.workspaceState.get<LegacyLaunch[]>(LEGACY_LAUNCHES_KEY, []);
+    if (!Array.isArray(launches)) {
+      return [];
+    }
+    const imported: Operation[] = [];
+    for (const launch of launches) {
+      if (!launch || typeof launch.runId !== "string" || launch.ended) {
+        continue;
+      }
+      const dedicated = launch.transport ? launch.transport === "dedicated-terminal" : launch.source === "terminal";
+      if (!dedicated) {
+        // A shell launch's guard was always the registry's, under the
+        // operations key, so there is nothing here to import. Deliberately
+        // not broadened: an unresolved *shell* launch record says a runner
+        // was seen running, not that a command may execute twice, and the
+        // observed-command case (`source: "observed"`) is someone else's
+        // command entirely.
+        continue;
+      }
+      const key = runnerKey(launch.runId);
+      if (this.recordFor(key)) {
+        continue; // a modern record already guards it
+      }
+      const atMs = typeof launch.startedAtMs === "number" ? launch.startedAtMs : Date.now();
+      const operation: Operation = {
+        id: `operation-legacy-${launch.id ?? launch.runId}`,
+        key,
+        caller: "runner",
+        label: `${launch.kind ?? "run-plan"} ${launch.stageId ?? launch.planPath ?? launch.manifest ?? ""}`.trim(),
+        repoRoot: launch.repoRoot ?? launch.planPath ?? "",
+        sparringDir: launch.sparringDir,
+        cwd: launch.repoRoot ?? "",
+        subcommand: launch.kind ?? "run-plan",
+        runId: launch.runId,
+        runnerKind: launch.kind,
+        stageId: launch.stageId,
+        planPath: launch.planPath,
+        manifest: launch.manifest,
+        transport: "dedicated-terminal",
+        state: "running-dedicated",
+        claimedAtMs: atMs,
+        armedAtMs: atMs,
+        waitExpired: true,
+        observation: "reattached",
+        terminalPid: typeof launch.terminalPid === "number" && launch.terminalPid > 0 ? launch.terminalPid : undefined,
+        terminalName: launch.terminalName,
+        enginePid: typeof launch.terminalPid === "number" && launch.terminalPid > 0 ? launch.terminalPid : undefined,
+        restored: true,
+      };
+      this.operations.set(operation.id, operation);
+      this.byKey.set(operation.key, operation.id);
+      imported.push(operation);
+      this.log(
+        `${operation.label}: a dedicated runner recorded by an earlier version of this extension, which kept its safety record outside the admission authority, was never observed ending. It is imported as a guarded operation${
+          operation.terminalPid === undefined ? " with no process id, so only you can settle it" : ` on process ${operation.terminalPid}`
+        }; a second command for that run is refused until it is settled.`,
+      );
+    }
+    return imported;
   }
 
   /** Re-tie a restored operation to a terminal that came back with its pid. */
@@ -1228,20 +1741,11 @@ export function outstanding(view: OperationView): boolean {
       return true;
     default:
       // `armed`, `running-shell`, `running-direct`, `running-dedicated`: this
-      // window's own are visible to it and to the caller that started them.
-      return view.restored;
+      // window's own are visible to it and to the caller that started them —
+      // unless observation of them has been lost, which is precisely when
+      // nobody here can account for them any more.
+      return view.restored || view.observationLost === true;
   }
-}
-
-/**
- * Whether a process in the table is still the direct child that was recorded.
- * A pid alone is not enough — pids are reused — so the recorded executable,
- * the subcommand, the repository and the operation's own target must be in
- * its command line too.
- */
-function isRecordedProcess(operation: Operation, commandLine: string): boolean {
-  const words = [operation.directCommand?.word, operation.subcommand, operation.repoRoot, operation.stageId].filter((word): word is string => Boolean(word));
-  return words.every((word) => commandLine.includes(word));
 }
 
 function view(operation: Operation): OperationView {
@@ -1264,6 +1768,8 @@ function view(operation: Operation): OperationView {
     identifiable: operation.execution !== undefined,
     restored: operation.restored,
     directPid: operation.directPid,
+    observationLost: operation.observationLost,
+    enginePid: operation.enginePid,
   };
 }
 
@@ -1284,11 +1790,20 @@ export function operationRefusal(operation: OperationView): string {
       "It will be released as soon as that process is gone. If you know it is already over, confirm it.",
     ].join(" ");
   }
+  if (operation.observationLost) {
+    // The terminal is gone, or someone else's command is in the foreground
+    // there. Neither ends a process, so what is said is exactly that.
+    return [
+      `Agent Sparring started ${operation.label} ${seconds} s ago and can no longer watch it: the terminal it was running in has closed, or another command has taken the foreground there.`,
+      "Neither of those ends a process — an engine that survives the hangup, or one that was suspended and put in the background, goes on working — so Agent Sparring cannot determine whether it is still active.",
+      "Check it before allowing another attempt: running it again while it runs would do the same engine operation twice. If you have checked and it is over, confirm it.",
+    ].join(" ");
+  }
   if (operation.state === "running-dedicated") {
     return [
       `Agent Sparring started ${operation.label} ${seconds} s ago in its own terminal${operation.terminalName ? ` ("${operation.terminalName}")` : ""}, and that process outlived the window reload.`,
       "Running it again now would do the same engine operation twice.",
-      "Close that terminal, or wait for it to finish. If you know it is already over, confirm it.",
+      "It will be released as soon as that process is gone. If you know it is already over, confirm it.",
     ].join(" ");
   }
   if (operation.state === "running-shell") {
@@ -1329,7 +1844,7 @@ export function admissionRefusal(blocked: OperationView): string {
     case "running-direct":
       return `Agent Sparring is already running ${blocked.label}. Wait for it to finish before running it again.`;
     case "running-dedicated":
-      return `Agent Sparring is already running ${blocked.label} in its own terminal. Running it again now would do the same engine operation twice — close that terminal, or wait for it to finish, and try again.`;
+      return `Agent Sparring is already running ${blocked.label} in its own terminal. Running it again now would do the same engine operation twice — wait for that process to finish and try again.`;
     case "running-shell":
       return `Agent Sparring is already running ${blocked.label}: the shell it was given to reported it as started. Running it again now would do the same engine operation twice.`;
     default:

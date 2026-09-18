@@ -42,6 +42,20 @@ import { chooseOwnedTerminal, explainCreation, unavailability, type OwnedTermina
 
 export interface TerminalLease {
   terminal: vscode.Terminal;
+  /**
+   * Whether this leased terminal's shell is idle *at this instant*, and
+   * observably so: still in the pool, its shell alive, its executions visible
+   * to this window, and nothing running in it.
+   *
+   * Synchronous by design, and the last thing a caller does before handing a
+   * command line over. Acquiring an idle terminal and then awaiting anything
+   * — shell integration, the durable record of the intent — leaves a window in
+   * which the person can start their own command in that very terminal, and a
+   * command written into it then would be typed into someone else's foreground
+   * process. So occupancy is checked again with no `await` between the check
+   * and `executeCommand`.
+   */
+  idle(): boolean;
   /** Hand the terminal back so the next command may reuse it. Idempotent. */
   release(): void;
   /** Close and forget it: a shell that never reported integration is of no use. */
@@ -166,6 +180,12 @@ export class TerminalPool implements vscode.Disposable {
     let done = false;
     return {
       terminal: entry.terminal,
+      idle: () =>
+        !done &&
+        this.entries.includes(entry) &&
+        entry.terminal.exitStatus === undefined &&
+        entry.observable &&
+        entry.active.size === 0,
       release: () => {
         if (!done) {
           done = true;

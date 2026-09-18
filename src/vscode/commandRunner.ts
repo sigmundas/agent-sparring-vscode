@@ -52,7 +52,8 @@ import type { CommandOutcome } from "../core/acceptance";
 import { executableWord, planExecutable, type ExecutablePlan } from "../core/cli";
 import type { LaunchProblem } from "./executionTracker";
 import { admissionRefusal, commandKey, operationRefusal, outstanding, type OperationRegistry, type OperationView } from "./operationRegistry";
-import { awaitExecutionEnd, awaitShellIntegration, EXECUTION_START_TIMEOUT_MS, hostEnv, performShellHandover, shellHandoverFor } from "./shellIntegration";
+import { handOverToIdleShell } from "./shellHandover";
+import { awaitExecutionEnd, awaitShellIntegration, EXECUTION_START_TIMEOUT_MS, hostEnv, shellHandoverFor } from "./shellIntegration";
 import { collectOutput } from "./terminalOutput";
 import type { TerminalPool } from "./terminalPool";
 
@@ -139,33 +140,47 @@ export class SparringCommandRunner {
         this.operations.release(claim, "the durable record of the intent could not be written, so the command was never handed to the shell");
         return { ok: false, error: armed.error, problem: "unconfirmed" };
       }
-      let request;
-      try {
-        request = performShellHandover(integration, word, options.args, handover);
-      } catch (error) {
-        this.operations.handoverFailed(armed.armed, `handing the command line to the shell threw (${(error as Error).message}), so nothing was submitted`);
-        lease.discard();
-        return { ok: false, error: `Agent Sparring could not hand ${label} to the terminal: ${(error as Error).message}`, problem: "unconfirmed" };
+      // The final occupancy check and the hand-over happen as one step, with
+      // nothing awaited in between, so a terminal the person has started
+      // something in since `arm` was awaited is left completely alone and
+      // another idle one is used (shellHandover.ts). The operation stays
+      // armed throughout: nothing has executed while a safe terminal is
+      // being looked for.
+      const handed = await handOverToIdleShell({ pool: this.terminals, cwd: options.cwd, lease, integration, word, args: options.args, reveal: false, log: this.log });
+      if (!handed.ok) {
+        if (handed.reason === "threw") {
+          this.operations.handoverFailed(armed.armed, `handing the command line to the shell threw (${handed.error.message}), so nothing was submitted`);
+          lease.discard();
+          return { ok: false, error: `Agent Sparring could not hand ${label} to the terminal: ${handed.error.message}`, problem: "unconfirmed" };
+        }
+        this.operations.handoverNotInvoked(armed.armed, handed.detail);
+        return {
+          ok: false,
+          error: `Agent Sparring did not run ${label}: ${handed.detail}. Nothing was written into any terminal, so nothing ran — try again when a terminal is free.`,
+          problem: "unconfirmed",
+        };
       }
-      lease.terminal.show(true);
+      const request = handed.request;
+      const leased = handed.lease;
+      leased.terminal.show(true);
       const output = collectOutput(request.execution);
-      this.operations.submittedToShell(armed.armed, lease, request.execution, output);
+      this.operations.submittedToShell(armed.armed, leased, request.execution, output);
       const settled = await this.operations.waitForStart(armed.armed, EXECUTION_START_TIMEOUT_MS);
       if (!settled.established) {
         // The shell has not started it, and may still. Nothing is treated as
         // run, nothing is retried through another transport, and the record
         // stays on the registry's books — it, not any timer, is what stops
         // this operation being done twice.
-        this.log(`${options.name}: the shell in "${lease.terminal.name}" has not reported the command as started; nothing is treated as run, and this operation is refused until its fate is known`);
+        this.log(`${options.name}: the shell in "${leased.terminal.name}" has not reported the command as started; nothing is treated as run, and this operation is refused until its fate is known`);
         return { ok: false, error: operationRefusal(settled.view), problem: "unconfirmed", submission: settled.view };
       }
       // The shell may report the end before this caller sees the start — a
       // command that finishes inside the same tick does exactly that. That
       // end is authoritative and is consumed here; installing a waiter for
       // an event that has already happened would wait for ever.
-      const exitCode = settled.ended ? settled.ended.exitCode : await awaitExecutionEnd(request.execution, lease.terminal);
+      const exitCode = settled.ended ? settled.ended.exitCode : await awaitExecutionEnd(request.execution, leased.terminal);
       const text = await output;
-      lease.release();
+      leased.release();
       this.log(
         `ran ${options.name} via shell integration (${word}, ${options.args.length} args${request.quotedHere ? ", command line quoted here" : ""}, cwd ${options.cwd}); exit ${exitCode === undefined ? "unknown" : exitCode}${settled.ended ? " (the shell reported the end before the start was observed)" : ""}`,
       );
@@ -205,7 +220,7 @@ export class SparringCommandRunner {
     let outcome: CommandOutcome;
     try {
       outcome = await runProcess(path, options.args, options.cwd, (pid) => {
-        this.operations.runningDirect(armed.armed, { pid, word: path, args: options.args }, `it runs as process ${pid} of this window, without a shell`);
+        this.operations.runningDirect(armed.armed, { pid, word: path, args: options.args, cwd: options.cwd }, `it runs as process ${pid} of this window, without a shell`);
       });
     } finally {
       this.operations.directProcessEnded(armed.armed, "the process that ran it has ended in front of us");

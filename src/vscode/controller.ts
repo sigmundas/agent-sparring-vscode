@@ -53,6 +53,7 @@ import {
 import {
   SUBMISSIONS_KEY,
   submissionFailureReason,
+  withSubmissionUnresolved,
   submissionFor,
   submissionState,
   withSubmission,
@@ -241,6 +242,12 @@ export class SparringController implements vscode.Disposable {
       this.watch(folder);
     }
     this.statusBar.show();
+    // Before anything can be admitted: the operations a previous window left
+    // unresolved, and the dedicated-runner guards an older version of this
+    // extension kept somewhere else entirely. Synchronous, and first, because
+    // the user can invoke a command the moment the extension activates and
+    // the admission authority must already know what may still be running.
+    this.submissions.restore();
     await this.migratePinPolicy();
     await this.refresh();
     this.armPolling();
@@ -898,7 +905,7 @@ export class SparringController implements vscode.Disposable {
     const submissions = this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY);
     for (const runId of Object.keys(submissions ?? {})) {
       const record = submissionFor(submissions, runId);
-      if (!record || record.failure) {
+      if (!record || record.failure || record.unresolved) {
         continue; // already reported; the drafts are kept and the panel says so
       }
       const execution = this.tracker.recordById(record.executionId);
@@ -949,7 +956,7 @@ export class SparringController implements vscode.Disposable {
   }
 
   /** What a window reload would find recorded about this window's launches (integration tests). */
-  persistedLaunches(): { runId: string; state: "running" | "ended" }[] {
+  persistedLaunches(): { runId: string; state: "running" | "unknown" | "ended" }[] {
     return this.tracker.persisted();
   }
 
@@ -979,6 +986,54 @@ export class SparringController implements vscode.Disposable {
    */
   overrideSubmission(operationId: string, note: string): OverrideResult {
     return this.submissions.override(operationId, note);
+  }
+
+  /**
+   * A person's explicit statement that the runner of one exact execution is
+   * no longer active — the way out of `unknown`, which nothing this window
+   * can observe would ever provide.
+   *
+   * Everything it touches is named by an exact id, so a panel rendered before
+   * a newer run started cannot affect that newer run: the execution id for
+   * liveness, and the immutable operation id for the guard. It does four
+   * things and deliberately not a fifth:
+   *
+   *  - ends that execution's liveness, recorded as the person's statement;
+   *  - overrides the duplicate guard for that exact operation, if one is
+   *    still outstanding, as an override and never as evidence;
+   *  - marks a submission that was waiting on that execution as unresolved,
+   *    which makes it retryable with its text intact;
+   *  - claims nothing about whether the engine recorded the evidence. It is
+   *    neither marked delivered nor marked failed to make buttons work.
+   */
+  async confirmRunnerInactive(runId: string, executionId: string): Promise<{ confirmed: boolean; reason?: "not-found" | "already-ended"; overrode: boolean; submission: boolean }> {
+    const ended = this.tracker.confirmInactive(runId, executionId);
+    let overrode = false;
+    const held = this.submissions.inFlightFor(runnerKey(runId));
+    if (held) {
+      overrode = this.submissions.override(held.id, "the person confirmed, having checked, that this runner is no longer active; this is an override, not an observation").overridden;
+    }
+    const record = this.submissionFor(runId);
+    let submission = false;
+    if (record && record.executionId === executionId && !record.failure && !record.unresolved) {
+      await this.context.workspaceState.update(
+        SUBMISSIONS_KEY,
+        withSubmissionUnresolved(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), runId, {
+          atMs: Date.now(),
+          note: "You confirmed that the runner this evidence was handed to is no longer active. Whether the engine recorded it is unknown, so nothing is claimed either way.",
+        }),
+      );
+      submission = true;
+    }
+    this.log(
+      `You confirmed that the runner of ${runId.split("|").pop() ?? runId} is no longer active. That is your statement, not an observation: liveness is ${
+        ended.confirmed ? "recorded as ended" : `unchanged (${ended.reason ?? "no such execution"})`
+      }${overrode ? ", the duplicate guard for that exact operation is released as an override" : ""}${
+        submission ? ", and the evidence you submitted is retryable with its text intact — Agent Sparring does not claim the engine recorded it" : ""
+      }.`,
+    );
+    this.render();
+    return { ...ended, overrode, submission };
   }
 
   /** Ask the process table what it can prove about every unresolved submission. */

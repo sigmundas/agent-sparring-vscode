@@ -78,7 +78,7 @@ function pool(): { acquire: () => unknown; acquired: FakeTerminal[] } {
       const terminal = new FakeTerminal(`Agent Sparring — test ${acquired.length + 1}`, 5100 + acquired.length);
       acquired.push(terminal);
       stub.window.terminals.push(terminal);
-      return { terminal, release: () => undefined, discard: () => undefined, retire: () => undefined };
+      return { terminal, idle: () => true, release: () => undefined, discard: () => undefined, retire: () => undefined };
     },
   };
 }

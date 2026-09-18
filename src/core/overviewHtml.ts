@@ -46,7 +46,8 @@ export type OverviewAction =
   | "openPlanSection"
   | "submitForReview"
   | "sendFeedbackForReview"
-  | "dismissSubmissionFailure";
+  | "dismissSubmissionFailure"
+  | "confirmRunnerInactive";
 
 /** A Pass / Fail / Can't test click or a note edit on one manual check, posted by the webview as it happens. */
 export interface HumanCheckMessage {
@@ -206,6 +207,7 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "submitForReview",
   "sendFeedbackForReview",
   "dismissSubmissionFailure",
+  "confirmRunnerInactive",
 ];
 
 const ACTIONS: ReadonlySet<string> = new Set<string>(OVERVIEW_ACTIONS);
@@ -538,6 +540,17 @@ function renderSubmissionState(panel: ActionRequired): string {
   if (panel.submitting) {
     return `<p class="submitting" title="${escapeHtml(panel.submitting.detail)}">${icon("dot", "accent")}${escapeHtml(panel.submitting.label)}</p>`;
   }
+  const unresolved = panel.submissionUnresolved;
+  if (unresolved) {
+    // Neither success nor failure, and it says so: nobody knows what the
+    // engine did with this evidence, and the panel must not invent an answer
+    // in either direction to make its buttons work.
+    return `<div class="subfail">
+<p class="preserved">${icon("warn", "escalate")}${escapeHtml(unresolved.preserved)}</p>
+<p class="muted small">${escapeHtml(unresolved.reason)} ${escapeHtml(unresolved.what)}</p>
+<div class="actions">${button("dismissSubmissionFailure", "Dismiss", true, "Hide this report. Nothing you entered is changed by dismissing it.", "quiet small")}</div>
+</div>`;
+  }
   const failed = panel.submissionFailure;
   if (!failed) {
     return "";
@@ -790,6 +803,11 @@ function renderStageCard(model: OverviewModel): string {
   }
   if (model.runner?.alive) {
     buttons.push(button("stopRunner", model.runner.label, true, "Send Ctrl-C to the terminal running this stage", "danger"));
+  }
+  if (model.unknownRunner) {
+    // The only way out of an unknown runner, and it is here — next to the
+    // state it settles — rather than in the Command Palette alone.
+    buttons.push(button("confirmRunnerInactive", model.unknownRunner.label, true, model.unknownRunner.detail, "quiet"));
   }
   const actions = model.actions;
   if (actions) {

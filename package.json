@@ -46,6 +46,11 @@
         "category": "Agent Sparring"
       },
       {
+        "command": "agentSparring.confirmRunnerInactive",
+        "title": "Confirm Previous Runner Is No Longer Active",
+        "category": "Agent Sparring"
+      },
+      {
         "command": "agentSparring.showLog",
         "title": "Show Log",
         "category": "Agent Sparring"

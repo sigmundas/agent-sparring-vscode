@@ -26,7 +26,7 @@ import { parseHandoffBranch, type PlanRunState, type SparringOutcome, type Stage
 import type { DeclaredRepository } from "./stageRepositories";
 import { deriveVerification, HUMAN_FEEDBACK_HEADING, parseHumanEvidence, parseHumanFeedback, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
 import { checkNameList } from "./humanTask";
-import { SUBMISSION_PRESERVED, type SubmissionRecord } from "./submission";
+import { SUBMISSION_PRESERVED, SUBMISSION_UNRESOLVED, type SubmissionRecord } from "./submission";
 import { formatTime } from "./logFormat";
 import { deriveLiveness, type ExecutionRecord, type LivenessState, type RunnerLiveness } from "./liveness";
 import { proposeNextStage, type NextStageProposal } from "./nextStage";
@@ -154,6 +154,17 @@ export interface HistoryEntry {
 
 /** How many recent meaningful events the Overview shows. */
 export const HISTORY_MAX = 4;
+
+/**
+ * What a person is told when a runner's fate could not be established.
+ *
+ * Deliberately in the vocabulary of the thing they can act on — a previous
+ * runner they can go and look at — and deliberately not in the extension's
+ * own lifecycle vocabulary: nobody outside this code needs the words
+ * "attribution", "guard" or "observation lost" to decide whether a process is
+ * still working.
+ */
+export const UNKNOWN_RUNNER_EXPLANATION = "Agent Sparring cannot determine whether the previous runner is still active. Check it before allowing another attempt.";
 
 /** A Markdown plan the user associated with a standalone stage in VS Code (workspace state only). */
 export interface AssociatedPlan {
@@ -464,6 +475,12 @@ export interface ActionRequired extends VerificationView {
    */
   submissionFailure?: { preserved: string; reason: string; what: string; error?: string };
   /**
+   * A submission nobody could resolve, settled by the person saying the
+   * runner is no longer active. Says what is unknown and what was kept; it
+   * claims neither success nor failure, because neither is known.
+   */
+  submissionUnresolved?: { preserved: string; reason: string; what: string };
+  /**
    * Resume *implementation* without new evidence: the existing Resume stage
    * / Resume plan operation, when one is offered. Deliberately separate from
    * Submit for review — that asks the reviewer to evaluate the unchanged
@@ -512,6 +529,16 @@ export interface OverviewModel {
   accepting?: { label: string; detail: string };
   /** A runner observed for this run: alive (Stop offered) or stopped. */
   runner?: { alive: boolean; label: string };
+  /**
+   * The way out of a runner whose fate nothing could establish.
+   *
+   * `unknown` used to be a dead end: the runner could not be attributed, so
+   * every action for the run was withheld — including the evidence
+   * submission the person had already typed — with nothing on screen that
+   * could settle it. This is the explicit human statement, and it names one
+   * exact execution so a stale panel cannot settle a newer run's runner.
+   */
+  unknownRunner?: { label: string; detail: string; executionId: string };
   /**
    * Non-action state shown instead of Run/Resume: `Running` only when a
    * process observation backs it; `Run status unknown` when telemetry alone
@@ -647,6 +674,13 @@ export function buildOverviewModel(
     model.runner = { alive: true, label: "Stop (Ctrl-C)" };
   } else if (liveness.interrupted) {
     model.runner = { alive: false, label: "Runner stopped" };
+  }
+  if (liveness.execution && liveness.execution.state === "unknown") {
+    model.unknownRunner = {
+      label: "I checked — runner is no longer active",
+      detail: `${UNKNOWN_RUNNER_EXPLANATION} Confirming records your statement: it releases this run's actions and lets you send your evidence again. It does not claim the engine did, or did not, do anything.`,
+      executionId: liveness.execution.id,
+    };
   }
   const loopEligible = run.kind === "plan" || (stage.state?.status !== "accepted" && stage.state?.status !== "frozen");
   if (artifacts.accepting) {
@@ -874,7 +908,7 @@ function actionRequired(
     const which = names ? `the remaining ${pending === 1 ? "check" : "checks"} (${names})` : pending === 1 ? "the remaining check" : `all ${pending} remaining checks`;
     submitDetail = `Record a result for ${which} first. Submitting asks the reviewer to rule on the evidence, so it goes when the evidence is complete.`;
   } else if (blocked(model)) {
-    submitDetail = "Nothing can run right now (a runner is alive or its status is unknown).";
+    submitDetail = blockedDetail(model);
   } else {
     submitEnabled = true;
     submitDetail = `Records the drafted results under '## Human evidence' and asks the reviewer to rule on them (${command}). The reviewer decides; nothing is marked ready or accepted here.`;
@@ -891,7 +925,7 @@ function actionRequired(
   } else if (!draft) {
     sendDetail = "Describe what you found in the field above first. It goes to the reviewer as it is written, against the unchanged candidate.";
   } else if (blocked(model)) {
-    sendDetail = "Nothing can run right now (a runner is alive or its status is unknown).";
+    sendDetail = blockedDetail(model);
   } else {
     sendEnabled = true;
     sendDetail = `Records this text under '## Human evidence' as '${HUMAN_FEEDBACK_HEADING.replace(/^#+\s*/, "")}' and asks the reviewer to rule again on the unchanged candidate (${command}). It records no check result: ${pending === 0 ? "nothing is claimed about the checks either way" : `the ${pending === 1 ? "outstanding check stays outstanding" : `${pending} outstanding checks stay outstanding`}`}. The reviewer decides what follows — changes, the same checks again, or revised checks.`;
@@ -902,7 +936,10 @@ function actionRequired(
   // having recorded anything, the panel says so above the reviewer's own
   // checks, with every drafted result still where the user left it.
   const submission = artifacts.submission?.runId === run.id ? artifacts.submission : undefined;
-  const inFlight = submission && !submission.failure ? submission : undefined;
+  // A submission a person has settled as unresolved is not in flight: the
+  // engine is not holding it, nobody knows what it did, and the whole point
+  // of that statement is that the evidence may be sent again.
+  const inFlight = submission && !submission.failure && !submission.unresolved ? submission : undefined;
   const submitting = inFlight
     ? {
         label: "Submitting…",
@@ -926,6 +963,14 @@ function actionRequired(
         error: failure.output,
       }
     : undefined;
+  const unresolvedSubmission =
+    submission?.unresolved && !landed
+      ? {
+          preserved: SUBMISSION_UNRESOLVED,
+          reason: submission.unresolved.note,
+          what: submission.results > 0 ? `${submission.results} check result${submission.results === 1 ? "" : "s"} and any notes are still drafted below.` : "Your feedback is still in the field below.",
+        }
+      : undefined;
   if (submitting) {
     submitEnabled = false;
     submitDetail = submitting.detail;
@@ -952,6 +997,7 @@ function actionRequired(
     feedback: { draft, submitted: parseHumanFeedback(artifacts.notesText), send: { label: "Send feedback for review", enabled: sendEnabled, detail: sendDetail } },
     submitting,
     submissionFailure,
+    submissionUnresolved: unresolvedSubmission,
     resume,
     planSection: Boolean(sectionLine && (run.kind === "plan" ? artifacts.plan : artifacts.associatedPlan?.exists)),
     review: artifacts.sparring,
@@ -1164,6 +1210,21 @@ function reviewFailure(liveness: RunnerLiveness): string | undefined {
 /** Nothing may be launched: a runner is alive, or telemetry claims a turn nothing has observed ending. */
 function blocked(model: OverviewModel): boolean {
   return model.busyState !== undefined || model.runner?.alive === true;
+}
+
+/**
+ * What is said about a withheld action. When the reason is an unknown runner
+ * it names the way out, because "its status is unknown" with nothing to press
+ * is the dead end this panel had.
+ */
+function blockedDetail(model: OverviewModel): string {
+  if (model.unknownRunner) {
+    return `${UNKNOWN_RUNNER_EXPLANATION} Confirm it with "${model.unknownRunner.label}" above and this is offered again, with everything you entered still here.`;
+  }
+  if (model.runner?.alive === true || model.busyState?.state === "running") {
+    return "A runner is alive for this run; wait for it to finish.";
+  }
+  return "Agent Sparring cannot determine whether the previous runner is still active. Check it before allowing another attempt.";
 }
 
 // ---------------------------------------------------------------- pieces

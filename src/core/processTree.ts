@@ -11,12 +11,39 @@ export interface ProcessInfo {
   pid: number;
   ppid: number;
   command: string;
+  /**
+   * When this process was born, exactly as `ps -o lstart=` printed it (`Thu
+   * Sep 18 11:12:13 2026`), when the probe was able to ask for it.
+   *
+   * This is the *generation* of the pid: pids are reused, and a recorded pid
+   * that is still in the table may be a different process entirely. A start
+   * time that differs from the one recorded when the operation was seen alive
+   * is therefore positive evidence that the recorded process is gone —
+   * whereas a command line that merely cannot be recognised is no evidence at
+   * all. Absent when the platform's `ps` would not print it, in which case a
+   * live pid with an unrecognisable command line stays unresolved.
+   */
+  started?: string;
 }
 
-/** Parse `ps -axo pid=,ppid=,command=` output; malformed lines are skipped. */
+/**
+ * Parse `ps -axo pid=,ppid=,lstart=,command=` output, or the same without
+ * `lstart=`; malformed lines are skipped.
+ *
+ * Both shapes are accepted from one parser because the probe asks for the
+ * start time first and falls back to the narrower format when a platform's
+ * `ps` refuses it (processProbe.ts). A line is read as carrying a start time
+ * only when the third field really is a `ps` date, so a command line can
+ * never be mistaken for one.
+ */
 export function parsePsOutput(text: string): ProcessInfo[] {
   const rows: ProcessInfo[] = [];
   for (const line of text.split(/\r?\n/)) {
+    const dated = /^\s*(\d+)\s+(\d+)\s+([A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$/.exec(line);
+    if (dated) {
+      rows.push({ pid: Number(dated[1]), ppid: Number(dated[2]), started: dated[3].replace(/\s+/g, " ").trim(), command: dated[4].trim() });
+      continue;
+    }
     const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
     if (match) {
       rows.push({ pid: Number(match[1]), ppid: Number(match[2]), command: match[3].trim() });
@@ -77,4 +104,28 @@ export function findSelfOrDescendant(processes: ProcessInfo[], rootPid: number, 
 /** Whether a pid is in the snapshot at all. */
 export function processExists(processes: ProcessInfo[], pid: number): boolean {
   return processes.some((process) => process.pid === pid);
+}
+
+/**
+ * What a recorded pid, plus the generation fingerprint recorded with it, can
+ * prove about the process that was started.
+ *
+ *  - `gone`: the pid is not in the table at all, or it is in the table with a
+ *    demonstrably different birth time. Either way the recorded process has
+ *    ended; this is the only positive death evidence a process table gives.
+ *  - `alive`: the pid is there and its birth time is the recorded one, so it
+ *    is the same process.
+ *  - `unknown`: the pid is there but nothing recorded can distinguish it from
+ *    a reused pid — no fingerprint was captured, or this platform's `ps` does
+ *    not print one. A guard is kept in this case, never released.
+ */
+export function processGenerationVerdict(processes: ProcessInfo[], pid: number, generation: string | undefined): "gone" | "alive" | "unknown" {
+  const found = processes.find((process) => process.pid === pid);
+  if (!found) {
+    return "gone";
+  }
+  if (generation === undefined || found.started === undefined) {
+    return "unknown";
+  }
+  return found.started === generation ? "alive" : "gone";
 }

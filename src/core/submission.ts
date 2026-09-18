@@ -21,6 +21,12 @@
  *    evidence; now, and only now, the drafts are cleared.
  *  - **failed** — anything else, including no exit code at all. The drafts
  *    stay, byte for byte, and the panel says so above the engine's own error.
+ *  - **unresolved** — nobody could establish what the runner did, and a
+ *    person said so explicitly. Not a success and not a failure: the drafts
+ *    stay and the submission becomes retryable. Without this state a runner
+ *    whose liveness went unknown left the submission pending for ever and
+ *    every evidence action disabled, with the person's work stranded behind
+ *    them.
  *
  * The record also keeps the submitted entry verbatim. That is deliberate
  * redundancy: it is the same text the drafts still hold, and it is what makes
@@ -60,6 +66,18 @@ export interface SubmissionRecord {
   stageId?: string;
   /** Set once the execution ended without succeeding; absent while pending. */
   failure?: SubmissionFailure;
+  /**
+   * Set when a person stated that the runner this submission was handed to is
+   * no longer active.
+   *
+   * Neither `recorded` nor `failed`: the engine never told anyone what
+   * happened, and inventing either answer would be a lie about a person's
+   * recorded work. What it does is make the submission retryable again — the
+   * text is still here, and the buttons are offered — which is the one thing
+   * that was missing when a runner went unknown and every evidence action
+   * stayed disabled for ever.
+   */
+  unresolved?: { atMs: number; note: string };
 }
 
 /** workspaceState entry: run id → its latest submission. */
@@ -73,13 +91,30 @@ export const SUBMISSIONS_KEY = "agentSparring.submissions";
  * liveness this platform could not establish — because the cost of guessing
  * wrong is a person's recorded work, and the cost of waiting is a label.
  */
-export type SubmissionState = "pending" | "recorded" | "failed";
+export type SubmissionState = "pending" | "recorded" | "failed" | "unresolved";
 
 export function submissionState(execution: { state: "running" | "unknown" | "ended"; exitCode?: number } | undefined): SubmissionState {
   if (!execution || execution.state !== "ended") {
     return "pending";
   }
   return execution.exitCode === 0 ? "recorded" : "failed";
+}
+
+/** The sentence a submission left unresolved by an unknown runner leads with. */
+export const SUBMISSION_UNRESOLVED =
+  "Agent Sparring cannot tell whether the engine recorded this evidence — your check results and feedback were preserved, and you can send them again.";
+
+/**
+ * Record that a person settled an unknown runner for this submission. The
+ * entry, the results count and everything else are kept exactly as they
+ * were; only the statement is added.
+ */
+export function withSubmissionUnresolved(submissions: Submissions | undefined, runId: string, unresolved: { atMs: number; note: string }): Submissions {
+  const record = submissionFor(submissions, runId);
+  if (!record) {
+    return { ...(submissions ?? {}) };
+  }
+  return { ...submissions, [runId]: { ...record, unresolved } };
 }
 
 /** Exit codes that mean a person or a signal stopped it, not that the engine judged anything. */

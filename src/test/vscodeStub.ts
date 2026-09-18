@@ -94,6 +94,17 @@ export class FakeTerminal {
     this.exitStatus = { code: 0 };
     stub.window.closeEmitter.fire(this);
   }
+  /**
+   * The terminal goes away without the pty host reporting an exit code —
+   * what `terminal.dispose()` on a terminal whose process ignores or
+   * survives the hangup looks like, and what a person closing the tab looks
+   * like. Deliberately distinct from `dispose()`, which reports code 0 and
+   * is therefore evidence that the process exited.
+   */
+  close(): void {
+    this.exitStatus = { code: undefined };
+    stub.window.closeEmitter.fire(this);
+  }
   /** Shell integration appears, which is what a held launch is waiting for. */
   integrate(): FakeShellIntegration {
     const integration = new FakeShellIntegration(this);
@@ -130,9 +141,16 @@ const stub = {
     onDidChangeTerminalShellIntegration: integrationEmitter.event,
     /** Dedicated terminals the code under test created, in order. */
     created: [] as { name: string; shellPath?: string; shellArgs?: string[] }[],
+    /**
+     * The process id the next created terminal reports. A dedicated
+     * terminal's process *is* the engine, so a test that wants a real process
+     * behind one sets its real pid here.
+     */
+    nextTerminalPid: undefined as number | undefined,
     createTerminal(options: { name: string; shellPath?: string; shellArgs?: string[] }): FakeTerminal {
       stub.window.created.push(options);
-      const terminal = new FakeTerminal(options.name);
+      const terminal = new FakeTerminal(options.name, stub.window.nextTerminalPid);
+      stub.window.nextTerminalPid = undefined;
       stub.window.terminals.push(terminal);
       openEmitter.fire(terminal);
       return terminal;
@@ -160,6 +178,7 @@ export function install(): VscodeStub {
 export function reset(): void {
   stub.window.terminals.length = 0;
   stub.window.created.length = 0;
+  stub.window.nextTerminalPid = undefined;
 }
 
 /** Let queued microtasks and timers run, so the code under test reaches its next await. */

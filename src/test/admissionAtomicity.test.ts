@@ -92,6 +92,7 @@ function pool(): { acquire: (cwd: string) => unknown; acquired: FakeTerminal[]; 
       stub.window.terminals.push(terminal);
       return {
         terminal,
+        idle: () => true,
         release: () => undefined,
         discard: () => discarded.push(terminal),
         retire: () => retired.push(terminal),
