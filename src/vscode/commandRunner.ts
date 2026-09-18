@@ -131,7 +131,11 @@ export class SparringCommandRunner {
     // shell-less route is never armed for a shell.
     const handover = integration ? shellHandoverFor(word, options.args) : undefined;
     if (integration && handover && handover.via !== "no-shell") {
-      const armed = await this.operations.arm(claim, "shell", { word, plan: configured.plan });
+      // The exact invocation goes on the durable record here, before the
+      // hand-over. A short command carries no `--repo-root` and cannot be
+      // parsed for a target, so this argument array is the only thing a later
+      // window can recognise it by in a process table.
+      const armed = await this.operations.arm(claim, "shell", { word, plan: configured.plan, args: options.args });
       if (!armed.ok) {
         // The intent could not be made durable, so nothing is handed over:
         // the one ordering under which a crash cannot strand a started
@@ -162,9 +166,13 @@ export class SparringCommandRunner {
       }
       const request = handed.request;
       const leased = handed.lease;
-      leased.terminal.show(true);
+      // The shell has the command line. Advancing the record is the first
+      // thing done with that fact, before anything that could throw: a
+      // failure while revealing a terminal or attaching to its output stream
+      // must not leave a handed-over operation recorded as merely armed.
       const output = collectOutput(request.execution);
       this.operations.submittedToShell(armed.armed, leased, request.execution, output);
+      leased.terminal.show(true);
       const settled = await this.operations.waitForStart(armed.armed, EXECUTION_START_TIMEOUT_MS);
       if (!settled.established) {
         // The shell has not started it, and may still. Nothing is treated as
@@ -200,7 +208,7 @@ export class SparringCommandRunner {
       return { ok: false, error: direct.error, problem: direct.problem };
     }
     const path = executableWord(direct.plan);
-    const armed = await this.operations.arm(claim, "direct-process", { word: path, plan: direct.plan });
+    const armed = await this.operations.arm(claim, "direct-process", { word: path, plan: direct.plan, args: options.args });
     if (!armed.ok) {
       this.operations.release(claim, "the durable record of the intent could not be written, so nothing was spawned");
       return { ok: false, error: armed.error, problem: "unconfirmed" };

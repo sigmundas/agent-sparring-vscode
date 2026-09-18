@@ -37,7 +37,7 @@
  *     armed  → running-dedicated    `runningDedicated`
  *     submitted-shell → running-shell   the shell reported that execution
  *                                       started, or the process table proved
- *                                       it is running under that shell
+ *                                       the command itself is running
  *
  * Every transition *out* of a guard removes duplicate protection, so each one
  * names the evidence that proves this exact operation cannot execute again:
@@ -47,8 +47,6 @@
  *  | reserved        | `never-executed`           | cannot-execute |
  *  | armed           | `handover-threw`           | cannot-execute |
  *  | armed           | `never-handed-over`        | cannot-execute |
- *  | submitted-shell | `terminal-closed`          | cannot-execute |
- *  | submitted-shell | `shell-process-gone`       | cannot-execute |
  *  | running-shell   | `shell-execution-ended`    | completed      |
  *  | running-shell   | `engine-process-gone`      | completed      |
  *  | running-direct  | `direct-process-ended`     | completed      |
@@ -57,34 +55,77 @@
  *  | running-dedicated | `dedicated-process-gone` | completed      |
  *  | any guard       | `human-override`           | human-override |
  *
+ * There is deliberately no row for `submitted-shell`. A command that has been
+ * handed to a shell leaves that state in exactly three ways: it is found to be
+ * running (and the guard *advances*), its own execution is reported as ended
+ * (through `running-shell`), or a person overrides that exact operation id.
+ *
  * `reserved` is the only state that is not persisted, and it is the only one
  * for which "nothing could have executed" is true by construction: no
  * transport has been invoked, and a reload has nothing to duplicate.
  *
+ * ## The irreversible boundary
+ *
+ * The two `armed` resolutions are the only ones that rest on this window's own
+ * knowledge of what it did rather than on a fact about a process, and both are
+ * strictly *pre*-hand-over:
+ *
+ *  - `never-handed-over`: no idle shell could be found, so `executeCommand`
+ *    was never called;
+ *  - `handover-threw`: `executeCommand` itself threw, so the shell was given
+ *    nothing. That call is the only thing inside its own `try`
+ *    (shellIntegration.ts, `performShellHandover`), so this cannot be reached
+ *    by a failure that happens after the shell has the command line. Reading
+ *    back the returned execution's metadata used to share that `try`, and a
+ *    throw from it resolved the operation as `cannot-execute` while the shell
+ *    was holding the command.
+ *
+ * Once `executeCommand` has returned, everything is observation.
+ *
  * ## Loss of observation is not termination evidence
  *
- * The distinction the table above turns on, stated once:
+ * The distinction the table above turns on, stated once: **after
+ * `executeCommand` has been called, nothing that this window stops being able
+ * to see is evidence about what is running.** Not one of these ends a guard:
  *
- *  - a **submitted-shell** operation that was never observed started is
- *    ended by its *shell* disappearing — the process that held the queued
- *    line is gone, so that line can never be read. This is the one place a
- *    closed terminal is evidence, and it is evidence about the shell, not
- *    about any engine process;
- *  - an operation **known to have started** is a process, and a process is
- *    ended only by facts about that process. Its terminal closing, another
- *    foreground command starting in that terminal, a command line that
- *    cannot be recognised, an unavailable probe: every one of those is a
- *    change in what can be *observed*, and none of them is a change in what
- *    is *running*. Real VS Code testing settled this: a HUP- and
- *    TERM-resistant engine process survives `terminal.dispose()` and goes on
- *    doing work, and a suspended engine that is put in the background leaves
- *    its shell free to run the next foreground command while it runs on.
+ *  - no start event, in this window or after a reload. A shell reports a start
+ *    only if something is listening, and a reloaded window was not;
+ *  - the terminal closing. Under a *started* operation the pty goes and the
+ *    process need not: real VS Code testing settled it, with a HUP- and
+ *    TERM-resistant engine going on working after `terminal.dispose()`. Under
+ *    a *submitted* one it is no better — the shell may have read the line
+ *    before it went, and the child it started can be reparented to pid 1 and
+ *    keep running;
+ *  - the shell process disappearing. It is gone, so it will not read the line
+ *    *from now on*; it says nothing about whether it already did. This used to
+ *    be treated as proof that the line could never be read, which released the
+ *    guard over a live engine whose shell had died;
+ *  - a descendant search coming back empty. A dying shell reparents its
+ *    children, so the engine is no longer under the shell's pid — which is why
+ *    the whole process table is searched for a submitted command, not only the
+ *    shell's subtree;
+ *  - a reload losing the `TerminalShellExecution`, another foreground command
+ *    in the same terminal (`^Z` then `bg` leaves exactly that trace), a
+ *    matcher that cannot attribute a process, or a probe that cannot run.
  *
  * When observation is lost, the record keeps its guard, its terminal
  * attachment is dropped so nothing is written to a terminal that is gone or
  * no longer ours, and process-specific reconciliation continues. If no
  * definitive probe is possible, the operation stays unknown and guarded until
  * a person overrides that exact operation id.
+ *
+ * ## What a submitted command is reconciled against
+ *
+ * A short engine command (freeze-candidate, accept-candidate, new-stage) is
+ * not one of the loop subcommands, so its command line cannot be parsed for a
+ * project and a target and `targetOf` has nothing to offer. Such an operation
+ * used to have no reconciliation path at all after a reload. So the *actual
+ * invocation* — the executable word this extension resolved, the argument
+ * array verbatim, and the working directory — is recorded with the durable
+ * intent for every transport, shell included, and compared by exact argument
+ * identity (core/processInvocation.ts). Nothing is matched by substring, and a
+ * `false` from either matcher means "I cannot attribute this process", which
+ * leaves the guard where it is.
  *
  * ## What is not evidence, and may never end a guard
  *
@@ -95,9 +136,13 @@
  *  - **the terminal-reconnect grace period after a window reload.** That a
  *    terminal did not come back within six seconds says nothing about whether
  *    its shell, or the process it hosts, is alive;
- *  - **a terminal closing under a started operation.** The pty goes; the
- *    process need not. A process that ignores or survives the hangup keeps
- *    running, which is exactly the case a guard exists for;
+ *  - **a terminal closing over an operation that was handed over.** The pty
+ *    goes; the process need not. A process that ignores or survives the hangup
+ *    keeps running, which is exactly the case a guard exists for — and a
+ *    command the shell had only been *given* is no safer to write off, because
+ *    the shell may have read that line before the pty went;
+ *  - **the shell process that took a command disappearing.** It will not read
+ *    the line from now on, which is not the same as never having read it;
  *  - **another foreground command in the same terminal.** It proves that the
  *    previous foreground relationship changed — a `bg` after a `^Z` does that
  *    while the engine runs on — and nothing else. It updates occupancy and
@@ -272,8 +317,6 @@ export type OperationEvidence =
   | "never-executed"
   | "handover-threw"
   | "never-handed-over"
-  | "terminal-closed"
-  | "shell-process-gone"
   | "shell-execution-ended"
   | "terminal-process-exited"
   | "engine-process-gone"
@@ -287,8 +330,6 @@ const OUTCOME_OF: Readonly<Record<OperationEvidence, OperationOutcome>> = {
   "never-executed": "cannot-execute",
   "handover-threw": "cannot-execute",
   "never-handed-over": "cannot-execute",
-  "terminal-closed": "cannot-execute",
-  "shell-process-gone": "cannot-execute",
   "shell-execution-ended": "completed",
   "terminal-process-exited": "completed",
   "engine-process-gone": "completed",
@@ -313,8 +354,6 @@ export const OPERATION_RESOLUTIONS: readonly { from: OperationState; evidence: O
     outcome: "cannot-execute",
     proves: "no idle shell could be found for it, so `executeCommand` was never called at all and no process was spawned — known from this window's own instruction stream, not inferred",
   },
-  { from: "submitted-shell", evidence: "terminal-closed", outcome: "cannot-execute", proves: "the shell process that held the queued line is gone with its pty, so that line can never be read by anything" },
-  { from: "submitted-shell", evidence: "shell-process-gone", outcome: "cannot-execute", proves: "the exact shell process that took the line no longer exists" },
   { from: "running-shell", evidence: "shell-execution-ended", outcome: "completed", proves: "the shell reported that exact execution finishing" },
   {
     from: "running-shell",
@@ -464,8 +503,16 @@ interface Operation extends OperationIdentity {
   observation?: OperationObservation;
   /** The child process this window spawned for a direct operation. */
   directPid?: number;
-  /** Exactly what was spawned, so the pid can be confirmed to still be it after a reload. */
-  directCommand?: RecordedInvocation;
+  /**
+   * Exactly what this operation is, as an invocation: the executable word that
+   * was resolved, the argument array verbatim and the working directory. Kept
+   * for *every* transport, not only the spawning ones, because it is the only
+   * thing that can recognise a short engine command in a process table — such
+   * a command takes no `--repo-root` and cannot be parsed for a target, so a
+   * shell-submitted `freeze-candidate` had no reconciliation path at all after
+   * a reload.
+   */
+  invocation?: RecordedInvocation;
   /**
    * The engine process positively attributed to this operation: the child of
    * the shell that was found running it, or the dedicated terminal's own
@@ -530,6 +577,13 @@ interface PersistedOperation {
    * line declared live processes gone.
    */
   direct?: { pid: number; word: string; args: string[]; cwd?: string };
+  /**
+   * The invocation this operation is, for every transport: what a process
+   * table row has to match, token for token, to be positively attributed to
+   * it. Written from `arm` onwards, so it is durable before anything can
+   * execute; records written before this field existed fall back to `direct`.
+   */
+  invocation?: { word: string; args: string[]; cwd?: string };
   /** The engine process attributed to this operation, when one was positively found. */
   enginePid?: number;
   /** That process's birth time as `ps` printed it, which is what distinguishes it from a reused pid. */
@@ -713,7 +767,7 @@ export class OperationRegistry implements vscode.Disposable {
    * told; that is the one ordering under which a crash can never leave a
    * started operation with no durable identity.
    */
-  async arm(claim: OperationClaim, transport: OperationTransport, details?: Pick<OperationIdentity, "word" | "plan">): Promise<ArmResult> {
+  async arm(claim: OperationClaim, transport: OperationTransport, details?: Pick<OperationIdentity, "word" | "plan"> & { args?: string[] }): Promise<ArmResult> {
     const operation = this.held(claim, "reserved");
     operation.transport = transport;
     operation.state = "armed";
@@ -722,6 +776,13 @@ export class OperationRegistry implements vscode.Disposable {
     if (details) {
       operation.word = details.word;
       operation.plan = details.plan;
+      if (details.word && details.args) {
+        // The actual invocation, recorded with the intent rather than after
+        // the fact: a crash between the durable write and the hand-over then
+        // leaves a record the next window can still look for in the process
+        // table, and a shell submission is as reconcilable as a spawned one.
+        operation.invocation = { word: details.word, args: [...details.args], cwd: operation.cwd };
+      }
     }
     try {
       await this.persist();
@@ -731,6 +792,7 @@ export class OperationRegistry implements vscode.Disposable {
       operation.state = "reserved";
       operation.transport = undefined;
       operation.armedAtMs = undefined;
+      operation.invocation = undefined;
       const message = (error as Error).message;
       this.log(`${operation.label}: the durable record of the intent to run it could not be written (${message}); nothing was started`);
       return { ok: false, error: `Agent Sparring could not record that it is about to run ${operation.label}, so it did not start it: ${message}` };
@@ -770,7 +832,7 @@ export class OperationRegistry implements vscode.Disposable {
     // array as passed, and the working directory it was spawned in. Nothing
     // semantic is derived from it, because several subcommands carry no
     // `--repo-root` at all and are identified by their cwd alone.
-    operation.directCommand = { word: process.word, args: [...process.args], cwd: process.cwd };
+    operation.invocation = { word: process.word, args: [...process.args], cwd: process.cwd };
     operation.enginePid = process.pid;
     this.log(`${operation.label}: ${detail}; a second copy of this operation is refused until it ends`);
     this.persistQuietly();
@@ -1051,11 +1113,18 @@ export class OperationRegistry implements vscode.Disposable {
         continue;
       }
       if (operation.state === "submitted-shell") {
-        // The one case in which a closed terminal is evidence, and it is
-        // evidence about the *shell*: this operation was never observed
-        // started, and the process that held its queued line is gone with the
-        // pty, so nothing can ever read that line.
-        this.resolve(operation, "terminal-closed", `the terminal "${terminal.name}" that took it was closed before anything reported it as started, so the shell that held that line is gone with it`);
+        // This used to be the one case in which a closed terminal was treated
+        // as evidence, on the argument that the shell holding the queued line
+        // had gone with the pty. It does not follow. The shell may have read
+        // that line already — nothing was listening for a start after a
+        // reload, and even in this window a start event can be missed — and
+        // the engine it began is then reparented and goes on running. So the
+        // guard stays, and the process table is asked about the command
+        // itself.
+        this.loseObservation(
+          operation,
+          `the terminal "${terminal.name}" that took it has closed. That is the end of what could be watched, not proof that the line was never read: the shell may have run it before the pty went, and the engine it started can outlive both. The guard remains and the process table is searched for that exact command.`,
+        );
       } else if (operation.state === "running-dedicated" && terminal.exitStatus?.code !== undefined) {
         // The pty host reported an exit *status* for the process that is the
         // engine. That is not "the terminal went away": it is the process's
@@ -1191,7 +1260,7 @@ export class OperationRegistry implements vscode.Disposable {
     if (!this.probeSupported()) {
       this.log(
         operation.state === "submitted-shell"
-          ? `${operation.label}: no process probe is available on ${process.platform}, so its fate stays unknown until its terminal closes or you confirm it cannot run`
+          ? `${operation.label}: no process probe is available on ${process.platform}, so nothing here can establish whether the shell ran that line; its fate stays unknown until its own execution is reported or you confirm it cannot run`
           : `${operation.label}: no process probe is available on ${process.platform}, so whether the process this window started before the reload is still running cannot be established here; the operation stays blocked until you confirm it is over`,
       );
       return;
@@ -1284,7 +1353,7 @@ export class OperationRegistry implements vscode.Disposable {
       return; // the same process, still running
     }
     const running = processes.find((item) => item.pid === pid) as ProcessInfo;
-    if (operation.directCommand && commandLineIsInvocation(running.command, operation.directCommand)) {
+    if (operation.invocation && commandLineIsInvocation(running.command, operation.invocation)) {
       return; // positively this invocation: still running
     }
     this.unresolvedProbe(
@@ -1348,29 +1417,100 @@ export class OperationRegistry implements vscode.Disposable {
   }
 
   /**
-   * Two things a process table can prove about a command a shell was given:
-   * that the shell is gone (so a queued line can never be read), or that
-   * this exact command is running *under that shell* (so it started, and the
-   * guard advances rather than lifting).
+   * What a process table can say about a command a shell was given.
    *
-   * Attribution requires the ancestry as well as the command identity. A
-   * process that merely looks similar, anywhere in the table, says nothing
-   * about the line this particular shell was given.
+   * One thing it can prove: that this exact command is running. Then the
+   * guard *advances* to `running-shell` on the pid that was found, and from
+   * there that pid's own fate settles it.
+   *
+   * One thing it cannot prove, and used to be read as proof: that the command
+   * never ran. The shell being gone from the table means it will not read the
+   * line from now on; it says nothing about whether it already did, and a
+   * child it started before it died is reparented to pid 1 with its command
+   * line intact. So a missing shell is a loss of observation — the guard
+   * remains — and the search is not confined to the shell's descendants,
+   * which is where that reparented engine used to be looked for in vain.
+   *
+   * Ancestry is still required *while the ancestor exists*: a matching
+   * process somewhere else in the table, under a shell that is not ours while
+   * ours is alive and still holding the line, is a different invocation of the
+   * same operation and proves nothing about this one. Once our shell is gone,
+   * a positively attributed process anywhere is the best available account of
+   * what became of the line, and anchoring the guard to it is strictly safer
+   * than leaving the operation with no pid at all — its fate then follows a
+   * real process rather than waiting for a person.
    */
   private probeSubmittedShell(operation: Operation, processes: ProcessInfo[]): void {
     const shellPid = operation.terminalPid;
+    const shellKnown = shellPid !== undefined && shellPid > 0;
+    const shellGone = shellKnown && !processExists(processes, shellPid);
+    if (shellGone) {
+      this.loseObservation(
+        operation,
+        `the shell process ${shellPid} that took it no longer exists. It may well have read that line before it went — and an engine it started is reparented rather than killed — so this is the loss of the only thing that was watching, not proof that nothing ran. The guard remains and the whole process table is searched for that exact command.`,
+      );
+    }
+    const found = this.attributeSubmitted(operation, processes, shellGone ? undefined : shellPid);
+    if (found) {
+      this.advanceToProbedRunning(operation, found.process, found.where);
+      return;
+    }
+    this.unresolvedProbe(
+      operation,
+      shellGone
+        ? "the shell that took it is gone and no process in the table can be positively attributed to that command. Whether it ran, and whether it is still running, cannot be established here, so it stays guarded until its own process is identified or you confirm it cannot run."
+        : "nothing in the process table can be positively attributed to that command yet. That is not proof that it never ran, so it stays guarded.",
+    );
+  }
+
+  /**
+   * The process running a submitted command, if one can be positively
+   * attributed to it.
+   *
+   * `underShell` is the shell's pid while that shell is still alive, and
+   * undefined once it is gone (or was never recorded). While it is given, that
+   * shell's own subtree is the only place a match counts: a child of a live
+   * shell is where its command runs, and a match elsewhere is someone else's
+   * invocation of the same operation while ours may still be read. Once the
+   * shell is gone there is no subtree left to search, so the whole table is.
+   *
+   * Both matchers are offered, because an operation has at most one of them: a
+   * loop subcommand can be parsed out of a command line, and a short engine
+   * command can only be recognised by the invocation that was recorded for it.
+   */
+  private attributeSubmitted(operation: Operation, processes: ProcessInfo[], underShell: number | undefined): { process: ProcessInfo; where: string } | undefined {
     const target = this.targetOf(operation);
-    if (shellPid !== undefined && shellPid > 0 && target && targetIsAttributable(target)) {
-      const running = findSelfOrDescendant(processes, shellPid, (commandLine) => commandLineIsOperation(commandLine, target));
-      if (running && running.pid !== shellPid) {
-        operation.observation = "probed";
-        this.advanceToProbedRunning(operation, running);
-        return;
+    const invocation = operation.invocation;
+    const matchers: ((commandLine: string) => boolean)[] = [];
+    if (target && targetIsAttributable(target)) {
+      matchers.push((commandLine) => commandLineIsOperation(commandLine, target));
+    }
+    if (invocation) {
+      matchers.push((commandLine) => commandLineIsInvocation(commandLine, invocation));
+    }
+    if (matchers.length === 0) {
+      return undefined; // no question can be asked, so there is no answer
+    }
+    for (const matches of matchers) {
+      if (underShell !== undefined) {
+        const under = findSelfOrDescendant(processes, underShell, matches);
+        if (under && under.pid !== underShell) {
+          return { process: under, where: `under the shell ${underShell} that took it` };
+        }
+        continue;
+      }
+      const anywhere = processes.find((item) => matches(item.command));
+      if (anywhere) {
+        return { process: anywhere, where: `in the process table as pid ${anywhere.pid}, no longer under the shell that took it` };
       }
     }
-    if (shellPid !== undefined && shellPid > 0 && !processExists(processes, shellPid)) {
-      this.resolve(operation, "shell-process-gone", `the shell process ${shellPid} that took it no longer exists, so the line it was given can never be read`);
+    if (underShell !== undefined && matchers.some((matches) => processes.some((item) => item.pid !== underShell && matches(item.command)))) {
+      this.unresolvedProbe(
+        operation,
+        `a process matching that command is running, but not under the shell ${underShell} that was given this line — and that shell is still alive, so it may still read it. That is another invocation of the same operation, and it settles nothing about this one.`,
+      );
     }
+    return undefined;
   }
 
   /**
@@ -1439,8 +1579,8 @@ export class OperationRegistry implements vscode.Disposable {
     );
   }
 
-  /** A submitted command found running under its own shell: the same record, now running. */
-  private advanceToProbedRunning(operation: Operation, running: ProcessInfo): void {
+  /** A submitted command found running in the process table: the same record, now running. */
+  private advanceToProbedRunning(operation: Operation, running: ProcessInfo, where: string): void {
     operation.state = "running-shell";
     operation.observation = "probed";
     // The pid that *is* this operation, with its birth time. From here on the
@@ -1449,7 +1589,7 @@ export class OperationRegistry implements vscode.Disposable {
     operation.generation = running.started ?? operation.generation;
     clearInterval(operation.probeTimer);
     operation.probeTimer = undefined;
-    this.log(`${operation.label}: this exact command is running under the shell ${operation.terminalPid} that took it (pid ${running.pid}), so it started; the operation stays guarded until that process is gone`);
+    this.log(`${operation.label}: this exact command is running ${where}, so it started; the operation stays guarded until that process is gone`);
     this.persistQuietly();
     this.changeEmitter.fire();
     this.startProbing(operation);
@@ -1509,8 +1649,9 @@ export class OperationRegistry implements vscode.Disposable {
         terminalName: operation.terminalName,
         direct:
           operation.directPid !== undefined
-            ? { pid: operation.directPid, word: operation.directCommand?.word ?? "", args: operation.directCommand?.args ?? [], cwd: operation.directCommand?.cwd }
+            ? { pid: operation.directPid, word: operation.invocation?.word ?? "", args: operation.invocation?.args ?? [], cwd: operation.invocation?.cwd }
             : undefined,
+        invocation: operation.invocation ? { word: operation.invocation.word, args: operation.invocation.args, cwd: operation.invocation.cwd } : undefined,
         enginePid: operation.enginePid,
         generation: operation.generation,
         observationLost: operation.observationLost,
@@ -1524,11 +1665,12 @@ export class OperationRegistry implements vscode.Disposable {
    *
    * They keep blocking a duplicate. What a restored shell operation cannot do
    * is recognise its own execution: VS Code does not hand a
-   * `TerminalShellExecution` back, so this window has no identity for it. Its
-   * fate can still be established from its terminal closing or from the
-   * process table, and until one of those happens it stays guarded. A
-   * terminal that simply does not reconnect proves nothing and is not one of
-   * them.
+   * `TerminalShellExecution` back, so this window has no identity for it —
+   * which also means the absence of a start event says nothing at all, since
+   * nothing was listening. Its fate can be established by finding the command
+   * in the process table, or by a person. A terminal that does not reconnect,
+   * a terminal that closes and a shell that has since died are all silence,
+   * not answers, and none of them settles such a record.
    */
   restore(): OperationView[] {
     if (this.restored) {
@@ -1553,7 +1695,7 @@ export class OperationRegistry implements vscode.Disposable {
         waitExpired: item.waitExpired ?? true,
         observation: "reattached",
         directPid: item.direct?.pid,
-        directCommand: item.direct ? { word: item.direct.word, args: item.direct.args ?? [], cwd: item.direct.cwd } : undefined,
+        invocation: item.invocation ?? (item.direct ? { word: item.direct.word, args: item.direct.args ?? [], cwd: item.direct.cwd } : undefined),
         enginePid: item.enginePid ?? item.direct?.pid,
         generation: item.generation,
         observationLost: item.observationLost,
@@ -1718,7 +1860,7 @@ export class OperationRegistry implements vscode.Disposable {
         this.log(
           operation.state === "running-dedicated"
             ? `${operation.label}: the dedicated terminal whose process is running it is back after the reload. It remains a dedicated runner, and its guard remains.`
-            : `${operation.label}: the terminal "${terminal.name}" that took it is back after the reload. Its execution identity is not, so closing it — or its shell disappearing — is what will settle it.`,
+            : `${operation.label}: the terminal "${terminal.name}" that took it is back after the reload. Its execution identity is not, so neither closing it nor its shell disappearing can settle it: only finding that command in the process table, its own execution being reported, or your confirmation.`,
         );
         this.changeEmitter.fire();
       }
@@ -1788,6 +1930,16 @@ export function operationRefusal(operation: OperationView): string {
       `Agent Sparring started ${operation.label} ${seconds} s ago, before this window reloaded, and the process it started${operation.directPid !== undefined ? ` (pid ${operation.directPid})` : ""} is still running.`,
       "Running it again now would do the same engine operation twice.",
       "It will be released as soon as that process is gone. If you know it is already over, confirm it.",
+    ].join(" ");
+  }
+  if (operation.state === "submitted-shell" && operation.observationLost) {
+    // The command was written into a shell and this window can no longer
+    // watch that shell. It is not known to have run, and it is not known not
+    // to have run; saying either would be an invention.
+    return [
+      `Agent Sparring gave ${operation.label} to the terminal${operation.terminalName ? ` "${operation.terminalName}"` : ""} ${seconds} s ago, and that terminal has since closed or its shell has gone.`,
+      "That does not settle it: a shell can read a queued line and the engine it starts goes on running without either of them, so Agent Sparring cannot determine whether that command ran, or is running now.",
+      "Check it before allowing another attempt. If you have checked and it cannot run any more, confirm it.",
     ].join(" ");
   }
   if (operation.observationLost) {

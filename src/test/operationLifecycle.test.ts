@@ -638,17 +638,18 @@ describe("an override acts on the exact operation it was asked about", () => {
       // person would be shown a dialog about.
       const firstRun = runner.run({ ...options, name: "freeze-candidate (A)" });
       await waitingForIntegration();
-      terminals.acquired[0].integrate();
-      await until(() => terminals.acquired[0].executions[0], "A to be handed to the shell");
+      const firstIntegration = terminals.acquired[0].integrate();
+      const firstExecution = await until(() => terminals.acquired[0].executions[0], "A to be handed to the shell");
       const a = await firstRun;
       assert.equal(a.ok, false, "A was never reported as started");
       const dialogAbout = a.ok ? undefined : a.submission;
       assert.ok(dialogAbout, "and the person is offered the override for it");
 
-      // A is resolved by evidence while that dialog is open: its terminal
-      // closes, so its shell and the line it was given are gone.
-      terminals.acquired[0].dispose();
-      await until(() => (registry.inFlightFor(key) === undefined ? true : undefined), "A to be resolved by its terminal closing");
+      // A is resolved by evidence while that dialog is open: the shell
+      // reports that exact execution finishing, which is the one thing that
+      // settles a command a shell was given.
+      stub.window.endEmitter.fire({ terminal: terminals.acquired[0], shellIntegration: firstIntegration, execution: firstExecution, exitCode: 0 });
+      await until(() => (registry.inFlightFor(key) === undefined ? true : undefined), "A to be resolved by its own execution ending");
 
       // B: the same operation, deliberately run again. It takes the same key
       // and is a different record with a different id.

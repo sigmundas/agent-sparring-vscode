@@ -116,10 +116,30 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     // Submitted commands whose start has not been observed: never runners,
     // and the reason a second command for the same run is refused.
     vscode.commands.registerCommand("agentSparring._test.unresolvedSubmissions", () => controller.unresolvedSubmissions()),
+    // The one record holding a run's duplicate guard, in whatever state —
+    // including the states this window is itself watching, which `unresolved`
+    // deliberately leaves out because nobody can tell it anything about them.
+    vscode.commands.registerCommand("agentSparring._test.guardFor", (runId: string) => controller.guardFor(runId)),
     // Takes the immutable operation id, exactly as the dialog does: an
     // override never searches for another record with the same key.
     vscode.commands.registerCommand("agentSparring._test.overrideSubmission", (operationId: string, note: string) => controller.overrideSubmission(operationId, note ?? "confirmed by the person in a test").overridden),
     vscode.commands.registerCommand("agentSparring._test.probeSubmissions", () => controller.probeSubmissions()),
+    // The explicit human recovery from `unknown`, driven exactly as the
+    // Overview drives it: both ids come from the model that was built, never
+    // from a lookup made when the click arrives. With no ids given, the ones
+    // the panel would currently carry are used; passing a stale pair is how a
+    // test reproduces a panel left open while a newer run started.
+    vscode.commands.registerCommand("agentSparring._test.confirmRunnerInactive", async (executionId?: string, operationId?: string) => {
+      const run = controller.currentSelection.selected;
+      if (!run) {
+        return undefined;
+      }
+      const unknown = executionId === undefined ? ((await overview.buildModel()) as { unknownRunner?: { executionId: string; operationId?: string } }).unknownRunner : { executionId, operationId };
+      if (!unknown) {
+        return undefined;
+      }
+      return controller.confirmRunnerInactive(run.id, unknown.executionId, unknown.operationId);
+    }),
     vscode.commands.registerCommand("agentSparring._test.acceptStage", async () => {
       const run = controller.currentSelection.selected;
       return run?.kind === "stage" ? performAcceptStage(controller, run) : undefined;
@@ -770,9 +790,14 @@ async function confirmRunnerInactiveCommand(controller: SparringController, over
   if (confirmed !== "Yes — it is no longer active") {
     return;
   }
-  const result = await controller.confirmRunnerInactive(run.id, unknown.executionId);
+  // Both ids come from the model this dialog was built from, and neither is
+  // looked up again: the execution whose liveness is ended, and the exact
+  // operation whose guard the person is taking responsibility for. A newer run
+  // that started while this dialog was open holds the same runner key, and
+  // must be left exactly as it is.
+  const result = await controller.confirmRunnerInactive(run.id, unknown.executionId, unknown.operationId);
   await overview.update();
-  if (!result.confirmed && result.reason === "not-found") {
+  if (!result.confirmed) {
     void vscode.window.showInformationMessage("Agent Sparring: that runner is no longer the one this run is waiting on — the panel has been refreshed. Nothing was changed.");
     return;
   }

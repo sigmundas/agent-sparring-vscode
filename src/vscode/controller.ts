@@ -976,6 +976,15 @@ export class SparringController implements vscode.Disposable {
   }
 
   /**
+   * The operation holding this run's duplicate guard right now, in whatever
+   * state. Read once while a surface is built, so what that surface offers
+   * acts on the record it was built from rather than on a later lookup.
+   */
+  guardFor(runId: string): OperationView | undefined {
+    return this.submissions.inFlightFor(runnerKey(runId));
+  }
+
+  /**
    * A person's explicit override: they have checked that this exact operation
    * cannot still run, and accept the risk of a duplicate if they are wrong.
    * Recorded as an override, never as evidence that it never ran.
@@ -995,10 +1004,18 @@ export class SparringController implements vscode.Disposable {
    *
    * Everything it touches is named by an exact id, so a panel rendered before
    * a newer run started cannot affect that newer run: the execution id for
-   * liveness, and the immutable operation id for the guard. It does four
-   * things and deliberately not a fifth:
+   * liveness, and the immutable operation id the panel was rendered from for
+   * the guard. Both come from the caller; neither is looked up again here.
+   * Looking the guard up afresh by runner key was the defect: the panel's
+   * confirmation checked the exact execution id, and then overrode whichever
+   * operation happened to hold that run's key by the time the person clicked
+   * — so confirming a stale panel released a *newer* operation's guard.
    *
-   *  - ends that execution's liveness, recorded as the person's statement;
+   * It does four things and deliberately not a fifth:
+   *
+   *  - ends that execution's liveness, recorded as the person's statement.
+   *    If that execution is not the one this run is waiting on any more,
+   *    nothing at all happens and the caller is told so;
    *  - overrides the duplicate guard for that exact operation, if one is
    *    still outstanding, as an override and never as evidence;
    *  - marks a submission that was waiting on that execution as unresolved,
@@ -1006,13 +1023,24 @@ export class SparringController implements vscode.Disposable {
    *  - claims nothing about whether the engine recorded the evidence. It is
    *    neither marked delivered nor marked failed to make buttons work.
    */
-  async confirmRunnerInactive(runId: string, executionId: string): Promise<{ confirmed: boolean; reason?: "not-found" | "already-ended"; overrode: boolean; submission: boolean }> {
+  async confirmRunnerInactive(runId: string, executionId: string, operationId?: string): Promise<{ confirmed: boolean; reason?: "not-found" | "already-ended"; overrode: boolean; submission: boolean }> {
     const ended = this.tracker.confirmInactive(runId, executionId);
-    let overrode = false;
-    const held = this.submissions.inFlightFor(runnerKey(runId));
-    if (held) {
-      overrode = this.submissions.override(held.id, "the person confirmed, having checked, that this runner is no longer active; this is an override, not an observation").overridden;
+    const released = releaseGuardOnConfirmedInactive(ended, operationId, (id, note) => this.submissions.override(id, note));
+    if (released.untouched) {
+      this.log(`the duplicate guard was left alone: ${released.untouched}`);
     }
+    if (!ended.confirmed) {
+      // The execution the panel was rendered from is not the one this run is
+      // waiting on any more. Nothing here is about anything the person
+      // actually looked at, so nothing is touched — least of all a guard,
+      // which by then may belong to a newer operation entirely.
+      this.log(
+        `You confirmed that a runner of ${runId.split("|").pop() ?? runId} is no longer active, but that is no longer the execution this run is waiting on (${ended.reason ?? "no such execution"}). Nothing was changed.`,
+      );
+      this.render();
+      return { ...ended, overrode: false, submission: false };
+    }
+    const overrode = released.overrode;
     const record = this.submissionFor(runId);
     let submission = false;
     if (record && record.executionId === executionId && !record.failure && !record.unresolved) {
@@ -1026,9 +1054,9 @@ export class SparringController implements vscode.Disposable {
       submission = true;
     }
     this.log(
-      `You confirmed that the runner of ${runId.split("|").pop() ?? runId} is no longer active. That is your statement, not an observation: liveness is ${
-        ended.confirmed ? "recorded as ended" : `unchanged (${ended.reason ?? "no such execution"})`
-      }${overrode ? ", the duplicate guard for that exact operation is released as an override" : ""}${
+      `You confirmed that the runner of ${runId.split("|").pop() ?? runId} is no longer active. That is your statement, not an observation: liveness is recorded as ended${
+        overrode ? ", the duplicate guard for that exact operation is released as an override" : ""
+      }${
         submission ? ", and the evidence you submitted is retryable with its text intact — Agent Sparring does not claim the engine recorded it" : ""
       }.`,
     );
@@ -1278,4 +1306,52 @@ function now(): string {
   const date = new Date();
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+/** Why a confirmation did not release any guard. Each one is a truthful "nothing changed". */
+export type GuardUntouched =
+  | "the execution that confirmation was about is not the one this run is waiting on"
+  | "the panel named no operation, so there was nothing to take responsibility for"
+  | "that operation had already been resolved"
+  | "that operation has nothing outstanding for anyone to settle";
+
+/**
+ * Release the duplicate guard a person has taken responsibility for, and
+ * nothing else.
+ *
+ * Two identities have to line up, and both come from the surface the person
+ * was looking at:
+ *
+ *  - the confirmation must have succeeded for the exact execution that surface
+ *    named. A confirmation that found nothing to end is about a runner this
+ *    run is no longer waiting on, and may not release anything;
+ *  - the operation id is the one the surface was rendered from, and is the only
+ *    thing consulted. A record that has since been resolved is reported as such
+ *    rather than searched for again, so whatever holds that operation key *now*
+ *    — a newer run, started while the panel sat open — is untouched.
+ *
+ * Both were missing. The override ran whatever the confirmation answered, and
+ * it ran against a fresh `inFlightFor(runnerKey(runId))` lookup, so confirming
+ * a stale panel released a newer operation's guard.
+ *
+ * Kept as a function over `override` so this identity rule can be exercised
+ * against a real registry without building a controller
+ * (src/test/staleConfirmation.test.ts).
+ */
+export function releaseGuardOnConfirmedInactive(
+  ended: { confirmed: boolean },
+  operationId: string | undefined,
+  override: (operationId: string, note: string) => OverrideResult,
+): { overrode: boolean; untouched?: GuardUntouched } {
+  if (!ended.confirmed) {
+    return { overrode: false, untouched: "the execution that confirmation was about is not the one this run is waiting on" };
+  }
+  if (!operationId) {
+    return { overrode: false, untouched: "the panel named no operation, so there was nothing to take responsibility for" };
+  }
+  const result = override(operationId, "the person confirmed, having checked, that this runner is no longer active; this is an override, not an observation");
+  if (result.overridden) {
+    return { overrode: true };
+  }
+  return { overrode: false, untouched: result.reason === "already-resolved" ? "that operation had already been resolved" : "that operation has nothing outstanding for anyone to settle" };
 }

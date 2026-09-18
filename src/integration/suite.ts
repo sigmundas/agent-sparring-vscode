@@ -1124,8 +1124,10 @@ function memento(): vscode.Memento {
  *  A. a shell whose foreground belongs to an interactive process that eats the
  *     command line. Nothing may be recorded as running, nothing persisted, the
  *     terminal never written to again, the engine never run — and the
- *     submission stays unresolved until its terminal is closed, which is the
- *     one thing that proves the command can no longer run.
+ *     submission stays unresolved. Closing that terminal was once treated as
+ *     the one thing that proved the command could no longer run; it proves
+ *     nothing, because this window cannot know the shell did not read the line
+ *     first, so the guard remains and only the person settles it.
  *  B. a shell stopped with SIGSTOP, the reviewer's reproduction: the command is
  *     taken now and executed minutes later. Until then nothing is running and
  *     a second copy is refused; when the shell continues, that exact execution
@@ -1192,12 +1194,32 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
       assert.equal(second.ok ? undefined : second.problem, "unconfirmed");
       assert.equal(registry.unresolved().length, 1, "and nothing new was submitted");
 
-      // Closing that terminal is what settles it: the shell that took the
-      // command is gone, so the command can no longer run.
+      // Closing that terminal settles nothing. It used to resolve the
+      // submission as `cannot-execute`, on the argument that the shell holding
+      // the queued line had gone with the pty — but this window cannot know
+      // that the shell did not read the line first, and an engine it started
+      // would be reparented rather than killed. So the guard stays, the record
+      // says observation was lost, and only the person settles it.
       terminal.dispose();
-      await new Promise((resolve) => setTimeout(resolve, 1000));
-      assert.deepEqual(registry.unresolved(), [], "closing the terminal resolves the submission");
-      assert.equal(tracker.executionFor(runId), undefined, "and still records no execution: nothing ever ran");
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      const afterClose = registry.unresolved();
+      assert.equal(afterClose.length, 1, `closing the terminal leaves the submission exactly where it was, got ${JSON.stringify(afterClose)}`);
+      assert.equal(afterClose[0].state, "submitted-shell");
+      assert.equal(afterClose[0].observationLost, true, "with the record saying that what was lost is the observation");
+      assert.ok(
+        !logged.some((line) => /resolved as cannot-execute/.test(line)),
+        `and nothing was resolved as cannot-execute, got ${JSON.stringify(logged.filter((line) => /resolved as/.test(line)))}`,
+      );
+      assert.equal(tracker.executionFor(runId), undefined, "still no execution: nothing was ever observed running");
+      const thirdTime = await tracker.launch({ configured: executable, args: ["run-plan", "plans/never-executed.md", "--repo-root", reportedRepo], cwd: reportedRepo, name: "false-runner regression (after the close)", runId, kind: "run-plan", reveal: false });
+      assert.equal(thirdTime.ok, false, "so a duplicate is still refused");
+      assert.match(thirdTime.ok ? "" : thirdTime.error, /cannot determine whether that command ran/, "and the reason is the honest one");
+
+      // The explicit human override, on that exact operation id, is the way
+      // out — recorded as the person's statement, never as evidence.
+      assert.equal(registry.override(afterClose[0].id, "the person checked the terminal after closing it").overridden, true);
+      assert.deepEqual(registry.unresolved(), [], "after which the operation may be given again");
+      assert.ok(logged.some((line) => /resolved as human-override/.test(line)), "recorded as an override");
       const received = await fs.readFile(typed, "utf8").catch(() => "");
       console.log(`integration: the bypassed terminal's occupant received ${JSON.stringify(received.trim().slice(0, 60))}`);
     } finally {
@@ -1312,6 +1334,11 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
         runnerKind: "run-plan",
         planPath: "plans/never-executed.md",
         word: executable,
+        // The exact invocation, as the durable intent records it for every
+        // transport. A relative plan path cannot be compared against anything
+        // `ps` prints, so this argument array is the only thing that can
+        // recognise this command in a process table.
+        invocation: { word: executable, args: ["run-plan", "plans/never-executed.md"], cwd: reportedRepo },
         submittedAtMs: Date.now() - 4000,
         terminalPid: shellPid,
         terminalName: "Agent Sparring — sporely-py-reported-statistics",
@@ -1360,7 +1387,11 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
       }
     }
 
-    // C2: the process table can speak, and says that shell is gone.
+    // C2: the process table can speak, and says that shell is gone — which is
+    // not an answer. The shell may have read the line and died afterwards, and
+    // an engine it started is reparented rather than killed, so a missing
+    // shell plus an empty table is exactly "nobody knows". This used to
+    // resolve the operation as `cannot-execute` and admit a duplicate.
     {
       const stored = memento();
       await stored.update(OPERATIONS_KEY, persisted);
@@ -1369,9 +1400,51 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
       const tracker = trackerWith(registry, stored, logged);
       try {
         await tracker.reattach();
-        await waitUntil(() => (registry.unresolved().length === 0 ? true : undefined), 15_000, "the process table proves the shell that took it is gone");
-        assert.ok(logged.some((line) => /resolved as cannot-execute \(shell-process-gone\)/.test(line)), `settled by evidence, got ${JSON.stringify(logged)}`);
-        assert.equal(tracker.executionFor(runId), undefined, "and nothing is recorded as having run");
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        const held = registry.unresolved();
+        assert.equal(held.length, 1, `a shell that is gone does not settle a line it may already have read, got ${JSON.stringify(held)}`);
+        assert.equal(held[0].state, "submitted-shell");
+        assert.equal(held[0].observationLost, true, "the record says the observation is what was lost");
+        assert.ok(!logged.some((line) => /resolved as cannot-execute/.test(line)), `and nothing was resolved as cannot-execute, got ${JSON.stringify(logged)}`);
+        assert.equal(tracker.executionFor(runId), undefined, "nothing is recorded as having run either: that is equally unknown");
+        const refused = await tracker.launch({ configured: executable, args: ["run-plan", "plans/never-executed.md"], cwd: reportedRepo, name: "while it is unknown", runId, kind: "run-plan", reveal: false });
+        assert.equal(refused.ok, false, "so the duplicate stays refused");
+        assert.equal(registry.override(held[0].id, "the person checked").overridden, true, "and only the person settles it");
+      } finally {
+        tracker.dispose();
+        registry.dispose();
+      }
+    }
+
+    // C2b: the shell is gone and the engine it started is in the table,
+    // reparented to pid 1. The descendant-only search could never find it
+    // there; the whole table can, and the guard follows that pid.
+    {
+      const stored = memento();
+      await stored.update(OPERATIONS_KEY, persisted);
+      const logged: string[] = [];
+      const engine = `${executable} run-plan plans/never-executed.md`;
+      let table = [
+        { pid: 1, ppid: 0, command: "/sbin/launchd" },
+        { pid: 2147480500, ppid: 1, command: engine },
+      ];
+      const registry = new OperationRegistry({ workspaceState: stored } as unknown as vscode.ExtensionContext, (message: string) => logged.push(message), () => true, async () => table);
+      const tracker = trackerWith(registry, stored, logged);
+      try {
+        await tracker.reattach();
+        const running = await waitUntil(() => {
+          const [held] = registry.unresolved();
+          return held?.state === "running-shell" ? held : undefined;
+        }, 15_000, "the reparented engine to be found anywhere in the table and the guard to follow it");
+        assert.equal(running.enginePid, 2147480500, "anchored to the pid it was actually found as");
+        assert.ok(!logged.some((line) => /resolved as cannot-execute/.test(line)), "and nothing was resolved on the way there");
+        const refused = await tracker.launch({ configured: executable, args: ["run-plan", "plans/never-executed.md"], cwd: reportedRepo, name: "over a live reparented engine", runId, kind: "run-plan", reveal: false });
+        assert.equal(refused.ok, false, "a duplicate over a live engine is refused");
+
+        // That pid going is the evidence, and the only evidence.
+        table = [{ pid: 1, ppid: 0, command: "/sbin/launchd" }];
+        await waitUntil(() => (registry.unresolved().length === 0 ? true : undefined), 15_000, "the guard to be released once that process is gone");
+        assert.ok(logged.some((line) => /resolved as completed \(engine-process-gone\)/.test(line)), `settled by a fact about that process, got ${JSON.stringify(logged.filter((line) => /resolved as/.test(line)))}`);
       } finally {
         tracker.dispose();
         registry.dispose();
@@ -1496,7 +1569,9 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
     }
   }
 
-  console.log("integration: an unconfirmed submission keeps its identity, refuses a second copy, is settled by its terminal closing — and a stopped shell that runs it later is promoted to a real, persisted, normally-ended runner; a reload keeps it until evidence settles it, and an unrelated runner never does");
+  console.log(
+    "integration: an unconfirmed submission keeps its identity and refuses a second copy; its terminal closing and its shell disappearing both leave it guarded, a reparented engine anywhere in the table is found and followed, an unrelated runner never answers for it, and a stopped shell that runs it later is promoted to a real, persisted, normally-ended runner",
+  );
 }
 
 // ---------------------------------------------------------------- what a direct execution's lifetime is actually tied to
@@ -1892,6 +1967,11 @@ async function pendingSubmissions(): Promise<{ id: string; runId?: string; key: 
   return (await vscode.commands.executeCommand("agentSparring._test.unresolvedSubmissions")) as { id: string; runId?: string; key: string; state: string; waitExpired: boolean; subcommand: string }[];
 }
 
+/** The one record holding a run's duplicate guard, whatever state it is in. */
+async function guardFor(runId: string): Promise<{ id: string; state: string; observationLost?: boolean } | undefined> {
+  return (await vscode.commands.executeCommand("agentSparring._test.guardFor", runId)) as { id: string; state: string; observationLost?: boolean } | undefined;
+}
+
 async function runningLaunches(runId: string): Promise<{ runId: string; state: string }[]> {
   const launches = (await vscode.commands.executeCommand("agentSparring._test.persistedLaunches")) as { runId: string; state: string }[];
   return launches.filter((launch) => launch.runId === runId && launch.state === "running");
@@ -1916,12 +1996,23 @@ async function waitUntil<T>(read: () => T | undefined | Promise<T | undefined>, 
  * What the user actually did: closed `Agent Sparring — <project>` while the
  * runner inside it was working, and later reloaded the window.
  *
- * Closing the terminal kills the shell and with it the runner, so the
- * extension must treat that as the end of the execution there and then —
- * and the record of that end must survive a reload, because a reload does
- * not un-observe a death. Without both halves the run came back after the
- * reload with nothing but an unmatched `turn.started`, and the Overview sat
- * at "Run status unknown" with every action withheld.
+ * This section used to assert that closing the terminal killed the shell and
+ * with it the runner, so the extension could record the execution as ended
+ * there and then. Real testing in VS Code disproved the premise: a HUP- and
+ * TERM-resistant engine process survives `terminal.dispose()` and goes on
+ * working. Closing a terminal is therefore the end of what this window can
+ * *watch*, and nothing more.
+ *
+ * So the contract asserted here is the conservative one:
+ *
+ *  - liveness becomes `unknown`, with the sentence that says why, and never
+ *    `stopped` — which would be a claim nothing here can make, and would
+ *    invite a second runner over a live one;
+ *  - that unknown state is persisted, so a reload finds it rather than an
+ *    unmatched `turn.started` and a silent dead end;
+ *  - the duplicate guard for that run is untouched by any of it;
+ *  - and the way out is the person's explicit statement, acting on the exact
+ *    execution and the exact operation the panel was built from.
  */
 async function closedTerminalAssertions(report: DiscoveryDiagnostic, reportedRepo: string): Promise<void> {
   if (!(await shellIntegrationAvailable(reportedRepo))) {
@@ -1953,25 +2044,54 @@ async function closedTerminalAssertions(report: DiscoveryDiagnostic, reportedRep
 
   const [terminal] = ownTerminals();
   assert.ok(terminal, "the extension's terminal is open");
+  const guardedBefore = await guardFor(runId);
+  assert.equal(guardedBefore?.state, "running-shell", "while it runs, the duplicate guard is on the execution the shell reported");
   terminal.dispose();
 
-  const stopped = await waitFor(runId, (liveness) => liveness.state === "stopped", 15_000, "closing the terminal ends the execution immediately");
-  assert.equal(stopped.execution?.state, "ended");
-  assert.equal(stopped.turnActive, false, "nothing is presented as still working");
+  const lost = await waitFor(runId, (liveness) => liveness.state === "unknown", 15_000, "closing the terminal makes liveness unknown rather than stopped");
+  assert.equal(lost.execution?.state, "unknown", "the execution is not claimed to have ended: nothing observed that");
+  assert.match(lost.detail, /cannot determine whether the previous runner is still active/, "and the reason is said in the words a person can act on");
+  assert.notEqual(lost.state, "stopped", "a closed terminal is not a dead process");
+  // `interrupted` is a claim about a turn that ended; nothing ended here, so
+  // an open turn stays open and is simply no longer being watched.
   if (turnWasOpen) {
-    assert.equal(stopped.interrupted, true, "the open turn is presented as interrupted, never as still working");
+    assert.equal(lost.interrupted, false, "an open turn is not presented as interrupted by a terminal going away");
   }
 
   const after = (await vscode.commands.executeCommand("agentSparring._test.persistedLaunches")) as { runId: string; state: string }[];
   assert.ok(
-    after.some((launch) => launch.runId === runId && launch.state === "ended"),
-    `a reload must still find that this runner died, got ${JSON.stringify(after)}`,
+    after.some((launch) => launch.runId === runId && launch.state === "unknown"),
+    `a reload must find this runner recorded as unknown, got ${JSON.stringify(after)}`,
   );
   assert.ok(
-    !after.some((launch) => launch.runId === runId && launch.state === "running"),
-    "and must not find it recorded as running",
+    !after.some((launch) => launch.runId === runId && launch.state === "ended"),
+    "and must not find it recorded as ended, which nothing established",
   );
-  console.log("integration: closing the extension's terminal ends the execution at once, and the reload record says so");
+  const guardedAfter = await guardFor(runId);
+  assert.equal(guardedAfter?.id, guardedBefore?.id, "the duplicate guard is the same record it was before the terminal closed");
+  assert.equal(guardedAfter?.state, "running-shell", "in the same state: nothing about that process was established");
+  assert.equal(guardedAfter?.observationLost, true, "with the record saying that what was lost is the observation");
+
+  // The way out is the person's, and it acts on the ids the panel carries.
+  const model = (await vscode.commands.executeCommand("agentSparring._test.overviewModel")) as { unknownRunner?: { executionId: string; operationId?: string } };
+  assert.ok(model.unknownRunner, "the Overview offers the explicit recovery where the person is");
+  assert.equal(model.unknownRunner.executionId, lost.execution?.id, "naming the exact execution it was built from");
+
+  // A stale pair — an execution id this run is not waiting on — must do
+  // nothing at all, however tempting the run id is.
+  const stale = (await vscode.commands.executeCommand("agentSparring._test.confirmRunnerInactive", "an-execution-that-is-not-this-one", model.unknownRunner.operationId)) as { confirmed: boolean; overrode: boolean };
+  assert.equal(stale.confirmed, false, "a confirmation for another execution confirms nothing");
+  assert.equal(stale.overrode, false, "and releases no guard");
+  assert.equal((await guardFor(runId))?.id, guardedBefore?.id, "the guard is still the same untouched record");
+
+  const confirmed = (await vscode.commands.executeCommand("agentSparring._test.confirmRunnerInactive")) as { confirmed: boolean; overrode: boolean };
+  assert.equal(confirmed.confirmed, true, "the person's own statement settles that execution");
+  assert.equal(confirmed.overrode, true, "and releases the guard on that exact operation, as an override");
+  assert.equal(await guardFor(runId), undefined, "after which another run may be started");
+  const settled = await livenessOf(runId);
+  assert.equal(settled.execution?.state, "ended", "recorded as ended, as their statement and not as an observation");
+  assert.match(settled.execution?.detail ?? "", /You confirmed/, "and the record says whose statement it is");
+  console.log("integration: closing the extension's terminal leaves liveness unknown and the guard intact, and the person's confirmation is the way out");
 }
 
 // ---------------------------------------------------------------- Submit result and continue: resume-plan --evidence reaches the engine

@@ -505,7 +505,7 @@ export class ExecutionTracker implements vscode.Disposable {
       // rather than nothing at all; a failed write means nothing is handed
       // over, because a started operation with no record is the one outcome
       // that cannot be recovered from.
-      const armed = await this.operations.arm(claim, "shell", { word, plan: configured.plan });
+      const armed = await this.operations.arm(claim, "shell", { word, plan: configured.plan, args: options.args });
       if (!armed.ok) {
         lease.release();
         this.operations.release(claim, "the durable record of the intent could not be written, so the command was never handed to the shell");
@@ -569,7 +569,7 @@ export class ExecutionTracker implements vscode.Disposable {
     const path = executableWord(direct.plan);
     // Same ordering for the transport that spawns a process of its own: the
     // intent is durable before `createTerminal`, which is irreversible.
-    const armed = await this.operations.arm(claim, "dedicated-terminal", { word: path, plan: direct.plan });
+    const armed = await this.operations.arm(claim, "dedicated-terminal", { word: path, plan: direct.plan, args: options.args });
     if (!armed.ok) {
       this.operations.release(claim, "the durable record of the intent could not be written, so no dedicated terminal was created");
       return { ok: false, error: armed.error, problem: "unconfirmed" };

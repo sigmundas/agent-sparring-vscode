@@ -231,6 +231,7 @@ export class OverviewPanelManager implements vscode.Disposable {
         manifestStages: await this.manifestStages(run),
         managedPlanRun: await this.managedPlanRun(run),
         existingStageIds: this.existingStageIds(run),
+        guardedOperationId: this.controller.guardFor(run.id)?.id,
       };
     }
     const model = buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.executionFor(selection.selected?.id));

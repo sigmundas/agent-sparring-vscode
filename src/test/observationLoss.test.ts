@@ -214,14 +214,33 @@ after(async () => {
 // ---------------------------------------------------------------------------
 
 describe("the resolution table distinguishes lost observation from a finished process", () => {
-  it("a closed terminal settles only a command that was never observed started", () => {
-    const closures = OPERATION_RESOLUTIONS.filter((transition) => transition.evidence === "terminal-closed");
+  it("nothing is settled by a terminal closing or a shell disappearing", () => {
+    // Both of these used to end a `submitted-shell` guard, on the argument
+    // that the shell holding the queued line was gone. It does not follow: the
+    // shell may have read the line first, and the engine it started is
+    // reparented rather than killed.
     assert.deepEqual(
-      closures.map((transition) => transition.from),
-      ["submitted-shell"],
-      "the shell that held a queued line being gone is evidence about that line; a closed terminal under a running process is not",
+      OPERATION_RESOLUTIONS.filter((transition) => /terminal-closed|shell-process-gone/.test(transition.evidence)),
+      [],
+      "losing the pty, or the shell, is losing the observation",
     );
-    assert.equal(closures[0].outcome, "cannot-execute");
+    assert.deepEqual(
+      OPERATION_RESOLUTIONS.filter((transition) => transition.from === "submitted-shell" && transition.evidence !== "human-override"),
+      [],
+      "a handed-over command is released only by its own execution (through running-shell) or by a person",
+    );
+  });
+
+  it("the only resolutions that rest on this window's own knowledge are strictly before the hand-over", () => {
+    const fromKnowledge = OPERATION_RESOLUTIONS.filter((transition) => /never-executed|never-handed-over|handover-threw/.test(transition.evidence));
+    assert.deepEqual(
+      fromKnowledge.map((transition) => transition.from).sort(),
+      ["armed", "armed", "reserved"],
+      "only a reservation and an armed record can be settled without a fact about a process",
+    );
+    for (const transition of fromKnowledge) {
+      assert.match(transition.proves, /never called|was never invoked|threw|no transport was invoked/, `${transition.evidence} rests on executeCommand not having run`);
+    }
   });
 
   it("no resolution rests on another command starting in the same terminal", () => {

@@ -44,6 +44,15 @@ export type HandoverOutcome =
   /** `executeCommand` itself threw, so the shell was given nothing. */
   | { ok: false; reason: "threw"; error: Error };
 
+/**
+ * Both `ok: false` answers mean the same thing, and it is the only thing a
+ * caller may resolve an operation on: `executeCommand` was never reached, or
+ * it threw, so this window knows from its own instruction stream that no shell
+ * was given anything. Anything that goes wrong *after* it returns comes back
+ * as `ok: true` with `request.metadataError` set, because by then the shell has
+ * the command line (shellIntegration.ts, `performShellHandover`).
+ */
+
 export interface HandoverRequest {
   pool: Pick<TerminalPool, "acquire">;
   cwd: string;
@@ -73,11 +82,21 @@ export async function handOverToIdleShell(request: HandoverRequest): Promise<Han
       // The critical step: the check and the hand-over, with nothing awaited
       // in between, so no user activity can come between them.
       if (handover.via !== "no-shell" && lease.idle()) {
-        try {
-          return { ok: true, lease, request: performShellHandover(integration, request.word, request.args, handover) };
-        } catch (error) {
-          return { ok: false, reason: "threw", error: error as Error };
+        // Deliberately no `try` around this: `performShellHandover` keeps
+        // `executeCommand` alone inside its own, and reports anything that
+        // goes wrong afterwards as a hand-over that happened. A `catch` here
+        // would put the irreversible call and the observation of its result
+        // back inside one block, which is the defect being removed.
+        const attempt = performShellHandover(integration, request.word, request.args, handover);
+        if (attempt.handedOver) {
+          if (attempt.request.metadataError) {
+            request.log(
+              `"${lease.terminal.name}" was given the command, but reading back what the host said it handed over failed (${attempt.request.metadataError.message}). The shell has the command line; only how it can be described here is affected.`,
+            );
+          }
+          return { ok: true, lease, request: attempt.request };
         }
+        return { ok: false, reason: "threw", error: attempt.error };
       }
       if (handover.via === "no-shell") {
         // This shell's quoting cannot be written here. That is a fact about

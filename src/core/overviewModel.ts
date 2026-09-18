@@ -246,6 +246,14 @@ export interface OverviewArtifacts {
    * existing stage, and a managed run creates the next stage itself.
    */
   existingStageIds?: readonly string[];
+  /**
+   * The immutable id of the operation holding this run's duplicate guard at
+   * the moment the panel was built, when there is one. It is carried into the
+   * rendered recovery control so a confirmation acts on the record the person
+   * was actually shown, instead of whichever operation holds that run's key
+   * when the click arrives.
+   */
+  guardedOperationId?: string;
 }
 
 /** The managed plan run the standalone stage on screen is a stage of. */
@@ -538,7 +546,15 @@ export interface OverviewModel {
    * could settle it. This is the explicit human statement, and it names one
    * exact execution so a stale panel cannot settle a newer run's runner.
    */
-  unknownRunner?: { label: string; detail: string; executionId: string };
+  /**
+   * The explicit way out of `unknown`, with both ids the confirmation acts on
+   * baked into what was rendered: the execution whose liveness it ends, and
+   * the duplicate guard whose release the person is taking responsibility for.
+   * The operation id is carried rather than looked up when the click arrives,
+   * so a panel left open while a newer run starts can only ever settle what it
+   * was showing (`operationId` absent: there was no guard to release).
+   */
+  unknownRunner?: { label: string; detail: string; executionId: string; operationId?: string };
   /**
    * Non-action state shown instead of Run/Resume: `Running` only when a
    * process observation backs it; `Run status unknown` when telemetry alone
@@ -680,6 +696,7 @@ export function buildOverviewModel(
       label: "I checked — runner is no longer active",
       detail: `${UNKNOWN_RUNNER_EXPLANATION} Confirming records your statement: it releases this run's actions and lets you send your evidence again. It does not claim the engine did, or did not, do anything.`,
       executionId: liveness.execution.id,
+      operationId: artifacts.guardedOperationId,
     };
   }
   const loopEligible = run.kind === "plan" || (stage.state?.status !== "accepted" && stage.state?.status !== "frozen");
