@@ -6,7 +6,9 @@
  */
 
 import * as vscode from "vscode";
-import { planShellHandover, shellFamily } from "../core/cli";
+import { planShellHandover, shellFamily, type ShellHandover } from "../core/cli";
+
+export type { ShellHandover };
 
 /** How long a fresh terminal gets to report shell integration before a fallback is used. */
 export const SHELL_INTEGRATION_TIMEOUT_MS = 5000;
@@ -39,7 +41,7 @@ export function awaitShellIntegration(terminal: vscode.Terminal, timeoutMs = SHE
 /**
  * How long the shell gets to report a handed-over command as started before
  * the caller stops waiting. It is a user-interface deadline and nothing more:
- * the submission itself outlives it (submissionRegistry.ts).
+ * the operation itself outlives it (operationRegistry.ts).
  */
 export const EXECUTION_START_TIMEOUT_MS = 5000;
 
@@ -74,23 +76,36 @@ export interface ShellRequest {
 }
 
 /**
- * Run `word` with `args` in `integration`'s shell.
+ * Whether, and how, this shell can be given `word` with `args` — decided
+ * *before* anything irreversible happens.
  *
  * VS Code's `executeCommand(executable, args)` escaping is exact for flags
  * and paths but mangles anything a person wrote (see
  * `vscodeQuotingIsFaithful`), so when an argument would not survive it, the
  * command line is built here instead and passed as one already-quoted
- * string. Returns undefined when this shell's quoting is not reproduced in
+ * string. `no-shell` means this shell's quoting is not reproduced in
  * `shellCommandLine` — the caller must then reach the process without a
  * shell rather than send it something it cannot express.
+ *
+ * Deciding this first is what lets a caller record its durable intent to run
+ * the operation only when it really is about to: an operation that can never
+ * be handed to this shell must not be armed for one.
  */
-export function executeThroughShell(integration: vscode.TerminalShellIntegration, word: string, args: string[], shell = vscode.env.shell, platform: NodeJS.Platform = process.platform): ShellRequest | undefined {
-  const handover = planShellHandover(word, args, shellFamily(shell, platform));
-  if (handover.via === "no-shell") {
-    return undefined;
-  }
+export function shellHandoverFor(word: string, args: string[], shell = vscode.env.shell, platform: NodeJS.Platform = process.platform): ShellHandover {
+  return planShellHandover(word, args, shellFamily(shell, platform));
+}
+
+/**
+ * Hand a planned command over. The first irreversible step of a shell launch,
+ * and the only one: everything the caller must record durably has to be on
+ * disk before this is called.
+ */
+export function performShellHandover(integration: vscode.TerminalShellIntegration, word: string, args: string[], handover: ShellHandover): ShellRequest {
   if (handover.via === "command-line") {
     return { execution: integration.executeCommand(handover.commandLine), commandLine: handover.commandLine, quotedHere: true };
+  }
+  if (handover.via === "no-shell") {
+    throw new Error("performShellHandover was called for a command this shell cannot be given");
   }
   const execution = integration.executeCommand(word, args);
   return { execution, commandLine: execution.commandLine.value, quotedHere: false };

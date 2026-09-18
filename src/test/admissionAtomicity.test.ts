@@ -12,7 +12,7 @@
  * already unavoidable.
  *
  * The fix is a synchronous claim on the operation key, taken as the first
- * thing a launch does (submissionRegistry.ts). These tests hold the first
+ * thing a launch does (operationRegistry.ts). These tests hold the first
  * invocation at exactly the point where the second used to get in — the
  * await on shell integration, after the claim and before anything is handed
  * to a shell — let the second one enter, and assert that it obtains nothing:
@@ -37,22 +37,22 @@ const stub = install();
 
 type Tracker = import("../vscode/executionTracker").ExecutionTracker;
 type Runner = import("../vscode/commandRunner").SparringCommandRunner;
-type Registry = import("../vscode/submissionRegistry").SubmissionRegistry;
+type Registry = import("../vscode/operationRegistry").OperationRegistry;
 
 let ExecutionTracker: typeof import("../vscode/executionTracker").ExecutionTracker;
 let SparringCommandRunner: typeof import("../vscode/commandRunner").SparringCommandRunner;
-let SubmissionRegistry: typeof import("../vscode/submissionRegistry").SubmissionRegistry;
-let commandKey: typeof import("../vscode/submissionRegistry").commandKey;
-let runnerKey: typeof import("../vscode/submissionRegistry").runnerKey;
-let SUBMISSIONS_KEY: string;
+let OperationRegistry: typeof import("../vscode/operationRegistry").OperationRegistry;
+let commandKey: typeof import("../vscode/operationRegistry").commandKey;
+let runnerKey: typeof import("../vscode/operationRegistry").runnerKey;
+let OPERATIONS_KEY: string;
 
 before(async () => {
   // After install(), so `require("vscode")` inside them resolves to the stub.
-  const registry = await import("../vscode/submissionRegistry");
-  SubmissionRegistry = registry.SubmissionRegistry;
+  const registry = await import("../vscode/operationRegistry");
+  OperationRegistry = registry.OperationRegistry;
   commandKey = registry.commandKey;
   runnerKey = registry.runnerKey;
-  SUBMISSIONS_KEY = registry.SUBMISSIONS_KEY;
+  OPERATIONS_KEY = registry.OPERATIONS_KEY;
   ExecutionTracker = (await import("../vscode/executionTracker")).ExecutionTracker;
   SparringCommandRunner = (await import("../vscode/commandRunner")).SparringCommandRunner;
 });
@@ -115,7 +115,7 @@ describe("admission for one operation key is atomic", () => {
   it("refuses a second runner launch that arrives while the first is being prepared", async () => {
     const logged: string[] = [];
     const ctx = context();
-    const registry: Registry = new SubmissionRegistry(ctx as never, (message) => logged.push(message), () => false, async () => []);
+    const registry: Registry = new OperationRegistry(ctx as never, (message: string) => logged.push(message), () => false, async () => []);
     const terminals = pool();
     const tracker: Tracker = new ExecutionTracker(ctx as never, (message) => logged.push(message), () => [], terminals as never, registry);
     const runId = "plan-run-1";
@@ -135,10 +135,10 @@ describe("admission for one operation key is atomic", () => {
       const first = tracker.launch(options);
       await waitingForIntegration();
       assert.equal(terminals.acquired.length, 1, "one terminal was acquired");
-      assert.equal(registry.unresolvedFor(runnerKey(runId)), undefined, "nothing has been submitted to a shell yet");
+      assert.equal(registry.pendingShellFor(runnerKey(runId)), undefined, "nothing has been submitted to a shell yet");
       assert.equal(registry.inFlightFor(runnerKey(runId))?.state, "reserved", "but the operation is claimed");
       assert.deepEqual(registry.unresolved(), [], "and a reservation is not an unresolved submission");
-      assert.equal(ctx.workspaceState.get(SUBMISSIONS_KEY, undefined), undefined, "nor is it persisted: nothing could execute after a reload");
+      assert.equal(ctx.workspaceState.get(OPERATIONS_KEY, undefined), undefined, "nor is it persisted: nothing could execute after a reload");
 
       // The second invocation enters now.
       const second = await tracker.launch({ ...options, name: "run-plan (second)" });
@@ -159,7 +159,10 @@ describe("admission for one operation key is atomic", () => {
       assert.equal(result.ok, true, "and it is a launch");
       assert.equal(result.ok ? result.via : undefined, "shell");
       assert.equal(tracker.executionFor(runId)?.state, "running");
-      assert.deepEqual(registry.unresolved(), [], "the submission was resolved by its own start");
+      // Started is not "safe to run another": the same record advances to
+      // running and keeps refusing a duplicate until this execution ends.
+      assert.equal(registry.inFlightFor(runnerKey(runId))?.state, "running-shell", "the same record now guards it as running");
+      assert.deepEqual(registry.unresolved(), [], "and this window is watching it, so there is nothing to ask a person about");
       assert.equal(integration.executed.length, 1, "still exactly one engine invocation");
     } finally {
       tracker.dispose();
@@ -170,7 +173,7 @@ describe("admission for one operation key is atomic", () => {
   it("refuses a second freeze-candidate that arrives while the first is being prepared", async () => {
     const logged: string[] = [];
     const ctx = context();
-    const registry: Registry = new SubmissionRegistry(ctx as never, (message) => logged.push(message), () => false, async () => []);
+    const registry: Registry = new OperationRegistry(ctx as never, (message: string) => logged.push(message), () => false, async () => []);
     const terminals = pool();
     const runner: Runner = new SparringCommandRunner((message) => logged.push(message), terminals as never, registry);
     const stage = "stage-4-editor-and-ui-inspection";
@@ -187,7 +190,7 @@ describe("admission for one operation key is atomic", () => {
       await waitingForIntegration();
       const key = commandKey(cwd, "freeze-candidate", stage);
       assert.equal(registry.inFlightFor(key)?.state, "reserved", "the operation is claimed before anything else happens");
-      assert.equal(registry.unresolvedFor(key), undefined, "and no shell has been given anything");
+      assert.equal(registry.pendingShellFor(key), undefined, "and no shell has been given anything");
 
       const second = await runner.run({ ...options, name: "freeze-candidate (second)" });
       assert.equal(second.ok, false, "the second freeze-candidate is refused");
@@ -230,7 +233,7 @@ describe("admission for one operation key is atomic", () => {
 
     const logged: string[] = [];
     const ctx = context();
-    const registry: Registry = new SubmissionRegistry(ctx as never, (message) => logged.push(message), () => false, async () => []);
+    const registry: Registry = new OperationRegistry(ctx as never, (message: string) => logged.push(message), () => false, async () => []);
     const terminals = pool();
     const runner: Runner = new SparringCommandRunner((message) => logged.push(message), terminals as never, registry);
     const stage = "stage-4-editor-and-ui-inspection";
@@ -248,7 +251,7 @@ describe("admission for one operation key is atomic", () => {
       // This shell will never report integration: its terminal is gone. The
       // command runner therefore falls back to a direct child process.
       terminals.acquired[0].dispose();
-      await until(() => (registry.inFlightFor(key)?.state === "direct" ? true : undefined), "the command to fall back to a direct process");
+      await until(() => (registry.inFlightFor(key)?.state === "running-direct" ? true : undefined), "the command to fall back to a direct process");
       const firstCall = await until(async () => (await fs.readFile(calls, "utf8").catch(() => "")).trim() || undefined, "the direct process to record its call");
       assert.equal(firstCall, `freeze-candidate ${stage}`);
       assert.deepEqual(registry.unresolved(), [], "a direct process this window is waiting on is not something it cannot account for");
@@ -256,7 +259,7 @@ describe("admission for one operation key is atomic", () => {
       // window reload (directExecutionSurvival.test.ts), and the window that
       // comes back must refuse the duplicate (directExecutionReload.test.ts).
       assert.deepEqual(
-        (ctx.workspaceState.get(SUBMISSIONS_KEY, []) as { key: string; direct?: { pid: number } }[]).map((item) => [item.key, typeof item.direct?.pid]),
+        (ctx.workspaceState.get(OPERATIONS_KEY, []) as { key: string; direct?: { pid: number } }[]).map((item) => [item.key, typeof item.direct?.pid]),
         [[key, "number"]],
         "and is persisted with its pid",
       );
@@ -296,7 +299,7 @@ describe("admission for one operation key is atomic", () => {
   it("keeps the durable record when a shell has been given the command, and only then", async () => {
     const logged: string[] = [];
     const ctx = context();
-    const registry: Registry = new SubmissionRegistry(ctx as never, (message) => logged.push(message), () => false, async () => []);
+    const registry: Registry = new OperationRegistry(ctx as never, (message: string) => logged.push(message), () => false, async () => []);
     const terminals = pool();
     const tracker: Tracker = new ExecutionTracker(ctx as never, (message) => logged.push(message), () => [], terminals as never, registry);
     const runId = "plan-run-2";
@@ -316,11 +319,11 @@ describe("admission for one operation key is atomic", () => {
       terminals.acquired[0].integrate();
       await until(() => terminals.acquired[0].executions[0], "the command to be handed to the shell");
       // Handed over and not reported: this is the durable state, unchanged.
-      const submitted = await until(() => registry.unresolvedFor(key), "the submission to be on the durable record");
-      assert.equal(submitted.state, "waiting");
-      assert.deepEqual((ctx.workspaceState.get(SUBMISSIONS_KEY, []) as { key: string }[]).map((item) => item.key), [key], "and persisted, so a reload still refuses a duplicate");
+      const submitted = await until(() => registry.pendingShellFor(key), "the submission to be on the durable record");
+      assert.equal(submitted.state, "submitted-shell");
+      assert.deepEqual((ctx.workspaceState.get(OPERATIONS_KEY, []) as { key: string }[]).map((item) => item.key), [key], "and persisted, so a reload still refuses a duplicate");
       // A person cannot be asked about a reservation, but can about this.
-      assert.equal(registry.override(key, "the person checked the terminal"), true);
+      assert.equal(registry.override(submitted.id, "the person checked the terminal").overridden, true, "and it is overridden by its exact operation id");
       const settled = await launching;
       assert.equal(settled.ok, false, "and the caller that was waiting for the shell is told, not left hanging");
     } finally {

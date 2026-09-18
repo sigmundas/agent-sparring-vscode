@@ -86,7 +86,7 @@ import { deriveStatus } from "../core/status";
 import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
 import { TerminalPool } from "./terminalPool";
 import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult } from "./executionTracker";
-import { SubmissionRegistry, runnerKey, type SubmissionView } from "./submissionRegistry";
+import { OperationRegistry, runnerKey, type OperationView, type OverrideResult } from "./operationRegistry";
 import { ManifestReader, type BoundManifest } from "./manifestReader";
 import { ActiveRepositoryTracker, RealPaths } from "./activeRepository";
 import { describeReadiness } from "../core/gitReadiness";
@@ -142,7 +142,7 @@ export class SparringController implements vscode.Disposable {
   /** The integrated terminals this extension owns: one per project, reused. */
   private readonly terminals: TerminalPool;
   /** Commands handed to a shell that may still execute; the duplicate-prevention authority. */
-  private readonly submissions: SubmissionRegistry;
+  private readonly submissions: OperationRegistry;
   /** Which repository this window is in; automatic selection is confined to it. */
   private readonly activeRepository: ActiveRepositoryTracker;
   /** Symlink resolution for repository roots, so two spellings of one directory are one repository. */
@@ -182,7 +182,7 @@ export class SparringController implements vscode.Disposable {
     this.terminals = new TerminalPool((message) => this.log(message));
     // The one authority on commands handed to a shell, shared by both
     // transports so neither can be made safe and the other left behind.
-    this.submissions = new SubmissionRegistry(context, (message) => this.log(message));
+    this.submissions = new OperationRegistry(context, (message: string) => this.log(message));
     this.tracker = new ExecutionTracker(
       context,
       (message) => this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} ${message}`),
@@ -959,22 +959,26 @@ export class SparringController implements vscode.Disposable {
    * "would running it again risk doing it twice", and it is what every engine
    * action consults before submitting anything.
    */
-  unresolvedSubmissionFor(runId: string | undefined): SubmissionView | undefined {
-    return this.submissions.unresolvedForRun(runId);
+  unresolvedSubmissionFor(runId: string | undefined): OperationView | undefined {
+    return this.submissions.pendingShellForRun(runId);
   }
 
   /** Every unresolved submission in this window, runner and short command alike. */
-  unresolvedSubmissions(): SubmissionView[] {
+  unresolvedSubmissions(): OperationView[] {
     return this.submissions.unresolved();
   }
 
   /**
-   * A person's explicit override: they have checked that the submitted
-   * command cannot still run, and accept the risk of a duplicate if they are
-   * wrong. Recorded as an override, never as evidence that it never ran.
+   * A person's explicit override: they have checked that this exact operation
+   * cannot still run, and accept the risk of a duplicate if they are wrong.
+   * Recorded as an override, never as evidence that it never ran.
+   *
+   * Takes the immutable operation id. A dialog opened about one record and
+   * confirmed later must never clear a *different* operation that has since
+   * taken the same key, so there is deliberately no way to override by key.
    */
-  overrideSubmission(key: string, note: string): boolean {
-    return this.submissions.override(key, note);
+  overrideSubmission(operationId: string, note: string): OverrideResult {
+    return this.submissions.override(operationId, note);
   }
 
   /** Ask the process table what it can prove about every unresolved submission. */

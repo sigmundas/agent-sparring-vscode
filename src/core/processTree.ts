@@ -56,3 +56,25 @@ export function descendantsOf(processes: ProcessInfo[], rootPid: number): Proces
 export function findDescendant(processes: ProcessInfo[], rootPid: number, matches: (commandLine: string) => boolean): ProcessInfo | undefined {
   return descendantsOf(processes, rootPid).find((process) => matches(process.command));
 }
+
+/**
+ * The first process at or below `rootPid` whose command line satisfies
+ * `matches`.
+ *
+ * `findDescendant` excludes the root, which is right for a shell hosting a
+ * runner: the shell is not the engine. It is wrong for a dedicated terminal,
+ * whose own process *is* the engine — there the root is the only process that
+ * can ever match, and excluding it made a live dedicated runner look dead.
+ */
+export function findSelfOrDescendant(processes: ProcessInfo[], rootPid: number, matches: (commandLine: string) => boolean): ProcessInfo | undefined {
+  const self = processes.find((process) => process.pid === rootPid);
+  if (self && matches(self.command)) {
+    return self;
+  }
+  return findDescendant(processes, rootPid, matches);
+}
+
+/** Whether a pid is in the snapshot at all. */
+export function processExists(processes: ProcessInfo[], pid: number): boolean {
+  return processes.some((process) => process.pid === pid);
+}

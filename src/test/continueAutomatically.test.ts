@@ -20,7 +20,7 @@ import { buildResumePlanArgs, buildRunPlanArgs } from "../core/cli";
 import { discoverRuns, selectRun } from "../core/discovery";
 import { renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel, type OverviewArtifacts } from "../core/overviewModel";
-import { commandLineRuns, parseSparringCommand } from "../core/sparringCommand";
+import { commandLineIsOperation, parseSparringCommand } from "../core/sparringCommand";
 import { FOO_PLAN_KEY, FOO_PLAN_LABEL, FOO_STAGE_IDS, Workspace, sparringMarkdown } from "./fixtures";
 
 const NOW = Date.parse("2026-09-14T10:00:00.000Z");
@@ -53,8 +53,12 @@ describe("the engine command the automatic mode issues", () => {
     assert.equal(parsed?.subcommand, "run-plan");
     assert.equal(parsed?.manifest, "/tmp/foo.manifest.json");
     assert.equal(parsed?.planPath, undefined);
-    assert.ok(commandLineRuns("sparring resume-plan --manifest /other/dir/foo.manifest.json --repo-root /r --expected-branch b", { kind: "resume-plan", manifest: "/tmp/foo.manifest.json" }));
-    assert.ok(!commandLineRuns("sparring resume-plan --manifest /tmp/other.manifest.json --repo-root /r --expected-branch b", { kind: "resume-plan", manifest: "/tmp/foo.manifest.json" }));
+    // Matched by its full path. A manifest with the same basename in another
+    // directory is a different manifest, and used to match on the basename
+    // alone — which let one plan's runner resolve another plan's guard.
+    assert.ok(commandLineIsOperation("sparring resume-plan --manifest /tmp/foo.manifest.json --repo-root /r --expected-branch b", { kind: "resume-plan", repoRoot: "/r", manifest: "/tmp/foo.manifest.json" }));
+    assert.ok(!commandLineIsOperation("sparring resume-plan --manifest /other/dir/foo.manifest.json --repo-root /r --expected-branch b", { kind: "resume-plan", repoRoot: "/r", manifest: "/tmp/foo.manifest.json" }));
+    assert.ok(!commandLineIsOperation("sparring resume-plan --manifest /tmp/other.manifest.json --repo-root /r --expected-branch b", { kind: "resume-plan", repoRoot: "/r", manifest: "/tmp/foo.manifest.json" }));
   });
 });
 

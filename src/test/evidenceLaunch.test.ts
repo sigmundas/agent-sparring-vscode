@@ -270,7 +270,11 @@ describe("one launcher for every engine action", () => {
   it("both of those hand the arguments over through the one shared function", async () => {
     for (const file of ["vscode/executionTracker.ts", "vscode/commandRunner.ts"]) {
       const source = await read(file);
-      assert.match(source, /executeThroughShell\(/, `${file} uses the shared shell handover`);
+      // Two halves of the one shared hand-over: deciding whether this shell
+      // can be given the command (before anything durable is written), then
+      // performing it (the first irreversible step).
+      assert.match(source, /shellHandoverFor\(/, `${file} decides the shell hand-over through the shared function`);
+      assert.match(source, /performShellHandover\(/, `${file} performs it through the shared function`);
       assert.ok(!/integration\.executeCommand\(/.test(source), `${file} does not call executeCommand itself`);
     }
     const shared = await read("vscode/shellIntegration.ts");

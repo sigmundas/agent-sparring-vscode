@@ -27,7 +27,7 @@ import { buildOverviewModel, type CapturedPrompt, type ManifestStageView, type O
 import { ExecutionTracker } from "../vscode/executionTracker";
 import { listProcesses, processProbeSupported } from "../vscode/processProbe";
 import type { ProcessInfo } from "../core/processTree";
-import { SubmissionRegistry, SUBMISSIONS_KEY } from "../vscode/submissionRegistry";
+import { OperationRegistry, OPERATIONS_KEY } from "../vscode/operationRegistry";
 import type { TerminalLease, TerminalPool } from "../vscode/terminalPool";
 
 const STAGES = ["stage-reported-statistics-contract", "stage-reported-statistics-local-schema-barrier", "stage-reported-statistics-typed-parser", "stage-review-complete", "stage-review-complete-dirty", "stage-stale-turn"];
@@ -1184,7 +1184,8 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
       // will never run, so a second one is refused rather than submitted.
       const pending = registry.unresolved();
       assert.equal(pending.length, 1, `the submission is retained, got ${JSON.stringify(pending)}`);
-      assert.equal(pending[0].state, "uncertain");
+      assert.equal(pending[0].state, "submitted-shell");
+      assert.equal(pending[0].waitExpired, true, "its wait ran out, which changes nothing about the guard");
       assert.equal(pending[0].runId, runId);
       const second = await tracker.launch({ configured: executable, args: ["run-plan", "plans/never-executed.md", "--repo-root", reportedRepo], cwd: reportedRepo, name: "false-runner regression (again)", runId, kind: "run-plan", reveal: false });
       assert.equal(second.ok, false, "a second copy of the same operation is refused while the first may still start");
@@ -1246,7 +1247,7 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
       assert.equal(retired(), true, "its terminal is quarantined while its fate is unknown");
       const waiting = registry.unresolved();
       assert.equal(waiting.length, 1, "the identity of the submitted command is kept");
-      assert.equal(waiting[0].state, "uncertain");
+      assert.equal(waiting[0].state, "submitted-shell");
 
       // The shell continues, reads the line it was given, and runs it.
       process.kill(pid, "SIGCONT");
@@ -1255,14 +1256,18 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
       assert.equal(promoted.state, "running", "the exact execution became the runner");
       assert.equal(promoted.source, "launched", "promoted by execution identity, not rediscovered from a command line");
       assert.equal(tracker.hostingTerminal(runId), terminal.name);
-      assert.deepEqual(registry.unresolved(), [], "and the submission is resolved by its own start");
+      // Started is not "safe to start another". The same record advances to
+      // running, keeps refusing a duplicate, and is released by this
+      // execution's own end.
+      assert.equal(registry.inFlightFor(`run:${runId}`)?.state, "running-shell", "the same record now guards it as running");
+      assert.deepEqual(registry.unresolved(), [], "and this window is watching it, so there is nothing to ask a person about");
       await new Promise((resolve) => setTimeout(resolve, 250));
       assert.deepEqual(
         tracker.persisted().filter((launch) => launch.runId === runId),
         [{ runId, state: "running" }],
         "a reload would now find exactly this one live runner",
       );
-      assert.ok(logged.some((line) => /resolved as started — .*long after the wait had expired/.test(line)), `the log says it started late, got ${JSON.stringify(logged)}`);
+      assert.ok(logged.some((line) => /started it .*long after the wait had expired/.test(line)), `the log says it started late, got ${JSON.stringify(logged)}`);
       assert.ok(await fs.stat(argvLog).then(() => true, () => false), "and the engine really did run");
 
       const ended = await waitUntil(() => {
@@ -1316,17 +1321,17 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
     // C1: no process probe on this platform — the submission must simply stay.
     {
       const stored = memento();
-      await stored.update(SUBMISSIONS_KEY, persisted);
+      await stored.update(OPERATIONS_KEY, persisted);
       const logged: string[] = [];
-      const registry = new SubmissionRegistry({ workspaceState: stored } as unknown as vscode.ExtensionContext, (message) => logged.push(message), () => false, async () => []);
+      const registry = new OperationRegistry({ workspaceState: stored } as unknown as vscode.ExtensionContext, (message: string) => logged.push(message), () => false, async () => []);
       const tracker = trackerWith(registry, stored, logged);
       try {
         const reattaching = tracker.reattach();
         await new Promise((resolve) => setTimeout(resolve, 300));
         assert.deepEqual(
           registry.unresolved().map((item) => [item.runId, item.state, item.restored]),
-          [[runId, "uncertain", true]],
-          "restored as uncertain, and it says it came from before the reload",
+          [[runId, "submitted-shell", true]],
+          "restored as still submitted to a shell, and it says it came from before the reload",
         );
         assert.equal(tracker.executionFor(runId), undefined, "no runner is claimed for it");
         const refused = await tracker.launch({ configured: executable, args: ["run-plan", "plans/never-executed.md"], cwd: reportedRepo, name: "after the reload", runId, kind: "run-plan", reveal: false });
@@ -1344,9 +1349,11 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
 
         // Only a person can settle it on such a platform, and that is an
         // override, recorded as theirs.
-        assert.equal(registry.override(`run:${runId}`, "the person checked the terminal"), true);
+        const held = registry.inFlightFor(`run:${runId}`);
+        assert.ok(held, "the restored record is there");
+        assert.equal(registry.override(held.id, "the person checked the terminal").overridden, true);
         assert.deepEqual(registry.unresolved(), [], "after which the operation may be given again");
-        assert.ok(logged.some((line) => /resolved as overridden/.test(line)), "recorded as an override, not as evidence");
+        assert.ok(logged.some((line) => /resolved as human-override/.test(line)), "recorded as an override, not as evidence");
       } finally {
         tracker.dispose();
         registry.dispose();
@@ -1356,14 +1363,14 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
     // C2: the process table can speak, and says that shell is gone.
     {
       const stored = memento();
-      await stored.update(SUBMISSIONS_KEY, persisted);
+      await stored.update(OPERATIONS_KEY, persisted);
       const logged: string[] = [];
-      const registry = new SubmissionRegistry({ workspaceState: stored } as unknown as vscode.ExtensionContext, (message) => logged.push(message), () => true, async () => [{ pid: 1, command: "/sbin/launchd" }]);
+      const registry = new OperationRegistry({ workspaceState: stored } as unknown as vscode.ExtensionContext, (message: string) => logged.push(message), () => true, async () => [{ pid: 1, ppid: 0, command: "/sbin/launchd" }]);
       const tracker = trackerWith(registry, stored, logged);
       try {
         await tracker.reattach();
         await waitUntil(() => (registry.unresolved().length === 0 ? true : undefined), 15_000, "the process table proves the shell that took it is gone");
-        assert.ok(logged.some((line) => /resolved as shell-gone/.test(line)), `settled by evidence, got ${JSON.stringify(logged)}`);
+        assert.ok(logged.some((line) => /resolved as cannot-execute \(shell-process-gone\)/.test(line)), `settled by evidence, got ${JSON.stringify(logged)}`);
         assert.equal(tracker.executionFor(runId), undefined, "and nothing is recorded as having run");
       } finally {
         tracker.dispose();
@@ -1375,9 +1382,9 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
     // is proved, so the submission stays and a duplicate stays refused.
     {
       const stored = memento();
-      await stored.update(SUBMISSIONS_KEY, persisted);
+      await stored.update(OPERATIONS_KEY, persisted);
       const logged: string[] = [];
-      const registry = new SubmissionRegistry({ workspaceState: stored } as unknown as vscode.ExtensionContext, (message) => logged.push(message), () => true, async () => [{ pid: shellPid, command: "-zsh" }]);
+      const registry = new OperationRegistry({ workspaceState: stored } as unknown as vscode.ExtensionContext, (message: string) => logged.push(message), () => true, async () => [{ pid: shellPid, ppid: 1, command: "-zsh" }]);
       const tracker = trackerWith(registry, stored, logged);
       try {
         await tracker.reattach();
@@ -1401,54 +1408,88 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
   {
     const runId = "unrelated-runner-regression";
     const other = `${executable} run-loop stage-some-other-thing --repo-root ${reportedRepo}`;
+    const shellPid = 2147480001;
+    const manifest = "/store/manifests/reported-statistics.manifest.json";
     const stored = memento();
-    await stored.update(SUBMISSIONS_KEY, [
+    await stored.update(OPERATIONS_KEY, [
       {
-        id: "submission-awaiting-its-fate",
+        id: "operation-awaiting-its-fate",
         key: `run:${runId}`,
-        transport: "runner",
+        state: "submitted-shell",
+        transport: "shell",
+        caller: "runner",
         label: "run-plan reported-statistics.manifest.json",
+        repoRoot: reportedRepo,
         cwd: reportedRepo,
         subcommand: "run-plan",
         runId,
         runnerKind: "run-plan",
-        manifest: "/store/manifests/reported-statistics.manifest.json",
+        manifest,
         word: executable,
         submittedAtMs: Date.now() - 4000,
-        terminalPid: 2147480001,
+        terminalPid: shellPid,
         terminalName: "Agent Sparring — sporely-py-reported-statistics",
       },
     ]);
     const logged: string[] = [];
     // The process table holds that other runner *and* the shell that took our
-    // submission, so neither "shell-gone" nor "attributed" applies.
-    let processes = [
-      { pid: 2147480001, command: "-zsh" },
-      { pid: 4242, command: other },
+    // command, so neither "the shell is gone" nor "this is my operation"
+    // applies.
+    let processes: ProcessInfo[] = [
+      { pid: shellPid, ppid: 1, command: "-zsh" },
+      { pid: 4242, ppid: 1, command: other },
     ];
-    const registry = new SubmissionRegistry({ workspaceState: stored } as unknown as vscode.ExtensionContext, (message) => logged.push(message), () => true, async () => processes);
+    const registry = new OperationRegistry({ workspaceState: stored } as unknown as vscode.ExtensionContext, (message: string) => logged.push(message), () => true, async () => processes);
     const tracker = trackerWith(registry, stored, logged);
     try {
       registry.restore();
       await new Promise((resolve) => setTimeout(resolve, 1000));
       assert.equal(registry.unresolved().length, 1, "an unrelated run-loop does not answer for a queued run-plan");
 
-      // The unrelated runner ends. That says nothing about our submission either.
-      processes = [{ pid: 2147480001, command: "-zsh" }];
+      // The unrelated runner ends. That says nothing about our operation either.
+      processes = [{ pid: shellPid, ppid: 1, command: "-zsh" }];
       await registry.probeAll();
       assert.equal(registry.unresolved().length, 1, "and its ending does not answer for it retrospectively");
-      const refused = await tracker.launch({ configured: executable, args: ["run-plan", "--manifest", "/store/manifests/reported-statistics.manifest.json"], cwd: reportedRepo, name: "while another stage runs", runId, kind: "run-plan", manifest: "/store/manifests/reported-statistics.manifest.json", reveal: false });
+      const refused = await tracker.launch({ configured: executable, args: ["run-plan", "--manifest", manifest], cwd: reportedRepo, name: "while another stage runs", runId, kind: "run-plan", manifest, reveal: false });
       assert.equal(refused.ok, false, "so the duplicate run-plan stays refused throughout");
       assert.equal(refused.ok ? undefined : refused.problem, "unconfirmed");
 
-      // This exact command, though, is attributable evidence: it started.
+      // The same command line, in another repository. It is a different
+      // operation and must not touch this one — this is the reviewer's
+      // reproduction, and it used to resolve the guard.
       processes = [
-        { pid: 2147480001, command: "-zsh" },
-        { pid: 4343, command: `${executable} run-plan --manifest /store/manifests/reported-statistics.manifest.json --repo-root ${reportedRepo}` },
+        { pid: shellPid, ppid: 1, command: "-zsh" },
+        { pid: 4343, ppid: shellPid, command: `${executable} run-plan --manifest ${manifest} --repo-root /some/other/repo` },
       ];
       await registry.probeAll();
-      assert.deepEqual(registry.unresolved(), [], "the exact submitted command in the process table settles it");
-      assert.ok(logged.some((line) => /resolved as attributed/.test(line)), `and says so, got ${JSON.stringify(logged)}`);
+      assert.equal(registry.unresolved().length, 1, "a run-plan for another repository is another operation");
+
+      // The same manifest basename at another full path. Also a different
+      // operation, and also used to resolve this one.
+      processes = [
+        { pid: shellPid, ppid: 1, command: "-zsh" },
+        { pid: 4344, ppid: shellPid, command: `${executable} run-plan --manifest /elsewhere/reported-statistics.manifest.json --repo-root ${reportedRepo}` },
+      ];
+      await registry.probeAll();
+      assert.equal(registry.unresolved().length, 1, "a manifest of the same name elsewhere is another manifest");
+
+      // This exact command, running under the shell that was given the line.
+      // That proves it started — and "started" is a reason to keep refusing
+      // a duplicate, not to stop: the record advances, and stays guarded.
+      processes = [
+        { pid: shellPid, ppid: 1, command: "-zsh" },
+        { pid: 4345, ppid: shellPid, command: `${executable} run-plan --manifest ${manifest} --repo-root ${reportedRepo}` },
+      ];
+      await registry.probeAll();
+      assert.equal(registry.inFlightFor(`run:${runId}`)?.state, "running-shell", "the exact command under that exact shell proves it started");
+      const stillRefused = await tracker.launch({ configured: executable, args: ["run-plan", "--manifest", manifest], cwd: reportedRepo, name: "while it is running", runId, kind: "run-plan", manifest, reveal: false });
+      assert.equal(stillRefused.ok, false, "and a duplicate is still refused, because it is executing");
+
+      // Only its disappearance from the table ends it.
+      processes = [{ pid: shellPid, ppid: 1, command: "-zsh" }];
+      await registry.probeAll();
+      assert.deepEqual(registry.unresolved(), [], "and it is over when that process is gone");
+      assert.ok(logged.some((line) => /resolved as completed \(engine-process-gone\)/.test(line)), `settled by evidence about that process, got ${JSON.stringify(logged.filter((line) => line.includes("resolved")))}`);
     } finally {
       tracker.dispose();
       registry.dispose();
@@ -1564,7 +1605,7 @@ async function shortCommandAssertions(report: DiscoveryDiagnostic, reportedRepo:
     const submissions = await pendingSubmissions();
     assert.deepEqual(
       submissions.map((item) => [item.subcommand, item.state]),
-      [["freeze-candidate", "uncertain"]],
+      [["freeze-candidate", "submitted-shell"]],
       `the short command is on the same durable record as a runner command, got ${JSON.stringify(submissions)}`,
     );
 
@@ -1588,7 +1629,7 @@ async function shortCommandAssertions(report: DiscoveryDiagnostic, reportedRepo:
       return text.includes("freeze-candidate") ? text : undefined;
     }, 20_000, "the submitted freeze-candidate runs when the shell continues");
     assert.deepEqual(calls.trim().split("\n"), [`freeze-candidate ${stage}`], "exactly once, and nothing else");
-    await waitUntil(async () => ((await pendingSubmissions()).length === 0 ? true : undefined), 15_000, "and its fate is reconciled by its own execution");
+    await waitUntil(async () => ((await pendingSubmissions()).length === 0 ? true : undefined), 15_000, "and its fate is reconciled by its own execution's end, not by its start");
   } finally {
     if (stopped) {
       try {
@@ -1657,7 +1698,7 @@ async function lateStartAssertions(report: DiscoveryDiagnostic, reportedRepo: st
     const pendingEarly = await pendingSubmissions();
     assert.deepEqual(
       pendingEarly.map((item) => [item.runId, item.state]),
-      [[runId, "waiting"]],
+      [[runId, "submitted-shell"]],
       `the submission is tracked separately, got ${JSON.stringify(pendingEarly)}`,
     );
     assert.deepEqual(await runningLaunches(runId), [], "and nothing is persisted as an established running launch");
@@ -1666,7 +1707,7 @@ async function lateStartAssertions(report: DiscoveryDiagnostic, reportedRepo: st
     // actually known.
     await launching;
     assert.notEqual((await livenessOf(runId)).state, "running");
-    assert.deepEqual((await pendingSubmissions()).map((item) => item.state), ["uncertain"], "the submission survives the wait");
+    assert.deepEqual((await pendingSubmissions()).map((item) => [item.state, item.waitExpired]), [["submitted-shell", true]], "the submission survives the wait, unchanged in substance");
     assert.ok(
       warnings.messages.some((message) => /has not been able to confirm whether it started/.test(message)),
       `the wording says exactly that, got ${JSON.stringify(warnings.messages)}`,
@@ -1691,7 +1732,10 @@ async function lateStartAssertions(report: DiscoveryDiagnostic, reportedRepo: st
     const late = await waitFor(runId, (liveness) => liveness.state === "running", 20_000, "the late start becomes a real running runner");
     assert.equal(late.execution?.source, "launched", "promoted by execution identity");
     assert.notEqual(late.execution?.id, first.execution?.id);
-    assert.deepEqual(await pendingSubmissions(), [], "and the submission is resolved");
+    // The guard is not lifted by the start — it advances with it, and this
+    // window is now watching that execution, so there is nothing left to ask
+    // a person about.
+    assert.deepEqual(await pendingSubmissions(), [], "and there is nothing outstanding for a person once this window watches it");
     assert.equal(await vscode.commands.executeCommand("agentSparring._test.hostingTerminal", runId), owned.name);
     assert.deepEqual(await runningLaunches(runId), [{ runId, state: "running" }], "now, and only now, a reload would find a live runner");
 
@@ -1764,10 +1808,17 @@ async function overrideAssertions(report: DiscoveryDiagnostic, reportedRepo: str
 
     // The person confirms. This is an override, recorded as such — never as
     // evidence that the command did not run.
-    const key = (await pendingSubmissions())[0].key;
+    // By the exact operation id, never by the key: the dialog was about one
+    // record, and confirming it must not touch whatever holds that key now.
+    const operationId = (await pendingSubmissions())[0].id;
     assert.equal(
-      await vscode.commands.executeCommand("agentSparring._test.overrideSubmission", key, "the person checked the terminal and confirmed the command cannot still run"),
+      await vscode.commands.executeCommand("agentSparring._test.overrideSubmission", operationId, "the person checked the terminal and confirmed the command cannot still run"),
       true,
+    );
+    assert.equal(
+      await vscode.commands.executeCommand("agentSparring._test.overrideSubmission", operationId, "the same stale dialog, confirmed twice"),
+      false,
+      "and a record that has already been resolved is reported as such rather than searched for again",
     );
     assert.deepEqual(await pendingSubmissions(), [], "after which the operation may be given again");
     assert.notEqual((await livenessOf(runId)).state, "running", "and nothing about a runner was claimed by any of it");
@@ -1788,10 +1839,10 @@ async function overrideAssertions(report: DiscoveryDiagnostic, reportedRepo: str
 }
 
 /** A tracker over one terminal the pool would never hand out, with its own registry. */
-function trackerOver(lease: TerminalLease, logged: string[]): { tracker: ExecutionTracker; registry: SubmissionRegistry; dispose: () => void } {
+function trackerOver(lease: TerminalLease, logged: string[]): { tracker: ExecutionTracker; registry: OperationRegistry; dispose: () => void } {
   const stored = memento();
   const context = { workspaceState: stored } as unknown as vscode.ExtensionContext;
-  const registry = new SubmissionRegistry(context, (message) => logged.push(message));
+  const registry = new OperationRegistry(context, (message: string) => logged.push(message));
   const tracker = new ExecutionTracker(context, (message) => logged.push(message), () => [], { acquire: () => lease } as unknown as TerminalPool, registry);
   return {
     tracker,
@@ -1804,7 +1855,7 @@ function trackerOver(lease: TerminalLease, logged: string[]): { tracker: Executi
 }
 
 /** A tracker over a given registry, for the reload and attribution scenarios. */
-function trackerWith(registry: SubmissionRegistry, stored: vscode.Memento, logged: string[]): ExecutionTracker {
+function trackerWith(registry: OperationRegistry, stored: vscode.Memento, logged: string[]): ExecutionTracker {
   const context = { workspaceState: stored } as unknown as vscode.ExtensionContext;
   const terminal = { name: "never used", dispose: () => undefined } as unknown as vscode.Terminal;
   const pool = { acquire: () => bypassLease(terminal).lease } as unknown as TerminalPool;
@@ -1837,8 +1888,8 @@ function captureWarnings(): { messages: string[]; restore: () => void } {
   };
 }
 
-async function pendingSubmissions(): Promise<{ runId?: string; key: string; state: string; subcommand: string }[]> {
-  return (await vscode.commands.executeCommand("agentSparring._test.unresolvedSubmissions")) as { runId?: string; key: string; state: string; subcommand: string }[];
+async function pendingSubmissions(): Promise<{ id: string; runId?: string; key: string; state: string; waitExpired: boolean; subcommand: string }[]> {
+  return (await vscode.commands.executeCommand("agentSparring._test.unresolvedSubmissions")) as { id: string; runId?: string; key: string; state: string; waitExpired: boolean; subcommand: string }[];
 }
 
 async function runningLaunches(runId: string): Promise<{ runId: string; state: string }[]> {

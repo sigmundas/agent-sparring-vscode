@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import { buildRunLoopArgs, buildRunPlanArgs } from "../core/cli";
 import { discoverRuns, locateSparringDirs, runIdFor, selectRun, type PlanRunSnapshot } from "../core/discovery";
-import { commandLineRuns, matchSparringCommand, parseSparringCommand, planKey, planLabel, planRunId, tokenizeCommandLine } from "../core/sparringCommand";
+import { commandLineIsOperation, targetIsAttributable, matchSparringCommand, parseSparringCommand, planKey, planLabel, planRunId, tokenizeCommandLine } from "../core/sparringCommand";
 import { FOO_PLAN_KEY, FOO_PLAN_LABEL, Workspace } from "./fixtures";
 
 describe("command line tokenizer", () => {
@@ -135,13 +135,64 @@ describe("matching a typed command to a discovered run", () => {
   });
 });
 
-describe("commandLineRuns (post-reload process probe predicate)", () => {
-  it("matches the runner's own command line and nothing else", () => {
-    const python = "/Users/me/.venv/bin/python /Users/me/.venv/bin/sparring run-loop stage-x --repo-root /code/app --expected-branch main";
-    assert.equal(commandLineRuns(python, { kind: "run-loop", stageId: "stage-x" }), true);
-    assert.equal(commandLineRuns(python, { kind: "run-loop", stageId: "stage-y" }), false);
-    assert.equal(commandLineRuns(python, { kind: "run-plan", planPath: "/code/app/docs/p.md" }), false);
-    assert.equal(commandLineRuns("claude -p --output-format stream-json", { kind: "run-loop", stageId: "stage-x" }), false, "the provider child is not the runner");
-    assert.equal(commandLineRuns("/venv/bin/python /venv/bin/sparring run-plan docs/p.md --expected-branch m", { kind: "run-plan", planPath: "/code/app/docs/p.md" }), true);
+describe("commandLineIsOperation (the predicate that may remove duplicate protection)", () => {
+  const loop = "/Users/me/.venv/bin/python /Users/me/.venv/bin/sparring run-loop stage-x --repo-root /code/app --expected-branch main";
+
+  it("matches the operation's own command line and nothing else", () => {
+    assert.equal(commandLineIsOperation(loop, { kind: "run-loop", repoRoot: "/code/app", stageId: "stage-x" }), true);
+    assert.equal(commandLineIsOperation(loop, { kind: "run-loop", repoRoot: "/code/app", stageId: "stage-y" }), false);
+    assert.equal(commandLineIsOperation(loop, { kind: "run-plan", repoRoot: "/code/app", planPath: "/code/app/docs/p.md" }), false, "another subcommand is another operation");
+    assert.equal(commandLineIsOperation("claude -p --output-format stream-json", { kind: "run-loop", repoRoot: "/code/app", stageId: "stage-x" }), false, "the provider child is not the runner");
+    assert.equal(
+      commandLineIsOperation("/venv/bin/python /venv/bin/sparring run-plan /code/app/docs/p.md --repo-root /code/app --expected-branch m", { kind: "run-plan", repoRoot: "/code/app", planPath: "/code/app/docs/p.md" }),
+      true,
+    );
+  });
+
+  it("the same stage id in another repository is a different operation", () => {
+    // The reviewer's reproduction: `stage-4` exists in both repositories, and
+    // matching on the stage id alone let repository B's runner resolve
+    // repository A's guard.
+    assert.equal(commandLineIsOperation(loop, { kind: "run-loop", repoRoot: "/code/other", stageId: "stage-x" }), false);
+    const elsewhere = loop.replace("/code/app", "/code/other");
+    assert.equal(commandLineIsOperation(elsewhere, { kind: "run-loop", repoRoot: "/code/app", stageId: "stage-x" }), false);
+    assert.equal(commandLineIsOperation(elsewhere, { kind: "run-loop", repoRoot: "/code/other", stageId: "stage-x" }), true, "in its own repository it does match");
+  });
+
+  it("the same plan or manifest basename at another full path is a different operation", () => {
+    // The other reproduction: plan and manifest paths were compared by
+    // basename, so /repo/other/plan.md resolved /repo/one/plan.md.
+    const other = "sparring run-plan /repo/other/plan.md --repo-root /repo/one --expected-branch b";
+    assert.equal(commandLineIsOperation(other, { kind: "run-plan", repoRoot: "/repo/one", planPath: "/repo/one/plan.md" }), false);
+    assert.equal(
+      commandLineIsOperation("sparring resume-plan --manifest /other/dir/foo.manifest.json --repo-root /r --expected-branch b", { kind: "resume-plan", repoRoot: "/r", manifest: "/tmp/foo.manifest.json" }),
+      false,
+      "a manifest of the same name in another directory is another manifest",
+    );
+    assert.equal(
+      commandLineIsOperation("sparring resume-plan --manifest /tmp/foo.manifest.json --repo-root /r --expected-branch b", { kind: "resume-plan", repoRoot: "/r", manifest: "/tmp/foo.manifest.json" }),
+      true,
+    );
+  });
+
+  it("a command line that names no project, or names one relatively, proves nothing", () => {
+    assert.equal(commandLineIsOperation("sparring run-loop stage-x --expected-branch main", { kind: "run-loop", repoRoot: "/code/app", stageId: "stage-x" }), false, "ps gives no cwd, so nothing can be resolved");
+    assert.equal(commandLineIsOperation("sparring run-loop stage-x --repo-root ../app --expected-branch main", { kind: "run-loop", repoRoot: "/code/app", stageId: "stage-x" }), false);
+    assert.equal(commandLineIsOperation("sparring run-plan docs/p.md --repo-root /code/app", { kind: "run-plan", repoRoot: "/code/app", planPath: "/code/app/docs/p.md" }), false, "a relative plan path cannot be compared either");
+  });
+
+  it("--sparring-dir identifies the project, exactly as the engine treats it", () => {
+    const withDir = "sparring --sparring-dir /code/app/.sparring run-loop stage-x --expected-branch main";
+    assert.equal(commandLineIsOperation(withDir, { kind: "run-loop", repoRoot: "/code/app", stageId: "stage-x" }), true, "the engine's default location under the repository root");
+    assert.equal(commandLineIsOperation(withDir, { kind: "run-loop", repoRoot: "/code/app", sparringDir: "/elsewhere/.sparring", stageId: "stage-x" }), false);
+    assert.equal(commandLineIsOperation("sparring --sparring-dir /other/.sparring run-loop stage-x", { kind: "run-loop", repoRoot: "/code/app", stageId: "stage-x" }), false);
+  });
+
+  it("an operation that cannot be recognised at all is never matched", () => {
+    assert.equal(targetIsAttributable({ kind: "run-loop", stageId: "stage-x" }), false, "no project");
+    assert.equal(targetIsAttributable({ kind: "run-loop", repoRoot: "/code/app" }), false, "no stage");
+    assert.equal(targetIsAttributable({ kind: "run-plan", repoRoot: "/code/app", planPath: "docs/p.md" }), false, "a relative plan path");
+    assert.equal(targetIsAttributable({ kind: "run-plan", repoRoot: "/code/app", planPath: "/code/app/docs/p.md" }), true);
+    assert.equal(commandLineIsOperation(loop, { kind: "run-loop", stageId: "stage-x" }), false, "and an unattributable target matches nothing");
   });
 });

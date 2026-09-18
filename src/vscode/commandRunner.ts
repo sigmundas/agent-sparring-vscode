@@ -23,24 +23,36 @@
  *
  * Submitting is not running here either, and this transport carries the same
  * risk of doing an engine operation twice as the runner launcher does. So it
- * submits through the same authority (submissionRegistry.ts), and claims the
+ * goes through the same authority (operationRegistry.ts), and claims the
  * operation there before it does anything at all: an earlier freeze-candidate
- * that is being prepared, that may still execute, or that is running as a
- * child process of this window all refuse the next one, before the executable
- * is resolved and before a terminal is acquired. Two clicks in the same
- * instant cannot both get past that claim, and the direct-process fallback
- * holds it until the child has exited. A command the
+ * that is being prepared, that may still execute, that is *executing*, or
+ * that is running as a child process of this window all refuse the next one,
+ * before the executable is resolved and before a terminal is acquired. Two
+ * clicks in the same instant cannot both get past that claim, and the
+ * direct-process fallback holds it until the child has exited. A command the
  * shell has not reported as started is not treated as run and — unlike the
  * missing-integration case — is deliberately *not* retried through the
  * direct-process transport, because the submitted line may still be read.
+ *
+ * Two orderings here are load-bearing:
+ *
+ *  - the durable execution intent is written, and awaited, before the command
+ *    line is handed to the shell or a child is spawned. A crash in between
+ *    then leaves a record that blocks conservatively instead of nothing at
+ *    all (`arm`);
+ *  - the guard is *not* released when the shell says the command started.
+ *    These commands are short — freeze-candidate finishes in a second — and
+ *    "started" used to end the guard, leaving the operation running and
+ *    unguarded. The same record advances to running and is released by that
+ *    execution's own end.
  */
 
 import { execFile } from "node:child_process";
 import type { CommandOutcome } from "../core/acceptance";
 import { executableWord, planExecutable, type ExecutablePlan } from "../core/cli";
 import type { LaunchProblem } from "./executionTracker";
-import { awaitExecutionEnd, awaitShellIntegration, EXECUTION_START_TIMEOUT_MS, executeThroughShell, hostEnv } from "./shellIntegration";
-import { admissionRefusal, commandKey, outstanding, submissionRefusal, type SubmissionRegistry, type SubmissionView } from "./submissionRegistry";
+import { admissionRefusal, commandKey, operationRefusal, outstanding, type OperationRegistry, type OperationView } from "./operationRegistry";
+import { awaitExecutionEnd, awaitShellIntegration, EXECUTION_START_TIMEOUT_MS, hostEnv, performShellHandover, shellHandoverFor } from "./shellIntegration";
 import { collectOutput } from "./terminalOutput";
 import type { TerminalPool } from "./terminalPool";
 
@@ -53,20 +65,24 @@ export interface RunCommandOptions {
   cwd: string;
   /** Terminal title suffix and log label. */
   name: string;
-  /** What must not be run twice while an earlier submission of it may still execute. */
+  /** What must not be run twice while an earlier copy of it may still execute. */
   operation?: { subcommand: string; target?: string };
+  /** The repository or worktree this acts on, for the operation's identity; defaults to `cwd`. */
+  repoRoot?: string;
+  /** The engine's sparring directory, when it is not `<repoRoot>/.sparring`. */
+  sparringDir?: string;
 }
 
 export type RunCommandResult =
   | { ok: true; outcome: CommandOutcome; via: "shell" | "process"; plan: ExecutablePlan }
-  | { ok: false; error: string; problem: LaunchProblem; submission?: SubmissionView };
+  | { ok: false; error: string; problem: LaunchProblem; submission?: OperationView };
 
 export class SparringCommandRunner {
   constructor(
     private readonly log: (message: string) => void,
     private readonly terminals: TerminalPool,
-    /** The one authority on commands handed to a shell (submissionRegistry.ts). */
-    private readonly submissions: SubmissionRegistry,
+    /** The one authority on engine operations in flight (operationRegistry.ts). */
+    private readonly operations: OperationRegistry,
   ) {}
 
   dispose(): void {
@@ -83,7 +99,16 @@ export class SparringCommandRunner {
     // The first thing that happens, and the only synchronous one: while this
     // operation is claimed, no other invocation can resolve an executable,
     // acquire a terminal or send anything for it.
-    const admission = this.submissions.claim({ key, transport: "command", label, cwd: options.cwd, subcommand, stageId: target });
+    const admission = this.operations.claim({
+      key,
+      caller: "command",
+      label,
+      repoRoot: options.repoRoot ?? options.cwd,
+      sparringDir: options.sparringDir,
+      cwd: options.cwd,
+      subcommand,
+      stageId: target,
+    });
     if (!admission.admitted) {
       const blocked = admission.blocked;
       this.log(`refused to run ${options.name}: ${blocked.label} is already in flight (${blocked.state}); it is not run a second time`);
@@ -92,7 +117,7 @@ export class SparringCommandRunner {
     const claim = admission.claim;
     const configured = await planExecutable(options.configured, hostEnv(options.cwd), true);
     if (!configured.ok) {
-      this.submissions.release(claim, "the executable could not be resolved, so nothing was ever submitted");
+      this.operations.release(claim, "the executable could not be resolved, so nothing was ever submitted");
       return { ok: false, error: configured.error, problem: configured.problem };
     }
     // The project's own terminal, for as long as this command runs — and only
@@ -100,33 +125,54 @@ export class SparringCommandRunner {
     const lease = this.terminals.acquire(options.cwd);
     const integration = await awaitShellIntegration(lease.terminal);
     const word = executableWord(configured.plan);
-    const submission = integration ? this.submissions.submit(claim, lease, { word, plan: configured.plan }) : undefined;
-    const request = integration ? executeThroughShell(integration, word, options.args) : undefined;
-    if (request && submission) {
+    // Whether this shell *can* be given the command is decided before
+    // anything durable is written: an operation that must take the
+    // shell-less route is never armed for a shell.
+    const handover = integration ? shellHandoverFor(word, options.args) : undefined;
+    if (integration && handover && handover.via !== "no-shell") {
+      const armed = await this.operations.arm(claim, "shell", { word, plan: configured.plan });
+      if (!armed.ok) {
+        // The intent could not be made durable, so nothing is handed over:
+        // the one ordering under which a crash cannot strand a started
+        // operation without a record.
+        lease.release();
+        this.operations.release(claim, "the durable record of the intent could not be written, so the command was never handed to the shell");
+        return { ok: false, error: armed.error, problem: "unconfirmed" };
+      }
+      let request;
+      try {
+        request = performShellHandover(integration, word, options.args, handover);
+      } catch (error) {
+        this.operations.handoverFailed(armed.armed, `handing the command line to the shell threw (${(error as Error).message}), so nothing was submitted`);
+        lease.discard();
+        return { ok: false, error: `Agent Sparring could not hand ${label} to the terminal: ${(error as Error).message}`, problem: "unconfirmed" };
+      }
       lease.terminal.show(true);
       const output = collectOutput(request.execution);
-      this.submissions.attach(submission, request.execution, output);
-      const settled = await this.submissions.wait(submission, EXECUTION_START_TIMEOUT_MS);
+      this.operations.submittedToShell(armed.armed, lease, request.execution, output);
+      const settled = await this.operations.waitForStart(armed.armed, EXECUTION_START_TIMEOUT_MS);
       if (!settled.established) {
         // The shell has not started it, and may still. Nothing is treated as
-        // run, nothing is retried through another transport, and the
-        // submission stays on the registry's books — it, not any timer, is
-        // what stops this operation being done twice.
+        // run, nothing is retried through another transport, and the record
+        // stays on the registry's books — it, not any timer, is what stops
+        // this operation being done twice.
         this.log(`${options.name}: the shell in "${lease.terminal.name}" has not reported the command as started; nothing is treated as run, and this operation is refused until its fate is known`);
-        return { ok: false, error: submissionRefusal(settled.view), problem: "unconfirmed", submission: settled.view };
+        return { ok: false, error: operationRefusal(settled.view), problem: "unconfirmed", submission: settled.view };
       }
-      const exitCode = await awaitExecutionEnd(request.execution, lease.terminal);
+      // The shell may report the end before this caller sees the start — a
+      // command that finishes inside the same tick does exactly that. That
+      // end is authoritative and is consumed here; installing a waiter for
+      // an event that has already happened would wait for ever.
+      const exitCode = settled.ended ? settled.ended.exitCode : await awaitExecutionEnd(request.execution, lease.terminal);
       const text = await output;
       lease.release();
-      this.log(`ran ${options.name} via shell integration (${word}, ${options.args.length} args${request.quotedHere ? ", command line quoted here" : ""}, cwd ${options.cwd}); exit ${exitCode === undefined ? "unknown" : exitCode}`);
+      this.log(
+        `ran ${options.name} via shell integration (${word}, ${options.args.length} args${request.quotedHere ? ", command line quoted here" : ""}, cwd ${options.cwd}); exit ${exitCode === undefined ? "unknown" : exitCode}${settled.ended ? " (the shell reported the end before the start was observed)" : ""}`,
+      );
       return { ok: true, outcome: { exitCode, output: text, resolvedBy: configured.plan.kind === "shell" ? "shell" : "path" }, via: "shell", plan: configured.plan };
     }
-    if (submission) {
-      // Nothing was handed over, so nothing can still execute — but this
-      // operation is still about to be run, and stays claimed.
-      this.submissions.unsubmit(claim, "the command line was never handed to the shell, so nothing was submitted");
-    }
     if (integration) {
+      // The shell is fine, it just cannot carry this command line; keep it.
       lease.release();
     } else {
       lease.discard();
@@ -135,13 +181,19 @@ export class SparringCommandRunner {
     // here): fall back to this process's view and an argument array.
     const direct = await planExecutable(options.configured, hostEnv(options.cwd), false);
     if (!direct.ok) {
-      this.submissions.release(claim, "no executable could be resolved without a shell either, so nothing was started");
+      this.operations.release(claim, "no executable could be resolved without a shell either, so nothing was started");
       return { ok: false, error: direct.error, problem: direct.problem };
     }
     const path = executableWord(direct.plan);
-    // The child process is started under the claim and the claim is given up
-    // only when it has ended: there is no instant between "about to spawn"
-    // and "spawned" in which a second invocation could spawn another one.
+    const armed = await this.operations.arm(claim, "direct-process", { word: path, plan: direct.plan });
+    if (!armed.ok) {
+      this.operations.release(claim, "the durable record of the intent could not be written, so nothing was spawned");
+      return { ok: false, error: armed.error, problem: "unconfirmed" };
+    }
+    // The child process is spawned under an armed record, and the record is
+    // given up only when it has ended: there is no instant between "about to
+    // spawn" and "spawned" in which a second invocation could spawn another
+    // one, and no instant in which a crash would leave no record.
     //
     // Its pid and command line go on the record as soon as the spawn returns
     // them, without an await in between, because such a child outlives this
@@ -153,10 +205,10 @@ export class SparringCommandRunner {
     let outcome: CommandOutcome;
     try {
       outcome = await runProcess(path, options.args, options.cwd, (pid) => {
-        this.submissions.runningDirectly(claim, `it runs as process ${pid} of this window, without a shell`, { pid, word: path, args: options.args });
+        this.operations.runningDirect(armed.armed, { pid, word: path, args: options.args }, `it runs as process ${pid} of this window, without a shell`);
       });
     } finally {
-      this.submissions.release(claim, "the process that ran it has ended");
+      this.operations.directProcessEnded(armed.armed, "the process that ran it has ended in front of us");
     }
     this.log(`ran ${options.name} as a direct process (${path}, ${options.args.length} args, cwd ${options.cwd}; shell integration unavailable); exit ${outcome.exitCode === undefined ? "unknown" : outcome.exitCode}`);
     return { ok: true, outcome, via: "process", plan: direct.plan };

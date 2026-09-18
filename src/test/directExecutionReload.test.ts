@@ -12,14 +12,17 @@
  * that the duplicate is still refused, and that it is released only by
  * evidence that the operation is over.
  *
- * The two transports are guarded by different records on purpose:
+ * Both transports are guarded by the same record, in the same authority:
  *
- *  - a short command's child process has nowhere else to live, so the
- *    registry persists its pid and command line and reconciles it against
- *    the process table;
- *  - a dedicated-terminal runner is already a persisted launch with its
- *    terminal's pid, restored to running when that terminal comes back, so
- *    that record is the guard and no second one is kept.
+ *  - a short command's child process is persisted with its pid and command
+ *    line, and reconciled against the process table;
+ *  - a dedicated-terminal runner is persisted with the *transport* it is —
+ *    `dedicated-terminal` — and its terminal's pid, and reconciled the same
+ *    way. That the transport is immutable is the point: the launch record's
+ *    `source` changes to `reattached` when a reload re-finds the terminal,
+ *    and deriving "this is a dedicated runner" from that observation meant
+ *    the *second* reload no longer knew what it was looking at and dropped
+ *    the guard.
  */
 
 import assert from "node:assert/strict";
@@ -31,22 +34,22 @@ import { FakeTerminal, install, reset, until } from "./vscodeStub";
 
 const stub = install();
 
-type Registry = import("../vscode/submissionRegistry").SubmissionRegistry;
+type Registry = import("../vscode/operationRegistry").OperationRegistry;
 type Tracker = import("../vscode/executionTracker").ExecutionTracker;
 type Runner = import("../vscode/commandRunner").SparringCommandRunner;
-type Probe = () => Promise<{ pid: number; command: string }[]>;
+type Probe = () => Promise<{ pid: number; ppid: number; command: string }[]>;
 
-let SubmissionRegistry: typeof import("../vscode/submissionRegistry").SubmissionRegistry;
+let OperationRegistry: typeof import("../vscode/operationRegistry").OperationRegistry;
 let ExecutionTracker: typeof import("../vscode/executionTracker").ExecutionTracker;
 let SparringCommandRunner: typeof import("../vscode/commandRunner").SparringCommandRunner;
-let commandKey: typeof import("../vscode/submissionRegistry").commandKey;
-let SUBMISSIONS_KEY: string;
+let commandKey: typeof import("../vscode/operationRegistry").commandKey;
+let OPERATIONS_KEY: string;
 
 before(async () => {
-  const registry = await import("../vscode/submissionRegistry");
-  SubmissionRegistry = registry.SubmissionRegistry;
+  const registry = await import("../vscode/operationRegistry");
+  OperationRegistry = registry.OperationRegistry;
   commandKey = registry.commandKey;
-  SUBMISSIONS_KEY = registry.SUBMISSIONS_KEY;
+  OPERATIONS_KEY = registry.OPERATIONS_KEY;
   ExecutionTracker = (await import("../vscode/executionTracker")).ExecutionTracker;
   SparringCommandRunner = (await import("../vscode/commandRunner")).SparringCommandRunner;
 });
@@ -109,7 +112,7 @@ describe("a reload does not release a direct engine operation that is still runn
     };
 
     // ---- the window that starts it -------------------------------------
-    const before: Registry = new SubmissionRegistry({ workspaceState: kept } as never, (message) => logged.push(message), () => false, async () => []);
+    const before: Registry = new OperationRegistry({ workspaceState: kept } as never, (message: string) => logged.push(message), () => false, async () => []);
     const firstPool = pool();
     const firstRunner: Runner = new SparringCommandRunner((message) => logged.push(message), firstPool as never, before);
     const running = firstRunner.run(options);
@@ -117,11 +120,11 @@ describe("a reload does not release a direct engine operation that is still runn
     firstPool.acquired[0].dispose(); // shell integration never appears: the direct fallback is taken
     const directly = await until(() => {
       const held = before.inFlightFor(key);
-      return held?.state === "direct" ? held : undefined;
+      return held?.state === "running-direct" ? held : undefined;
     }, "the operation to be running as a direct process");
     const pid = directly.directPid;
     assert.ok(pid !== undefined, "the child's pid is on the record");
-    const persisted = kept.get<{ key: string; direct?: { pid: number; word: string; args: string[] } }[]>(SUBMISSIONS_KEY, []);
+    const persisted = kept.get<{ key: string; direct?: { pid: number; word: string; args: string[] } }[]>(OPERATIONS_KEY, []);
     assert.deepEqual(
       persisted.map((item) => [item.key, item.direct?.pid, item.direct?.args]),
       [[key, pid, options.args]],
@@ -140,17 +143,17 @@ describe("a reload does not release a direct engine operation that is still runn
       const { parsePsOutput } = await import("../core/processTree");
       return new Promise((resolve) => execFile("ps", ["-axo", "pid=,ppid=,command="], { maxBuffer: 16 * 1024 * 1024 }, (error, stdout) => resolve(error ? [] : parsePsOutput(stdout))));
     };
-    const after: Registry = new SubmissionRegistry({ workspaceState: kept } as never, (message) => logged.push(message), () => true, table);
+    const after: Registry = new OperationRegistry({ workspaceState: kept } as never, (message: string) => logged.push(message), () => true, table);
     const secondPool = pool();
     const secondRunner: Runner = new SparringCommandRunner((message) => logged.push(message), secondPool as never, after);
     try {
       const restored = after.restore();
       assert.deepEqual(
-        restored.map((item) => [item.state, item.restored, item.directPid]),
-        [["direct", true, pid]],
+        restored.map((item: { state: string; restored: boolean; directPid?: number }) => [item.state, item.restored, item.directPid]),
+        [["running-direct", true, pid]],
         "the reloaded window finds the operation it started, as a running process rather than a shell submission",
       );
-      assert.deepEqual(after.unresolved().map((item) => item.state), ["direct"], "and cannot account for it on its own");
+      assert.deepEqual(after.unresolved().map((item: { state: string }) => item.state), ["running-direct"], "and cannot account for it on its own");
 
       const refused = await secondRunner.run({ ...options, name: "freeze-candidate (after the reload)" });
       assert.equal(refused.ok, false, "so the same operation is refused");
@@ -172,10 +175,10 @@ describe("a reload does not release a direct engine operation that is still runn
         return after.inFlightFor(key) === undefined ? true : undefined;
       }, "the process table to settle it once the child has exited");
       assert.ok(
-        logged.some((line) => /resolved as process-gone/.test(line)),
+        logged.some((line) => /resolved as completed \(direct-process-gone\)/.test(line)),
         `settled by evidence about that process, got ${JSON.stringify(logged.filter((line) => line.includes("resolved")))}`,
       );
-      assert.deepEqual(kept.get(SUBMISSIONS_KEY, []), [], "and nothing is left on the record");
+      assert.deepEqual(kept.get(OPERATIONS_KEY, []), [], "and nothing is left on the record");
     } finally {
       after.dispose();
       await fs.rm(dir, { recursive: true, force: true });
@@ -192,7 +195,7 @@ describe("a reload does not release a direct engine operation that is still runn
     const cwd = path.join(os.tmpdir(), "agent-sparring-no-probe");
     const stage = "stage-4-editor-and-ui-inspection";
     const key = commandKey(cwd, "freeze-candidate", stage);
-    await kept.update(SUBMISSIONS_KEY, [
+    await kept.update(OPERATIONS_KEY, [
       {
         id: "submission-from-the-previous-window",
         key,
@@ -205,13 +208,13 @@ describe("a reload does not release a direct engine operation that is still runn
         direct: { pid: 2147480002, word: "/venv/bin/sparring", args: ["freeze-candidate", stage] },
       },
     ]);
-    const registry: Registry = new SubmissionRegistry({ workspaceState: kept } as never, (message) => logged.push(message), () => false, async () => []);
+    const registry: Registry = new OperationRegistry({ workspaceState: kept } as never, (message: string) => logged.push(message), () => false, async () => []);
     const terminals = pool();
     const runner: Runner = new SparringCommandRunner((message) => logged.push(message), terminals as never, registry);
     try {
       registry.restore();
       await registry.probeAll();
-      assert.deepEqual(registry.unresolved().map((item) => [item.state, item.restored]), [["direct", true]], "the operation is still on the record");
+      assert.deepEqual(registry.unresolved().map((item: { state: string; restored: boolean }) => [item.state, item.restored]), [["running-direct", true]], "the operation is still on the record");
       assert.ok(
         logged.some((line) => /no process probe is available/.test(line) && /before the reload/.test(line)),
         `and the log says why nothing here can settle it, got ${JSON.stringify(logged)}`,
@@ -228,9 +231,11 @@ describe("a reload does not release a direct engine operation that is still runn
       assert.equal(refused.ok ? undefined : refused.submission?.directPid, 2147480002, "named as the process it is about");
       assert.equal(terminals.acquired.length, 0, "nothing was acquired for it");
 
-      assert.equal(registry.override(key, "the person confirmed that the process is over"), true, "the override applies to a restored process, not only to a shell submission");
+      const held = registry.inFlightFor(key);
+      assert.ok(held, "the record is there to be overridden");
+      assert.equal(registry.override(held.id, "the person confirmed that the process is over").overridden, true, "the override applies to a restored process, not only to a shell submission");
       assert.deepEqual(registry.unresolved(), [], "after which the operation may be run again");
-      assert.ok(logged.some((line) => /resolved as overridden/.test(line)), "recorded as an override, not as evidence");
+      assert.ok(logged.some((line) => /resolved as human-override/.test(line)), "recorded as an override, not as evidence");
     } finally {
       registry.dispose();
     }
@@ -252,7 +257,7 @@ describe("a reload does not release a direct engine operation that is still runn
     };
 
     // ---- the window that starts it -------------------------------------
-    const before: Registry = new SubmissionRegistry({ workspaceState: kept } as never, (message) => logged.push(message), () => false, async () => []);
+    const before: Registry = new OperationRegistry({ workspaceState: kept } as never, (message: string) => logged.push(message), () => false, async () => []);
     const firstPool = pool();
     const firstTracker: Tracker = new ExecutionTracker({ workspaceState: kept } as never, (message) => logged.push(message), () => [], firstPool as never, before);
     const launched = firstTracker.launch(options);
@@ -263,11 +268,19 @@ describe("a reload does not release a direct engine operation that is still runn
     assert.equal(result.ok ? result.via : undefined, "terminal");
     assert.equal(stub.window.created.length, 1, "exactly one dedicated terminal");
     const dedicated = stub.window.terminals[stub.window.terminals.length - 1];
-    await until(() => (kept.get<{ runId: string; source: string; terminalPid: number }[]>("agentSparring.launches", []).length === 1 ? true : undefined), "the launch to be persisted with its terminal's pid");
-    const persistedLaunch = kept.get<{ runId: string; source: string; terminalPid: number }[]>("agentSparring.launches", [])[0];
+    await until(() => (kept.get<{ runId: string; source: string; transport?: string; terminalPid: number }[]>("agentSparring.launches", []).length === 1 ? true : undefined), "the launch to be persisted with its terminal's pid");
+    const persistedLaunch = kept.get<{ runId: string; source: string; transport?: string; terminalPid: number }[]>("agentSparring.launches", [])[0];
     assert.equal(persistedLaunch.source, "terminal", "recorded as a process of ours, not as a shell command");
     assert.equal(persistedLaunch.terminalPid, await dedicated.processId);
-    assert.deepEqual(kept.get(SUBMISSIONS_KEY, []), [], "and no second record is kept for it: the launch is the record");
+    assert.equal(persistedLaunch.transport, "dedicated-terminal", "with the transport it is, which no later observation overwrites");
+    // The guard is the registry's, as it is for every other transport: one
+    // authority answers "would starting this again risk doing it twice".
+    const guard = kept.get<{ key: string; state: string; transport: string; terminalPid?: number }[]>(OPERATIONS_KEY, []);
+    assert.deepEqual(
+      guard.map((item) => [item.key, item.state, item.transport]),
+      [[`run:${runId}`, "running-dedicated", "dedicated-terminal"]],
+      "and the operation guard is persisted as a dedicated-terminal runner",
+    );
 
     // ---- the reload: VS Code brings the terminal back ------------------
     before.dispose();
@@ -275,7 +288,7 @@ describe("a reload does not release a direct engine operation that is still runn
     reset();
     const reconnected = new FakeTerminal("Agent Sparring — run-plan", persistedLaunch.terminalPid);
     stub.window.terminals.push(reconnected);
-    const after: Registry = new SubmissionRegistry({ workspaceState: kept } as never, (message) => logged.push(message), () => false, async () => []);
+    const after: Registry = new OperationRegistry({ workspaceState: kept } as never, (message: string) => logged.push(message), () => false, async () => []);
     const secondPool = pool();
     const tracker: Tracker = new ExecutionTracker({ workspaceState: kept } as never, (message) => logged.push(message), () => [], secondPool as never, after);
     try {
@@ -288,6 +301,7 @@ describe("a reload does not release a direct engine operation that is still runn
       assert.equal(stub.window.created.length, 0, "no second dedicated terminal was created");
       assert.equal(secondPool.acquired.length, 0, "and no terminal was acquired for it");
       await reattaching;
+      assert.equal(after.inFlightFor(`run:${runId}`)?.state, "running-dedicated", "and it is still known to be a dedicated runner");
 
       // The evidence that ends it is the one it always was: that terminal is
       // gone, and it exists only while its process does.

@@ -61,7 +61,7 @@ import { STAGE_MODES_KEY, STAGE_MODE_LABELS, STAGE_MODES, modesForPlan, type Sta
 import { withTemporaryFile } from "../core/tempFile";
 import type { SparringController } from "./controller";
 import type { EngineFailure, LaunchProblem, LaunchResult } from "./executionTracker";
-import type { SubmissionView } from "./submissionRegistry";
+import type { OperationView } from "./operationRegistry";
 import { outputTail } from "./terminalOutput";
 import { currentBranch, knownRepositories, pendingChanges } from "./git";
 import { manifestSupport } from "./engineProbe";
@@ -114,7 +114,9 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     // Submitted commands whose start has not been observed: never runners,
     // and the reason a second command for the same run is refused.
     vscode.commands.registerCommand("agentSparring._test.unresolvedSubmissions", () => controller.unresolvedSubmissions()),
-    vscode.commands.registerCommand("agentSparring._test.overrideSubmission", (key: string, note: string) => controller.overrideSubmission(key, note ?? "confirmed by the person in a test")),
+    // Takes the immutable operation id, exactly as the dialog does: an
+    // override never searches for another record with the same key.
+    vscode.commands.registerCommand("agentSparring._test.overrideSubmission", (operationId: string, note: string) => controller.overrideSubmission(operationId, note ?? "confirmed by the person in a test").overridden),
     vscode.commands.registerCommand("agentSparring._test.probeSubmissions", () => controller.probeSubmissions()),
     vscode.commands.registerCommand("agentSparring._test.acceptStage", async () => {
       const run = controller.currentSelection.selected;
@@ -669,7 +671,7 @@ async function performAcceptStage(controller: SparringController, run: Standalon
   const invocation = { stageId: run.stage.stageId, repoRoot, expectedBranch, sparringDir: run.location.sparringDir };
   controller.setAccepting(run.id, true);
   controller.log(`Accept stage ${run.stage.stageId}: freeze-candidate, then accept-candidate (branch ${expectedBranch})`);
-  let problem: { error: string; problem: LaunchProblem; submission?: SubmissionView } | undefined;
+  let problem: { error: string; problem: LaunchProblem; submission?: OperationView } | undefined;
   try {
     const result = await acceptStage(async (args) => {
       const outcome = await controller.runCommand({ configured: configuredExecutable(), args, cwd: repoRoot, name: `Accept stage: ${run.stage.stageId}` });
@@ -1375,7 +1377,7 @@ async function explainLaunch(controller: SparringController, result: LaunchResul
  * can stop a line already sitting in a shell's input. So it is asked for
  * modally, in those words, and what it permits is a retry.
  */
-async function explainUnconfirmed(controller: SparringController, error: string, submission: SubmissionView | undefined): Promise<void> {
+async function explainUnconfirmed(controller: SparringController, error: string, submission: OperationView | undefined): Promise<void> {
   const choices = submission ? ["Show Log", "I checked — allow retry"] : ["Show Log"];
   const choice = await vscode.window.showWarningMessage(`Agent Sparring: ${error}`, ...choices);
   if (choice === "Show Log") {
@@ -1387,7 +1389,7 @@ async function explainUnconfirmed(controller: SparringController, error: string,
   }
   // A command a shell holds and a process started before a reload are two
   // different things to be asked about, and are asked about as themselves.
-  const direct = submission.state === "direct";
+  const direct = submission.state === "running-direct" || submission.state === "running-dedicated";
   const detail = (
     direct
       ? [
@@ -1411,9 +1413,24 @@ async function explainUnconfirmed(controller: SparringController, error: string,
   if (confirmed !== "Allow retry") {
     return;
   }
-  if (controller.overrideSubmission(submission.key, direct ? "the person confirmed that the process started before the reload is over; this is an override, not an observation" : "the person confirmed, having checked the terminal, that this command cannot still run; this is an override, not an observation")) {
+  // The exact record the dialog was about, by its immutable id. If that
+  // record has been resolved while the dialog was open — the shell reported
+  // it, its terminal closed, the process table settled it — and a *new*
+  // operation has since taken the same key, confirming this dialog must not
+  // touch that new one.
+  const result = controller.overrideSubmission(
+    submission.id,
+    direct
+      ? "the person confirmed that the process started before the reload is over; this is an override, not an observation"
+      : "the person confirmed, having checked the terminal, that this command cannot still run; this is an override, not an observation",
+  );
+  if (result.overridden) {
     void vscode.window.showInformationMessage(`Agent Sparring: ${submission.label} may be run again. Its earlier submission was cleared by you, not by evidence.`);
+    return;
   }
+  void vscode.window.showInformationMessage(
+    `Agent Sparring: that submission of ${submission.label} has already been resolved or replaced since you were asked about it, so nothing was overridden. Try the operation again; if something is still in flight you will be told about that one.`,
+  );
 }
 
 /**
@@ -1421,7 +1438,7 @@ async function explainUnconfirmed(controller: SparringController, error: string,
  * gets the settings dialog, a command whose fate is unknown gets the same
  * treatment as an unconfirmed launch.
  */
-async function explainCommandProblem(controller: SparringController, problem: { error: string; problem: LaunchProblem; submission?: SubmissionView }): Promise<void> {
+async function explainCommandProblem(controller: SparringController, problem: { error: string; problem: LaunchProblem; submission?: OperationView }): Promise<void> {
   if (problem.problem !== "unconfirmed") {
     await explainExecutableProblem(problem.error);
     return;
@@ -1693,7 +1710,7 @@ async function performStartNextStage(controller: SparringController, overview: O
     }
   }
   controller.log(`Start next stage: sparring new-stage ${proposal.stageId} --brief-file <temporary copy of ${planName} › ${proposal.display}>`);
-  let problem: { error: string; problem: LaunchProblem; submission?: SubmissionView } | undefined;
+  let problem: { error: string; problem: LaunchProblem; submission?: OperationView } | undefined;
   // The brief travels through a temporary file outside the workspace; the
   // engine reads it and writes brief.md. The file is removed afterwards.
   const result: NewStageResult = await withTemporaryFile(rendered.brief, `${proposal.stageId}.md`, (briefFile) =>
