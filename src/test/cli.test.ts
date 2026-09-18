@@ -35,8 +35,8 @@ describe("CLI argument building", () => {
 
   it("resume-plan adds --evidence only when non-empty", () => {
     const base = { planPath: "p.md", repoRoot: "/r", expectedBranch: "b" };
-    assert.deepEqual(buildResumePlanArgs({ ...base, evidence: "  " }), ["resume-plan", "p.md", "--repo-root", "/r", "--expected-branch", "b"]);
-    assert.deepEqual(buildResumePlanArgs({ ...base, evidence: "Tested on a Pixel 7" }).slice(-2), ["--evidence", "Tested on a Pixel 7"]);
+    assert.deepEqual(buildResumePlanArgs({ source: "markdown", ...base, evidence: "  " }), ["resume-plan", "p.md", "--repo-root", "/r", "--expected-branch", "b"]);
+    assert.deepEqual(buildResumePlanArgs({ source: "markdown", ...base, evidence: "Tested on a Pixel 7" }).slice(-2), ["--evidence", "Tested on a Pixel 7"]);
   });
 });
 

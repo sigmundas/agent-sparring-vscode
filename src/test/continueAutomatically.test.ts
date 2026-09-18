@@ -40,7 +40,7 @@ describe("the engine command the automatic mode issues", () => {
   it("run-plan --manifest, with --adopt only when asked", () => {
     assert.deepEqual(buildRunPlanArgs({ manifest: "/tmp/m.json", repoRoot: "/code/app", expectedBranch: "feature/x" }), ["run-plan", "--manifest", "/tmp/m.json", "--repo-root", "/code/app", "--expected-branch", "feature/x"]);
     assert.deepEqual(buildRunPlanArgs({ manifest: "/tmp/m.json", repoRoot: "/code/app", expectedBranch: "feature/x", adopt: true }), ["run-plan", "--manifest", "/tmp/m.json", "--repo-root", "/code/app", "--expected-branch", "feature/x", "--adopt"]);
-    assert.deepEqual(buildResumePlanArgs({ manifest: "/tmp/m.json", repoRoot: "/code/app", expectedBranch: "feature/x", evidence: "done" }), ["resume-plan", "--manifest", "/tmp/m.json", "--repo-root", "/code/app", "--expected-branch", "feature/x", "--evidence", "done"]);
+    assert.deepEqual(buildResumePlanArgs({ source: "manifest", manifest: "/tmp/m.json", repoRoot: "/code/app", expectedBranch: "feature/x", evidence: "done" }), ["resume-plan", "--manifest", "/tmp/m.json", "--repo-root", "/code/app", "--expected-branch", "feature/x", "--evidence", "done"]);
   });
 
   it("a plan path and a manifest are alternatives, never both", () => {
@@ -63,21 +63,37 @@ describe("the engine command the automatic mode issues", () => {
 });
 
 describe("the automatic path is one engine call, not a loop", () => {
-  it("builds a manifest and launches exactly one run-plan / resume-plan", async () => {
-    const source = fn(await commandsSource(), "performContinueAutomatically");
+  it("starting builds a manifest and launches exactly one run-plan", async () => {
+    const source = fn(await commandsSource(), "startManagedRun");
     assert.match(source, /buildManifest\(\{/, "the plan is interpreted once, here");
-    assert.match(source, /buildRunPlanArgs\(\{ \.\.\.invocation, adopt \}\) : buildResumePlanArgs\(invocation\)/, "one command, chosen by whether a run is already recorded");
+    assert.match(source, /buildRunPlanArgs\(\{ manifest: manifestPath,/, "a fresh managed run is always started from the manifest");
     assert.equal((source.match(/controller\.launch\(/g) ?? []).length, 1, "exactly one launch");
     assert.ok(!/buildRunLoopArgs|buildFreezeCandidateArgs|buildAcceptCandidateArgs|buildNewStageArgs|acceptStage\(/.test(source), "no per-stage command: the engine sequences, freezes and accepts");
     assert.ok(!/for \(|while \(|forEach\(.*launch/.test(source.replace(/for \(const problem of built\.skipped\)[\s\S]*?\n {2}}/, "")), "nothing here iterates over stages to run them");
   });
 
+  it("continuing an existing run launches exactly one resume-plan, and never builds its own input", async () => {
+    // The input kind is the run's own recorded one, decided in
+    // planInvocationFor and nowhere else. This function may not reach for a
+    // manifest (or a plan path) of its own, because doing so is precisely how
+    // a Markdown-started run came to be resumed with --manifest.
+    const source = fn(await commandsSource(), "continueManagedRun");
+    assert.match(source, /await planInvocationFor\(controller, run\)/, "one place decides the input");
+    assert.match(source, /buildResumePlanArgs\(\{ \.\.\.input,/, "and it is carried through verbatim");
+    assert.ok(!/buildManifest\(\{/.test(source), "no second interpretation of the plan");
+    assert.ok(!/buildRunPlanArgs/.test(source), "an existing run is never started again");
+    assert.equal((source.match(/launch\(controller, location, args/g) ?? []).length, 1, "exactly one launch");
+  });
+
   it("confirms once, before the first stage, and never in a loop", async () => {
-    const source = fn(await commandsSource(), "performContinueAutomatically");
-    assert.match(source, /Run this plan automatically until Agent Sparring needs you\?/);
-    assert.equal((source.match(/showInformationMessage\(\s*"Run this plan/g) ?? []).length, 1);
-    assert.match(source, /if \(options\.confirm\)/, "the one confirmation is skippable only by the test hook");
-    const describePlan = /function describePlan\([\s\S]*?\n}\n/.exec(await commandsSource())?.[0] ?? "";
+    const source = await commandsSource();
+    for (const where of ["startManagedRun", "continueManagedRun"]) {
+      const body = fn(source, where);
+      assert.match(body, /Run this plan automatically until Agent Sparring needs you\?/, `${where} asks once`);
+      assert.equal((body.match(/showInformationMessage\(\s*"Run this plan/g) ?? []).length, 1, `${where} asks exactly once`);
+      assert.match(body, /if \(\w*\.?confirm\)/, "the one confirmation is skippable only by the test hook");
+    }
+    const describePlan = /function describePlan\([\s\S]*?\n}\n/.exec(source)?.[0] ?? "";
     assert.match(describePlan, /with no further confirmation/, "the dialog says plainly that nothing else will be asked");
     assert.match(describePlan, /stops when the reviewer needs you, escalates, something fails, or the plan is complete/);
   });
@@ -95,7 +111,7 @@ describe("the automatic path is one engine call, not a loop", () => {
     // unchanged plan: the engine refuses a run whose digest moved. So
     // neither call may know something the other does not.
     const source = await commandsSource();
-    for (const where of ["performContinueAutomatically", "planInvocationFor"]) {
+    for (const where of ["startManagedRun", "planInvocationFor"]) {
       const body = fn(source, where);
       assert.match(body, /known: await knownStageIds\(/, `${where} carries the project's existing stage ids and briefs`);
       assert.match(body, /\.\.\.declarationsFor\(controller, /, `${where} carries the declared sibling repositories and stage modes, from the one place that reads them`);
@@ -145,13 +161,18 @@ describe("the automatic path is one engine call, not a loop", () => {
 
   it("one preflight, and only when something is actually wrong", async () => {
     // A healthy plan must get exactly one dialog: the confirmation. The
-    // preflight is a single modal listing everything at once, never a chain.
+    // preflight is a single modal listing everything at once, never a chain,
+    // and it is the same one whether the run is being started or continued.
     const source = await commandsSource();
-    const perform = fn(source, "performContinueAutomatically");
-    assert.match(perform, /const blockers = await preflight\(/);
-    assert.match(perform, /if \(blockers\.length > 0\)/, "silent when there is nothing to say");
-    assert.equal((perform.match(/showWarningMessage\(/g) ?? []).length, 3, "an unreadable plan, an unbuildable one, and the preflight — never two in a row");
-    assert.ok(perform.indexOf("const blockers") < perform.indexOf("if (options.confirm)"), "before the confirmation, not after");
+    const refused = fn(source, "refusedByPreflight");
+    assert.match(refused, /const blockers = await preflight\(/);
+    assert.match(refused, /if \(blockers\.length === 0\)/, "silent when there is nothing to say");
+    assert.equal((refused.match(/showWarningMessage\(/g) ?? []).length, 1, "one modal listing everything at once");
+    for (const where of ["startManagedRun", "continueManagedRun"]) {
+      const body = fn(source, where);
+      assert.match(body, /await refusedByPreflight\(/, `${where} preflights`);
+      assert.ok(body.indexOf("refusedByPreflight") < body.indexOf("Run this plan automatically"), "before the confirmation, not after");
+    }
     const body = fn(source, "preflight");
     for (const check of [/adoptionGaps\(/, /is not a Git repository here/, /declares \$\{repository\.branch\}/, /last handoff was written on/, /uncommitted change/, /no `run-plan --manifest`/]) {
       assert.match(body, check, `preflight covers ${check}`);
@@ -172,8 +193,21 @@ describe("the automatic path is one engine call, not a loop", () => {
   it("resumes a manifest-started run with --manifest, because the engine refuses the other input", async () => {
     const source = fn(await commandsSource(), "planInvocationFor");
     assert.match(source, /run\.state\.source !== "manifest"/, "the engine's own record of which input the run executes");
-    assert.match(source, /return \{ planPath: run\.planPath \}/, "a markdown run keeps its plan path");
+    assert.match(source, /return \{ planPath: run\.planPath, source: "markdown" \}/, "a markdown run keeps its plan path, and says so");
     assert.match(source, /buildManifest\(\{/, "a manifest run gets its manifest rebuilt, deterministically");
+    assert.match(source, /source: "manifest" \}/, "and says that too, so the builder can check it");
+  });
+
+  it("the recorded source travels with the invocation, and a mismatch cannot be built at all", () => {
+    // The rule, at the one place every resume passes through. A run started
+    // from a Markdown plan is resumed from that plan; one started from a
+    // manifest is resumed with --manifest. Handing the builder the other kind
+    // is a thrown error, not a warning, because the engine would refuse the
+    // run and no button could then continue the plan.
+    assert.deepEqual(buildResumePlanArgs({ source: "markdown", planPath: "docs/plan.md", repoRoot: "/r", expectedBranch: "b" }), ["resume-plan", "docs/plan.md", "--repo-root", "/r", "--expected-branch", "b"]);
+    assert.deepEqual(buildResumePlanArgs({ source: "manifest", manifest: "/tmp/m.json", repoRoot: "/r", expectedBranch: "b" }), ["resume-plan", "--manifest", "/tmp/m.json", "--repo-root", "/r", "--expected-branch", "b"]);
+    assert.throws(() => buildResumePlanArgs({ source: "markdown", manifest: "/tmp/m.json", repoRoot: "/r", expectedBranch: "b" }), /started from a markdown plan input/);
+    assert.throws(() => buildResumePlanArgs({ source: "manifest", planPath: "docs/plan.md", repoRoot: "/r", expectedBranch: "b" }), /started from a manifest plan input/);
   });
 });
 
@@ -235,7 +269,11 @@ describe("what the Overview offers in each mode", () => {
     await ws.writePlanRun(FOO_PLAN_KEY, { plan: FOO_PLAN_LABEL, status: "paused", current_stage_index: 0, current_stage: FOO_STAGE_IDS[0] });
     await ws.writeStage(FOO_STAGE_IDS[0], { status: "working" });
     const model = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, { handoff: false, sparring: false, brief: false, plan: true, planText: "# Foo plan\n" }, NOW);
-    assert.match(model.continueAutomatically!.detail, /sparring resume-plan --manifest/);
+    // This fixture's run was recorded without a source, which the engine
+    // reads as `markdown` — so the offer must not promise --manifest, which
+    // the engine would refuse for it.
+    assert.match(model.continueAutomatically!.detail, /sparring resume-plan Foo plan:/);
+    assert.ok(!model.continueAutomatically!.detail.includes("--manifest"));
   });
 
   it("a complete plan run offers nothing to continue", async () => {

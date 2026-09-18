@@ -32,7 +32,7 @@ navigates.
 
 | Command | Effect |
 | --- | --- |
-| `Agent Sparring: Run Plan` | Pick a plan Markdown file (`## Stage <n> — <title>` headings), confirm the branch, launch `run-plan`. The branch is asked for here because nothing has been decided yet — this is the run that records it. |
+| `Agent Sparring: Run Plan` | Pick a plan Markdown file (`## Stage <n> — <title>` headings), confirm the branch, and start it the way `agentSparring.planContinuation` says a plan is run: in automatic mode the same managed, manifest-driven run **Continue automatically** starts; in manual mode `run-plan <plan>`. The branch is asked for here because nothing has been decided yet — this is the run that records it. If a run already exists for that plan it is continued, on its own recorded input kind, rather than started again. |
 | `Agent Sparring: Resume Plan` | Pick a paused/running plan run, optionally record human evidence, launch `resume-plan`. The branch is *not* asked for: the run recorded `expected_branch` when it started and the engine refuses any other, so the checked-out branch is used when it matches and the mismatch is explained when it does not. |
 | `Agent Sparring: Run / Resume Stage` | For the selected standalone stage (or after picking one), launch `sparring run-loop <stage> --repo-root <project> --expected-branch <current branch>` in a terminal. The branch comes from the Git repository owning the project (built-in Git API, then `.git/HEAD`); a detached HEAD is refused, never guessed. Also offered as **Run stage** / **Resume stage** in the Overview. |
 | `Agent Sparring: Accept Stage` | For a stage whose independent review passed (**Review complete**): one action that runs the engine's `freeze-candidate` and, only if that succeeds, `accept-candidate` for the selected stage, project and current branch. Refusals are translated (uncommitted changes, not pushed, wrong branch, code changed after the review); the engine's own output goes to the Output Channel. Also offered as **Accept stage** in the Overview. |
@@ -40,7 +40,8 @@ navigates.
 | `Agent Sparring: Match Stage to Plan Section…` | When the Overview cannot tell which stage of the associated plan the selected stage is, pick it from the plan's stages (also **Match this stage…** / **Change match…** in the Overview). It remaps **only the stage on screen**, and the dialog is titled with that stage's name so it cannot be mistaken for another. Stored with the association in VS Code workspace state, never in engine state. |
 | `Agent Sparring: Review Stage Matches…` | The plan-level view: every stage this project has and which section of the plan it resolves to, with the ones nothing could place — and any two stages claiming the same section — first. Pick one to say which section *it* is. Use this to fix a historical stage; **Change match…** would remap the current one instead. When nothing needs placing the list says so — *All stages are matched. Select one only if you want to change it.* — and fixing the last unplaced stage closes it rather than reopening. Also **All stage matches…** in the Overview. |
 | `Agent Sparring: Start Next Stage from Plan…` | For an accepted standalone stage with an associated plan: create the stage that follows it (by stage label) with the engine's own `sparring new-stage <id>`, after a confirmation naming the title, the proposed id and the plan section. The Overview switches to the new stage, the plan association follows it, and its fresh `brief.md` opens beside the plan section for you to fill in before **Run stage**. Also **Start next stage** in the Overview. |
-| `Agent Sparring: Continue Plan Automatically` | Build the execution manifest for the plan of the selected run and start (or resume) the engine's managed plan run against it: `sparring run-plan --manifest … [--adopt]` / `sparring resume-plan --manifest …`. The engine then sequences the stages itself. One confirmation before the first stage; none between stages. Also **Continue automatically** in the Overview. |
+| `Agent Sparring: Continue Plan Automatically` | Start the engine's managed plan run for the plan of the selected run, from an execution manifest the extension builds (`sparring run-plan --manifest … [--adopt] [--allow-push-for-run]`), or continue the run that already exists — with the plan input *that run* was recorded as using, never a different one. The engine then sequences the stages itself. One confirmation before the first stage; none between stages. Also **Continue automatically** in the Overview. |
+| `Agent Sparring: Allow Push of the Verified Candidate` | For a managed run the engine has paused because a verified candidate is not on its intended remote branch: hand the engine permission to push that exact commit (`sparring resume-plan --allow-push-candidate <commit>`), and with the run toggle on, this run's later verified candidates too. The engine pushes, re-proves the commit is on the remote branch and then runs its own acceptance gate; the extension never runs `git push`. Also **Allow push** in the Overview, which is where the choice belongs. |
 | `Agent Sparring: Sibling Repositories for a Plan Stage…` | Declare which *other* repositories a plan stage's reviewed candidate spans, so acceptance pins and verifies the complete set instead of the primary commit alone. Pick the stage, pick a repository this window knows (or browse to one) and confirm the branch its candidate must be on; no commit is ever asked for. Stored in VS Code workspace state per worktree, plan and stage label, emitted into the execution manifest, and shown quietly in the Overview. Removing a declaration is the same command. |
 | `Agent Sparring: Stage Mode for a Plan Stage…` | Declare that a plan stage is a *review* of work rather than work: no implementation agent runs for it, and a fresh independent reviewer inspects the candidates the earlier stages accepted. Nothing is inferred from a stage's title or its brief's prose — this command is the only way to say it. Stored in VS Code workspace state per worktree, plan and stage label, and emitted into the execution manifest as `mode`. Setting it back to *Implementation* removes the declaration. |
 | `Agent Sparring: Copy Review Context for Chat` | For a stage the reviewer handed back to you: put the whole review on the clipboard as plain Markdown — the stage and its goal, the routing state, the reviewer's summary and note, every human-gate check with its instruction and pass criteria verbatim, the concrete names the review refers to, the latest handoff claims, the reviewer's findings and the stage's plan section — so it can be pasted into ChatGPT/Claude, an issue or a message and asked about. No provider prompts, model reasoning, command output or activity log. Also **Copy context for chat** in the Overview, beside **Open detailed review**, with **Copy this check** under each outstanding check. |
@@ -268,9 +269,80 @@ such a stage rather than *Review turn*, and its instructions are the captured
 `prompts/0001-reviewer-original.md` — which is how you check that the actor
 working right now really is a fresh reviewer.
 
+**A run's plan input never changes.** Which of the two inputs a *managed run*
+is continued from is the run's own recorded `source`, and nothing in the UI
+may change it: a run started from a Markdown plan is resumed with that plan's
+path, and one started from a manifest with `--manifest`. The engine refuses a
+resume from the other kind — rightly, since the two describe different
+execution content for the same plan — so generating such a request left a
+plan that no button could continue. One function decides the input from the
+recorded source, every path that reaches `resume-plan` goes through it, and
+the command builder refuses to assemble a mismatch at all. Historical
+Markdown runs therefore stay resumable exactly as they are; nothing migrates
+or rewrites a run's input kind.
+
+For the same reason, **Run plan…** starts a new plan the way the configured
+mode says a plan is run: in automatic mode it is the same managed,
+manifest-driven run that **Continue automatically** starts — same manifest,
+same preflight, same confirmation — and in manual mode it hands the plan's own
+path to `run-plan`. There is no second button that quietly starts the same
+plan on the other terms. If a run already exists for that plan, Run plan…
+continues it instead of starting a second one.
+
 **Pause after each stage** (`manual`) keeps the per-stage checkpoints below
 unchanged, for when you want to look before every provider turn. In automatic
 mode those actions are still there, just no longer the obvious path.
+
+## Push authorization
+
+Acceptance only ever freezes a commit that is already on its intended remote
+branch. When a reviewed candidate is not — usually because the project's own
+agent instructions forbid an agent from pushing unasked — the engine pauses
+and records *why*, as typed state rather than prose:
+
+```json
+"awaiting": { "kind": "push_authorization_required", "candidate_sha": "f2e455c…",
+              "remote": "origin", "remote_branch": "feature/add-reference-dialog" }
+```
+
+The Overview reads exactly that and shows a **permission**, not a test:
+
+> **Push authorization required**
+> Candidate f2e455c is ready to push to origin/feature/add-reference-dialog.
+> `[ Allow push ]` `[ Do not allow ]`
+> `[ ]` Auto-push future accepted candidates in this run
+
+There are deliberately no Pass / Fail / Can't test controls, no progress
+count and no Submit for review. That is the defect this replaced: a reviewer
+could express the requirement as a human-gate check ("explicit push
+authorization is required"), the panel rendered it as a manual check, a
+person pressed *Pass* — and nothing was authorized. The answer went back as
+reviewer evidence, the reviewer said READY again, and the gate refused the
+same candidate again.
+
+**Allow push** hands the engine the permission for the exact commit on
+screen (`resume-plan --allow-push-candidate <commit>`), and with the toggle
+on, for this run's later verified candidates too (`--allow-push-for-run`).
+The engine performs the push, re-proves that the commit really is reachable
+from that remote branch, and then runs its own unchanged acceptance gate. The
+extension never runs `git push` itself, on any path: the component that owns
+acceptance owns the push.
+
+The commit is the one the panel was rendered from, and the engine refuses the
+flag unless the run is in fact waiting for that exact commit — so a panel
+left open while the run moved on cannot authorize a candidate nobody looked
+at. **Do not allow** changes nothing at all: pushing the branch yourself and
+continuing the plan normally is a perfectly good way through.
+
+The toggle's position is a draft in this window (so a rerender does not move
+it); the *decision* is recorded by the engine for that run, which is why
+**Auto-push is on for this run** is still shown after a window reload. It
+covers this run, this worktree, this branch and that one remote branch, by
+ordinary non-force push, and nothing else — no force, no tags, no other
+branch, no sibling repository, and no project-wide default. Starting a new
+managed run offers the same choice up front, as the second button on the
+confirmation (a modal dialog cannot hold a checkbox); the ordinary button
+starts the run with no push authorization at all, which is the default.
 
 ## Plans: managed runs and associated files
 

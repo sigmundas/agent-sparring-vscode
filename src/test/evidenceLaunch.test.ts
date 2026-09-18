@@ -110,7 +110,7 @@ const SHELLS = ["/bin/sh", "/bin/bash", "/bin/zsh"];
 describe("handing a free-text argument to a shell", () => {
   it("VS Code's own escaping turns a gate check's evidence into shell syntax — the reported failure", async () => {
     const { dir, file } = await argvReporter();
-    const args = buildResumePlanArgs({ manifest: path.join(dir, "m.json"), repoRoot: dir, expectedBranch: "feature/x", evidence: realEvidence() });
+    const args = buildResumePlanArgs({ source: "manifest", manifest: path.join(dir, "m.json"), repoRoot: dir, expectedBranch: "feature/x", evidence: realEvidence() });
     assert.deepEqual(args.slice(-2, -1), ["--evidence"], "the argument array itself is correct: this was never an argument-building bug");
 
     const line = asVsCodeWouldSend(file, args);
@@ -128,7 +128,7 @@ describe("handing a free-text argument to a shell", () => {
   for (const shell of SHELLS) {
     it(`a command line built here survives ${shell} exactly`, async () => {
       const { dir, file } = await argvReporter();
-      const args = buildResumePlanArgs({ manifest: path.join(dir, "m.json"), repoRoot: dir, expectedBranch: "feature/x", evidence: realEvidence() });
+      const args = buildResumePlanArgs({ source: "manifest", manifest: path.join(dir, "m.json"), repoRoot: dir, expectedBranch: "feature/x", evidence: realEvidence() });
       const line = shellCommandLine(file, args, "posix");
       assert.ok(line, "a POSIX shell is one this extension can quote for");
       const seen = await throughShell(shell, line, dir);
@@ -160,7 +160,7 @@ describe("handing a free-text argument to a shell", () => {
     const loop = { stageId: "stage-reported-statistics-typed-parser", repoRoot: "/Users/me/Code/my repo", expectedBranch: "feature/reported-statistics" };
     for (const args of [
       buildRunPlanArgs({ planPath: "/Users/me/Code/my repo/docs/plans/active/reported.md", repoRoot: loop.repoRoot, expectedBranch: loop.expectedBranch, adopt: true }),
-      buildResumePlanArgs({ manifest: "/Users/me/Library/Application Support/Code/User/globalStorage/m.json", repoRoot: loop.repoRoot, expectedBranch: loop.expectedBranch }),
+      buildResumePlanArgs({ source: "manifest", manifest: "/Users/me/Library/Application Support/Code/User/globalStorage/m.json", repoRoot: loop.repoRoot, expectedBranch: loop.expectedBranch }),
       buildRunLoopArgs(loop),
       buildRunSparringArgs(loop),
       buildFreezeCandidateArgs(loop),
@@ -169,7 +169,7 @@ describe("handing a free-text argument to a shell", () => {
     ]) {
       assert.equal(needsOwnQuoting(args), false, `unchanged: ${args[0]}`);
     }
-    assert.equal(needsOwnQuoting(buildResumePlanArgs({ planPath: "p.md", repoRoot: "/r", expectedBranch: "b", evidence: realEvidence() })), true, "only the free-text one is taken over");
+    assert.equal(needsOwnQuoting(buildResumePlanArgs({ source: "markdown", planPath: "p.md", repoRoot: "/r", expectedBranch: "b", evidence: realEvidence() })), true, "only the free-text one is taken over");
   });
 
   it("knows exactly which arguments VS Code's escaping can carry", () => {
@@ -183,7 +183,7 @@ describe("handing a free-text argument to a shell", () => {
 
   it("the launcher's decision, for the exact invocation that failed", async () => {
     const { dir, file } = await argvReporter();
-    const args = buildResumePlanArgs({ manifest: path.join(dir, "m.json"), repoRoot: dir, expectedBranch: "feature/x", evidence: realEvidence() });
+    const args = buildResumePlanArgs({ source: "manifest", manifest: path.join(dir, "m.json"), repoRoot: dir, expectedBranch: "feature/x", evidence: realEvidence() });
     const handover = planShellHandover(file, args, "posix");
     assert.equal(handover.via, "command-line", "the evidence launch is quoted here, not by VS Code");
     assert.deepEqual((await throughShell("/bin/zsh", (handover as { commandLine: string }).commandLine, dir)).argv, args);

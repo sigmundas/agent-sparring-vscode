@@ -22,7 +22,7 @@ import { describeRepositoryContext, emptyStateLines, emptyStateTitle, type Repos
 import { parseBriefGoal, parseBriefOpening } from "./brief";
 import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
-import { parseHandoffBranch, type PlanRunState, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
+import { PUSH_AUTHORIZATION_REQUIRED, parseHandoffBranch, type PlanRunState, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
 import type { DeclaredRepository } from "./stageRepositories";
 import { deriveVerification, HUMAN_FEEDBACK_HEADING, parseHumanEvidence, parseHumanFeedback, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
 import { checkNameList } from "./humanTask";
@@ -195,6 +195,17 @@ export interface OverviewArtifacts {
   humanChecks?: Record<string, CheckRecord>;
   /** Freeform findings the user has typed but not sent yet (VS Code workspace state); not a check result. */
   humanFeedback?: string;
+  /**
+   * The "Auto-push future accepted candidates in this run" toggle as the
+   * person has currently set it, before they have allowed anything (VS Code
+   * workspace state, so a rerender does not move it back).
+   *
+   * It is a draft of an intention and nothing more. The *decision* is
+   * recorded by the engine when Allow push runs, and the Overview reads it
+   * back from the run state (`autoPushEnabled`) — never from here — so what
+   * survives a reload is what the engine was actually told.
+   */
+  autoPushDraft?: boolean;
   /** Evidence handed to the engine and not yet recorded by it, or a submission that failed; see submission.ts. */
   submission?: SubmissionRecord;
   /** Contents of the stage's notes.md when readable; only its `## Human evidence` section is consulted (what is already recorded). */
@@ -501,12 +512,68 @@ export interface ActionRequired extends VerificationView {
   review: boolean;
 }
 
+/**
+ * The engine is holding a finished, verified candidate and will not push it
+ * without being told to.
+ *
+ * This is **not** a manual check and must never be presented as one. It came
+ * to exist because the reviewer could express the requirement as a
+ * human-gate check — "explicit push authorization is required" — and a
+ * person answering *Pass* to that check authorized nothing: the answer went
+ * back as evidence, the reviewer said READY again, and the acceptance gate
+ * refused the same candidate again. So there are no Pass / Fail / Can't test
+ * controls here, no progress count and no submit-for-review path. There is
+ * one decision, and it is a permission.
+ *
+ * Every fact is the engine's own record of why the run stopped (`awaiting`
+ * in the plan-run state): the commit, the remote and the branch are read,
+ * never derived, and nothing here runs git.
+ */
+export interface PushAuthorization {
+  /** `Push authorization required`. */
+  headline: string;
+  /** One sentence: what is ready, and where it would go. */
+  text: string;
+  /** The full commit id, for the engine contract; `shortSha` is what is shown. */
+  candidateSha: string;
+  shortSha: string;
+  /** `origin/feature/x`, as the acceptance gate would check it. */
+  target: string;
+  /** The stage the candidate belongs to, as the engine named it. */
+  stageId: string;
+  allow: { label: string; enabled: boolean; detail: string };
+  /** Leaving it for now: nothing is run, nothing is recorded, the run stays paused. */
+  dismiss: { label: string; detail: string };
+  /**
+   * The run-scoped half of the same decision, as a toggle the person sets
+   * before allowing: on, the permission covers the candidates this run
+   * verifies from here on, and the engine stops asking.
+   */
+  autoPush: { label: string; checked: boolean; detail: string };
+  /** The engine's own vocabulary and identifiers, one disclosure away. */
+  technical: TechnicalDetail[];
+}
+
 export interface OverviewModel {
   kind: "empty" | "ambiguous" | "run";
   /** The plan the stage belongs to (managed run or associated file), for the header. */
   planName?: string;
   /** The checked-out branch is not this stage's; nothing that runs the engine is offered while it is set. */
   branchGuard?: BranchGuard;
+  /**
+   * The engine is waiting for permission to push a verified candidate. It
+   * takes the place of `actionRequired`, because it is the reason the run is
+   * stopped and it is a decision of a different kind — a permission, not a
+   * test.
+   */
+  pushAuthorization?: PushAuthorization;
+  /**
+   * This run already has run-scoped push authorization recorded, so it will
+   * not stop to ask again. Shown quietly, and read from the engine's own run
+   * state — which is why it survives a reload: the choice was never kept
+   * here.
+   */
+  autoPushEnabled?: { label: string; detail: string };
   /** Reviewer hand-back to the human; present only for NEEDS_YOU / ESCALATE with no turn in progress. */
   actionRequired?: ActionRequired;
   title: string;
@@ -782,6 +849,18 @@ export function buildOverviewModel(
     // The way forward, or back, is that run's own screen.
     delete model.continueAutomatically;
   }
+  model.autoPushEnabled = autoPushEnabled(run);
+  model.pushAuthorization = pushAuthorization(run, artifacts, model, branchGuard, liveness);
+  if (model.pushAuthorization) {
+    // The run is stopped on a permission, not on a review. Nothing that would
+    // start work is offered beside it: continuing is exactly what Allow push
+    // does, and a second route to it would either race the first or resume
+    // into the same refusal.
+    delete model.continueAutomatically;
+    delete model.planAction;
+    delete model.banner;
+    return model;
+  }
   model.actionRequired = actionRequired(run, presentation, outcome, plan, artifacts, model, branchGuard, liveness);
   if (model.actionRequired) {
     if (model.continueAutomatically?.kind === "adopt") {
@@ -843,6 +922,104 @@ export function branchMismatch(run: RunSnapshot, artifacts: OverviewArtifacts): 
     return undefined; // nothing was read about the repository: no claim either way
   }
   return { expected: expected.branch.trim(), actual, source: expected.source, detail: expected.detail };
+}
+
+// ---------------------------------------------------------------- push authorization
+
+/**
+ * The engine's typed request for permission to push, turned into the one
+ * decision a person makes about it.
+ *
+ * Built **only** from `awaiting` in the engine's plan-run state — the run
+ * itself recorded why it stopped, with the exact commit and remote ref
+ * involved. Nothing here reads a reviewer's summary, a needs-you reason,
+ * AGENTS.md or any prose, and nothing here runs git: a permission question
+ * assembled by guessing at sentences is how a human "passed" a check that
+ * authorized nothing.
+ *
+ * Withheld while a runner is alive (the engine is not waiting for anything),
+ * while the branch is wrong (the engine refuses the resume outright), and
+ * while a stage-accept operation of this window is in flight.
+ */
+function pushAuthorization(
+  run: RunSnapshot,
+  artifacts: OverviewArtifacts,
+  model: OverviewModel,
+  branchGuard: BranchGuard | undefined,
+  liveness: RunnerLiveness,
+): PushAuthorization | undefined {
+  if (run.kind !== "plan" || run.state.status !== "paused") {
+    return undefined;
+  }
+  const awaiting = run.state.awaiting;
+  if (!awaiting || awaiting.kind !== PUSH_AUTHORIZATION_REQUIRED) {
+    return undefined;
+  }
+  if (model.accepting || liveness.state === "running") {
+    return undefined;
+  }
+  const target = `${awaiting.remote}/${awaiting.remoteBranch}`;
+  // Git's own abbreviation, with no ellipsis: this is a commit id a person
+  // will compare against `git log`, not a shortened session id.
+  const shortSha = awaiting.candidateSha.slice(0, 7);
+  const autoPushDraft = artifacts.autoPushDraft === true;
+  let enabled = true;
+  let detail = autoPushDraft
+    ? `Pushes ${shortSha} to ${target} and lets this run push the candidates it verifies from here on, so it stops asking. Ordinary Git push of this branch; the engine then checks the commit really is there and accepts the stage as usual.`
+    : `Pushes ${shortSha} to ${target} and continues. Ordinary Git push of this branch, nothing else; the engine then checks the commit really is there and accepts the stage as usual.`;
+  if (branchGuard) {
+    enabled = false;
+    detail = `Switch to ${branchGuard.expected} first; the engine refuses to continue this run from another branch.`;
+  } else if (liveness.turnActive) {
+    enabled = false;
+    detail = liveness.detail;
+  }
+  return {
+    headline: "Push authorization required",
+    text: `Candidate ${shortSha} is ready to push to ${target}.`,
+    candidateSha: awaiting.candidateSha,
+    shortSha,
+    target,
+    stageId: awaiting.stageId,
+    allow: { label: "Allow push", enabled, detail },
+    dismiss: {
+      label: "Do not allow",
+      detail: "Leaves this run exactly as it is: nothing is pushed, nothing is recorded, and the candidate is not accepted. You can push the branch yourself and continue the plan instead.",
+    },
+    autoPush: {
+      label: "Auto-push future accepted candidates in this run",
+      checked: autoPushDraft,
+      detail: "Applies to this run only, and is recorded by the engine rather than remembered here. It covers the candidates this run verifies, on this branch, to this one remote branch — nothing else, and no other plan.",
+    },
+    technical: [
+      { label: "Engine state", value: `awaiting.kind = ${awaiting.kind}` },
+      { label: "Candidate commit", value: awaiting.candidateSha },
+      { label: "Stage", value: awaiting.stageId },
+      { label: "Local branch", value: awaiting.branch },
+      { label: "Intended remote branch", value: `${awaiting.remote} refs/heads/${awaiting.remoteBranch}` },
+      ...(awaiting.detail ? [{ label: "Why the gate refused it", value: awaiting.detail }] : []),
+      { label: "What allowing does", value: "sparring resume-plan … --allow-push-candidate <commit>, plus --allow-push-for-run when the toggle is on. The engine performs the push; the extension never runs git push itself." },
+    ],
+  };
+}
+
+/**
+ * This run has already been given run-scoped push authorization.
+ *
+ * Read from the engine's recorded state, which is the whole point: the
+ * choice was made once, by a person, and it is the engine that remembers it
+ * — so it is still true after a window reload, and it is still true in
+ * another window.
+ */
+function autoPushEnabled(run: RunSnapshot): OverviewModel["autoPushEnabled"] {
+  if (run.kind !== "plan" || run.state.pushAuthorization?.scope !== "run") {
+    return undefined;
+  }
+  const authorization = run.state.pushAuthorization;
+  return {
+    label: "Auto-push is on for this run",
+    detail: `Candidates this run verifies are pushed to ${authorization.remote}/${authorization.remoteBranch} without asking. Recorded by the engine for this run; it covers no other plan and no other branch.`,
+  };
 }
 
 // ---------------------------------------------------------------- action required (NEEDS_YOU / ESCALATE)
@@ -1130,11 +1307,17 @@ function continueAutomatically(
     if (run.state.status === "complete") {
       return undefined;
     }
+    // Which input the resume will use is the run's own recorded `source`,
+    // never a choice this button makes — see commands.ts `planInvocationFor`.
+    // Saying `--manifest` for a run the engine recorded as a Markdown one
+    // described a command that would be refused, and was how the wrong one
+    // came to be issued.
+    const input = run.state.source === "manifest" ? "--manifest …" : `${plan.name}`;
     return {
       label: "Continue automatically",
       primary: true,
       kind: "continue",
-      detail: `sparring resume-plan --manifest …: the engine continues this managed run of ${plan.name} stage by stage, accepting each READY candidate through its own gate, and stops when it needs you.`,
+      detail: `sparring resume-plan ${input}: the engine continues this managed run of ${plan.name} stage by stage, accepting each READY candidate through its own gate, and stops when it needs you.`,
     };
   }
   return {

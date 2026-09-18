@@ -51,6 +51,7 @@ import {
   type HumanFeedbackDrafts,
 } from "../core/humanChecks";
 import {
+  AUTO_PUSH_DRAFT_KEY,
   SUBMISSIONS_KEY,
   submissionFailureReason,
   withSubmissionUnresolved,
@@ -873,6 +874,33 @@ export class SparringController implements vscode.Disposable {
   async clearHumanFeedback(runId: string): Promise<void> {
     await this.context.workspaceState.update(HUMAN_FEEDBACK_KEY, withoutHumanFeedback(this.context.workspaceState.get<HumanFeedbackDrafts>(HUMAN_FEEDBACK_KEY), runId));
     this.render();
+  }
+
+  // ---------------------------------------------------------------- the auto-push toggle (an intention, not a permission)
+
+  /**
+   * How the person has set "Auto-push future accepted candidates in this
+   * run" for this run, before they have allowed anything.
+   *
+   * It is kept here for one reason only: so ticking the box survives the
+   * panel re-rendering under it. It is **not** where auto-push lives. The
+   * permission itself is recorded by the engine when Allow push runs, and
+   * the Overview reads it back from the run state — so what survives a
+   * reload is what the engine was told, not what a checkbox in this window
+   * once said.
+   */
+  autoPushDraft(runId: string | undefined): boolean {
+    return runId !== undefined && this.context.workspaceState.get<Record<string, boolean>>(AUTO_PUSH_DRAFT_KEY)?.[runId] === true;
+  }
+
+  async setAutoPushDraft(runId: string, enabled: boolean): Promise<void> {
+    const drafts = { ...(this.context.workspaceState.get<Record<string, boolean>>(AUTO_PUSH_DRAFT_KEY) ?? {}) };
+    if (enabled) {
+      drafts[runId] = true;
+    } else {
+      delete drafts[runId];
+    }
+    await this.context.workspaceState.update(AUTO_PUSH_DRAFT_KEY, drafts);
   }
 
   // ---------------------------------------------------------------- submissions (drafts survive until the engine records them)

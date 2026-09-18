@@ -330,7 +330,7 @@ describe("the exact text, all the way to the engine", () => {
 
     // 5. the evidence entry, and the argument array the engine is handed
     const entry = renderHumanFeedback(after.model.actionRequired!.feedback.draft!, new Date(NOW))!;
-    const args = buildResumePlanArgs({ manifest: "/tmp/m.json", repoRoot: "/repo", expectedBranch: "feature/reported-statistics", evidence: entry });
+    const args = buildResumePlanArgs({ source: "manifest", manifest: "/tmp/m.json", repoRoot: "/repo", expectedBranch: "feature/reported-statistics", evidence: entry });
     const evidence = args[args.indexOf("--evidence") + 1];
     assert.ok(evidence.includes(CRASH), "every line of what the person typed is in the one argument");
     assert.equal(evidence.split(/\r?\n/).length, entry.split(/\r?\n/).length, "nothing was joined or dropped");

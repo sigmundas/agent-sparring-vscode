@@ -108,7 +108,18 @@ export class Workspace {
 
   async writePlanRun(
     planKey: string,
-    state: { plan: string; status: "running" | "paused" | "complete"; current_stage_index: number; current_stage: string; expected_branch?: string; source?: "markdown" | "manifest" },
+    state: {
+      plan: string;
+      status: "running" | "paused" | "complete";
+      current_stage_index: number;
+      current_stage: string;
+      expected_branch?: string;
+      source?: "markdown" | "manifest";
+      /** The engine's typed pause (plan.py: `PlanRunState.awaiting`), verbatim. */
+      awaiting?: Record<string, unknown> | null;
+      /** The recorded push permission (push_gate.py: `PushAuthorization`), verbatim. */
+      push_authorization?: Record<string, unknown> | null;
+    },
   ): Promise<string> {
     const dir = path.join(this.sparringDir, "plans");
     await fs.mkdir(dir, { recursive: true });
@@ -121,6 +132,11 @@ export class Workspace {
       plan_digest: "0".repeat(64),
       status: state.status,
       ...(state.source ? { source: state.source } : {}),
+      // Written only when the caller says so, including as an explicit null:
+      // a run recorded before push authorization existed has neither key at
+      // all, and that case has to be reproducible here.
+      ...(state.awaiting !== undefined ? { awaiting: state.awaiting } : {}),
+      ...(state.push_authorization !== undefined ? { push_authorization: state.push_authorization } : {}),
     };
     await fs.writeFile(file, JSON.stringify(payload, null, 2) + "\n");
     return file;

@@ -32,9 +32,66 @@ export interface PlanRunState {
    * from state written before manifests existed, and read as `markdown`.
    */
   source: PlanRunSource;
+  /**
+   * The typed reason this run is stopped, when the reason is one the runner
+   * itself recorded rather than a reviewer's verdict (plan.py:
+   * `PlanRunState.awaiting`, push_gate.py: `PushRequired`). Today there is
+   * one kind, and the whole point of it being typed is that a consumer
+   * switches on `kind` instead of reading prose: a run waiting for
+   * permission to push is not a run waiting for a manual test, and the
+   * difference used to be invisible. Absent for every run recorded before
+   * the engine had it, and absent whenever the run is not stopped on such a
+   * reason.
+   */
+  awaiting?: PushAuthorizationRequired;
+  /**
+   * What a person has allowed this run to push, and for exactly what
+   * (push_gate.py: `PushAuthorization`). Absent — including for every run
+   * recorded before push authorization existed — means no authorization at
+   * all, which is the engine's default and is never inferred otherwise.
+   */
+  pushAuthorization?: PushAuthorizationState;
 }
 
 export type PlanRunSource = "markdown" | "manifest";
+
+/** push_gate.py: the one typed reason a managed run stops on today. */
+export const PUSH_AUTHORIZATION_REQUIRED = "push_authorization_required";
+
+/**
+ * A verified candidate the engine will not push without being told to.
+ *
+ * Every field comes from the engine's own record of the pause, so a
+ * consumer can name the exact commit and the exact remote branch without
+ * running git and without parsing a sentence.
+ */
+export interface PushAuthorizationRequired {
+  kind: typeof PUSH_AUTHORIZATION_REQUIRED;
+  stageId: string;
+  /** The full 40-character commit id the reviewer said READY over. */
+  candidateSha: string;
+  /** The local branch the run was started for. */
+  branch: string;
+  remote: string;
+  remoteBranch: string;
+  /** Git's own account of why the commit is not on the remote yet; diagnostic. */
+  detail?: string;
+}
+
+/** `candidate`: one commit of one stage. `run`: this run's later verified candidates. */
+export type PushAuthorizationScope = "candidate" | "run";
+
+export interface PushAuthorizationState {
+  scope: PushAuthorizationScope;
+  /** The worktree the permission was granted in, resolved. */
+  repoRoot: string;
+  branch: string;
+  remote: string;
+  remoteBranch: string;
+  /** Candidate scope only. */
+  stageId?: string;
+  candidateSha?: string;
+}
 
 const PLAN_RUN_STATUSES: ReadonlySet<string> = new Set(["running", "paused", "complete"]);
 
@@ -55,7 +112,71 @@ export function parsePlanRunState(text: string): PlanRunState {
   }
   const rawSource = payload["source"];
   const source: PlanRunSource = rawSource === "manifest" ? "manifest" : "markdown";
-  return { plan, planDigest, expectedBranch, currentStageIndex, currentStage, status: status as PlanRunStatus, source };
+  return {
+    plan,
+    planDigest,
+    expectedBranch,
+    currentStageIndex,
+    currentStage,
+    status: status as PlanRunStatus,
+    source,
+    awaiting: parseAwaiting(payload["awaiting"]),
+    pushAuthorization: parsePushAuthorization(payload["push_authorization"]),
+  };
+}
+
+/**
+ * The typed pause, or undefined.
+ *
+ * Undefined for absent, for a kind this version does not know, and for a
+ * record missing any field it would have to be rendered from. That is
+ * deliberate: half a push request is not a push request, and presenting one
+ * without the commit it is about would ask a person to authorize they know
+ * not what. An unknown kind is a newer engine, and the honest answer to it
+ * is to fall back to the ordinary presentation rather than to guess.
+ */
+function parseAwaiting(raw: unknown): PushAuthorizationRequired | undefined {
+  if (!isRecord(raw) || raw["kind"] !== PUSH_AUTHORIZATION_REQUIRED) {
+    return undefined;
+  }
+  const stageId = text(raw, "stage_id");
+  const candidateSha = text(raw, "candidate_sha");
+  const branch = text(raw, "branch");
+  const remote = text(raw, "remote");
+  const remoteBranch = text(raw, "remote_branch");
+  if (!stageId || !candidateSha || !branch || !remote || !remoteBranch) {
+    return undefined;
+  }
+  return { kind: PUSH_AUTHORIZATION_REQUIRED, stageId, candidateSha, branch, remote, remoteBranch, detail: text(raw, "detail") };
+}
+
+/** The recorded permission, or undefined — which means no permission, never an error. */
+function parsePushAuthorization(raw: unknown): PushAuthorizationState | undefined {
+  if (!isRecord(raw)) {
+    return undefined;
+  }
+  const scope = raw["scope"];
+  if (scope !== "candidate" && scope !== "run") {
+    return undefined;
+  }
+  const repoRoot = text(raw, "repo_root");
+  const branch = text(raw, "branch");
+  const remote = text(raw, "remote");
+  const remoteBranch = text(raw, "remote_branch");
+  if (!repoRoot || !branch || !remote || !remoteBranch) {
+    return undefined;
+  }
+  const stageId = text(raw, "stage_id");
+  const candidateSha = text(raw, "candidate_sha");
+  if (scope === "candidate" && (!stageId || !candidateSha)) {
+    return undefined; // a one-candidate permission that names no candidate is not one
+  }
+  return { scope, repoRoot, branch, remote, remoteBranch, stageId, candidateSha };
+}
+
+function text(payload: Record<string, unknown>, key: string): string | undefined {
+  const value = payload[key];
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 // ---------------------------------------------------------------------------

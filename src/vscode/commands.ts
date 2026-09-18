@@ -43,11 +43,11 @@ import {
 } from "../core/discovery";
 import { FOLLOW_ACTIVE_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
-import { parseHandoffBranch, parsePlanStages } from "../core/engineFormats";
+import { parseHandoffBranch, parsePlanStages, type PlanRunSource } from "../core/engineFormats";
 import { appendHumanEvidence, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
 import { blocksLaunch } from "../core/liveness";
 import type { OverviewAction } from "../core/overviewHtml";
-import { UNKNOWN_RUNNER_EXPLANATION } from "../core/overviewModel";
+import { UNKNOWN_RUNNER_EXPLANATION, type PlanContinuation } from "../core/overviewModel";
 import { createStage, proposeNextStage, renderNextStageBrief, type NewStageResult } from "../core/nextStage";
 import { buildStageIndex, locateStage, parsePlanHeadings, sectionSummary, type HeadingRef, type PlanHeading, type StageEntry } from "../core/planAssociation";
 import { stageMatchRows, type StageMatchRow, type StageToMatch } from "../core/stageMatches";
@@ -89,6 +89,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.reviewStageMatches", () => reviewStageMatchesCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.startNextStage", () => startNextStageCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.continueAutomatically", () => void performContinueAutomatically(controller, overview, { confirm: true })),
+    vscode.commands.registerCommand("agentSparring.allowPush", () => void allowPushCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.stageRepositories", () => stageRepositoriesCommand(controller)),
     vscode.commands.registerCommand("agentSparring.stageMode", () => stageModeCommand(controller)),
     vscode.commands.registerCommand("agentSparring.copyReviewContext", () => overview.copyReviewContext()),
@@ -164,6 +165,17 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
       return run?.kind === "stage" ? performStartNextStage(controller, overview, run, { confirm: false }) : undefined;
     }),
     vscode.commands.registerCommand("agentSparring._test.continueAutomatically", () => performContinueAutomatically(controller, overview, { confirm: false })),
+    // Allow push exactly as the panel drives it: the candidate comes from the
+    // model that was built, and the toggle from the stored draft. Passing a
+    // toggle here only sets that draft first, so a test can reproduce both
+    // halves of the one click.
+    vscode.commands.registerCommand("agentSparring._test.allowPush", async (autoPush?: boolean) => {
+      const run = controller.currentSelection.selected;
+      if (run && autoPush !== undefined) {
+        await controller.setAutoPushDraft(run.id, autoPush);
+      }
+      return allowPushCommand(controller, overview);
+    }),
     vscode.commands.registerCommand("agentSparring._test.declareStageRepository", async (label: string, repository: DeclaredRepository | undefined) => {
       const run = controller.currentSelection.selected;
       const key = run ? await planKeyFor(controller, run) : undefined;
@@ -505,6 +517,12 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       return;
     case "confirmRunnerInactive":
       await confirmRunnerInactiveCommand(controller, overview);
+      return;
+    case "allowPush":
+      await allowPushCommand(controller, overview);
+      return;
+    case "doNotAllowPush":
+      await doNotAllowPushCommand(controller, overview);
       return;
     case "dismissSubmissionFailure":
       if (run) {
@@ -1020,6 +1038,102 @@ async function explainWrongBranch(guard: { expected: string; actual?: string }, 
   void vscode.window.showWarningMessage(
     `Agent Sparring: ${subject} ${guard.expected}, but ${where}. Switch branches first; the engine refuses a run on another branch.`,
   );
+}
+
+// ---------------------------------------------------------------- push authorization
+
+export type AllowPushOutcome =
+  | { ok: true; candidateSha: string; forRun: boolean; executionId?: string }
+  | { ok: false; reason: "no-run" | "not-waiting" | "stale" | "branch" | "input" | "cancelled" | "launch"; message?: string };
+
+/**
+ * Allow the engine to push the candidate the person is looking at.
+ *
+ * What this does **not** do is push anything. The extension runs no `git
+ * push`, and there is no code path here that could: it hands the engine a
+ * permission (`resume-plan --allow-push-candidate <commit>`, plus
+ * `--allow-push-for-run` when the toggle is on) and the engine performs the
+ * push, re-proves that the commit is really on the remote branch, and then
+ * runs its own unchanged acceptance gate. Whether the push may happen at all
+ * is therefore decided in one place, by the component that owns acceptance.
+ *
+ * The commit is taken from the model the button was rendered from, and the
+ * engine is *also* told to check it against what the run is actually waiting
+ * on. That is what makes a panel that has been open a while harmless: it can
+ * only ever authorize the candidate it was showing, and if the run has moved
+ * on the engine refuses rather than authorizing a commit nobody looked at.
+ */
+async function allowPushCommand(controller: SparringController, overview: OverviewPanelManager): Promise<AllowPushOutcome> {
+  const run = controller.currentSelection.selected;
+  if (!run || run.kind !== "plan") {
+    return { ok: false, reason: "no-run" };
+  }
+  const model = await overview.buildModel();
+  const panel = model.kind === "run" ? model.pushAuthorization : undefined;
+  if (!panel) {
+    void vscode.window.showInformationMessage("Agent Sparring: this run is not waiting for permission to push anything right now.");
+    await overview.update();
+    return { ok: false, reason: "not-waiting" };
+  }
+  if (!panel.allow.enabled) {
+    void vscode.window.showInformationMessage(`Agent Sparring: ${panel.allow.detail}`);
+    return { ok: false, reason: model.branchGuard ? "branch" : "cancelled" };
+  }
+  const forRun = panel.autoPush.checked;
+  const expectedBranch = await resolveExpectedBranch(run.location, run.state.expectedBranch);
+  if (!expectedBranch) {
+    return { ok: false, reason: "branch" };
+  }
+  const input = await planInvocationFor(controller, run);
+  if (!input) {
+    return { ok: false, reason: "input" };
+  }
+  const args = buildResumePlanArgs({
+    ...input,
+    repoRoot: run.location.repoRoot,
+    expectedBranch,
+    sparringDir: run.location.sparringDir,
+    allowPush: { candidateSha: panel.candidateSha, forRun },
+  });
+  controller.log(
+    `Allow push: authorizing ${panel.candidateSha} for ${panel.target}${forRun ? ", and this run's later verified candidates" : ""}; the engine performs the push and then its own acceptance gate`,
+  );
+  const result = await launch(controller, run.location, args, "resume-plan", run.planPath, "manifest" in input ? input.manifest : undefined);
+  if (!result.ok) {
+    await overview.update();
+    return { ok: false, reason: "launch", message: result.error };
+  }
+  // The toggle was an intention; the engine now holds the decision, and the
+  // Overview reads it back from the run state. Keeping the draft would leave
+  // this window's checkbox as a second, quieter answer to the same question.
+  await controller.setAutoPushDraft(run.id, false);
+  await overview.update();
+  return { ok: true, candidateSha: panel.candidateSha, forRun, executionId: result.record.id };
+}
+
+/**
+ * Leave it. Nothing is pushed, nothing is recorded, and the run stays
+ * exactly where the engine left it — which is a real answer, because
+ * pushing the branch by hand and resuming normally is a perfectly good way
+ * through this, and so is deciding not to accept the candidate at all.
+ */
+async function doNotAllowPushCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
+  const run = controller.currentSelection.selected;
+  if (!run) {
+    return;
+  }
+  const model = await overview.buildModel();
+  const panel = model.kind === "run" ? model.pushAuthorization : undefined;
+  if (!panel) {
+    await overview.update();
+    return;
+  }
+  await controller.setAutoPushDraft(run.id, false);
+  controller.log(`Allow push: declined for ${panel.candidateSha}; nothing was pushed and the run is unchanged`);
+  void vscode.window.showInformationMessage(
+    `Agent Sparring: nothing was pushed. ${panel.shortSha} is still waiting, and the plan is paused where it was. You can push the branch to ${panel.target} yourself and then continue the plan, or leave it as it is.`,
+  );
+  await overview.update();
 }
 
 // ---------------------------------------------------------------- plan association (UI metadata only)
@@ -1607,6 +1721,19 @@ async function launch(controller: SparringController, location: SparringLocation
   return result;
 }
 
+/**
+ * Run a plan: pick the project and the plan document, then start it the way
+ * the configured continuation mode says a plan is run.
+ *
+ * There is deliberately no second answer to "how is a plan started". In
+ * **automatic** mode (the default) this is the same managed, manifest-driven
+ * run that Continue automatically starts — same manifest, same preflight,
+ * same confirmation — because a plan started from a differently-labelled
+ * button used to become a *Markdown* managed run, which then could not be
+ * continued by the automatic path at all (the engine refuses to resume a run
+ * from another kind of input, rightly). In **manual** mode the plan's own
+ * path is handed to `run-plan`, which is what that mode is for.
+ */
 async function runPlanCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
   const location = await pickLocation(controller);
   if (!location) {
@@ -1616,17 +1743,44 @@ async function runPlanCommand(controller: SparringController, overview: Overview
   if (!planPath) {
     return;
   }
-  const expectedBranch = await resolveExpectedBranch(location);
-  if (!expectedBranch) {
-    return;
-  }
-  const args = buildRunPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir });
   const runId = planRunId(location, planPath);
   if (controller.livenessFor(runId).state === "running") {
     await sayRunnerAlive(controller, overview, "a runner for this plan is alive in a terminal of this window.", runId);
     return;
   }
+  const existing = controller.currentDiscovery.runs.find((candidate) => candidate.id === runId);
+  if (existing?.kind === "plan") {
+    // The engine refuses a fresh run of a plan it already has a run for, and
+    // that run's input kind is its own. Continue it instead of starting a
+    // second one on different terms.
+    await resumePlanCommand(controller, existing);
+    return;
+  }
+  const expectedBranch = await resolveExpectedBranch(location);
+  if (!expectedBranch) {
+    return;
+  }
+  if (planContinuationMode() === "automatic") {
+    const markdown = await readOptional(planPath);
+    if (markdown === undefined) {
+      void vscode.window.showWarningMessage(`Agent Sparring: the plan document ${path.basename(planPath)} could not be read.`);
+      return;
+    }
+    const label = planLabel(planPath, location.repoRoot);
+    await startManagedRun(controller, overview, { location, planPath, markdown, label, runId, expectedBranch, confirm: true });
+    return;
+  }
+  const args = buildRunPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir });
   await launch(controller, location, args, "run-plan", planPath);
+}
+
+/**
+ * The user's plan-progression mode, read the same way the Overview reads it
+ * (`agentSparring.planContinuation`), so what the panel offers and what a
+ * command does cannot disagree.
+ */
+function planContinuationMode(): PlanContinuation {
+  return vscode.workspace.getConfiguration("agentSparring").get<string>("planContinuation", "automatic") === "manual" ? "manual" : "automatic";
 }
 
 /**
@@ -1963,9 +2117,28 @@ function declarationsFor(controller: SparringController, key: string, location: 
   };
 }
 
-async function planInvocationFor(controller: SparringController, run: PlanRunSnapshot): Promise<{ planPath: string } | { manifest: string } | undefined> {
+/**
+ * The plan input a resume of `run` must use — the **one** place that decides
+ * it, for every path that ultimately calls `resume-plan`.
+ *
+ * The rule is short and has no exceptions: a run is resumed from the kind of
+ * input it was started from. `source=markdown` resumes with the plan's own
+ * path; `source=manifest` resumes with a freshly rebuilt manifest. Nothing
+ * in the UI may change an existing run's input kind, because the engine
+ * refuses such a resume — correctly, since the two describe different
+ * execution content for the same plan — and a run that no button can
+ * continue is the failure this exists to prevent. The recorded source is
+ * carried in the result so the command builder can check it too, rather than
+ * trusting each caller to have asked here.
+ *
+ * Undefined means nothing can be launched, and the reason has already been
+ * shown to the person.
+ */
+type PlanResumeInput = ({ planPath: string } | { manifest: string }) & { source: PlanRunSource };
+
+async function planInvocationFor(controller: SparringController, run: PlanRunSnapshot): Promise<PlanResumeInput | undefined> {
   if (run.state.source !== "manifest") {
-    return { planPath: run.planPath };
+    return { planPath: run.planPath, source: "markdown" };
   }
   const markdown = await readOptional(run.planPath);
   if (markdown === undefined) {
@@ -1976,7 +2149,7 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
     markdown,
     planLabel: run.state.plan,
     planName: path.basename(run.planPath),
-    known: await knownStageIds(controller, run, markdown),
+    known: await knownStageIds(controller, run.location.projectDir, markdown),
     ...declarationsFor(controller, run.planKey, run.location),
   });
   if (!built.ok) {
@@ -1985,7 +2158,7 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
   }
   try {
     await controller.manifestDirectory();
-    return { manifest: await writeManifestFile(controller, run, built.manifest) };
+    return { manifest: await writeManifestFile(controller, run, built.manifest), source: "manifest" };
   } catch (error) {
     void vscode.window.showErrorMessage(`Agent Sparring: could not write the execution manifest: ${(error as Error).message}. Nothing was started.`);
     return undefined;
@@ -1995,7 +2168,23 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
 // ---------------------------------------------------------------- continue automatically (engine-managed plan)
 
 export type ContinueAutomaticallyOutcome =
-  | { ok: true; runId: string; manifest: string; kind: "run-plan" | "resume-plan"; adopt: boolean; stages: number }
+  | {
+      ok: true;
+      runId: string;
+      /** Absent when the run is continued from its own Markdown plan; see `input`. */
+      manifest?: string;
+      kind: "run-plan" | "resume-plan";
+      /**
+       * Which plan input was actually handed to the engine. For a resume it
+       * is always the run's recorded `source`, never a choice — see
+       * `planInvocationFor`.
+       */
+      input: PlanRunSource;
+      adopt: boolean;
+      stages: number;
+      /** The run was started with run-scoped push authorization. */
+      autoPush?: boolean;
+    }
   | { ok: false; reason: "no-plan" | "unreadable" | "manifest" | "preflight" | "branch" | "complete" | "running" | "cancelled" | "write" | "owned"; message?: string };
 
 /**
@@ -2053,11 +2242,82 @@ async function performContinueAutomatically(controller: SparringController, over
   }
 
   const label = run.kind === "plan" ? run.state.plan : planLabel(planPath, location.repoRoot);
+  const runId = runIdFor(location, "plan", planKey(label));
+  const existing = controller.currentDiscovery.runs.find((candidate) => candidate.id === runId);
+  const managed = existing?.kind === "plan" ? existing : undefined;
+  if (managed?.state.status === "complete") {
+    void vscode.window.showInformationMessage(`Agent Sparring: the managed run of ${label} is complete; every stage was accepted.`);
+    return { ok: false, reason: "complete" };
+  }
+  if (controller.livenessFor(runId).state === "running") {
+    await sayRunnerAlive(controller, overview, `a runner for ${label} is already alive in a terminal of this window.`, runId);
+    return { ok: false, reason: "running" };
+  }
+
+  // A managed run's branch is already recorded and already enforced by the
+  // engine, so it is resolved, not asked for; a fresh run takes the branch
+  // the repository is actually on. Either way no picker appears.
+  if (managed) {
+    const expectedBranch = await resolveExpectedBranch(location, managed.state.expectedBranch);
+    if (!expectedBranch) {
+      return { ok: false, reason: "branch" }; // resolveExpectedBranch already named the mismatch
+    }
+    // An existing run is *continued*, on its own terms: the input kind comes
+    // from what the engine recorded, never from which button was pressed.
+    return continueManagedRun(controller, overview, { run: managed, markdown, expectedBranch, stage: currentStageOf(run), confirm: options.confirm });
+  }
+  const expectedBranch = await currentBranch(location.repoRoot);
+  if (!expectedBranch) {
+    void vscode.window.showErrorMessage(
+      `Agent Sparring: no Git branch is checked out in ${location.folderName} (detached HEAD or not a repository). Check out the plan's branch, then start again.`,
+    );
+    return { ok: false, reason: "branch" };
+  }
+  return startManagedRun(controller, overview, { location, planPath, markdown, label, runId, expectedBranch, stage: currentStageOf(run), confirm: options.confirm });
+}
+
+/** What a fresh managed run needs to know before it is started. */
+interface ManagedStart {
+  location: SparringLocation;
+  planPath: string;
+  markdown: string;
+  /** The plan label the run will be keyed by (plan.py: plan_label). */
+  label: string;
+  runId: string;
+  expectedBranch: string;
+  /**
+   * The stage the person is looking at, when there is one. Only the
+   * preflight uses it, for the one check that is about a stage's own history
+   * rather than about the plan.
+   */
+  stage?: StageSnapshot;
+  confirm: boolean;
+}
+
+/**
+ * Start a fresh engine-managed run of this plan, from an execution manifest.
+ *
+ * The extension does the interpreting once — which headings are canonical
+ * stages, how `3A`/`3B`/`3C` order, which sections are historical handoffs,
+ * which stage ids the project already uses, what each brief says — writes
+ * that out as a manifest (manifest.ts) and hands it to `run-plan
+ * --manifest`. From then on the engine sequences: it accepts a READY
+ * candidate through its existing hard gate and starts the next stage, with
+ * no Accept stage / Start next stage / Run stage click in between. It stops
+ * at NEEDS_YOU, ESCALATE, a failure, or the end of the plan. The extension
+ * implements no sequencing of its own.
+ *
+ * One confirmation, before the first stage, and it carries the one
+ * run-scoped choice that has to be made up front if it is to apply from the
+ * first candidate: whether this run may push the candidates it verifies.
+ */
+async function startManagedRun(controller: SparringController, overview: OverviewPanelManager, start: ManagedStart): Promise<ContinueAutomaticallyOutcome> {
+  const { location, planPath, markdown, label, runId, expectedBranch } = start;
   const built = buildManifest({
     markdown,
     planLabel: label,
     planName: path.basename(planPath),
-    known: await knownStageIds(controller, run, markdown),
+    known: await knownStageIds(controller, location.projectDir, markdown),
     ...declarationsFor(controller, planKey(label), location),
   });
   if (!built.ok) {
@@ -2074,74 +2334,29 @@ async function performContinueAutomatically(controller: SparringController, over
     return { ok: false, reason: "manifest", message: built.problems[0]?.reason };
   }
 
-  const runId = runIdFor(location, "plan", planKey(label));
-  const existing = controller.currentDiscovery.runs.find((candidate) => candidate.id === runId);
-  const managed = existing?.kind === "plan" ? existing : undefined;
-  if (managed?.state.status === "complete") {
-    void vscode.window.showInformationMessage(`Agent Sparring: the managed run of ${label} is complete; every stage was accepted.`);
-    return { ok: false, reason: "complete" };
-  }
-  if (controller.livenessFor(runId).state === "running") {
-    await sayRunnerAlive(controller, overview, `a runner for ${label} is already alive in a terminal of this window.`, runId);
-    return { ok: false, reason: "running" };
-  }
-
-  // A managed run's branch is already recorded and already enforced by the
-  // engine, so it is resolved, not asked for; a fresh run takes the branch
-  // the repository is actually on. Either way no picker appears.
-  let expectedBranch: string | undefined;
-  if (managed) {
-    expectedBranch = await resolveExpectedBranch(location, managed.state.expectedBranch);
-    if (!expectedBranch) {
-      // resolveExpectedBranch already named the mismatch.
-      return { ok: false, reason: "branch" };
-    }
-  } else {
-    expectedBranch = await currentBranch(location.repoRoot);
-    if (!expectedBranch) {
-      void vscode.window.showErrorMessage(
-        `Agent Sparring: no Git branch is checked out in ${location.folderName} (detached HEAD or not a repository). Check out the plan's branch, then start again.`,
-      );
-      return { ok: false, reason: "branch" };
-    }
-  }
-
-  const kind: "run-plan" | "resume-plan" = managed ? "resume-plan" : "run-plan";
   // Only a fresh run needs --adopt, and only when the plan's stages already
   // exist on disk from stage-by-stage work. The engine still checks each one
   // and reports what it inherits; nothing is taken over silently.
   const onDisk = await existingStages(controller, location, built.manifest);
-  const adopt = kind === "run-plan" && onDisk.size > 0;
+  const adopt = onDisk.size > 0;
 
-  const blockers = await preflight(run, { manifest: built.manifest, location, adopt, onDisk, expectedBranch });
-  if (blockers.length > 0) {
-    controller.log(`Continue automatically: refused — ${blockers.map((problem) => problem.title).join("; ")}`);
-    const detail = blockers.map((problem) => `• ${problem.title}\n   ${problem.fix}`).join("\n\n");
-    const fixes = [...new Set(blockers.map((problem) => problem.action).filter((action): action is PreflightAction => action !== undefined))];
-    const choice = await vscode.window.showWarningMessage(
-      blockers.length === 1 ? "Agent Sparring: one thing needs fixing before this plan can run automatically." : `Agent Sparring: ${blockers.length} things need fixing before this plan can run automatically.`,
-      { modal: true, detail },
-      ...fixes.map((action) => PREFLIGHT_ACTIONS[action]),
-    );
-    const chosen = fixes.find((action) => PREFLIGHT_ACTIONS[action] === choice);
-    if (chosen === "review-matches") {
-      await reviewStageMatchesCommand(controller, overview);
-    } else if (chosen === "declare-siblings") {
-      await stageRepositoriesCommand(controller);
-    }
-    return { ok: false, reason: "preflight", message: blockers[0].title };
+  if (await refusedByPreflight(controller, overview, start.stage, { manifest: built.manifest, location, adopt, onDisk, expectedBranch })) {
+    return { ok: false, reason: "preflight", message: "preflight" };
   }
 
-  if (options.confirm) {
-    const detail = describePlan(built.manifest, controller, location, { kind, adopt, expectedBranch, skipped: built.skipped.length });
+  let autoPush = false;
+  if (start.confirm) {
+    const detail = describePlan(built.manifest, controller, location, { kind: "run-plan", adopt, expectedBranch, skipped: built.skipped.length });
     const choice = await vscode.window.showInformationMessage(
       "Run this plan automatically until Agent Sparring needs you?",
       { modal: true, detail },
       "Run automatically",
+      AUTO_PUSH_START_LABEL,
     );
-    if (choice !== "Run automatically") {
+    if (choice !== "Run automatically" && choice !== AUTO_PUSH_START_LABEL) {
       return { ok: false, reason: "cancelled" };
     }
+    autoPush = choice === AUTO_PUSH_START_LABEL;
   }
 
   let manifestPath: string;
@@ -2157,18 +2372,17 @@ async function performContinueAutomatically(controller: SparringController, over
     controller.log(`Continue automatically: not executable, left in the plan — ${problem.reason}`);
   }
   controller.log(
-    `Continue automatically: ${kind}${adopt ? " --adopt" : ""} --manifest ${manifestPath} (${built.manifest.stages.length} stage(s): ${built.manifest.stages.map((stage) => stage.stage_id).join(", ")})`,
+    `Continue automatically: run-plan${adopt ? " --adopt" : ""}${autoPush ? " --allow-push-for-run" : ""} --manifest ${manifestPath} (${built.manifest.stages.length} stage(s): ${built.manifest.stages.map((stage) => stage.stage_id).join(", ")})`,
   );
 
-  const invocation = { manifest: manifestPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir };
-  const args = kind === "run-plan" ? buildRunPlanArgs({ ...invocation, adopt }) : buildResumePlanArgs(invocation);
+  const args = buildRunPlanArgs({ manifest: manifestPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir, adopt, allowPushForRun: autoPush });
   const result = await controller.launch({
     configured: configuredExecutable(),
     args,
     cwd: location.repoRoot,
-    name: `${kind}: ${path.basename(planPath)}`,
+    name: `run-plan: ${path.basename(planPath)}`,
     runId,
-    kind,
+    kind: "run-plan",
     planPath,
     manifest: manifestPath,
     reveal: true,
@@ -2178,7 +2392,114 @@ async function performContinueAutomatically(controller: SparringController, over
   if (!result.ok) {
     return { ok: false, reason: "write", message: result.error };
   }
-  return { ok: true, runId, manifest: manifestPath, kind, adopt, stages: built.manifest.stages.length };
+  return { ok: true, runId, manifest: manifestPath, kind: "run-plan", input: "manifest", adopt, stages: built.manifest.stages.length, autoPush };
+}
+
+/** The second choice on the start confirmation; the same permission `--allow-push-for-run` records. */
+const AUTO_PUSH_START_LABEL = "Run automatically, and push accepted candidates";
+
+/**
+ * Continue the engine's existing managed run of this plan.
+ *
+ * The input kind is the run's own, decided in exactly one place
+ * (`planInvocationFor`) and checked again by the command builder: a run
+ * started from a Markdown plan is continued from that plan, and a run
+ * started from a manifest is continued from a freshly rebuilt manifest.
+ * Pressing a differently-labelled button never changes it — the engine
+ * refuses such a resume, and a run no button can continue was the failure
+ * that made this one function the only decision point.
+ */
+async function continueManagedRun(
+  controller: SparringController,
+  overview: OverviewPanelManager,
+  context: { run: PlanRunSnapshot; markdown: string; expectedBranch: string; stage?: StageSnapshot; confirm: boolean },
+): Promise<ContinueAutomaticallyOutcome> {
+  const { run, expectedBranch } = context;
+  const location = run.location;
+  const input = await planInvocationFor(controller, run);
+  if (!input) {
+    return { ok: false, reason: "manifest" }; // planInvocationFor said why
+  }
+  const manifest = "manifest" in input ? input.manifest : undefined;
+
+  if (await refusedByPreflight(controller, overview, context.stage, { location, adopt: false, onDisk: new Set<string>(), expectedBranch })) {
+    return { ok: false, reason: "preflight", message: "preflight" };
+  }
+
+  if (context.confirm) {
+    const stages = declaredStages(context.markdown);
+    const choice = await vscode.window.showInformationMessage(
+      "Run this plan automatically until Agent Sparring needs you?",
+      {
+        modal: true,
+        detail: [
+          `Agent Sparring continues the engine's managed run of ${run.state.plan}.`,
+          "",
+          `Branch: ${expectedBranch}`,
+          `Continuing at: ${run.currentStage.stageId}${stages ? ` (${stages} stage(s) in the plan)` : ""}`,
+          "",
+          "Each stage runs implementation ↔ review and, on READY, is frozen and accepted at its exact pushed commit — with no further confirmation. The run stops when the reviewer needs you, escalates, something fails, or the plan is complete.",
+        ].join("\n"),
+      },
+      "Run automatically",
+    );
+    if (choice !== "Run automatically") {
+      return { ok: false, reason: "cancelled" };
+    }
+  }
+
+  controller.log(`Continue automatically: resume-plan ${manifest ? `--manifest ${manifest}` : run.planPath} (the run is recorded as a ${input.source} plan input)`);
+  const args = buildResumePlanArgs({ ...input, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir });
+  const result = await launch(controller, location, args, "resume-plan", run.planPath, manifest);
+  await overview.update();
+  if (!result.ok) {
+    return { ok: false, reason: "write", message: result.error };
+  }
+  return { ok: true, runId: run.id, manifest, kind: "resume-plan", input: input.source, adopt: false, stages: declaredStages(context.markdown) ?? 0 };
+}
+
+/** How many `## Stage <n> — <title>` sections a plan declares, when it parses at all. */
+function declaredStages(markdown: string): number | undefined {
+  try {
+    return parsePlanStages(markdown).length || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Run the preflight and, when it found something, say all of it at once.
+ *
+ * True means nothing was launched. Shared by starting and continuing so a
+ * dirty worktree or a wrong branch is reported the same way whichever it
+ * was, and so a healthy plan still gets exactly one dialog: the
+ * confirmation.
+ */
+async function refusedByPreflight(
+  controller: SparringController,
+  overview: OverviewPanelManager,
+  stage: StageSnapshot | undefined,
+  context: PreflightContext,
+): Promise<boolean> {
+  const blockers = await preflight(stage, context);
+  if (blockers.length === 0) {
+    return false;
+  }
+  controller.log(`Continue automatically: refused — ${blockers.map((problem) => problem.title).join("; ")}`);
+  const detail = blockers.map((problem) => `• ${problem.title}\n   ${problem.fix}`).join("\n\n");
+  const fixes = [...new Set(blockers.map((problem) => problem.action).filter((action): action is PreflightAction => action !== undefined))];
+  const choice = await vscode.window.showWarningMessage(
+    blockers.length === 1 ? "Agent Sparring: one thing needs fixing before this plan can run automatically." : `Agent Sparring: ${blockers.length} things need fixing before this plan can run automatically.`,
+    { modal: true, detail },
+    ...fixes.map((action) => PREFLIGHT_ACTIONS[action]),
+  );
+  const chosen = fixes.find((action) => PREFLIGHT_ACTIONS[action] === choice);
+  if (chosen === "review-matches") {
+    await reviewStageMatchesCommand(controller, overview);
+  } else if (chosen === "declare-siblings") {
+    await stageRepositoriesCommand(controller);
+  }
+  return true;
 }
 
 /**
@@ -2202,10 +2523,10 @@ async function performContinueAutomatically(controller: SparringController, over
  * there is no history to protect, and the current section is the better
  * text.
  */
-async function knownStageIds(controller: SparringController, run: RunSnapshot, markdown: string): Promise<KnownStage[]> {
+async function knownStageIds(controller: SparringController, projectDir: string, markdown: string): Promise<KnownStage[]> {
   const headings = parsePlanHeadings(markdown);
   const known: KnownStage[] = [];
-  for (const candidate of stagesOfProject(controller, run.location.projectDir)) {
+  for (const candidate of stagesOfProject(controller, projectDir)) {
     const briefText = await readOptional(path.join(candidate.stage.dir, BRIEF_FILENAME));
     const position = locateStage(headings, {
       stageId: candidate.stage.stageId,
@@ -2273,6 +2594,21 @@ interface PreflightProblem {
 }
 
 /**
+ * `manifest` is absent when no manifest is involved — continuing a run the
+ * engine recorded as a Markdown one. The checks that are *about* a manifest
+ * (a stage that would be re-created, a declared sibling, an engine without
+ * `--manifest`) then have nothing to check and say nothing, rather than
+ * being answered from a manifest that will not be executed.
+ */
+interface PreflightContext {
+  manifest?: ExecutionManifest;
+  location: SparringLocation;
+  adopt: boolean;
+  onDisk: Set<string>;
+  expectedBranch: string;
+}
+
+/**
  * Everything that would make this run fail or do damage, found before the
  * confirmation rather than in a terminal afterwards.
  *
@@ -2284,17 +2620,14 @@ interface PreflightProblem {
  * the authority and a hedged warning in front of a working run is worse than
  * silence.
  */
-async function preflight(
-  run: RunSnapshot,
-  context: { manifest: ExecutionManifest; location: SparringLocation; adopt: boolean; onDisk: Set<string>; expectedBranch: string },
-): Promise<PreflightProblem[]> {
+async function preflight(stage: StageSnapshot | undefined, context: PreflightContext): Promise<PreflightProblem[]> {
   const { manifest, location } = context;
   const problems: PreflightProblem[] = [];
 
   // 1. A stage that would be created inside a sequence that has already run
   //    past it: an existing stage nothing could recognise. Running it would
   //    re-implement accepted work under a new id.
-  if (context.adopt) {
+  if (manifest && context.adopt) {
     for (const stage of adoptionGaps(manifest, context.onDisk)) {
       problems.push({
         title: `${stage.label} — ${stage.title} would be started again, as a new stage ${stage.stage_id}.`,
@@ -2307,7 +2640,7 @@ async function preflight(
   // 2. A declared sibling repository that is not where, or not as, it was
   //    declared. Acceptance pins each one, and the engine would refuse the
   //    whole stage at the freeze boundary — after the run had started.
-  for (const stage of manifest.stages) {
+  for (const stage of manifest?.stages ?? []) {
     for (const repository of stage.repositories ?? []) {
       const root = path.resolve(location.repoRoot, repository.path);
       if (!(await isDirectory(path.join(root, ".git")))) {
@@ -2331,9 +2664,10 @@ async function preflight(
 
   // 3. The stage's own candidate was built somewhere else. Same source the
   //    Overview's branch guard uses: the branch written into the last
-  //    handoff, which is the only branch a standalone stage records.
-  const stage = currentStageOf(run);
-  const handoffBranch = parseHandoffBranch((await readOptional(path.join(stage.dir, HANDOFF_FILENAME))) ?? "");
+  //    handoff, which is the only branch a standalone stage records. Skipped
+  //    when the run was started without a stage on screen (Run plan from the
+  //    Command Palette): there is no stage whose history could disagree.
+  const handoffBranch = stage ? parseHandoffBranch((await readOptional(path.join(stage.dir, HANDOFF_FILENAME))) ?? "") : undefined;
   if (handoffBranch && handoffBranch !== context.expectedBranch) {
     problems.push({
       title: `${context.expectedBranch} is checked out, but this stage's last handoff was written on ${handoffBranch}.`,
@@ -2353,7 +2687,7 @@ async function preflight(
 
   // 5. An engine that predates the manifest input would fail on the flag,
   //    in a terminal, having done nothing.
-  if ((await manifestSupport(configuredExecutable(), location.repoRoot)) === "missing-manifest") {
+  if (manifest && (await manifestSupport(configuredExecutable(), location.repoRoot)) === "missing-manifest") {
     problems.push({
       title: "The configured sparring engine has no `run-plan --manifest`.",
       fix: "Automatic continuation needs a newer engine. Update it, or keep using the per-stage actions.",
@@ -2434,6 +2768,16 @@ function describePlan(
   parts.push(
     "",
     "After this, each stage runs implementation ↔ review and, on READY, is frozen and accepted at its exact pushed commit — with no further confirmation. The run stops when the reviewer needs you, escalates, something fails, or the plan is complete.",
+  );
+  // The one run-scoped choice that has to be made before the first stage if
+  // it is to apply to the first candidate. Off unless it is chosen: the
+  // ordinary button starts the run with no push authorization at all, and the
+  // run then stops and asks the first time a verified candidate is not on the
+  // remote. (A modal dialog cannot hold a checkbox, so the choice is the
+  // second button rather than a tick-box — the default is still no.)
+  parts.push(
+    "",
+    `"${AUTO_PUSH_START_LABEL}" additionally lets this run push the candidates it verifies to their remote branch, so it does not stop to ask for each one. It applies to this run only, and to nothing but an ordinary push of ${context.expectedBranch}.`,
   );
   return parts.join("\n");
 }

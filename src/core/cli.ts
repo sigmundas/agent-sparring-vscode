@@ -5,9 +5,9 @@
  * Arguments are always returned as arrays for a shell-less spawn; nothing is
  * quoted or joined, so paths with spaces are safe on every platform.
  *
- * CLI surface used (cli.py at 35a2fb2):
- *   sparring [--sparring-dir DIR] run-plan    (PLAN | --manifest FILE) --repo-root ROOT --expected-branch BRANCH [--adopt]
- *   sparring [--sparring-dir DIR] resume-plan (PLAN | --manifest FILE) --repo-root ROOT --expected-branch BRANCH [--evidence TEXT]
+ * CLI surface used (cli.py at 35a2fb2, plus push authorization):
+ *   sparring [--sparring-dir DIR] run-plan    (PLAN | --manifest FILE) --repo-root ROOT --expected-branch BRANCH [--adopt] [--allow-push-for-run]
+ *   sparring [--sparring-dir DIR] resume-plan (PLAN | --manifest FILE) --repo-root ROOT --expected-branch BRANCH [--evidence TEXT] [--allow-push-candidate SHA] [--allow-push-for-run]
  *   sparring [--sparring-dir DIR] run-loop    STAGE --repo-root ROOT --expected-branch BRANCH
  *   sparring [--sparring-dir DIR] run-sparring STAGE --repo-root ROOT --expected-branch BRANCH
  *   sparring [--sparring-dir DIR] freeze-candidate STAGE --repo-root ROOT --expected-branch BRANCH
@@ -20,6 +20,7 @@
 import { constants as fsConstants } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { PlanRunSource } from "./engineFormats";
 
 export const DEFAULT_EXECUTABLE = "sparring";
 
@@ -42,22 +43,81 @@ export interface PlanInvocation {
  * `sparring run-plan (<plan> | --manifest <file>) --repo-root … --expected-branch …`
  * (cli.py: run_plan). `adopt` adds `--adopt`, which lets the run take over
  * stages that already exist instead of refusing them — each one checked and
- * reported by the engine, never silently inherited.
+ * reported by the engine, never silently inherited. `allowPushForRun` adds
+ * `--allow-push-for-run`, recording as part of creating the run that it may
+ * push the verified candidates it produces (see `PushAuthorizationRequest`).
  */
-export function buildRunPlanArgs(invocation: PlanInvocation & { adopt?: boolean }): string[] {
+export function buildRunPlanArgs(invocation: PlanInvocation & { adopt?: boolean; allowPushForRun?: boolean }): string[] {
   const args = [...globalArgs(invocation), "run-plan", ...planInput(invocation), ...loopArgs(invocation)];
   if (invocation.adopt) {
     args.push("--adopt");
   }
+  if (invocation.allowPushForRun) {
+    args.push("--allow-push-for-run");
+  }
   return args;
 }
 
-export function buildResumePlanArgs(invocation: PlanInvocation & { evidence?: string }): string[] {
+/**
+ * A person's answer to the engine's push-authorization request.
+ *
+ * `candidateSha` is the exact commit that was on screen, and it is always
+ * sent: the engine refuses it unless the run is in fact waiting for
+ * permission to push that commit, which is what makes a panel that has been
+ * open a while unable to authorize a candidate the run has since replaced.
+ * `forRun` is the "stop asking me for this run" half of the same click.
+ */
+export interface PushAuthorizationRequest {
+  candidateSha: string;
+  forRun?: boolean;
+}
+
+export interface ResumePlanInvocation extends PlanInvocation {
+  /**
+   * The input kind the run is **recorded** as (`source` in the engine's
+   * plan-run state). Required, and required to agree with the input given:
+   * the engine refuses to resume a run from a different kind of input than
+   * it was started from, and that refusal is right — the two describe
+   * different execution content for the same plan. Passing the recorded
+   * source here is what makes generating such a request impossible instead
+   * of merely unlikely.
+   */
+  source: PlanRunSource;
+  evidence?: string;
+  /** Present only when the person has just allowed a push; see `PushAuthorizationRequest`. */
+  allowPush?: PushAuthorizationRequest;
+}
+
+export function buildResumePlanArgs(invocation: ResumePlanInvocation): string[] {
+  requireRecordedInputKind(invocation);
   const args = [...globalArgs(invocation), "resume-plan", ...planInput(invocation), ...loopArgs(invocation)];
   if (invocation.evidence && invocation.evidence.trim()) {
     args.push("--evidence", invocation.evidence.trim());
   }
+  if (invocation.allowPush) {
+    args.push("--allow-push-candidate", invocation.allowPush.candidateSha);
+    if (invocation.allowPush.forRun) {
+      args.push("--allow-push-for-run");
+    }
+  }
   return args;
+}
+
+/**
+ * The input kind of a resume must be the recorded one. Not a warning and not
+ * a fallback: building the command at all is refused, because the engine
+ * would refuse the run and the person would be left with a plan that cannot
+ * be continued by any button.
+ */
+function requireRecordedInputKind(invocation: ResumePlanInvocation): void {
+  const given: PlanRunSource = invocation.manifest ? "manifest" : "markdown";
+  if (given === invocation.source) {
+    return;
+  }
+  throw new Error(
+    `this plan run was started from a ${invocation.source} plan input; refusing to build a resume from a ${given} one. ` +
+      "The engine refuses to resume a run from a different kind of input, and an existing run's input kind is never changed.",
+  );
 }
 
 /** Exactly one plan input, as the engine requires: the manifest flag or the positional plan. */

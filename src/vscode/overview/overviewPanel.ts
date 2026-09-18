@@ -13,12 +13,14 @@ import { parseStageState, type StageStatus } from "../../core/engineFormats";
 import { planRunDisplayName } from "../../core/planMembership";
 import {
   isActionMessage,
+  isAutoPushMessage,
   isCopyMessage,
   isCopyPromptMessage,
   isHumanCheckMessage,
   isHumanFeedbackMessage,
   isOpenPromptSourceMessage,
   renderOverviewHtml,
+  type AutoPushMessage,
   type CopyMessage,
   type CopyPromptMessage,
   type HumanCheckMessage,
@@ -80,6 +82,8 @@ export class OverviewPanelManager implements vscode.Disposable {
         void this.recordHumanCheck(message);
       } else if (isHumanFeedbackMessage(message)) {
         void this.recordHumanFeedback(message);
+      } else if (isAutoPushMessage(message)) {
+        void this.recordAutoPushChoice(message);
       } else if (isCopyMessage(message)) {
         void this.copyForChat(message);
       } else if (isOpenPromptSourceMessage(message)) {
@@ -143,6 +147,25 @@ export class OverviewPanelManager implements vscode.Disposable {
     }
     await this.controller.setHumanFeedback(run.id, message.text);
     this.lastHtmlKey = JSON.stringify(await this.buildModel());
+  }
+
+  /**
+   * The auto-push toggle, stored as a draft so the panel re-rendering under
+   * it does not move it back.
+   *
+   * Nothing is authorized here and no command runs: the checkbox says what
+   * Allow push should ask for, and Allow push is the only thing that asks.
+   * The page is re-rendered so the box's own state and the Allow push
+   * tooltip stay in step, and the comparison key is advanced first so the
+   * stored choice alone does not queue a second rebuild.
+   */
+  private async recordAutoPushChoice(message: AutoPushMessage): Promise<void> {
+    const run = this.controller.currentSelection.selected;
+    if (!run) {
+      return;
+    }
+    await this.controller.setAutoPushDraft(run.id, message.enabled);
+    await this.update();
   }
 
   /**
@@ -232,6 +255,7 @@ export class OverviewPanelManager implements vscode.Disposable {
         managedPlanRun: await this.managedPlanRun(run),
         existingStageIds: this.existingStageIds(run),
         guardedOperationId: this.controller.guardFor(run.id)?.id,
+        autoPushDraft: this.controller.autoPushDraft(run.id),
       };
     }
     const model = buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.executionFor(selection.selected?.id));

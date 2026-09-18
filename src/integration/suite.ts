@@ -20,7 +20,7 @@ import type { DiscoveryDiagnostic } from "../core/diagnose";
 import { discoverRuns, selectRun } from "../core/discovery";
 import { planKey } from "../core/sparringCommand";
 import { BINDING_VERSION, bindingFileName, manifestFileName, parseExecutionManifest, renderBindingRecord } from "../core/manifest";
-import { isCopyPromptMessage, isHumanCheckMessage, isHumanFeedbackMessage, isOpenPromptSourceMessage, renderOverviewHtml } from "../core/overviewHtml";
+import { isActionMessage, isAutoPushMessage, isCopyPromptMessage, isHumanCheckMessage, isHumanFeedbackMessage, isOpenPromptSourceMessage, renderOverviewHtml } from "../core/overviewHtml";
 import { withHumanCheck, type HumanCheckDrafts } from "../core/humanChecks";
 import type { ExecutionRecord, LivenessState, RunnerLiveness } from "../core/liveness";
 import { buildOverviewModel, type CapturedPrompt, type ManifestStageView, type OverviewArtifacts } from "../core/overviewModel";
@@ -74,6 +74,7 @@ export async function run(): Promise<void> {
     ["accept", () => acceptStageAssertions(report, reportedRepo)],
     ["plan", () => planAssociationAssertions(report, reportedRepo, fixtureRoot)],
     ["gate", () => gateClickAssertions()],
+    ["pushauth", () => pushAuthorizationAssertions()],
     ["prompt", () => promptInspectorAssertions()],
     ["evidence", () => evidenceLaunchAssertions(reportedRepo, fixtureRoot)],
     ["advance", () => advancementAssertions(reportedRepo)],
@@ -613,6 +614,127 @@ async function gateClickAssertions(): Promise<void> {
     assert.equal(withFeedback.actionRequired?.feedback.send.enabled, true);
     assert.equal(withFeedback.actionRequired?.progress, "0 / 1 verified", "and it claims nothing about the check");
     assert.equal(withFeedback.actionRequired?.submit.enabled, false);
+  } finally {
+    panel.dispose();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------- push authorization, on the real wire
+
+/**
+ * The permission panel, in a real Chromium webview.
+ *
+ * Two things can only be proven here. The **toggle** is a checkbox, and a
+ * checkbox reports through `change`, not `click` — a listener wired to the
+ * wrong event renders a control that looks right and does nothing, which is
+ * exactly the class of failure this panel exists to end. And **Allow push**
+ * has to reach the host as an action the host will accept, since a message
+ * the guard drops is a dead button.
+ *
+ * The click is a real DOM event on the real document, and everything it
+ * reaches is the shipped listener.
+ */
+async function pushAuthorizationAssertions(): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "agent-sparring-push-"));
+  const candidate = "f2e455c9a1b2c3d4e5f60718293a4b5c6d7e8f90";
+  const branch = "feature/add-reference-dialog-redesign";
+  const stages = path.join(root, ".sparring", "stages");
+  await fs.mkdir(path.join(stages, GATE_STAGE), { recursive: true });
+  await fs.writeFile(path.join(stages, GATE_STAGE, "state.json"), JSON.stringify({ status: "working", base_sha: null, candidate_sha: null, implementation_session_id: "impl", sparring_session_id: "spar" }));
+  await fs.writeFile(
+    path.join(stages, GATE_STAGE, "sparring.md"),
+    ["# Sparring: gate", "", "## Routing outcome", "", "- Action: `READY`", "- Summary: The change is correct and complete.", ""].join("\n"),
+  );
+  await fs.mkdir(path.join(root, ".sparring", "plans"), { recursive: true });
+  await fs.writeFile(
+    path.join(root, ".sparring", "plans", `${GATE_PLAN_KEY}.json`),
+    JSON.stringify({
+      current_stage: GATE_STAGE,
+      current_stage_index: 0,
+      expected_branch: branch,
+      plan: GATE_PLAN_LABEL,
+      plan_digest: "0".repeat(64),
+      source: "manifest",
+      status: "paused",
+      awaiting: {
+        kind: "push_authorization_required",
+        stage_id: GATE_STAGE,
+        candidate_sha: candidate,
+        branch,
+        remote: "origin",
+        remote_branch: branch,
+        detail: `${candidate} is not reachable from origin/${branch} (abc1234)`,
+      },
+      push_authorization: null,
+    }),
+  );
+  await fs.mkdir(path.join(root, "plans"), { recursive: true });
+  await fs.writeFile(path.join(root, "plans", "reported-statistics.md"), "# Reported statistics\n\n## Stage 3D — Transport\n\nThe transport.\n");
+
+  const location = { sparringDir: path.join(root, ".sparring"), projectDir: root, repoRoot: root, workspaceFolder: root, folderName: path.basename(root) };
+  const selection = selectRun((await discoverRuns([location])).runs);
+  assert.ok(selection.selected, "the paused managed plan run is discovered");
+  const view = (autoPushDraft: boolean) =>
+    buildOverviewModel(selection, undefined, { handoff: false, sparring: true, brief: false, plan: false, git: { branch }, autoPushDraft }, Date.now());
+
+  const before = view(false);
+  assert.equal(before.pushAuthorization?.candidateSha, candidate, "the panel is built from the engine's typed pause");
+  assert.equal(before.pushAuthorization?.autoPush.checked, false);
+  assert.equal(before.actionRequired, undefined, "and it is not a manual-verification panel");
+
+  const panel = vscode.window.createWebviewPanel("agentSparring.pushAuthTest", "push authorization", { viewColumn: vscode.ViewColumn.Active, preserveFocus: true }, { enableScripts: true, localResourceRoots: [] });
+  try {
+    // No check control is on the page at all: the permission panel is not a
+    // test, and the version of it that looked like one is the defect.
+    const document = renderOverviewHtml(before, "probe", panel.webview.cspSource);
+    for (const forbidden of ['data-outcome="pass"', 'data-action="submitForReview"']) {
+      assert.ok(!document.includes(forbidden), `the rendered page must not contain ${forbidden}`);
+    }
+    const waitFor = (type: string, timeoutMs = 15_000) =>
+      new Promise<Record<string, unknown>>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`no ${type} message arrived from the webview within ${timeoutMs}ms`)), timeoutMs);
+        panel.webview.onDidReceiveMessage((message: Record<string, unknown>) => {
+          if (message?.["type"] === type) {
+            clearTimeout(timer);
+            resolve(message);
+          }
+        });
+      });
+
+    // 1. Ticking the toggle. A checkbox does not report through `click`.
+    const toggleNonce = crypto.randomBytes(16).toString("base64");
+    const gotToggle = waitFor("autoPush");
+    const ticker = `<script nonce="${toggleNonce}">document.querySelector('input[data-autopush]').click();</script>`;
+    panel.webview.html = renderOverviewHtml(before, toggleNonce, panel.webview.cspSource).replace("</body>", `${ticker}</body>`);
+    const toggle = await gotToggle;
+    assert.deepEqual(toggle, { type: "autoPush", enabled: true }, "the real checkbox reported its new position");
+    assert.ok(isAutoPushMessage(toggle), "and the host accepts it");
+
+    // The stored choice comes back on the next render, so the box does not
+    // move under the person while they read the panel.
+    const after = view(true);
+    assert.equal(after.pushAuthorization?.autoPush.checked, true);
+    assert.match(renderOverviewHtml(after, toggleNonce, panel.webview.cspSource), /data-autopush="run" checked/);
+
+    // 2. Allow push itself, as an action the host will accept.
+    const allowNonce = crypto.randomBytes(16).toString("base64");
+    const gotAction = waitFor("action");
+    const clicker = `<script nonce="${allowNonce}">document.querySelector('button[data-action="allowPush"]').click();</script>`;
+    panel.webview.html = renderOverviewHtml(after, allowNonce, panel.webview.cspSource).replace("</body>", `${clicker}</body>`);
+    const action = await gotAction;
+    assert.deepEqual(action, { type: "action", action: "allowPush" }, "the button posted the action");
+    assert.ok(isActionMessage(action), "and the host accepts it — a dropped message is a dead button");
+
+    // 3. And there is a non-destructive way out, on the same document.
+    const dismissNonce = crypto.randomBytes(16).toString("base64");
+    const gotDismiss = waitFor("action");
+    const decliner = `<script nonce="${dismissNonce}">document.querySelector('button[data-action="doNotAllowPush"]').click();</script>`;
+    panel.webview.html = renderOverviewHtml(after, dismissNonce, panel.webview.cspSource).replace("</body>", `${decliner}</body>`);
+    assert.deepEqual(await gotDismiss, { type: "action", action: "doNotAllowPush" });
+    console.log(
+      "integration: the typed push request renders a permission, its real checkbox reports through change and comes back ticked, Allow push and Do not allow both reach the host, and no check control is on the page",
+    );
   } finally {
     panel.dispose();
     await fs.rm(root, { recursive: true, force: true });

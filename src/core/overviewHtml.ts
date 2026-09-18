@@ -16,7 +16,7 @@
 import { ACTIVE_CONTEXT_HEADLINE, FOLLOW_ACTIVE_LABEL, SELECT_RUN_LABEL } from "./activeRepository";
 import { CHECK_OUTCOMES, isCheckKey, type CheckItem, type CheckOutcome } from "./humanChecks";
 import { checkName, humanTask, splitPassCriteria } from "./humanTask";
-import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type TimelineItem, type WhatsNext } from "./overviewModel";
+import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type PushAuthorization, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { MatchSource } from "./planAssociation";
 import type { PromptView, PromptViewSection } from "./promptInspector";
 import type { StageRunAction } from "./runner";
@@ -47,7 +47,9 @@ export type OverviewAction =
   | "submitForReview"
   | "sendFeedbackForReview"
   | "dismissSubmissionFailure"
-  | "confirmRunnerInactive";
+  | "confirmRunnerInactive"
+  | "allowPush"
+  | "doNotAllowPush";
 
 /** A Pass / Fail / Can't test click or a note edit on one manual check, posted by the webview as it happens. */
 export interface HumanCheckMessage {
@@ -69,6 +71,25 @@ export interface HumanCheckMessage {
 export interface HumanFeedbackMessage {
   type: "humanFeedback";
   text: string;
+}
+
+/**
+ * The auto-push toggle, posted when it is ticked or unticked.
+ *
+ * It carries an intention, not a decision: nothing is authorized and no
+ * command runs until Allow push is pressed. It is its own message type
+ * rather than an action so the host cannot confuse "the person changed a
+ * checkbox" with "the person granted a permission" — the two do very
+ * different things and must not share a payload.
+ */
+export interface AutoPushMessage {
+  type: "autoPush";
+  enabled: boolean;
+}
+
+export function isAutoPushMessage(message: unknown): message is AutoPushMessage {
+  const record = asRecord(message);
+  return record !== undefined && record["type"] === "autoPush" && typeof record["enabled"] === "boolean";
 }
 
 /** An action button click, posted by the webview. */
@@ -208,6 +229,8 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "sendFeedbackForReview",
   "dismissSubmissionFailure",
   "confirmRunnerInactive",
+  "allowPush",
+  "doNotAllowPush",
 ];
 
 const ACTIONS: ReadonlySet<string> = new Set<string>(OVERVIEW_ACTIONS);
@@ -288,7 +311,15 @@ ${(model.emptyLines ?? []).map((line) => `<p class="muted">${escapeHtml(line)}</
   if (model.branchGuard) {
     parts.push(renderBranchGuard(model.branchGuard));
   }
-  if (model.actionRequired) {
+  if (model.autoPushEnabled) {
+    // Quiet, above the panels, and read from the engine's own run state — so
+    // it is still here after a reload, which is the whole point of the
+    // choice living there rather than in this window.
+    parts.push(`<p class="autopush" title="${escapeHtml(model.autoPushEnabled.detail)}">${icon("check", "good")}${escapeHtml(model.autoPushEnabled.label)}</p>`);
+  }
+  if (model.pushAuthorization) {
+    parts.push(renderPushAuthorization(model.pushAuthorization));
+  } else if (model.actionRequired) {
     parts.push(renderActionRequired(model, model.actionRequired));
   } else if (model.banner) {
     parts.push(`<div class="banner ${model.banner.kind}">${escapeHtml(model.banner.text)}</div>`);
@@ -411,6 +442,48 @@ function renderBranchGuard(guard: BranchGuard): string {
 <p class="muted small">Switch branches before resuming. ${escapeHtml(guard.detail)}</p>
 </section>`;
 }
+
+// ---------------------------------------------------------------- push authorization
+
+/**
+ * The permission panel: one sentence, one button, one toggle.
+ *
+ * Deliberately *unlike* the manual-verification panel it replaces. There are
+ * no Pass / Fail / Can't test controls, no progress count, no evidence field
+ * and no Submit for review: this is not a test, and the version of it that
+ * looked like one let a person "pass" a check that authorized nothing while
+ * the acceptance gate went on refusing the same candidate. What a person
+ * decides here is whether the engine may push a commit, and the two answers
+ * are Allow push and Do not allow.
+ *
+ * The lifecycle words the engine uses — freeze, candidate identity, remote
+ * reachability — stay out of the normal layer entirely and live in the
+ * details disclosure, where they belong.
+ */
+function renderPushAuthorization(panel: PushAuthorization): string {
+  const toggle = `<label class="toggle" title="${escapeHtml(panel.autoPush.detail)}"><input type="checkbox" data-autopush="run"${panel.autoPush.checked ? " checked" : ""}> ${escapeHtml(panel.autoPush.label)}</label>`;
+  // The same demoted layer, the same markup, as every other panel's: the
+  // engine's vocabulary is one disclosure away, never deleted.
+  const rows = panel.technical.map((row) => `<dt>${escapeHtml(row.label)}</dt><dd>${escapeHtml(row.value)}</dd>`).join("");
+  const details = panel.technical.length > 0 ? `<details class="tech"><summary>Show technical details</summary><dl class="techlist">${rows}</dl></details>` : "";
+  return `<section class="card action push">
+<div class="actionhead"><h2>${icon("warn", "needs_you")}${escapeHtml(panel.headline)}</h2>
+<p class="summary">${escapeHtml(panel.text)}</p>
+<p class="muted small helper">${escapeHtml(PUSH_HELPER)}</p></div>
+<div class="pushchoice">${toggle}</div>
+${details}
+<div class="actions">${button("allowPush", panel.allow.label, panel.allow.enabled, panel.allow.detail, "primary")}${button("doNotAllowPush", panel.dismiss.label, true, panel.dismiss.detail, "quiet")}</div>
+</section>`;
+}
+
+/**
+ * What allowing actually does, in the plainest words there are. It names the
+ * one Git operation and the one place it goes, because the whole reason this
+ * panel exists is that a person could previously agree to "push
+ * authorization" without anything being pushed.
+ */
+export const PUSH_HELPER =
+  "The review is finished and this exact commit is what would be accepted. Agent Sparring will not push it without your say-so. Allowing it pushes this branch, to that one place, and nothing else — then the plan continues.";
 
 // ---------------------------------------------------------------- action required
 
@@ -1252,6 +1325,13 @@ textarea.note:focus { outline: 1px solid var(--vscode-focusBorder); }
 .subfail .actions { margin-top: 8px; }
 pre.engineerror { margin: 6px 0 0; padding: 6px 8px; max-height: 9em; overflow: auto; background: var(--vscode-editor-background); border: 1px solid var(--line); border-radius: 4px; font-family: var(--vscode-editor-font-family); font-size: 0.88em; white-space: pre-wrap; overflow-wrap: anywhere; }
 
+/* A permission, not a test: one sentence, one toggle, two answers. */
+.action.push { border-left: 3px solid var(--info); }
+.pushchoice { margin-top: 10px; }
+.pushchoice .toggle { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.pushchoice .toggle input { margin: 0; }
+.autopush { display: inline-flex; align-items: center; gap: 6px; margin: 0 0 8px; color: var(--good); font-weight: 600; }
+
 /* The freeform channel: beside the checks, never inside one of them. */
 .feedback { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
 .feedback h4 { margin: 0 0 2px; }
@@ -1487,6 +1567,14 @@ const SCRIPT = `
     var target = element ? element.closest('button[data-action]') : null;
     if (!target || target.disabled) { return; }
     vscode.postMessage({ type: 'action', action: target.getAttribute('data-action') });
+  });
+  // The auto-push toggle. It reports as it is ticked, so the choice survives
+  // a rerender of the page; it authorizes nothing on its own -- Allow push is
+  // what runs an engine command, and it reads this choice from the host.
+  document.addEventListener('change', function (event) {
+    var box = event.target;
+    if (!(box instanceof HTMLInputElement) || !box.hasAttribute('data-autopush')) { return; }
+    vscode.postMessage({ type: 'autoPush', enabled: box.checked });
   });
   // Every text field is saved as it is typed (debounced) and on blur, so a
   // re-render of the page never loses what was typed; the extension stores it

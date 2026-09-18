@@ -86,6 +86,17 @@ export type Submissions = Record<string, SubmissionRecord>;
 export const SUBMISSIONS_KEY = "agentSparring.submissions";
 
 /**
+ * workspaceState entry for the auto-push toggle's *draft* position: run id →
+ * true.
+ *
+ * Deliberately named a draft. The permission it leads to is engine run state
+ * (`push_authorization`), and this window's memory of a checkbox must never
+ * be mistaken for it: a tick that was never turned into an engine command
+ * authorizes nothing, and a reload reads the authorization from the engine.
+ */
+export const AUTO_PUSH_DRAFT_KEY = "agentSparring.autoPushDraft";
+
+/**
  * Where a submission stands. `pending` is the answer whenever anything is
  * unknown — an execution that cannot be found, one still running, one whose
  * liveness this platform could not establish — because the cost of guessing
