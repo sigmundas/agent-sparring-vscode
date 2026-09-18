@@ -1385,19 +1385,33 @@ async function explainUnconfirmed(controller: SparringController, error: string,
   if (choice !== "I checked — allow retry" || !submission) {
     return;
   }
-  const detail = [
-    `Agent Sparring cannot cancel a command a shell has already been given, and it has no evidence about this one either way.`,
-    "",
-    `Submitted: ${submission.label}`,
-    `To: ${submission.terminalName ?? "a terminal of this window"}`,
-    "",
-    "Only confirm this if you have looked at that terminal and that command cannot start any more. If it can, running the operation again may run it twice.",
-  ].join("\n");
+  // A command a shell holds and a process started before a reload are two
+  // different things to be asked about, and are asked about as themselves.
+  const direct = submission.state === "direct";
+  const detail = (
+    direct
+      ? [
+          "Agent Sparring started this operation as a process of its own, in a window that has since reloaded, and cannot see that process in the process table from here.",
+          "",
+          `Started: ${submission.label}`,
+          `As process: ${submission.directPid ?? "unknown"}`,
+          "",
+          "Only confirm this if that process is really over. If it is still running, running the operation again would do it twice.",
+        ]
+      : [
+          "Agent Sparring cannot cancel a command a shell has already been given, and it has no evidence about this one either way.",
+          "",
+          `Submitted: ${submission.label}`,
+          `To: ${submission.terminalName ?? "a terminal of this window"}`,
+          "",
+          "Only confirm this if you have looked at that terminal and that command cannot start any more. If it can, running the operation again may run it twice.",
+        ]
+  ).join("\n");
   const confirmed = await vscode.window.showWarningMessage("Allow this operation to be run again?", { modal: true, detail }, "Allow retry");
   if (confirmed !== "Allow retry") {
     return;
   }
-  if (controller.overrideSubmission(submission.key, "the person confirmed, having checked the terminal, that this command cannot still run; this is an override, not an observation")) {
+  if (controller.overrideSubmission(submission.key, direct ? "the person confirmed that the process started before the reload is over; this is an override, not an observation" : "the person confirmed, having checked the terminal, that this command cannot still run; this is an override, not an observation")) {
     void vscode.window.showInformationMessage(`Agent Sparring: ${submission.label} may be run again. Its earlier submission was cleared by you, not by evidence.`);
   }
 }

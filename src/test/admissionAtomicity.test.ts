@@ -251,8 +251,15 @@ describe("admission for one operation key is atomic", () => {
       await until(() => (registry.inFlightFor(key)?.state === "direct" ? true : undefined), "the command to fall back to a direct process");
       const firstCall = await until(async () => (await fs.readFile(calls, "utf8").catch(() => "")).trim() || undefined, "the direct process to record its call");
       assert.equal(firstCall, `freeze-candidate ${stage}`);
-      assert.deepEqual(registry.unresolved(), [], "a direct process is not a shell submission");
-      assert.equal(ctx.workspaceState.get(SUBMISSIONS_KEY, undefined), undefined, "and is not persisted: it cannot outlive this window");
+      assert.deepEqual(registry.unresolved(), [], "a direct process this window is waiting on is not something it cannot account for");
+      // It *is* persisted, with what identifies it: such a child survives a
+      // window reload (directExecutionSurvival.test.ts), and the window that
+      // comes back must refuse the duplicate (directExecutionReload.test.ts).
+      assert.deepEqual(
+        (ctx.workspaceState.get(SUBMISSIONS_KEY, []) as { key: string; direct?: { pid: number } }[]).map((item) => [item.key, typeof item.direct?.pid]),
+        [[key, "number"]],
+        "and is persisted with its pid",
+      );
 
       // The second invocation, while that process is still running.
       const second = await runner.run({ ...options, name: "freeze-candidate (direct, second)" });

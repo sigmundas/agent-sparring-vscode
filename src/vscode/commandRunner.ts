@@ -40,7 +40,7 @@ import type { CommandOutcome } from "../core/acceptance";
 import { executableWord, planExecutable, type ExecutablePlan } from "../core/cli";
 import type { LaunchProblem } from "./executionTracker";
 import { awaitExecutionEnd, awaitShellIntegration, EXECUTION_START_TIMEOUT_MS, executeThroughShell, hostEnv } from "./shellIntegration";
-import { admissionRefusal, commandKey, submissionRefusal, type SubmissionRegistry, type SubmissionView } from "./submissionRegistry";
+import { admissionRefusal, commandKey, outstanding, submissionRefusal, type SubmissionRegistry, type SubmissionView } from "./submissionRegistry";
 import { collectOutput } from "./terminalOutput";
 import type { TerminalPool } from "./terminalPool";
 
@@ -87,7 +87,7 @@ export class SparringCommandRunner {
     if (!admission.admitted) {
       const blocked = admission.blocked;
       this.log(`refused to run ${options.name}: ${blocked.label} is already in flight (${blocked.state}); it is not run a second time`);
-      return { ok: false, error: admissionRefusal(blocked), problem: "unconfirmed", submission: blocked.state === "waiting" || blocked.state === "uncertain" ? blocked : undefined };
+      return { ok: false, error: admissionRefusal(blocked), problem: "unconfirmed", submission: outstanding(blocked) ? blocked : undefined };
     }
     const claim = admission.claim;
     const configured = await planExecutable(options.configured, hostEnv(options.cwd), true);
@@ -142,10 +142,19 @@ export class SparringCommandRunner {
     // The child process is started under the claim and the claim is given up
     // only when it has ended: there is no instant between "about to spawn"
     // and "spawned" in which a second invocation could spawn another one.
-    this.submissions.runningDirectly(claim, "it runs as a child process of this window, without a shell");
+    //
+    // Its pid and command line go on the record as soon as the spawn returns
+    // them, without an await in between, because such a child outlives this
+    // window: it is reparented to pid 1 and keeps running when the extension
+    // host is killed, which is what a window reload does (proven in
+    // src/test/directExecutionSurvival.test.ts). A reload must find it and
+    // refuse a second freeze-candidate, not conclude from its own missing
+    // claim that nothing is happening.
     let outcome: CommandOutcome;
     try {
-      outcome = await runProcess(path, options.args, options.cwd);
+      outcome = await runProcess(path, options.args, options.cwd, (pid) => {
+        this.submissions.runningDirectly(claim, `it runs as process ${pid} of this window, without a shell`, { pid, word: path, args: options.args });
+      });
     } finally {
       this.submissions.release(claim, "the process that ran it has ended");
     }
@@ -154,9 +163,15 @@ export class SparringCommandRunner {
   }
 }
 
-function runProcess(file: string, args: string[], cwd: string): Promise<CommandOutcome> {
+/**
+ * Spawn the engine without a shell. `started` is called synchronously with
+ * the child's pid the instant it exists, so the operation's identity is on
+ * the record before anything can interleave; a spawn that produces no pid at
+ * all never started, and nothing is recorded for it.
+ */
+function runProcess(file: string, args: string[], cwd: string, started?: (pid: number) => void): Promise<CommandOutcome> {
   return new Promise((resolve) => {
-    execFile(file, args, { cwd, maxBuffer: 4 * 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
+    const child = execFile(file, args, { cwd, maxBuffer: 4 * 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
       const output = `${stdout ?? ""}${stderr ?? ""}`;
       if (!error) {
         resolve({ exitCode: 0, output, resolvedBy: "path" });
@@ -173,5 +188,8 @@ function runProcess(file: string, args: string[], cwd: string): Promise<CommandO
         resolve({ exitCode: undefined, output: `${output}${error.message}\n`, resolvedBy: "path" });
       }
     });
+    if (child.pid !== undefined) {
+      started?.(child.pid);
+    }
   });
 }

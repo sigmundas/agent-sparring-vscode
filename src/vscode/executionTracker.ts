@@ -55,7 +55,7 @@ import { probeRunnerProcesses, type RunnerProbe } from "../core/runnerProcesses"
 import { commandLineRuns, matchSparringCommand, parseSparringCommand, type SparringSubcommand } from "../core/sparringCommand";
 import { listProcesses, processProbeSupported } from "./processProbe";
 import { awaitShellIntegration, EXECUTION_START_TIMEOUT_MS, executeThroughShell, hostEnv, SHELL_INTEGRATION_TIMEOUT_MS } from "./shellIntegration";
-import { admissionRefusal, runnerKey, submissionRefusal, type Establishment, type SubmissionRegistry, type SubmissionView } from "./submissionRegistry";
+import { admissionRefusal, outstanding, runnerKey, submissionRefusal, type Establishment, type SubmissionRegistry, type SubmissionView } from "./submissionRegistry";
 import type { TerminalLease } from "./terminalPool";
 import { collectOutput } from "./terminalOutput";
 import type { TerminalPool } from "./terminalPool";
@@ -138,6 +138,15 @@ interface Tracked {
   output?: Promise<string>;
   /** The project terminal this command holds until it ends. */
   lease?: TerminalLease;
+  /**
+   * This launch *is* a process of ours: a dedicated terminal whose shell is
+   * the engine, started because no shell integration was available. Such a
+   * process is owned by VS Code's pty host, not by the extension host, and
+   * survives a window reload (integration suite, section `outlives`), so
+   * this persisted launch — restored to running when its terminal comes back
+   * — is what refuses a duplicate afterwards. Nothing else records it.
+   */
+  dedicated?: boolean;
 }
 
 interface PersistedLaunch {
@@ -310,6 +319,11 @@ export class ExecutionTracker implements vscode.Disposable {
     }
   }
 
+  /** A dedicated-terminal launch for this run that has not been seen to end. */
+  private liveDedicatedFor(runId: string): Tracked | undefined {
+    return [...this.tracked.values()].find((item) => item.record.runId === runId && item.dedicated && item.record.state !== "ended");
+  }
+
   private liveItemFor(runId: string): Tracked | undefined {
     return [...this.tracked.values()].filter((item) => item.record.runId === runId && item.record.state !== "ended").sort((a, b) => b.record.startedAtMs - a.record.startedAtMs)[0];
   }
@@ -340,6 +354,25 @@ export class ExecutionTracker implements vscode.Disposable {
     // running as a process of ours.
     const key = runnerKey(options.runId);
     const label = `${options.kind} ${options.stageId ?? options.planPath ?? options.manifest ?? ""}`.trim();
+    // A dedicated-terminal launch is an engine process this extension started
+    // without a shell, and it outlives a window reload. Its record does too,
+    // and a live one refuses a second command for the same run — this is the
+    // duplicate guard for that transport, in this window and after a reload
+    // alike, and it is settled by the same evidence as ever: the terminal
+    // that hosts the process being gone.
+    const dedicated = this.liveDedicatedFor(options.runId);
+    if (dedicated) {
+      this.log(`refused to launch ${options.name}: ${describe(dedicated)} is running as the process of a dedicated terminal; a second command for this run is not started`);
+      return {
+        ok: false,
+        problem: "unconfirmed",
+        error: [
+          `Agent Sparring started ${describe(dedicated)} in its own terminal${dedicated.record.state === "running" ? "" : ", and cannot yet tell whether that process is still running"}.`,
+          "Running it again now would do the same engine operation twice.",
+          "Close that terminal, or wait for it to finish, and try again.",
+        ].join(" "),
+      };
+    }
     const admission = this.submissions.claim({
       key,
       transport: "runner",
@@ -356,7 +389,7 @@ export class ExecutionTracker implements vscode.Disposable {
       const blocked = admission.blocked;
       this.log(`refused to launch ${options.name}: ${blocked.label} is ${describeHold(blocked)}; a second command for this run is not submitted`);
       // Only a shell submission is something a person can be asked about.
-      return { ok: false, error: admissionRefusal(blocked), problem: "unconfirmed", submission: blocked.state === "waiting" || blocked.state === "uncertain" ? blocked : undefined };
+      return { ok: false, error: admissionRefusal(blocked), problem: "unconfirmed", submission: outstanding(blocked) ? blocked : undefined };
     }
     const claim = admission.claim;
     const configured = await planExecutable(options.configured, hostEnv(options.cwd), true);
@@ -420,7 +453,7 @@ export class ExecutionTracker implements vscode.Disposable {
     }
     this.dropEnded(options.runId);
     const path = executableWord(direct.plan);
-    const dedicated = vscode.window.createTerminal({
+    const dedicatedTerminal = vscode.window.createTerminal({
       name: `Agent Sparring — ${options.name}`,
       shellPath: path,
       shellArgs: options.args,
@@ -428,25 +461,29 @@ export class ExecutionTracker implements vscode.Disposable {
       iconPath: new vscode.ThemeIcon("debug-alt"),
     });
     if (options.reveal) {
-      dedicated.show(true);
+      dedicatedTerminal.show(true);
     }
-    const item = this.track(options, "terminal", dedicated, undefined);
+    const item = this.track(options, "terminal", dedicatedTerminal, undefined);
     item.word = path;
     item.plan = direct.plan;
+    item.dedicated = true;
     // This terminal's process *is* the runner, so the operation is under way
     // for as long as that terminal lives. The claim is held until it closes,
     // which is also how this launch's liveness ends — there is no instant in
-    // between where a second command could get in.
-    this.submissions.runningDirectly(claim, `it runs as the process of a dedicated terminal "${dedicated.name}"`);
+    // between where a second command could get in. The claim is not given a
+    // pid to persist: this launch is already persisted, with its terminal's
+    // pid, and after a reload it is that record (not a second one) which
+    // refuses a duplicate.
+    this.submissions.runningDirectly(claim, `it runs as the process of a dedicated terminal "${dedicatedTerminal.name}", whose own persisted launch is what refuses a duplicate across a reload`);
     const released = vscode.window.onDidCloseTerminal((closed) => {
-      if (closed === dedicated) {
+      if (closed === dedicatedTerminal) {
         released.dispose();
         this.submissions.release(claim, "the dedicated terminal that ran it has closed, so the operation is over");
       }
     });
     this.disposables.push(released);
     this.log(`launched ${options.name} in a dedicated terminal (shell integration unavailable; ${path}, ${options.args.length} args, cwd ${options.cwd})`);
-    void this.persistWithPid(item, dedicated);
+    void this.persistWithPid(item, dedicatedTerminal);
     this.changeEmitter.fire("started");
     return { ok: true, record: item.record, via: "terminal" };
   }
@@ -691,6 +728,7 @@ export class ExecutionTracker implements vscode.Disposable {
         planPath: launch.planPath,
         manifest: launch.manifest,
         terminalPid: launch.terminalPid,
+        dedicated: launch.source === "terminal",
       };
       if (launch.ended) {
         item.record = { ...item.record, state: "ended", endedAtMs: launch.ended.atMs, exitCode: launch.ended.exitCode, detail: launch.ended.detail };

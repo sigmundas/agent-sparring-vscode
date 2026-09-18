@@ -26,8 +26,11 @@
  *    record then drops back to a reservation (`unsubmit`) while the caller
  *    runs the operation another way, and is `release`d if it cannot;
  *  - `released` — the operation never reached a shell at all, or the process
- *    this window ran instead of one has ended. Nothing was ever queued
- *    anywhere, so there is nothing to be afraid of;
+ *    this window ran instead of one has ended in front of us. Nothing was
+ *    ever queued anywhere, so there is nothing to be afraid of;
+ *  - `process-gone` — a direct child process recorded before a reload is no
+ *    longer in the process table (or its pid now holds something else), so
+ *    that operation is over;
  *  - `overridden` — a person stated that it cannot still run. That is an
  *    override, not evidence, and is recorded as such.
  *
@@ -79,11 +82,32 @@
  * A second caller that finds *any* of those states for its key is refused
  * before it resolves an executable, acquires a terminal or sends a byte.
  *
- * `reserved` and `direct` are this window's own in-flight work: they are not
- * persisted, because a reload cannot leave either of them able to execute —
- * a reservation never reached a shell, and a direct child process does not
- * outlive the extension host that spawned it. Only what a *shell* was given
- * is written down, which is the durable semantics that was there before.
+ * `reserved` is this window's own preparation and is never persisted: nothing
+ * has executed, so a reload leaves nothing to duplicate.
+ *
+ * `direct` is different, and the first version of this got it wrong by
+ * assuming a direct execution dies with the window. Both direct transports
+ * were then measured, and both outlive it:
+ *
+ *  - a dedicated terminal's process is spawned by VS Code's pty host, not by
+ *    the extension host (asserted from the process table in the integration
+ *    suite, section `outlives`), and persistent terminal sessions are on by
+ *    default, so a window reload reconnects it;
+ *  - a child of `execFile` survives its parent being SIGKILLed, reparented to
+ *    pid 1 with its command line intact (asserted in
+ *    src/test/directExecutionSurvival.test.ts).
+ *
+ * So a started direct operation keeps an identity across a reload. The two
+ * transports keep it in the place that already owns the evidence:
+ *
+ *  - a dedicated-terminal runner is already a persisted *launch* with its
+ *    terminal's pid, restored to running when that terminal comes back
+ *    (executionTracker.ts). No second record is kept here; the launcher
+ *    refuses a duplicate from that one;
+ *  - an `execFile` child has nowhere else to live, so this registry persists
+ *    it with its pid and its command line, restores it as `direct`, and
+ *    settles it from the process table: the pid gone — or holding something
+ *    else — is what ends it.
  *
  * Because a key holds one record, `override` and `withdraw` act on that exact
  * record rather than picking one of several with the same key.
@@ -109,17 +133,21 @@ export type SubmissionTransport = "runner" | "command";
  *    never persisted, because nothing can execute;
  *  - `waiting` — handed to a shell, which has not reported it yet;
  *  - `uncertain` — the caller's wait expired; unchanged in substance;
- *  - `direct` — not a shell submission at all: a dedicated terminal or a
- *    child process this window started really is running it. Blocks for that
- *    operation's lifetime; never persisted.
+ *  - `direct` — not a shell submission at all: a child process this window
+ *    started really is running it. Blocks for that operation's lifetime, and
+ *    is persisted once its pid is known, because such a process outlives a
+ *    window reload (see the note at the top of this file).
  */
 export type SubmissionState = "reserved" | "waiting" | "uncertain" | "direct";
 
 /** The states in which a command was handed to a shell and may still execute on its own. */
 const SUBMITTED: ReadonlySet<SubmissionState> = new Set<SubmissionState>(["waiting", "uncertain"]);
 
+/** How often a direct child process recorded before a reload is looked for. */
+const DIRECT_PROBE_INTERVAL_MS = 4000;
+
 /** How a submission's fate was established. Only `overridden` is not evidence. */
-export type SubmissionResolution = "started" | "ended" | "terminal-closed" | "shell-gone" | "attributed" | "not-submitted" | "overridden" | "released";
+export type SubmissionResolution = "started" | "ended" | "terminal-closed" | "shell-gone" | "attributed" | "not-submitted" | "overridden" | "released" | "process-gone";
 
 /** What a submission is, from the outside. Never an execution record. */
 export interface SubmissionView {
@@ -139,6 +167,8 @@ export interface SubmissionView {
   /** Whether this window still holds the exact execution identity (lost by a reload). */
   identifiable: boolean;
   restored: boolean;
+  /** The child process running it, for a `direct` operation whose pid is known. */
+  directPid?: number;
 }
 
 /** Everything the runner launcher needs to promote a submission into a tracked execution. */
@@ -195,6 +225,10 @@ export type SubmissionWait =
 
 interface Submission extends SubmissionIdentity {
   id: string;
+  /** The child process this window spawned for a `direct` operation. */
+  directPid?: number;
+  /** Exactly what was spawned, so the pid can be confirmed to still be it after a reload. */
+  directCommand?: { word: string; args: string[] };
   submittedAtMs: number;
   state: SubmissionState;
   terminal?: vscode.Terminal;
@@ -225,6 +259,11 @@ interface PersistedSubmission {
   submittedAtMs: number;
   terminalPid?: number;
   terminalName?: string;
+  /**
+   * Present only for a direct child process: the operation is not queued in
+   * any shell, it is running, and this is what identifies it after a reload.
+   */
+  direct?: { pid: number; word: string; args: string[] };
 }
 
 /** The operation key for a runner command: one unresolved submission per run. */
@@ -306,9 +345,15 @@ export class SubmissionRegistry implements vscode.Disposable {
     return runId ? this.unresolvedFor(runnerKey(runId)) : undefined;
   }
 
-  /** Every command a shell has been given and that is not accounted for. */
+  /**
+   * Everything this window cannot account for: a command a shell was given,
+   * and a direct process that was started before a reload and is still in the
+   * process table. A direct process *this* window started is not in the list
+   * — it is being awaited by the caller that started it, and offering a
+   * person an override for work that is visibly running would be nonsense.
+   */
   unresolved(): SubmissionView[] {
-    return [...this.submissions.values()].filter((submission) => SUBMITTED.has(submission.state)).map(view);
+    return [...this.submissions.values()].filter(unaccounted).map(view);
   }
 
   // ---------------------------------------------------------------- admission
@@ -391,15 +436,25 @@ export class SubmissionRegistry implements vscode.Disposable {
 
   /**
    * The operation is not going through a shell: this window started it
-   * itself, in a dedicated terminal or as a child process. There is nothing
-   * to wait for evidence about — it is running, observably — but a second
-   * copy must be refused for as long as it runs, so the claim is held until
-   * the caller `release`s it.
+   * itself. There is nothing to wait for evidence about — it is running,
+   * observably — but a second copy must be refused for as long as it runs,
+   * so the claim is held until the caller `release`s it.
+   *
+   * `process` identifies a child process that will outlive this window if the
+   * window reloads, and passing it is what makes the record durable. A caller
+   * that has no such process to name (a dedicated terminal, whose duplicate
+   * guard is its own persisted launch) keeps the claim for this window only.
    */
-  runningDirectly(claim: OperationClaim, detail: string): void {
+  runningDirectly(claim: OperationClaim, detail: string, process?: { pid: number; word: string; args: string[] }): void {
     const submission = this.held(claim, "reserved");
     submission.state = "direct";
+    if (process) {
+      submission.directPid = process.pid;
+      submission.directCommand = { word: process.word, args: process.args };
+    }
     this.log(`${submission.label}: ${detail}; a second copy of this operation is refused until it ends`);
+    void this.persist();
+    this.changeEmitter.fire();
   }
 
   /**
@@ -481,9 +536,10 @@ export class SubmissionRegistry implements vscode.Disposable {
    */
   override(key: string, note: string): boolean {
     const submission = this.recordFor(key);
-    if (!submission || !SUBMITTED.has(submission.state)) {
-      // Nothing was given to a shell for this operation, so there is nothing
-      // for a person to take responsibility for.
+    if (!submission || !unaccounted(submission)) {
+      // Nothing is outstanding for this operation that a person could take
+      // responsibility for: either nothing has executed, or what is running
+      // is being watched by the caller that started it.
       return false;
     }
     this.resolve(submission, "overridden", note);
@@ -586,17 +642,21 @@ export class SubmissionRegistry implements vscode.Disposable {
   private startProbing(submission: Submission): void {
     if (submission.probeTimer || !this.probeSupported()) {
       if (!this.probeSupported()) {
-        this.log(`${submission.label}: no process probe is available on ${process.platform}, so its fate stays unknown until its terminal closes or you confirm it cannot run`);
+        this.log(
+          submission.state === "direct"
+            ? `${submission.label}: no process probe is available on ${process.platform}, so whether the process this window started before the reload is still running cannot be established here; the operation stays blocked until you confirm it is over`
+            : `${submission.label}: no process probe is available on ${process.platform}, so its fate stays unknown until its terminal closes or you confirm it cannot run`,
+        );
       }
       return;
     }
-    submission.probeTimer = setInterval(() => void this.probeOnce(submission), PID_PROBE_INTERVAL_MS);
+    submission.probeTimer = setInterval(() => void this.probeOnce(submission), submission.state === "direct" ? DIRECT_PROBE_INTERVAL_MS : PID_PROBE_INTERVAL_MS);
     void this.probeOnce(submission);
   }
 
   /** Run one round of process evidence for every unresolved submission. */
   async probeAll(): Promise<void> {
-    for (const submission of [...this.submissions.values()].filter((item) => SUBMITTED.has(item.state))) {
+    for (const submission of [...this.submissions.values()].filter(unaccounted)) {
       await this.probeOnce(submission);
     }
   }
@@ -606,9 +666,9 @@ export class SubmissionRegistry implements vscode.Disposable {
       clearInterval(submission.probeTimer);
       return;
     }
-    if (!this.probeSupported() || !SUBMITTED.has(submission.state)) {
-      // A reservation and a direct process are not questions for the process
-      // table: nothing was queued in a shell for either.
+    if (!this.probeSupported() || !unaccounted(submission)) {
+      // A reservation is not a question for the process table, and neither is
+      // a process this window is itself waiting on.
       return;
     }
     let processes: { pid: number; command: string }[];
@@ -618,6 +678,17 @@ export class SubmissionRegistry implements vscode.Disposable {
       return; // A transient `ps` failure proves nothing.
     }
     if (!this.submissions.has(submission.id)) {
+      return;
+    }
+    if (submission.state === "direct") {
+      // A process recorded before a reload. It is over when its pid is gone,
+      // and equally when that pid now holds something else entirely.
+      const running = processes.find((item) => item.pid === submission.directPid);
+      if (!running) {
+        this.resolve(submission, "process-gone", `the process ${submission.directPid} this window started for it is no longer in the process table, so that operation is over`);
+      } else if (!isRecordedProcess(submission, running.command)) {
+        this.resolve(submission, "process-gone", `the pid ${submission.directPid} recorded for it now belongs to something else (${running.command.slice(0, 60)}), so that operation is over`);
+      }
       return;
     }
     if (submission.runnerKind) {
@@ -644,9 +715,10 @@ export class SubmissionRegistry implements vscode.Disposable {
   }
 
   private async persist(): Promise<void> {
-    // Only what a shell was actually given: a reservation and a direct
-    // process cannot outlive this window, so neither is written down.
-    const stored: PersistedSubmission[] = [...this.submissions.values()].filter((submission) => SUBMITTED.has(submission.state)).map((submission) => ({
+    // What a shell was given, and what a child process of ours is really
+    // running. A reservation is not written down: nothing has executed, so a
+    // reload has nothing to duplicate.
+    const stored: PersistedSubmission[] = [...this.submissions.values()].filter(persistable).map((submission) => ({
       id: submission.id,
       key: submission.key,
       transport: submission.transport,
@@ -662,6 +734,7 @@ export class SubmissionRegistry implements vscode.Disposable {
       submittedAtMs: submission.submittedAtMs,
       terminalPid: submission.terminalPid,
       terminalName: submission.terminalName,
+      direct: submission.state === "direct" && submission.directPid !== undefined ? { pid: submission.directPid, word: submission.directCommand?.word ?? "", args: submission.directCommand?.args ?? [] } : undefined,
     }));
     await this.context.workspaceState.update(SUBMISSIONS_KEY, stored);
   }
@@ -684,7 +757,9 @@ export class SubmissionRegistry implements vscode.Disposable {
     for (const item of stored) {
       const submission: Submission = {
         ...item,
-        state: "uncertain",
+        state: item.direct ? "direct" : "uncertain",
+        directPid: item.direct?.pid,
+        directCommand: item.direct ? { word: item.direct.word, args: item.direct.args } : undefined,
         restored: true,
       };
       const held = this.recordFor(submission.key);
@@ -706,7 +781,10 @@ export class SubmissionRegistry implements vscode.Disposable {
       restored.push(submission);
     }
     if (restored.length > 0) {
-      this.log(`window reloaded with ${restored.length} command(s) submitted to a shell whose fate is unknown; no runner is claimed for them, and a second copy of each is refused until evidence settles it`);
+      const direct = restored.filter((submission) => submission.state === "direct").length;
+      this.log(
+        `window reloaded with ${restored.length - direct} command(s) submitted to a shell whose fate is unknown${direct > 0 ? ` and ${direct} process(es) this window started itself` : ""}; no runner is claimed for any of them, and a second copy of each is refused until evidence settles it`,
+      );
       for (const submission of restored) {
         this.startProbing(submission);
       }
@@ -728,6 +806,29 @@ export class SubmissionRegistry implements vscode.Disposable {
   }
 }
 
+/**
+ * Whether a record is something this window cannot account for by itself: a
+ * command a shell holds, or a direct process that started before a reload.
+ */
+function unaccounted(submission: Submission): boolean {
+  return SUBMITTED.has(submission.state) || (submission.state === "direct" && submission.restored);
+}
+
+/** Whether a record must survive a window reload, because what it names can. */
+function persistable(submission: Submission): boolean {
+  return SUBMITTED.has(submission.state) || (submission.state === "direct" && submission.directPid !== undefined);
+}
+
+/**
+ * Whether a process in the table is still the direct child that was recorded.
+ * A pid alone is not enough — pids are reused — so the recorded executable
+ * and the operation's own words must be in its command line too.
+ */
+function isRecordedProcess(submission: Submission, commandLine: string): boolean {
+  const words = [submission.directCommand?.word, submission.subcommand, submission.stageId].filter((word): word is string => Boolean(word));
+  return words.every((word) => commandLine.includes(word));
+}
+
 function view(submission: Submission): SubmissionView {
   return {
     id: submission.id,
@@ -743,6 +844,7 @@ function view(submission: Submission): SubmissionView {
     terminalPid: submission.terminalPid,
     identifiable: submission.execution !== undefined,
     restored: submission.restored,
+    directPid: submission.directPid,
   };
 }
 
@@ -753,6 +855,15 @@ function view(submission: Submission): SubmissionView {
  */
 export function submissionRefusal(submission: SubmissionView): string {
   const seconds = Math.max(1, Math.round((Date.now() - submission.submittedAtMs) / 1000));
+  if (submission.state === "direct") {
+    // Started by an earlier window, without a shell, and still in the
+    // process table. Nothing about this one is uncertain except when it ends.
+    return [
+      `Agent Sparring started ${submission.label} ${seconds} s ago, before this window reloaded, and the process it started${submission.directPid !== undefined ? ` (pid ${submission.directPid})` : ""} is still running.`,
+      "Running it again now would do the same engine operation twice.",
+      "It will be released as soon as that process is gone. If you know it is already over, confirm it.",
+    ].join(" ");
+  }
   return [
     `Agent Sparring handed ${submission.label} to the terminal${submission.terminalName ? ` "${submission.terminalName}"` : ""} ${seconds} s ago and has not been able to confirm whether it started.`,
     submission.restored
@@ -768,12 +879,24 @@ export function submissionRefusal(submission: SubmissionView): string {
  * one case where nobody can say what is happening; the others are simply this
  * window already doing the thing.
  */
+/**
+ * Whether this is something a person could be asked about: a command a shell
+ * holds, or a process started before a reload. An operation this window is
+ * preparing or is itself waiting on is neither — nobody can tell it anything
+ * it does not already know.
+ */
+export function outstanding(view: SubmissionView): boolean {
+  return view.state === "waiting" || view.state === "uncertain" || (view.state === "direct" && view.restored);
+}
+
 export function admissionRefusal(blocked: SubmissionView): string {
   if (blocked.state === "waiting" || blocked.state === "uncertain") {
     return submissionRefusal(blocked);
   }
   if (blocked.state === "direct") {
-    return `Agent Sparring is already running ${blocked.label}. Wait for it to finish before running it again.`;
+    // A process from before a reload is a different situation from one this
+    // window is watching, and it has its own wording (submissionRefusal).
+    return blocked.restored ? submissionRefusal(blocked) : `Agent Sparring is already running ${blocked.label}. Wait for it to finish before running it again.`;
   }
   return `Agent Sparring is already starting ${blocked.label}. Wait for that to be handed to a terminal before running it again.`;
 }

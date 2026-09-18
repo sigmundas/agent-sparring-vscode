@@ -25,6 +25,8 @@ import { withHumanCheck, type HumanCheckDrafts } from "../core/humanChecks";
 import type { ExecutionRecord, LivenessState, RunnerLiveness } from "../core/liveness";
 import { buildOverviewModel, type CapturedPrompt, type ManifestStageView, type OverviewArtifacts } from "../core/overviewModel";
 import { ExecutionTracker } from "../vscode/executionTracker";
+import { listProcesses, processProbeSupported } from "../vscode/processProbe";
+import type { ProcessInfo } from "../core/processTree";
 import { SubmissionRegistry, SUBMISSIONS_KEY } from "../vscode/submissionRegistry";
 import type { TerminalLease, TerminalPool } from "../vscode/terminalPool";
 
@@ -84,6 +86,7 @@ export async function run(): Promise<void> {
     ["override", () => overrideAssertions(report, reportedRepo)],
     ["launchable", () => launchTargetAssertions(fixtureRoot, reportedRepo)],
     ["declarations", () => declarationScopeAssertions(reportedRepo, fixtureRoot)],
+    ["outlives", () => directExecutionOutlivesTheWindowAssertions()],
   ];
   const only = (process.env.AGENT_SPARRING_IT_ONLY ?? "").split(",").map((name) => name.trim()).filter(Boolean);
   for (const [name, section] of sections) {
@@ -1453,6 +1456,59 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
   }
 
   console.log("integration: an unconfirmed submission keeps its identity, refuses a second copy, is settled by its terminal closing — and a stopped shell that runs it later is promoted to a real, persisted, normally-ended runner; a reload keeps it until evidence settles it, and an unrelated runner never does");
+}
+
+// ---------------------------------------------------------------- what a direct execution's lifetime is actually tied to
+
+/**
+ * Whether an engine operation this window started *without* a shell can
+ * outlive the window. The submission record's safety identity for those two
+ * transports depended on the answer, and the answer had been assumed.
+ *
+ * The dedicated-terminal fallback (executionTracker.ts) is the half that can
+ * be settled here: a terminal's process is not spawned by the extension host
+ * at all — VS Code's pty host owns it — so restarting the extension host,
+ * which is what a window reload does, cannot end it. This asserts that from
+ * the process table: the extension host (`process.pid`) is nowhere in the
+ * terminal process's ancestry. Terminal reconnection after a reload is then
+ * ordinary VS Code behaviour (`terminal.integrated.enablePersistentSessions`,
+ * on by default), and the tracker already relies on it — `reattachTo` finds a
+ * dedicated terminal by its pid and calls the runner alive.
+ *
+ * The execFile fallback (commandRunner.ts) cannot be reload-tested in this
+ * host either, but its lifetime is the same POSIX fact and is asserted in
+ * src/test/directExecutionSurvival.test.ts against a parent that is really
+ * SIGKILLed: the child survives, reparented to pid 1, with its command line
+ * intact in the process table.
+ */
+async function directExecutionOutlivesTheWindowAssertions(): Promise<void> {
+  if (!processProbeSupported()) {
+    console.log(`integration: no process probe on ${process.platform}; direct-execution lifetime section skipped`);
+    return;
+  }
+  const persistent = vscode.workspace.getConfiguration("terminal.integrated").get<boolean>("enablePersistentSessions");
+  const terminal = vscode.window.createTerminal({ name: "a dedicated runner terminal", shellPath: "/bin/sh", shellArgs: ["-c", "sleep 120"] });
+  try {
+    const pid = await terminal.processId;
+    assert.ok(pid !== undefined, "the dedicated terminal's process id");
+    const processes = await listProcesses();
+    const byPid = new Map(processes.map((item) => [item.pid, item]));
+    const ancestry: ProcessInfo[] = [];
+    for (let current = byPid.get(pid); current && current.pid !== 1 && ancestry.length < 12; current = byPid.get(current.ppid)) {
+      ancestry.push(current);
+    }
+    assert.ok(ancestry.length > 1, `the terminal process has an ancestry, got ${JSON.stringify(ancestry)}`);
+    assert.equal(ancestry[0].pid, pid, "the chain starts at the terminal's own process");
+    assert.ok(
+      !ancestry.some((item) => item.pid === process.pid),
+      `the extension host (pid ${process.pid}) must not be in the terminal process's ancestry, got ${JSON.stringify(ancestry.map((item) => [item.pid, item.command.slice(0, 60)]))}`,
+    );
+    console.log(
+      `integration: a dedicated terminal's process (${pid}) is owned by ${JSON.stringify(ancestry[1]?.command.slice(0, 80) ?? "?")}, not by the extension host (${process.pid}); persistent sessions ${persistent === false ? "off" : "on"} — so a window reload cannot end it`,
+    );
+  } finally {
+    terminal.dispose();
+  }
 }
 
 // ---------------------------------------------------------------- a short engine command submitted to a stopped shell
