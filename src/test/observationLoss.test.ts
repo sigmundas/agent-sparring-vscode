@@ -98,7 +98,14 @@ function store(seed: Record<string, unknown> = {}): Store {
  * after it. `occupy` is how a test makes a terminal the person's at an exact
  * moment.
  */
-function pool(): {
+/**
+ * `shellPid`, when given, is the pid every acquired terminal reports as its
+ * shell. A test that wants the process table to be able to attribute a real
+ * engine to this hand-over passes the pid that really is that engine's
+ * ancestor: ancestry under the live shell is the only thing that binds a
+ * process to an operation, so a fake pid would (correctly) bind nothing.
+ */
+function pool(shellPid?: number): {
   acquire: (cwd: string) => unknown;
   acquired: FakeTerminal[];
   retired: FakeTerminal[];
@@ -115,7 +122,7 @@ function pool(): {
     discarded,
     occupy: (terminal) => occupied.add(terminal),
     acquire: () => {
-      const terminal = new FakeTerminal(`Agent Sparring — test ${acquired.length + 1}`, 8100 + acquired.length);
+      const terminal = new FakeTerminal(`Agent Sparring — test ${acquired.length + 1}`, shellPid ?? 8100 + acquired.length);
       acquired.push(terminal);
       stub.window.terminals.push(terminal);
       return {
@@ -294,7 +301,9 @@ describe("a process that survives its terminal keeps its guard", () => {
     const { child } = startEngine(where, ["run-loop", "stage-1", "--repo-root", dir]);
     await inTheTable(child.pid as number);
     const registry: Registry = new OperationRegistry({ workspaceState: kept } as never, (message: string) => logged.push(message), () => true, listProcesses);
-    const terminals = pool();
+    // The stand-in shell is the process that really started that engine, so
+    // the ancestry the attribution rule requires exists in the real table.
+    const terminals = pool(process.pid);
     const tracker: Tracker = new ExecutionTracker({ workspaceState: kept } as never, (message) => logged.push(message), () => [], terminals as never, registry, () => true, listProcesses);
     const key = runnerKey(options(dir).runId);
     try {
@@ -305,6 +314,7 @@ describe("a process that survives its terminal keeps its guard", () => {
       stub.window.startEmitter.fire({ terminal: terminals.acquired[0], shellIntegration: integration, execution });
       assert.equal((await launching).ok, true, "the shell reported it as started");
       assert.equal(registry.inFlightFor(key)?.state, "running-shell");
+      assert.equal(registry.inFlightFor(key)?.enginePid, undefined, "a start event is not a process lookup: running-shell normally has no pid bound");
 
       // The terminal goes away without an exit code — exactly what closing a
       // terminal whose process ignores the hangup looks like.
@@ -328,6 +338,7 @@ describe("a process that survives its terminal keeps its guard", () => {
       // does: first it finds the process, then the process is gone.
       await registry.probeAll();
       assert.equal(registry.inFlightFor(key)?.state, "running-shell", "a live engine process keeps it guarded");
+      assert.equal(registry.inFlightFor(key)?.enginePid, child.pid, "and the pid it binds is the descendant of the shell that ran it, not any matching process");
       process.kill(child.pid as number, "SIGKILL");
       await until(async () => {
         await registry.probeAll();

@@ -167,6 +167,27 @@
  * line. It is only the operation whose process was *never* identified that
  * has nothing to follow — and that one waits for a person.
  *
+ * **And `running-shell` is commonly that operation.** The normal path into it
+ * is the shell reporting that exact execution as started, which is an event
+ * and not a process lookup: `advanceToRunning` binds no pid. So a perfectly
+ * ordinary `running-shell` restored after a reload has `enginePid` undefined,
+ * `generation` undefined, the shell's pid, and the durable hand-over time.
+ * This file used to treat that case as licence to search the whole table for
+ * the operation's command line and adopt a unique match, and a review
+ * reproduced the harm end to end: the real engine was unmatchable, one
+ * unrelated process matched, it was recorded as this operation's engine pid,
+ * and *that stranger's exit* resolved the operation as `engine-process-gone`
+ * while the real engine ran on — admitting the duplicate the record existed
+ * to refuse. Knowing an execution started says a process existed; it never
+ * says which one. So a pidless `running-shell` binds a process under exactly
+ * the rule a submitted command does — known shell pid, that shell still
+ * alive, a strict descendant of it, positively matched, not born before the
+ * hand-over, and the only such candidate — and otherwise stays `running-shell`
+ * and guarded, with a person's override of that exact operation id as the way
+ * out. What differs between the two states is not the rule for binding a pid
+ * but what is known without one: a submitted command may never have run,
+ * while a `running-shell` one certainly did.
+ *
  * ## What is not evidence, and may never end a guard
  *
  *  - **any timer.** The wait a caller does is a user-interface deadline; a
@@ -552,10 +573,21 @@ export type StartWait =
 
 /**
  * What the process table can say about a command a shell was given. Either
- * one process is positively this hand-over's, or nothing is — and then `why`
- * is what a person is told, never a step towards adopting a look-alike.
+ * one process is positively this hand-over's, or nothing is — and then the
+ * reason says which part of the causal chain is missing, so the caller can
+ * phrase it for the state it is in. None of the negative answers is a step
+ * towards adopting a look-alike.
+ *
+ * `no-shell-pid` and `shell-gone` are about the ancestor rather than about
+ * any candidate, and they mean different things in the two states that ask
+ * this question, so the caller words them; `unattributable` is the structural
+ * answer about candidates and carries its own wording.
  */
-type SubmittedAttribution = { attributed: true; process: ProcessInfo; where: string } | { attributed: false; why: string };
+type ShellAttribution =
+  | { attributed: true; process: ProcessInfo; where: string }
+  | { attributed: false; reason: "no-shell-pid" }
+  | { attributed: false; reason: "shell-gone"; shellPid: number }
+  | { attributed: false; reason: "unattributable"; why: string };
 
 interface Operation extends OperationIdentity {
   readonly id: string;
@@ -1506,8 +1538,12 @@ export class OperationRegistry implements vscode.Disposable {
    * own execution to be reported, or for a person.
    */
   private probeSubmittedShell(operation: Operation, processes: ProcessInfo[]): void {
-    const shellPid = operation.terminalPid;
-    if (shellPid === undefined || shellPid <= 0) {
+    const attribution = this.attributeUnderShell(operation, processes);
+    if (attribution.attributed) {
+      this.advanceToProbedRunning(operation, attribution.process, attribution.where);
+      return;
+    }
+    if (attribution.reason === "no-shell-pid") {
       // Not knowing which shell took the line is not knowing that the shell
       // has gone: it may be alive and still holding the line. This used to
       // fall through to a search of the whole table, so a missing pid was
@@ -1518,20 +1554,15 @@ export class OperationRegistry implements vscode.Disposable {
       );
       return;
     }
-    if (!processExists(processes, shellPid)) {
+    if (attribution.reason === "shell-gone") {
       this.loseObservation(
         operation,
-        `the shell process ${shellPid} that took it no longer exists. It may well have read that line before it went — and an engine it started is reparented rather than killed — so this is the loss of the only thing that was watching, not proof that nothing ran. The guard remains.`,
+        `the shell process ${attribution.shellPid} that took it no longer exists. It may well have read that line before it went — and an engine it started is reparented rather than killed — so this is the loss of the only thing that was watching, not proof that nothing ran. The guard remains.`,
       );
       this.unresolvedProbe(
         operation,
         `the shell that took it is gone, so no process in the table can be tied to this hand-over any more: ancestry was the only thing that could, and there is no ancestor left.${this.lookAlikeNote(operation, processes, undefined)} Whether it ran, and whether it is still running, cannot be established here, so it stays guarded until its own execution is reported or you confirm it cannot run.`,
       );
-      return;
-    }
-    const attribution = this.attributeSubmitted(operation, processes, shellPid);
-    if (attribution.attributed) {
-      this.advanceToProbedRunning(operation, attribution.process, attribution.where);
       return;
     }
     this.unresolvedProbe(operation, attribution.why);
@@ -1575,27 +1606,48 @@ export class OperationRegistry implements vscode.Disposable {
   }
 
   /**
-   * The process running a submitted command, if one can be positively
-   * attributed to *this hand-over*.
+   * The process running this operation's command line, if one can be
+   * positively attributed to *this hand-over*.
    *
-   * `shellPid` is the shell this window gave the command line to, established
-   * to be alive. Its descendants are the only place a match can count: that
-   * is where a live shell runs what it was given, and it is the only relation
-   * between a process in the table and this particular `executeCommand`. A
-   * matching command line anywhere else is a different process running the
-   * same command.
+   * The one causal tie between a row in a process table and a particular
+   * `executeCommand` is ancestry under the shell that call was made against,
+   * and that tie is only readable while the shell is alive. So the chain is:
+   * the shell's pid is known; that shell is still in the table; the candidate
+   * is a strict descendant of it; the candidate is positively matched; and
+   * then two rejections that are rejections only and never reasons to adopt —
+   * a candidate born clearly before the durable intent cannot be this launch,
+   * and two indistinguishable candidates are not one identity.
    *
-   * Two further rejections, which are rejections only and never reasons to
-   * adopt: a candidate born clearly before the durable intent was written
-   * cannot be this launch, and two indistinguishable candidates are not one
-   * identity.
+   * Shared, deliberately, by the two states that have a command line but no
+   * process: a command a shell was *given* and never seen to start, and one
+   * the shell reported as started before this window lost sight of which OS
+   * process it is. The two know different things — the second one *did* run —
+   * but neither of them learns whose process a look-alike is, so the rule
+   * that binds a pid is one rule. What differs is the state, and what each
+   * caller says about it.
    */
-  private attributeSubmitted(operation: Operation, processes: ProcessInfo[], shellPid: number): SubmittedAttribution {
+  private attributeUnderShell(operation: Operation, processes: ProcessInfo[]): ShellAttribution {
+    const shellPid = operation.terminalPid;
+    if (shellPid === undefined || shellPid <= 0) {
+      // "Ancestry cannot be established", never "the shell is gone", and
+      // never permission to look somewhere ancestry does not reach.
+      return { attributed: false, reason: "no-shell-pid" };
+    }
+    if (!processExists(processes, shellPid)) {
+      // The ancestor that was the only thing tying a process to this
+      // hand-over has gone. A dying shell reparents its children, so what is
+      // left in the table carries no relation to this call at all.
+      return { attributed: false, reason: "shell-gone", shellPid };
+    }
     const matchers = this.matchersFor(operation);
     if (matchers.length === 0) {
       // No question can be asked, so there is no answer. A short command
       // armed before the invocation was recorded is in this position.
-      return { attributed: false, why: "nothing recorded for it could recognise it in a process table — neither a target a command line can be parsed for nor the invocation it was given — so whether it is running cannot be established here; it stays guarded." };
+      return {
+        attributed: false,
+        reason: "unattributable",
+        why: "nothing recorded for it could recognise it in a process table — neither a target a command line can be parsed for nor the invocation it was given — so whether it is running cannot be established here; it stays guarded.",
+      };
     }
     const matches = (commandLine: string) => matchers.some((matcher) => matcher(commandLine));
     const handedOverAtMs = operation.armedAtMs ?? operation.claimedAtMs;
@@ -1607,26 +1659,55 @@ export class OperationRegistry implements vscode.Disposable {
     if (candidates.length > 1) {
       return {
         attributed: false,
+        reason: "unattributable",
         why: `${candidates.length} processes under the shell ${shellPid} that took this line run that same command (pids ${candidates.map((item) => item.pid).join(", ")}). Two indistinguishable processes are not one identity, so none of them is adopted as this operation and the guard stays exactly where it is.`,
       };
     }
     if (under.length > 0) {
       return {
         attributed: false,
+        reason: "unattributable",
         why: `${under.length === 1 ? `pid ${under[0].pid} is` : `pids ${under.map((item) => item.pid).join(", ")} are`} running that command under the shell ${shellPid} that took this line, but ${under.length === 1 ? "it was" : "each was"} born before this command was handed over, so ${under.length === 1 ? "it is" : "they are"} an earlier invocation and not this one. The guard stays where it is.`,
       };
     }
     return {
       attributed: false,
+      reason: "unattributable",
       why: `nothing under the shell ${shellPid} that took this line can be positively attributed to that command yet.${this.lookAlikeNote(operation, processes, shellPid)} That is not proof that it never ran, so it stays guarded.`,
     };
   }
 
   /**
-   * A shell execution that started before a reload, whose execution identity
-   * VS Code cannot hand back. It really did run, so the question is only
-   * whether it still is: the process attributable to this exact operation is
-   * either in the table or it is over.
+   * A shell execution this window knows started — the shell reported that
+   * exact execution — but whose execution identity is no longer usable: a
+   * reload does not hand a `TerminalShellExecution` back, and a closed
+   * terminal leaves nothing to watch. It really did run, so the question is
+   * only whether it still is.
+   *
+   * Two quite different situations, and the difference is the whole of the
+   * safety here:
+   *
+   *  - **a pid was bound while it could be** — by the descendant search under
+   *    a live shell, or because the operation's own process is known. Then the
+   *    question is a fact about that pid and its birth-time generation, and it
+   *    is followed correctly through the shell dying and the engine being
+   *    reparented to pid 1;
+   *  - **no pid was ever bound.** The normal path into this state does not
+   *    bind one: `advanceToRunning` is a start event, not a process lookup, so
+   *    a legitimate `running-shell` restored after a reload commonly has no
+   *    `enginePid` at all. That is the common case, not an edge case.
+   *
+   * In the second case this used to search the *whole process table* for the
+   * operation's command line and adopt a unique match. A review reproduced the
+   * harm: the real engine was unmatchable, one unrelated process matched, it
+   * became this operation's `enginePid`, and its exit released the guard as
+   * `engine-process-gone` while the real engine went on running — admitting a
+   * duplicate. Uniqueness is not identity, recency is not identity, and a
+   * matching command line elsewhere in the table is not identity. So the
+   * pidless case is bound by exactly the same causal rule as a submitted
+   * command: ancestry under the still-live shell that was given the line, and
+   * nothing else. Knowing that it *started* tells us a process existed; it
+   * does not tell us which one, and it never licenses a look-alike.
    */
   private probeRunningShell(operation: Operation, processes: ProcessInfo[]): void {
     // The strong case: an engine pid was positively attributed to this
@@ -1647,8 +1728,7 @@ export class OperationRegistry implements vscode.Disposable {
         return;
       }
       const running = processes.find((item) => item.pid === operation.enginePid) as ProcessInfo;
-      const target = this.targetOf(operation);
-      if (target && targetIsAttributable(target) && commandLineIsOperation(running.command, target)) {
+      if (this.matchersFor(operation).some((matches) => matches(running.command))) {
         return;
       }
       this.unresolvedProbe(
@@ -1657,47 +1737,48 @@ export class OperationRegistry implements vscode.Disposable {
       );
       return;
     }
-    const target = this.targetOf(operation);
-    if (!target || !targetIsAttributable(target)) {
-      // Nothing in a command line could ever prove this is the operation — a
-      // relative `--repo-root .`, a command that names no project. The
-      // matcher has no question to ask, so it certainly has no answer, and a
-      // guard is never removed by a question that was not asked.
+    // No pid was ever bound to it. The shell said this exact execution
+    // started, so something ran; which process that is can only be settled by
+    // ancestry under that same shell, while it is alive.
+    const attribution = this.attributeUnderShell(operation, processes);
+    if (attribution.attributed) {
+      // Now there is a pid, and from here on its absence is real evidence —
+      // which is exactly why it may only be bound on this evidence.
+      this.bindEngineProcess(operation, attribution.process, attribution.where);
+      return;
+    }
+    const started = "the shell reported this exact execution as started, so it did run, but no process was ever bound to it and only ancestry under the shell that ran it could bind one now.";
+    if (attribution.reason === "no-shell-pid") {
       this.unresolvedProbe(
         operation,
-        "it was reported as started, but nothing in a process command line could positively identify it — the project or the target it was launched with cannot be compared against what `ps` reports. Whether it is still running cannot be established here, so it stays guarded until you confirm it is over.",
+        `${started} No process id was recorded for that terminal, so ancestry cannot be established at all — which is not the same as the shell having gone.${this.lookAlikeNote(operation, processes, undefined)} It stays guarded until its own process is identified and gone, or you confirm it is over.`,
       );
       return;
     }
-    const candidates = processes.filter((item) => commandLineIsOperation(item.command, target));
-    if (candidates.length > 1) {
-      // Binding a pid is what makes that pid's later absence releasing, so an
-      // ambiguous choice here would release this guard on a stranger's exit.
-      // Another window over the same repository is exactly how two matching
-      // processes arise.
+    if (attribution.reason === "shell-gone") {
       this.unresolvedProbe(
         operation,
-        `${candidates.length} processes in the table run this operation's command line (pids ${candidates.map((item) => item.pid).join(", ")}) and nothing distinguishes which of them this operation is — another window, or another invocation, produces the same command line. None of them is adopted as its process, and the guard stays until one is identified or you confirm it is over.`,
+        `${started} The shell process ${attribution.shellPid} that ran it is no longer in the table, and a dying shell reparents its children, so nothing left in the table can be tied to this execution.${this.lookAlikeNote(operation, processes, attribution.shellPid)} A matching command line elsewhere may belong to another window, another repository or another invocation, so none is adopted: it stays guarded until you confirm it is over.`,
       );
       return;
     }
-    if (candidates.length === 1) {
-      // Now there is a pid, and from here on its absence is real evidence.
-      const anywhere = candidates[0];
-      operation.enginePid = anywhere.pid;
-      operation.generation = anywhere.started ?? operation.generation;
-      this.log(`${operation.label}: the process running it is pid ${anywhere.pid}; from now on that pid's fate is what settles this operation`);
-      this.persistQuietly();
-      return;
-    }
-    // It was observed running, and no process in the table can be attributed
-    // to it. Without a pid that was once attributed, that is an attribution
-    // failure and not a death: `ps` may report the command line in a form the
-    // parser cannot recognise, or it may be running under a wrapper.
-    this.unresolvedProbe(
-      operation,
-      "it was reported as started before the window reloaded, and no process in the table can be positively attributed to it. That is an attribution failure, not proof that it ended, so the operation stays guarded until its own process is identified and gone, or you confirm it is over.",
-    );
+    this.unresolvedProbe(operation, `${started} ${attribution.why}`);
+  }
+
+  /**
+   * Anchor a `running-shell` operation to the process that is positively its
+   * own, with that process's birth time.
+   *
+   * From here the question is about this pid and its generation rather than
+   * about a command line, which is what lets the operation be followed safely
+   * through its shell dying and the engine being reparented. That asymmetry is
+   * only sound because the binding itself required a live ancestor.
+   */
+  private bindEngineProcess(operation: Operation, running: ProcessInfo, where: string): void {
+    operation.enginePid = running.pid;
+    operation.generation = running.started ?? operation.generation;
+    this.log(`${operation.label}: the process running it is pid ${running.pid}, ${where}; from now on that pid's fate is what settles this operation`);
+    this.persistQuietly();
   }
 
   /**

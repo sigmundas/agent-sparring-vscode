@@ -186,7 +186,7 @@ async function launchedRunnerAssertions(report: DiscoveryDiagnostic, reportedRep
 
   // Run 1: the fake runner writes turn.started, never turn.finished, and exits 3 after ~4 s.
   await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=4\nexit_with=3\n");
-  await vscode.commands.executeCommand("agentSparring.runStage");
+  await runStage();
   let running = await waitFor(runId, (liveness) => liveness.state === "running", 15_000, "runner observed alive after Run stage");
   assert.ok(running.execution?.source === "launched" || running.execution?.source === "terminal", `exact source, got ${running.execution?.source}`);
   console.log(`integration: run 1 observed via ${running.execution?.source}`);
@@ -205,7 +205,7 @@ async function launchedRunnerAssertions(report: DiscoveryDiagnostic, reportedRep
 
   // Run 2: a long-running fake, interrupted with Ctrl-C through the extension's Stop.
   await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=120\nexit_with=0\n");
-  await vscode.commands.executeCommand("agentSparring.runStage");
+  await runStage();
   const second = await waitFor(runId, (liveness) => liveness.state === "running" && liveness.execution?.startedAtMs !== stopped.execution?.startedAtMs, 15_000, "a second launch after a known stop is Running again");
   assert.notEqual(second.execution?.id, stopped.execution?.id);
   await waitFor(runId, (liveness) => liveness.turnActive, 10_000, "run 2 telemetry");
@@ -286,7 +286,7 @@ async function bareExecutableAssertions(report: DiscoveryDiagnostic, reportedRep
     const runId = runIdOf(report, reportedRepo, "stage-reported-statistics-typed-parser");
     assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
     await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=3\nexit_with=0\n");
-    await vscode.commands.executeCommand("agentSparring.runStage");
+    await runStage();
     const running = await waitFor(runId, (liveness) => liveness.state === "running", 15_000, "bare `sparring` launched through the shell is observed alive (no extension-host PATH precheck)");
     assert.equal(running.execution?.source, "launched", "handed to the shell through shell integration");
     const stopped = await waitFor(runId, (liveness) => liveness.state === "stopped", 20_000, "and it ends normally");
@@ -311,7 +311,7 @@ async function commandNotFoundAssertions(report: DiscoveryDiagnostic, reportedRe
   try {
     const runId = runIdOf(report, reportedRepo, "stage-reported-statistics-typed-parser");
     assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
-    await vscode.commands.executeCommand("agentSparring.runStage");
+    await runStage();
     const deadline = Date.now() + 15_000;
     let seen: { runId: string; word: string; exitCode: number } | undefined;
     while (Date.now() < deadline && !seen) {
@@ -937,7 +937,7 @@ async function terminalReuseAssertions(report: DiscoveryDiagnostic, reportedRepo
   assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
   await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=1\nexit_with=0\n");
 
-  await vscode.commands.executeCommand("agentSparring.runStage");
+  await runStage();
   const first = await waitFor(runId, (liveness) => liveness.state === "running", 15_000, "the first run starts");
   const opened = ownTerminals();
   assert.equal(opened.length, 1, `one terminal, named for the project, got: ${JSON.stringify(vscode.window.terminals.map((terminal) => terminal.name))}`);
@@ -945,7 +945,7 @@ async function terminalReuseAssertions(report: DiscoveryDiagnostic, reportedRepo
   const stopped = await waitFor(runId, (liveness) => liveness.state === "stopped", 20_000, "and it ends");
   assert.equal(stopped.execution?.exitCode, 0, "a finished execution cannot keep the UI running");
 
-  await vscode.commands.executeCommand("agentSparring.runStage");
+  await runStage();
   const second = await waitFor(runId, (liveness) => liveness.state === "running" && liveness.execution?.id !== stopped.execution?.id, 15_000, "a second Run stage");
   assert.deepEqual(ownTerminals(), opened, "the same terminal object ran it: nothing new was opened");
   assert.notEqual(second.execution?.id, first.execution?.id, "while the two executions are tracked separately");
@@ -962,7 +962,7 @@ async function terminalReuseAssertions(report: DiscoveryDiagnostic, reportedRepo
   opened[0].dispose();
   await new Promise((resolve) => setTimeout(resolve, 500));
   assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
-  await vscode.commands.executeCommand("agentSparring.runStage");
+  await runStage();
   await waitFor(runId, (liveness) => liveness.state === "running", 15_000, "a run after the terminal was closed");
   const reopened = ownTerminals();
   assert.equal(reopened.length, 1, "exactly one again");
@@ -1039,7 +1039,7 @@ async function occupiedTerminalAssertions(report: DiscoveryDiagnostic, reportedR
   await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=1\nexit_with=0\n");
 
   // 1. Agent Sparring opens its project terminal and finishes a command in it.
-  await vscode.commands.executeCommand("agentSparring.runStage");
+  await runStage();
   await waitFor(runId, (liveness) => liveness.state === "running", 15_000, "the first run starts in the project's terminal");
   const [owned] = ownTerminals();
   assert.ok(owned, "the extension's terminal is open");
@@ -1056,7 +1056,7 @@ async function occupiedTerminalAssertions(report: DiscoveryDiagnostic, reportedR
   await waitForOccupancy(ownedName, "occupied", 15_000, "the user's command makes the extension's own terminal unavailable");
 
   // 3. Run the stage again. Nothing may be written into the occupied terminal.
-  await vscode.commands.executeCommand("agentSparring.runStage");
+  await runStage();
   const second = await waitFor(runId, (liveness) => liveness.state === "running" && liveness.execution?.id !== first.execution?.id, 15_000, "the new run starts although the project's terminal is occupied");
   assert.equal(second.execution?.source, "launched", "and it was launched by this window, not inferred");
 
@@ -1718,7 +1718,7 @@ async function shortCommandAssertions(report: DiscoveryDiagnostic, reportedRepo:
   await fs.rm(callsLog, { force: true });
 
   // One ordinary run so the project's terminal exists, is ours and is idle.
-  await vscode.commands.executeCommand("agentSparring.runStage");
+  await runStage();
   await waitFor(runId, (liveness) => liveness.state === "running", 15_000, "a first run opens the project's terminal");
   await waitFor(runId, (liveness) => liveness.state === "stopped", 20_000, "and leaves it idle");
   const [owned] = ownTerminals();
@@ -1804,7 +1804,7 @@ async function lateStartAssertions(report: DiscoveryDiagnostic, reportedRepo: st
   await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=1\nexit_with=0\n");
 
   // An ordinary run first, so the terminal is one of ours, idle, and proven.
-  await vscode.commands.executeCommand("agentSparring.runStage");
+  await runStage();
   await waitFor(runId, (liveness) => liveness.state === "running", 15_000, "the first run starts");
   const first = await waitFor(runId, (liveness) => liveness.state === "stopped", 20_000, "and ends, leaving the terminal idle");
   const [owned] = ownTerminals();
@@ -1818,7 +1818,7 @@ async function lateStartAssertions(report: DiscoveryDiagnostic, reportedRepo: st
     stopped = true;
     // Not awaited: the assertions below are about the window *while* the
     // extension is waiting for a start that is not coming yet.
-    const launching = vscode.commands.executeCommand("agentSparring.runStage");
+    const launching = runStage();
 
     // Before the wait expires: a submission is not a runner.
     await new Promise((resolve) => setTimeout(resolve, 500));
@@ -1849,7 +1849,7 @@ async function lateStartAssertions(report: DiscoveryDiagnostic, reportedRepo: st
 
     // A retry is refused for that reason, and submits nothing.
     warnings.messages.length = 0;
-    await vscode.commands.executeCommand("agentSparring.runStage");
+    await runStage();
     assert.ok(
       warnings.messages.some((message) => /has not been able to confirm whether it started/.test(message)),
       `the retry is refused as unconfirmed, got ${JSON.stringify(warnings.messages)}`,
@@ -1913,7 +1913,7 @@ async function overrideAssertions(report: DiscoveryDiagnostic, reportedRepo: str
   const runId = runIdOf(report, reportedRepo, "stage-reported-statistics-typed-parser");
   assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
   await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=1\nexit_with=0\n");
-  await vscode.commands.executeCommand("agentSparring.runStage");
+  await runStage();
   await waitFor(runId, (liveness) => liveness.state === "running", 15_000, "a first run opens the project's terminal");
   await waitFor(runId, (liveness) => liveness.state === "stopped", 20_000, "and leaves it idle");
   const [owned] = ownTerminals();
@@ -1925,7 +1925,7 @@ async function overrideAssertions(report: DiscoveryDiagnostic, reportedRepo: str
   try {
     process.kill(pid, "SIGSTOP");
     stopped = true;
-    await vscode.commands.executeCommand("agentSparring.runStage");
+    await runStage();
     assert.equal((await pendingSubmissions()).length, 1, "the submission is unresolved");
 
     // Dismissing the dialog is not an override: nothing changes.
@@ -2003,6 +2003,89 @@ function bypassLease(terminal: vscode.Terminal): { lease: TerminalLease; retired
 }
 
 /** The warnings the extension showed, with every dialog dismissed. */
+/**
+ * Run a real command and fail as an assertion if it tries to open a *modal*
+ * dialog.
+ *
+ * VS Code's DialogService refuses modal dialogs in a test host: it throws
+ * from inside the extension host, so the whole run dies with a stack trace
+ * rather than with a statement about what went wrong. Worse, whether a
+ * command reaches a modal can depend on state an earlier section left behind
+ * — a run whose telemetry still claims an open turn makes `Run stage` ask for
+ * an override — so the failure is intermittent, which is how it was first
+ * seen (one run in four).
+ *
+ * This makes that case deterministic and legible rather than suppressing it.
+ * Ordinary, non-modal messages go on to whatever is installed (the real
+ * window, or `captureWarnings`), so every existing assertion about wording
+ * still holds; a modal request is recorded and reported as the assertion it
+ * ought to be, naming the command and the message. Production behaviour is
+ * untouched: this wraps only the window API, only for the duration of one
+ * command invocation, and only inside this suite.
+ */
+async function withoutModal<T>(what: string, body: () => Thenable<T>): Promise<T> {
+  const window = vscode.window as unknown as Record<string, unknown>;
+  const names = ["showWarningMessage", "showInformationMessage", "showErrorMessage"];
+  const originals = names.map((name) => [name, window[name]] as const);
+  const modals: string[] = [];
+  const isModal = (item: unknown): boolean => typeof item === "object" && item !== null && (item as { modal?: boolean }).modal === true;
+  for (const [name, original] of originals) {
+    window[name] = (message: string, ...rest: unknown[]) => {
+      if (rest.some(isModal)) {
+        modals.push(message);
+        return Promise.resolve(undefined);
+      }
+      return (original as (...args: unknown[]) => unknown)(message, ...rest);
+    };
+  }
+  let result: T;
+  try {
+    result = await body();
+  } finally {
+    for (const [name, original] of originals) {
+      window[name] = original;
+    }
+  }
+  assert.deepEqual(modals, [], `${what} must not need a modal confirmation here — the state this section set up should not require one. Got: ${JSON.stringify(modals)}`);
+  return result;
+}
+
+/** `Run stage`, as a person presses it, asserted never to need a modal here. */
+const runStage = (): Promise<unknown> => withoutModal("Run stage", () => vscode.commands.executeCommand("agentSparring.runStage"));
+
+/**
+ * Wait until every timestamp already in an activity log is in the past.
+ *
+ * The fixture's fake engine stamps its telemetry with the *end* of the second
+ * it was launched in (`…:SS.999Z`, see runTests.ts), so a turn it wrote can
+ * read as having begun up to a second after the launch actually happened.
+ * That is the fixture's clock, not the product's, and a test that records a
+ * runner as ended inside that second would leave the run's own open turn
+ * looking newer than the end of the runner that wrote it — an honest but
+ * quite different state ("a newer turn has since started; nothing has
+ * observed that runner"), which then makes the next `Run stage` ask for an
+ * override. So the ordering is settled here rather than raced on.
+ */
+async function waitPastLoggedTimestamps(activityFile: string): Promise<void> {
+  const text = await fs.readFile(activityFile, "utf8").catch(() => "");
+  const stamps = text
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return Date.parse((JSON.parse(line) as { ts?: string }).ts ?? "");
+      } catch {
+        return Number.NaN;
+      }
+    })
+    .filter((ms) => Number.isFinite(ms));
+  const newest = Math.max(0, ...stamps);
+  const left = newest + 1 - Date.now();
+  if (left > 0) {
+    await new Promise((resolve) => setTimeout(resolve, left));
+  }
+}
+
 function captureWarnings(): { messages: string[]; restore: () => void } {
   const window = vscode.window as unknown as Record<string, unknown>;
   const original = window["showWarningMessage"];
@@ -2085,7 +2168,7 @@ async function closedTerminalAssertions(report: DiscoveryDiagnostic, reportedRep
   // A runner that writes turn.started and then works for two minutes: the
   // turn is open when the terminal goes away, exactly as it was.
   await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=120\nexit_with=0\n");
-  await vscode.commands.executeCommand("agentSparring.runStage");
+  await runStage();
   await waitFor(runId, (liveness) => liveness.state === "running", 15_000, "the runner starts");
   // Whether the fake runner's turn.started has reached the fold by now is a
   // property of this host's file watching, not of what is being tested here.
@@ -2140,6 +2223,13 @@ async function closedTerminalAssertions(report: DiscoveryDiagnostic, reportedRep
   assert.equal(stale.overrode, false, "and releases no guard");
   assert.equal((await guardFor(runId))?.id, guardedBefore?.id, "the guard is still the same untouched record");
 
+  // The runner this section deliberately orphaned is still running and its
+  // `turn.started` is stamped with the end of the second it launched in, so
+  // the confirmation is made after that instant has passed. Otherwise the
+  // run's own open turn reads as a *newer* runner's, and the next section's
+  // `Run stage` asks for an override — which is honest, and was an
+  // intermittent failure rather than a statement about anything.
+  await waitPastLoggedTimestamps(path.join(reportedRepo, ".sparring", "stages", "stage-reported-statistics-typed-parser", "activity.jsonl"));
   const confirmed = (await vscode.commands.executeCommand("agentSparring._test.confirmRunnerInactive")) as { confirmed: boolean; overrode: boolean };
   assert.equal(confirmed.confirmed, true, "the person's own statement settles that execution");
   assert.equal(confirmed.overrode, true, "and releases the guard on that exact operation, as an override");
@@ -2147,6 +2237,11 @@ async function closedTerminalAssertions(report: DiscoveryDiagnostic, reportedRep
   const settled = await livenessOf(runId);
   assert.equal(settled.execution?.state, "ended", "recorded as ended, as their statement and not as an observation");
   assert.match(settled.execution?.detail ?? "", /You confirmed/, "and the record says whose statement it is");
+  assert.equal(
+    settled.turnActive,
+    false,
+    `the open turn is attributed to the runner the person confirmed rather than read as a newer one, so the next Run stage needs no second override; got ${JSON.stringify(settled)}`,
+  );
   console.log("integration: closing the extension's terminal leaves liveness unknown and the guard intact, and the person's confirmation is the way out");
 }
 
