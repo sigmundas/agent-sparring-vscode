@@ -19,7 +19,7 @@
 
 import { execFile } from "node:child_process";
 import { stat } from "node:fs/promises";
-import { parseEngineConfig, type EffectiveConfig } from "../core/effectiveConfig";
+import { parseEngineConfig, type ConfigField, type ConfigRole, type EffectiveConfig } from "../core/effectiveConfig";
 import { PROJECT_CONFIG_FILENAME } from "../core/settingsTarget";
 import * as path from "node:path";
 import { planExecutable } from "../core/cli";
@@ -93,4 +93,60 @@ function probe(file: string, cwd: string, sparringDir: string): Promise<Effectiv
 /** Testing seam: forget what was probed. */
 export function resetEffectiveConfigCache(): void {
   cache.clear();
+}
+
+/** What one attempted configuration change did. */
+export type ConfigWriteResult =
+  | { ok: true }
+  /** The engine refused, and this is its own diagnostic, for the person to read. */
+  | { ok: false; error: string };
+
+/**
+ * Change one field of one role, through the engine.
+ *
+ * The extension does not write `project.toml`. It runs
+ * `sparring set-config`, which owns the schema, the validation and the
+ * atomic write, and which refuses anything it could not resolve — so a
+ * value the engine will not accept never reaches the file, and this function
+ * reports the engine's own sentence rather than a translation of it.
+ *
+ * `value` is `null` to clear the override and use the provider's own
+ * default. The caller re-reads the effective configuration afterwards; the
+ * cache is dropped here so that re-read cannot be answered from before the
+ * write.
+ */
+export async function writeAgentConfig(
+  configured: string | undefined,
+  projectDir: string,
+  sparringDir: string,
+  role: ConfigRole,
+  field: ConfigField,
+  value: string | null,
+): Promise<ConfigWriteResult> {
+  const planned = await planExecutable(configured, hostEnv(projectDir), false);
+  if (!planned.ok || planned.plan.kind === "shell") {
+    return { ok: false, error: "The sparring CLI could not be resolved from this window." };
+  }
+  const file = planned.plan.path;
+  const flag = value === null ? `--${field}-default` : `--${field}`;
+  const args = ["--sparring-dir", sparringDir, "set-config", role, flag];
+  if (value !== null) {
+    args.push(value);
+  }
+  cache.delete(`${file}\u0000${sparringDir}`);
+  return new Promise((resolve) => {
+    execFile(
+      file,
+      args,
+      { cwd: projectDir, timeout: 15_000, maxBuffer: 1024 * 1024, windowsHide: true },
+      (error, stdout, stderr) => {
+        if (!error) {
+          resolve({ ok: true });
+          return;
+        }
+        const output = `${stderr ?? ""}${stdout ?? ""}`.trim();
+        resolve({ ok: false, error: output || error.message });
+      },
+    );
+  });
 }

@@ -89,6 +89,7 @@ export async function run(): Promise<void> {
     ["declarations", () => declarationScopeAssertions(reportedRepo, fixtureRoot)],
     ["outlives", () => directExecutionOutlivesTheWindowAssertions()],
     ["settings", () => settingsAssertions(report, reportedRepo)],
+    ["agentconfig", () => agentConfigAssertions(report, reportedRepo, fixtureRoot)],
   ];
   const only = (process.env.AGENT_SPARRING_IT_ONLY ?? "").split(",").map((name) => name.trim()).filter(Boolean);
   for (const [name, section] of sections) {
@@ -257,7 +258,28 @@ interface ModelReport {
   continueAutomatically?: { label: string; kind: string };
   plan?: { source: string; name: string; current?: string; matched?: string; next?: { display: string; line: number; summary?: string } };
   whatsNext?: { kind: string; heading?: string; summary?: string; text: string; hints?: string[]; start?: { stageId: string; label: string } };
-  agentConfig?: { lines: { role: string; text: string; detail: string }[]; configPath?: string; configExists?: boolean; note?: string; settings: { label: string; detail: string } };
+  agentConfig?: {
+    lines: { role: string; text: string; detail: string }[];
+    controls: {
+      role: string;
+      label: string;
+      provider: { value: string; fixedText?: string; options?: { value: string; label: string }[] };
+      model: { value: string; options?: { value: string }[]; placeholder?: string };
+      effort?: { value: string; options?: { value: string; label: string }[] };
+    }[];
+    configPath?: string;
+    configExists?: boolean;
+    scope?: string;
+    activeRunNote?: string;
+    note?: string;
+    settings: { label: string; detail: string };
+  };
+}
+
+interface AgentConfigOutcome {
+  applied: boolean;
+  refused?: string;
+  error?: string;
 }
 
 interface SettingsOutcome {
@@ -2886,4 +2908,154 @@ function built(result: unknown, projectDir: string): BuiltManifest {
   assert.ok(manifest, `a manifest could be built for ${path.basename(projectDir)}`);
   assert.equal(manifest.ok, true, `…and the plan is executable: ${String(manifest.reason)}`);
   return manifest;
+}
+
+// ---------------------------------------------------------------- the inline agent config selector
+
+/**
+ * Changing the model and the effort from the Overview, for real.
+ *
+ * What this proves end to end: the controls are built from what the engine
+ * reported, not from anything the extension knows; a change runs the
+ * engine's own `set-config` (it shows up in the engine call log, and the
+ * file it wrote is on disk) rather than the extension writing TOML; the
+ * value shown afterwards is re-read from the engine rather than assumed;
+ * a change the engine refuses leaves the engine's value on screen and the
+ * file untouched; and a change carrying a repository this window has moved
+ * on from is refused instead of being applied to the one now on screen.
+ */
+async function agentConfigAssertions(report: DiscoveryDiagnostic, reportedRepo: string, fixtureRoot: string): Promise<void> {
+  const model = async () => (await vscode.commands.executeCommand("agentSparring._test.overviewModel")) as ModelReport;
+  const change = async (message: unknown) => (await vscode.commands.executeCommand("agentSparring._test.agentConfig", message)) as AgentConfigOutcome;
+  const configPath = path.join(reportedRepo, ".sparring", "project.toml");
+  const callsLog = path.join(reportedRepo, ".sparring", "fake-calls.log");
+  const read = () => fs.readFile(configPath, "utf8").catch(() => "");
+  const calls = async () => (await fs.readFile(callsLog, "utf8").catch(() => "")).trim().split("\n").filter(Boolean);
+
+  await fs.rm(configPath, { force: true });
+  const runId = runIdOf(report, reportedRepo, "stage-review-complete");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+  // The panel has to be open: a control can only post a change after it has
+  // been rendered, and what it was rendered with is what the host compares
+  // an arriving change against.
+  await vscode.commands.executeCommand("agentSparring.openOverview");
+  await vscode.commands.executeCommand("agentSparring.refresh");
+
+  // The controls exist, and everything in them came from the engine.
+  const initial = await model();
+  const scope = initial.agentConfig?.scope;
+  assert.equal(scope, configPath, "the controls are scoped to this repository's config");
+  assert.deepEqual(
+    initial.agentConfig?.controls.map((control) => control.role),
+    ["stage", "sparring"],
+  );
+  const stageControl = initial.agentConfig!.controls[0];
+  const sparrerControl = initial.agentConfig!.controls[1];
+  assert.equal(stageControl.provider.fixedText, "Claude", "one provider for the role, so it is shown and not chosen");
+  assert.equal(stageControl.provider.options, undefined);
+  assert.equal(stageControl.model.options, undefined, "a model is free-form, never a closed list");
+  // The dropdown's entries are the engine's levels: the two providers'
+  // vocabularies differ, and the difference arrives from the engine.
+  assert.deepEqual(
+    stageControl.effort?.options?.map((option) => option.value),
+    ["", "low", "medium", "high", "xhigh", "max"],
+  );
+  assert.deepEqual(
+    sparrerControl.effort?.options?.map((option) => option.value),
+    ["", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+  );
+  assert.equal(stageControl.effort?.options?.[0].label, "Provider default");
+
+  // A model change goes through the engine, and the engine writes the file.
+  await fs.rm(callsLog, { force: true });
+  const set = await change({ type: "agentConfig", role: "stage", field: "model", value: "opus", scope });
+  assert.deepEqual([set.applied, set.error], [true, undefined], `set model: ${JSON.stringify(set)}`);
+  assert.deepEqual(await calls(), ["set-config stage"], "exactly one engine command, and it is the engine's own mutation");
+  assert.match(await read(), /^model = "opus"$/m, "the engine wrote the file; the extension never touched it");
+  assert.equal((await model()).agentConfig?.controls[0].model.value, "opus", "and the value shown is re-read from the engine");
+
+  // The other role is independent, and is reported from the same re-read.
+  await change({ type: "agentConfig", role: "sparring", field: "model", value: "gpt-5.6-terra", scope });
+  const both = await model();
+  assert.equal(both.agentConfig?.controls[0].model.value, "opus");
+  assert.equal(both.agentConfig?.controls[1].model.value, "gpt-5.6-terra");
+
+  // An effort from the dropdown, then the default option, which clears it.
+  await change({ type: "agentConfig", role: "stage", field: "effort", value: "xhigh", scope });
+  assert.equal((await model()).agentConfig?.controls[0].effort?.value, "xhigh");
+  await change({ type: "agentConfig", role: "sparring", field: "effort", value: "ultra", scope });
+  assert.equal((await model()).agentConfig?.controls[1].effort?.value, "ultra", "a level only Codex has");
+
+  // Clearing is null on the wire and the engine's own --default flag; the
+  // words "provider default" are never written as a value.
+  await change({ type: "agentConfig", role: "sparring", field: "model", value: null, scope });
+  const cleared = await model();
+  assert.equal(cleared.agentConfig?.controls[1].model.value, "", "the control shows the default option");
+  assert.doesNotMatch(await read(), /provider default/i, "no such model name is ever written");
+  assert.match(cleared.agentConfig?.lines[1].text ?? "", /Codex · provider default/);
+
+  // A level the engine refuses: nothing is written, and what stays on screen
+  // is the engine's value rather than the one that was asked for.
+  const before = await read();
+  await fs.rm(callsLog, { force: true });
+  const refused = await change({ type: "agentConfig", role: "stage", field: "effort", value: "ultra", scope });
+  assert.equal(refused.applied, false);
+  assert.match(refused.error ?? "", /not supported by provider 'claude-cli'/, "the engine's own diagnostic, not a translation");
+  assert.equal(await read(), before, "a refused change writes nothing");
+  assert.equal((await model()).agentConfig?.controls[0].effort?.value, "xhigh", "the engine's value, not the requested one");
+  assert.deepEqual(await calls(), ["set-config stage"], "it was attempted through the engine, and the engine said no");
+
+  // A change naming a repository this window is no longer looking at.
+  const elsewhere = path.join(fixtureRoot, "sporely", "nested-repo", ".sparring", "project.toml");
+  await fs.rm(elsewhere, { force: true });
+  await fs.rm(callsLog, { force: true });
+  const stale = await change({ type: "agentConfig", role: "stage", field: "model", value: "sonnet", scope: elsewhere });
+  assert.equal(stale.applied, false);
+  assert.match(stale.refused ?? "", /active repository changed/);
+  assert.deepEqual(await calls(), [], "no engine command at all");
+  assert.equal(await fs.access(elsewhere).then(() => true, () => false), false, "and nothing was written next door");
+  assert.equal((await model()).agentConfig?.controls[0].model.value, "opus", "this repository is untouched");
+
+  // Switching the selected run to another repository moves the scope with
+  // it, which is what makes the check above bite.
+  const nested = runIdOf(report, path.join(fixtureRoot, "sporely", "nested-repo"), "stage-nested-only");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", nested), nested);
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  const moved = await model();
+  assert.notEqual(moved.agentConfig?.scope, scope, "the controls now belong to the other repository");
+  // And the old scope is now the stale one, refused in that direction too.
+  const backwards = await change({ type: "agentConfig", role: "stage", field: "model", value: "sonnet", scope: scope as string });
+  assert.equal(backwards.applied, false);
+  assert.match(backwards.refused ?? "", /active repository changed/);
+  assert.equal((await read()).includes('model = "sonnet"'), false, "the repository that is no longer selected was not written to");
+
+  // Back, and two changes in quick succession: both are applied, in order,
+  // and neither is lost to the other's write.
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  const rapid = (await model()).agentConfig?.scope as string;
+  const [first, second] = await Promise.all([
+    change({ type: "agentConfig", role: "stage", field: "model", value: "sonnet", scope: rapid }),
+    change({ type: "agentConfig", role: "stage", field: "effort", value: "max", scope: rapid }),
+  ]);
+  assert.deepEqual([first.applied, second.applied], [true, true]);
+  const settled = await model();
+  assert.equal(settled.agentConfig?.controls[0].model.value, "sonnet", "neither write clobbered the other");
+  assert.equal(settled.agentConfig?.controls[0].effort?.value, "max");
+
+  // A message that is not a well-formed change never reaches the engine.
+  await fs.rm(callsLog, { force: true });
+  for (const bad of [
+    { type: "agentConfig", role: "reviewer", field: "model", value: "x", scope: rapid },
+    { type: "agentConfig", role: "stage", field: "repo.root", value: "/elsewhere", scope: rapid },
+    { type: "agentConfig", role: "stage", field: "model", value: "x" },
+  ]) {
+    const outcome = await change(bad);
+    assert.equal(outcome.applied, false, `refused: ${JSON.stringify(bad)}`);
+  }
+  assert.deepEqual(await calls(), [], "a malformed message runs no engine command");
+
+  await fs.rm(configPath, { force: true });
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  console.log("integration: the Agents controls were built from the engine's own levels, every change ran set-config and was re-read from show-config, a refused level kept the engine's value, and a change carrying another repository was never applied");
 }

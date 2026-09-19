@@ -45,7 +45,7 @@ navigates.
 | `Agent Sparring: Sibling Repositories for a Plan Stage…` | Declare which *other* repositories a plan stage's reviewed candidate spans, so acceptance pins and verifies the complete set instead of the primary commit alone. Pick the stage, pick a repository this window knows (or browse to one) and confirm the branch its candidate must be on; no commit is ever asked for. Stored in VS Code workspace state per worktree, plan and stage label, emitted into the execution manifest, and shown quietly in the Overview. Removing a declaration is the same command. |
 | `Agent Sparring: Stage Mode for a Plan Stage…` | Declare that a plan stage is a *review* of work rather than work: no implementation agent runs for it, and a fresh independent reviewer inspects the candidates the earlier stages accepted. Nothing is inferred from a stage's title or its brief's prose — this command is the only way to say it. Stored in VS Code workspace state per worktree, plan and stage label, and emitted into the execution manifest as `mode`. Setting it back to *Implementation* removes the declaration. |
 | `Agent Sparring: Copy Review Context for Chat` | For a stage the reviewer handed back to you: put the whole review on the clipboard as plain Markdown — the stage and its goal, the routing state, the reviewer's summary and note, every human-gate check with its instruction and pass criteria verbatim, the concrete names the review refers to, the latest handoff claims, the reviewer's findings and the stage's plan section — so it can be pasted into ChatGPT/Claude, an issue or a message and asked about. No provider prompts, model reasoning, command output or activity log. Also **Copy context for chat** in the Overview, beside **Open detailed review**, with **Copy this check** under each outstanding check. |
-| `Agent Sparring: Open Project Settings` | Open the active repository's `.sparring/project.toml` — where the provider, model and effort for the stage agent and the sparrer are set. If the file does not exist yet, offers **Create project settings**, which runs the engine's own `sparring init-config` and opens what it wrote. There is deliberately no settings form: the engine owns the schema, the file is human-owned configuration a managed run never rewrites, and a second template here would be free to drift from the one the engine validates against. Also **Settings** in the Overview's **Agents** section. |
+| `Agent Sparring: Open Project Settings` | Open the active repository's `.sparring/project.toml` — where the provider, model and effort for the stage agent and the sparrer are set. If the file does not exist yet, offers **Create project settings**, which runs the engine's own `sparring init-config` and opens what it wrote. The Overview's **Agents** section also edits the model and effort in place, through the engine's `sparring set-config`; this file stays the place the whole configuration is visible, and nothing in the extension writes TOML. |
 | `Agent Sparring: Choose sparring Executable…` | Pick the `sparring` CLI with a file dialog and store it as `agentSparring.executable`. |
 | `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / finalizing / future stages), the current stage as primary content (the stage as the plan names it — `Stage 3D — title`, with `6 of 8` as secondary metadata — a human state word with one explaining sentence, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), latest sparring result, small Stage Agent / Sparrer cards, Brief / Handoff / Sparring report / Diff / Plan document / Log buttons, and quiet metadata (where the engine's own words live). Never auto-opens; updates in place. |
 | `Agent Sparring: Show Log` | Focus the Output Channel. |
@@ -88,8 +88,52 @@ invalid, its own sentence is shown and no role values are displayed — an
 invalid configuration has no effective values, and plausible-looking ones
 beside an error are how a person ends up trusting the wrong thing.
 
-**Settings**, beside that section, opens the file. The file is the edit
-surface; there are no inline model or effort controls.
+### Changing it from the Overview
+
+Each role's **Model** and **Effort** are editable in place.
+
+**Model** is a plain text field, because both installed CLIs accept
+free-form model identifiers and gain new ones without an engine release; a
+closed list here would reject a model that exists. Leaving it empty means
+*Provider default* — the override is removed and the provider chooses. The
+words "provider default" are never written into the file as a model name.
+
+**Effort** is a dropdown whose entries are the levels the engine reported
+for that role's provider, in the engine's own order, with *Provider default*
+first. This extension contains no list of effort levels; the two providers'
+vocabularies differ, and the difference arrives from `show-config --json`. A
+provider with no effort setting at all gets no dropdown, rather than a
+disabled one that would suggest the setting exists and is merely
+unavailable.
+
+**Provider** is shown rather than chosen while the engine reports one
+provider for the role, which is the case today. It becomes a real dropdown
+as soon as the engine reports a second, without a change here.
+
+A change runs the engine's own `sparring set-config`; **nothing in this
+extension writes TOML**, and a test asserts that nothing does. Afterwards the
+effective configuration is re-read with `show-config` and the controls are
+redrawn from the engine's answer — never from the value that was requested.
+So a change the engine refuses leaves the engine's own diagnostic on screen
+and the engine's own value in the control.
+
+While a run is executing, the section says the change applies to the next
+agent turn. That is a statement about when it lands, not a restriction:
+configuration is resolved when a turn is launched, so an edit never
+reconfigures or restarts a provider process already running, and it does not
+touch run state or any prompt already captured. What a mid-session model
+change means on provider session resume is the provider's business, and
+neither the engine nor this extension claims to know.
+
+A change carries the `project.toml` its control was drawn from, and is
+applied only if that is still the file this window is looking at. Switching
+the active repository with a control open therefore refuses the change and
+redraws, rather than applying it to the repository that is now on screen. A
+control is disabled while its own change is in flight, and changes are
+carried out one at a time.
+
+**Settings**, beside that section, still opens the file. The controls are a
+convenience surface, not a replacement for seeing the real configuration.
 
 ## Settings
 

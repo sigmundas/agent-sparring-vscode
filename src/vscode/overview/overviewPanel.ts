@@ -6,6 +6,7 @@
  */
 
 import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, type PlanRunSnapshot, type RunSnapshot } from "../../core/discovery";
@@ -18,8 +19,10 @@ import {
   isCopyPromptMessage,
   isHumanCheckMessage,
   isHumanFeedbackMessage,
+  isAgentConfigMessage,
   isOpenPromptSourceMessage,
   renderOverviewHtml,
+  type AgentConfigMessage,
   type AutoPushMessage,
   type CopyMessage,
   type CopyPromptMessage,
@@ -29,7 +32,7 @@ import {
   type OverviewAction,
 } from "../../core/overviewHtml";
 import { PROMPTS_DIRNAME, PROMPT_INDEX_FILENAME, latestCapture, parseCaptureIndex } from "../../core/promptInspector";
-import { buildOverviewModel, type CapturedPrompt, type ManagedPlanRun, type ManifestStageView, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
+import { buildOverviewModel, type AgentConfigOutcome, type CapturedPrompt, type ManagedPlanRun, type ManifestStageView, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
 import { checkCopyText, reviewCopyText, type ReviewCopySource } from "../../core/reviewCopy";
 import { locateStage, parsePlanHeadings, type HeadingRef } from "../../core/planAssociation";
 import { planKey, planLabel } from "../../core/sparringCommand";
@@ -39,7 +42,7 @@ import type { SparringController } from "../controller";
 import { gitContext } from "../git";
 import { readHead as readFileHead } from "../fileHead";
 import { configuredExecutable } from "../engineExecutable";
-import { readEffectiveConfig } from "../configProbe";
+import { readEffectiveConfig, writeAgentConfig } from "../configProbe";
 import { settingsTarget } from "../../core/settingsTarget";
 import type { EffectiveConfig } from "../../core/effectiveConfig";
 
@@ -94,6 +97,8 @@ export class OverviewPanelManager implements vscode.Disposable {
         void this.openPromptSource(message);
       } else if (isCopyPromptMessage(message)) {
         void this.copyPrompt(message);
+      } else if (isAgentConfigMessage(message)) {
+        this.applyAgentConfig(message);
       }
     });
     this.panel.onDidChangeViewState((event) => {
@@ -169,6 +174,93 @@ export class OverviewPanelManager implements vscode.Disposable {
       return;
     }
     await this.controller.setAutoPushDraft(run.id, message.enabled);
+    await this.update();
+  }
+
+  /**
+   * Mutations run one at a time. The webview disables a control while its
+   * own change is in flight, but two different controls can still be changed
+   * in quick succession, and two engine processes writing the same file --
+   * each having validated against what it read -- is how one of them loses.
+   */
+  private configWrites: Promise<void> = Promise.resolve();
+
+  private applyAgentConfig(message: AgentConfigMessage): Promise<AgentConfigOutcome> {
+    const queued = this.configWrites.then(() => this.writeAgentConfig(message));
+    // The chain itself must not reject or carry a value, or one change's
+    // outcome would leak into the next one's turn.
+    this.configWrites = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    return queued;
+  }
+
+  /**
+   * Testing seam: deliver one webview message and wait for it to settle.
+   *
+   * It goes through the same guard the real webview channel uses, so a test
+   * exercises the validation and the write together rather than a
+   * conveniently shaped shortcut past them.
+   */
+  async deliverAgentConfig(message: unknown): Promise<AgentConfigOutcome> {
+    if (!isAgentConfigMessage(message)) {
+      return { applied: false, refused: "the message was not a well-formed configuration change" };
+    }
+    return this.applyAgentConfig(message);
+  }
+
+  /**
+   * Apply one inline configuration change, then show what the engine says.
+   *
+   * Two things this deliberately does not do. It does not write TOML — the
+   * engine's `set-config` owns the file, its schema and its validation. And
+   * it does not assume the result: whether the change succeeded or was
+   * refused, the panel is re-rendered from a fresh `show-config`, so what a
+   * person ends up looking at is the engine's resolved answer and never the
+   * value they asked for.
+   */
+  private async writeAgentConfig(message: AgentConfigMessage): Promise<AgentConfigOutcome> {
+    const target = settingsTarget(this.controller.currentSelection);
+    // The change names the project.toml its control was drawn from. It is
+    // applied only if that is still the file this window is looking at --
+    // not "if it matches the last thing rendered", which would let a change
+    // drawn for one repository be carried out against another between a
+    // selection changing and the panel catching up. The write target is
+    // therefore always the repository the control itself named.
+    if (!target || !(await sameFile(message.scope, target.configPath))) {
+      void vscode.window.showWarningMessage(
+        "Agent Sparring: the active repository changed, so that agent configuration change was not applied. The controls now show the current repository.",
+      );
+      await this.forceUpdate();
+      return { applied: false, refused: "the active repository changed" };
+    }
+    const result = await writeAgentConfig(
+      configuredExecutable(),
+      target.projectDir,
+      target.sparringDir,
+      message.role,
+      message.field,
+      message.value,
+    );
+    if (!result.ok) {
+      // The engine's own diagnostic, unedited: it knows why it refused.
+      void vscode.window.showErrorMessage(`Agent Sparring: ${result.error}`);
+    }
+    await this.forceUpdate();
+    return result.ok ? { applied: true } : { applied: false, error: result.error };
+  }
+
+  /**
+   * Re-render even if the model is byte-identical to the last one.
+   *
+   * After a refused change the model may well be unchanged — that is the
+   * point of a refusal — but the webview is still showing the value that was
+   * asked for, in a control disabled while it waited. Rebuilding the page is
+   * what puts the engine's value back in front of the person.
+   */
+  private async forceUpdate(): Promise<void> {
+    this.lastHtmlKey = undefined;
     await this.update();
   }
 
@@ -578,4 +670,31 @@ function readHead(file: string, limit = BRIEF_READ_LIMIT): Promise<string | unde
 function planContinuation(): PlanContinuation {
   const configured = vscode.workspace.getConfiguration("agentSparring").get<string>("planContinuation", "automatic");
   return configured === "manual" ? "manual" : "automatic";
+}
+
+/**
+ * Whether two paths name the same file.
+ *
+ * Compared as real paths, because the engine reports a resolved
+ * `config_path` while the cockpit builds its own by joining — and on a
+ * checkout reached through a symlink (a worktree under /tmp on macOS, for
+ * one) those two spellings of the same file differ. Falling back to the
+ * literal comparison keeps a file that does not exist yet comparable.
+ */
+async function sameFile(a: string, b: string): Promise<boolean> {
+  if (path.resolve(a) === path.resolve(b)) {
+    return true;
+  }
+  try {
+    return (await fs.realpath(path.resolve(a))) === (await fs.realpath(path.resolve(b)));
+  } catch {
+    // One of them does not exist; compare the directories that would hold
+    // them, so a project.toml that has not been created yet still matches.
+    try {
+      const [left, right] = await Promise.all([fs.realpath(path.dirname(path.resolve(a))), fs.realpath(path.dirname(path.resolve(b)))]);
+      return left === right && path.basename(a) === path.basename(b);
+    } catch {
+      return false;
+    }
+  }
 }
