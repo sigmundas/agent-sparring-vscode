@@ -293,6 +293,20 @@ describe("a re-issued check is a new evidence obligation", () => {
     assert.equal(submittableChecks(partly).length, 1);
   });
 
+  it("6b. with no asking recorded, the panel does not claim the reviewer asked again", async () => {
+    // It cannot know that. What it can say is that this gate does not record
+    // which round it is — which is the true, narrower statement.
+    const { view, reask } = await scene({ instanceId: null });
+    const notes = answered(ASK_1, undefined, { outcome: "pass" });
+    const legacy = view({ notes }).html;
+    assert.match(legacy, /this gate does not record which round it is, so it needs an answer for this one/);
+    assert.ok(!legacy.includes("the reviewer has asked it again"), "no claim about the reviewer");
+
+    // Once the engine records an asking, it *is* a re-ask, and it says so.
+    const current = (await reask("gateB", [scopeCheck(ASK_2)]))({ notes }).html;
+    assert.match(current, /the reviewer has asked it again, so it needs an answer for this round/);
+  });
+
   it("6. a gate recorded before instances existed loads, keeps its evidence, and can be answered", async () => {
     const { view } = await scene({ instanceId: null });
     const notes = answered(ASK_1, undefined, { outcome: "pass" });
@@ -371,14 +385,22 @@ describe("the panel and the submit command share one definition of readiness", (
       (await reask("gateB", [scopeCheck(ASK_2)]))({ notes, drafts: { [draftKeyFor(SCOPE, "gateB")]: { outcome: "fail" } } }),
       (await reask(null, [scopeCheck(ASK_2)]))({ notes }),
     ];
+    // The expected readiness of each state above, worked out by reading it
+    // rather than by re-running the implementation's own formula: nothing
+    // drafted, nothing drafted, one drafted, nothing drafted, one drafted,
+    // nothing drafted.
+    assert.deepEqual(
+      states.map(({ panel }) => panel.ready),
+      [false, false, true, false, true, false],
+    );
     for (const { panel } of states) {
-      assert.equal(panel.ready, submittableChecks(panel).length > 0 && submittableChecks(panel).length === panel.required.length, "ready is exactly: something to send, and nothing outstanding unanswered");
       if (panel.ready) {
         assert.ok(submittableChecks(panel).length > 0, "ready always has evidence to send");
+        assert.equal(submittableChecks(panel).length, panel.required.length, "and it covers every outstanding check");
         assert.equal(panel.submit.enabled, true);
       }
       if (submittableChecks(panel).length === 0) {
-        assert.equal(panel.ready, false);
+        assert.equal(panel.ready, false, "nothing to send is never ready");
         assert.equal(panel.submit.enabled, false, "and a disabled button whenever there is nothing to send");
       }
     }

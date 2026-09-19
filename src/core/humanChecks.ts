@@ -857,8 +857,26 @@ export interface CheckItem {
    * reviewer asked again because the last answer was not enough, so the
    * last answer must not be pre-filled as this one. For a gate check with
    * an instance this is `<instance>::<key>`; otherwise it is `key`.
+   *
+   * One consequence, accepted: a draft typed before this existed is stored
+   * under the bare key, so it is still read for a gate that names no
+   * asking, and is *not* read once the engine records one that does. That
+   * loses an unsent draft — a round of typing, once, for a person who was
+   * mid-answer when the extension updated. The alternative is reading a
+   * draft as the answer to a question it was not typed for, which is the
+   * defect this whole key exists to prevent.
    */
   draftKey: string;
+  /**
+   * Whether the gate this check came from said which asking it is.
+   *
+   * False for a gate recorded before instances existed, and for a derived
+   * check. It changes nothing about the rules — unattributable evidence is
+   * previous either way — but it changes what the panel may *say*: with no
+   * asking recorded, "the reviewer has asked this again" is a claim nothing
+   * here can support.
+   */
+  askingIdentified: boolean;
   /** The user's unsubmitted draft for *this* asking. */
   record?: CheckRecord;
   /** Evidence in notes.md that answers *this* asking; present ⇒ not outstanding. */
@@ -985,6 +1003,7 @@ function gateItems(gate: HumanGate): CheckItem[] {
     return {
       key,
       draftKey: draftKeyFor(key, gate.instanceId),
+      askingIdentified: gate.instanceId !== undefined,
       gateId: usable ? check.id : undefined,
       text: check.instruction,
       origin: "gate" as const,
@@ -1006,16 +1025,16 @@ export function draftKeyFor(key: string, gateInstanceId: string | undefined): st
 }
 
 function derivedItems(plan: PlanChecks, outcome: SparringOutcome | undefined): CheckItem[] {
-  const items: CheckItem[] = plan.explicit.map((check) => ({ key: check.key, draftKey: check.key, text: check.text, origin: "plan", line: check.line, previous: [] }));
+  const items: CheckItem[] = plan.explicit.map((check) => ({ key: check.key, draftKey: check.key, askingIdentified: false, text: check.text, origin: "plan", line: check.line, previous: [] }));
   for (const text of reviewerChecks(outcome)) {
     if (plan.explicit.length > 0 && matchReviewerRequest(plan.explicit, text) !== undefined) {
       continue;
     }
     const key = checkKey(text);
-    items.push({ key, draftKey: key, text, origin: "reviewer", previous: [] });
+    items.push({ key, draftKey: key, askingIdentified: false, text, origin: "reviewer", previous: [] });
   }
   if (items.length === 0) {
-    items.push(...plan.parents.map((check): CheckItem => ({ key: check.key, draftKey: check.key, text: check.text, origin: "plan", line: check.line, previous: [] })));
+    items.push(...plan.parents.map((check): CheckItem => ({ key: check.key, draftKey: check.key, askingIdentified: false, text: check.text, origin: "plan", line: check.line, previous: [] })));
   }
   return items;
 }
