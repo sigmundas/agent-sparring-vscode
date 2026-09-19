@@ -1303,29 +1303,45 @@ function renderActors(model: OverviewModel, scope: string): string {
 function renderActor(card: ActorCard, controls: AgentRoleControls | undefined, configScope: string | undefined): string {
   const busy = card.activity === "Working" || card.activity === "Sparring";
   const duration = card.duration ? ` for ${escapeHtml(card.duration)}` : "";
-  const quiet = card.quietFor ? ` <span class="muted">· no meaningful activity for ${escapeHtml(card.quietFor)}</span>` : "";
-  const uncertain = busy && card.uncertain ? ` <span class="muted">· runner status unknown</span>` : "";
+  // Read on their own line under the state, so neither carries the leading
+  // separator it needed when all of this was one sentence.
+  const quiet = card.quietFor ? `no meaningful activity for ${escapeHtml(card.quietFor)}` : "";
+  const uncertain = busy && card.uncertain ? `runner status unknown` : "";
   const who = whoClass(card.provider);
   // A telemetry-only turn reads "Working? (turn observed 3m ago)": the duration is
   // time since the observed start, not a claim that work is happening now.
   const word = busy && card.uncertain ? `${card.activity}?` : (card.activity ?? "");
-  const span = busy && card.uncertain ? (card.duration ? ` <span class="muted">(turn observed ${escapeHtml(card.duration)} ago)</span>` : "") : duration;
+  // The pill carries the state and, when the runner is confirmed, how long it
+  // has been true. The age of a turn nothing has confirmed is a different
+  // claim, so it reads as a note rather than lengthening the pill until it
+  // pushes the role name onto two lines.
+  const span = busy && card.uncertain ? "" : duration;
+  const observed = busy && card.uncertain && card.duration ? `turn observed ${escapeHtml(card.duration)} ago` : "";
   const role = actorRole(card);
-  const identity = `<div class="identity"><span class="avatar ${who}">${avatarGlyph(role)}</span>
-<div class="who"><div class="rolename ${who}">${escapeHtml(card.role)}</div><div class="provider muted">${escapeHtml(card.provider)}</div></div></div>`;
-  const settings = controls && configScope ? renderRoleControls(controls, configScope) : "";
   // No run, no stage: the card is a configuration surface and says nothing
-  // about activity. With a stage, the session line appears only once the
-  // engine has recorded one — an absent id is left off rather than shown as
-  // a placeholder for a value that does not exist yet.
+  // about activity, so the corner is empty rather than filled with a word
+  // for a state nothing is in.
+  //
+  // What the actor is doing is the first thing a person looks at, so it sits
+  // in the card's top corner on the role's own line. The word and how long
+  // it has been true are the state; the caveats that qualify it — a turn
+  // nothing has confirmed, a turn that has gone quiet — are true but
+  // secondary, and read underneath it rather than lengthening it.
+  const notes = [observed, uncertain, quiet].filter((note) => note !== "").join(" · ");
+  // The word and its duration are one text node inside the pill: the pill is
+  // a flex container, and a space between two of its children would be
+  // collapsed away, leaving "Working?for 12s".
   const activity = card.activity
-    ? `<div class="activity ${card.activity.toLowerCase()}${busy && card.uncertain ? " uncertain" : ""}">${icon("dot", "dot")}${escapeHtml(word)}${busy ? span : ""}${uncertain}${quiet}</div>`
+    ? `<span class="statepill ${card.activity.toLowerCase()}${busy && card.uncertain ? " uncertain" : ""}">${icon("dot", "dot")}<span>${escapeHtml(word)}${busy ? span : ""}</span></span>`
     : "";
-  const session =
-    card.sessionLabel && card.sessionKind
-      ? `<div class="session muted">${capitalize(card.sessionKind)}: ${escapeHtml(card.sessionLabel)}</div>`
-      : "";
-  const body = `${identity}${settings}${activity}${session}`;
+  // The caveats get the card's whole width on their own row. Kept in the
+  // corner with the pill they were the widest thing in the header, and a
+  // header sized by its longest caveat put the role name on two lines.
+  const statenote = notes ? `<div class="statenote">${notes}</div>` : "";
+  const identity = `<div class="identity"><span class="avatar ${who}">${avatarGlyph(role)}</span>
+<div class="who"><div class="rolename ${who}">${escapeHtml(card.role)}</div><div class="provider muted">${escapeHtml(card.provider)}</div></div>${activity}</div>${statenote}`;
+  const settings = controls && configScope ? renderRoleControls(controls, configScope) : "";
+  const body = `${identity}${settings}`;
   // No captured prompt means the engine has not run a turn for this actor
   // since prompt capture existed. An ordinary state, so the card simply
   // stays a card rather than offering a disclosure that would open on
@@ -1482,9 +1498,6 @@ function whoClass(name: string): string {
   return "other";
 }
 
-function capitalize(word: string): string {
-  return word.charAt(0).toUpperCase() + word.slice(1);
-}
 
 /**
  * One role's settings, inside that role's own card: model, effort, and the
@@ -1844,6 +1857,7 @@ p { margin: 0 0 4px; line-height: 1.45; }
 .actors { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 0 0 10px; }
 .actor { display: block; padding: 10px 12px; line-height: 1.45; }
 .actor .identity { display: flex; gap: 12px; align-items: center; }
+.actor .who { min-width: 0; }
 /* 2.8em is the height of the two-line column beside the avatar (the 1.05em
    role name and the 0.88em provider name, both at line-height 1.45), so the
    circle reads at the height of the identity row it sits in. Width and height
@@ -1858,11 +1872,17 @@ p { margin: 0 0 4px; line-height: 1.45; }
 .rolename.claude { color: var(--claude); }
 .rolename.codex { color: var(--codex); }
 .actor .provider { font-size: 0.88em; }
-.activity { display: flex; align-items: center; }
-.activity .icon.dot { color: var(--vscode-descriptionForeground); }
-.activity.working, .activity.sparring { color: var(--good); font-weight: 600; }
-.activity.working .icon.dot, .activity.sparring .icon.dot { color: var(--good); }
-.session { font-family: var(--vscode-editor-font-family); font-size: 0.85em; }
+/* What the actor is doing, in the card's top corner. Aligning it to the
+   start of the row puts it on the role name's line rather than centring it
+   against the two-line block, which is what makes the two read as one row.
+   It never wraps and never grows, so the role name keeps its own line. */
+.statepill { flex: none; margin-left: auto; align-self: flex-start; display: inline-flex; align-items: center; padding: 1px 8px; border: 1px solid var(--line); border-radius: 10px; font-size: 0.92em; white-space: nowrap; }
+.statepill .icon.dot { color: var(--vscode-descriptionForeground); }
+.statepill.working, .statepill.sparring { border-color: var(--good); color: var(--good); font-weight: 600; }
+.statepill.working .icon.dot, .statepill.sparring .icon.dot { color: var(--good); }
+/* The caveats: true, and deliberately quieter than the state they qualify.
+   Right-aligned so they read as trailing from the pill above them. */
+.statenote { margin-top: 4px; text-align: right; font-size: 0.82em; line-height: 1.35; color: var(--vscode-descriptionForeground); }
 
 /* The captured prompt opens below both cards, never inside the card that
    opens it: a card that grew would push the other actor's card out of its
@@ -1939,8 +1959,8 @@ button.quiet { background: transparent; color: var(--vscode-descriptionForegroun
 .busy.unknown { border-color: var(--warn); color: var(--warn); }
 .busy.accepting { border-color: var(--info); color: var(--info); }
 .stopped, .stale, .inferred { display: flex; align-items: center; color: var(--warn); }
-.activity.uncertain { color: var(--warn); }
-.activity.uncertain .icon.dot { color: var(--warn); }
+.statepill.uncertain { border-color: var(--warn); color: var(--warn); }
+.statepill.uncertain .icon.dot { color: var(--warn); }
 
 .facts { display: grid; grid-template-columns: max-content 1fr; gap: 1px 12px; margin: 0; padding-top: 8px; border-top: 1px solid var(--line); font-size: 0.82em; color: var(--vscode-descriptionForeground); }
 .facts dt { color: var(--vscode-descriptionForeground); }
