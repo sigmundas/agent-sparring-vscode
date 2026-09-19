@@ -105,6 +105,22 @@ async function midPlan() {
   return render(ws);
 }
 
+/** The same run, with results already in the engine's ledger for stage 1's obligation. */
+async function midPlanWith(results: unknown[]) {
+  const ws = await Workspace.create();
+  await ws.writePlan(FOO_PLAN_LABEL, FOO_PLAN_MARKDOWN);
+  await ws.writePlanRun(FOO_PLAN_KEY, {
+    plan: FOO_PLAN_LABEL,
+    status: "running",
+    current_stage_index: 1,
+    current_stage: STAGE_2,
+    deferred_human_checks: [obligation(STAGE_1, INSTANCE_1, "resize-readability", "Check comparison readability", RATIONALE_1, results)],
+  });
+  await ws.writeStage(STAGE_1, { status: "accepted", candidate_sha: "a".repeat(40) }, { "sparring.md": sparringWithDeferral() });
+  await ws.writeStage(STAGE_2, { status: "working", implementation_session_id: "impl-2" });
+  return render(ws);
+}
+
 /** The plan's verification checkpoint: every stage accepted, two obligations owed. */
 async function atCheckpoint(options: { results?: unknown[]; reason?: "plan_completion" | "promoted"; drafts?: OverviewArtifacts["humanChecks"] } = {}) {
   const ws = await Workspace.create();
@@ -220,6 +236,14 @@ describe("a stage accepted with a deferral", () => {
     assert.ok(!ui.includes("Manual verification required"));
   });
 
+  it("counts only the checks still owed, and says nothing once they are all answered", async () => {
+    const answered = await midPlanWith([{ check_id: "resize-readability", outcome: "pass" }]);
+    assert.equal(answered.model.deferredNote, undefined, "nothing is owed, so there is nothing to note");
+
+    const failed = await midPlanWith([{ check_id: "resize-readability", outcome: "fail" }]);
+    assert.equal(failed.model.deferredNote?.label, "Review passed — 1 manual check deferred until plan completion");
+  });
+
   it("says the review passed and the check is still owed, with the reviewer's reason", async () => {
     const { model, html } = await midPlan();
     assert.equal(model.deferredNote?.label, "Review passed — 1 manual check deferred until plan completion");
@@ -276,6 +300,30 @@ describe("the plan's verification checkpoint", () => {
     assert.match(panel.summary, /recorded as failed/);
     assert.match(panel.summary, /will not complete/);
     assert.equal(panel.ready, false);
+  });
+
+  it("a Fail or a Can't test stays answerable: only a Pass settles a check", async () => {
+    // The engine keeps the run stopped on a failed or untested obligation, so
+    // a panel that moved the check into "already recorded" left a plan that
+    // could never finish: nothing to submit, and a summary saying the check
+    // had to be answered again.
+    for (const outcome of ["fail", "blocked"] as const) {
+      const { model } = await atCheckpoint({ results: [{ check_id: "resize-readability", outcome, note: "what I saw" }] });
+      const panel = model.actionRequired!;
+      assert.deepEqual(panel.required.map((item) => item.key), ["resize-readability", "android-smoke"], outcome);
+      assert.equal(panel.recorded.length, 0, outcome);
+      // What was reported last time is still shown, as history.
+      assert.deepEqual(panel.required[0].previous.map((entry) => entry.outcome), [outcome], outcome);
+      assert.match(panel.submit.detail, /Record a result for/, outcome);
+      assert.ok(!panel.submit.detail.includes("nothing further to send"), outcome);
+    }
+  });
+
+  it("counts what is still owed, not what was ever deferred", async () => {
+    const { model } = await atCheckpoint({ results: [{ check_id: "resize-readability", outcome: "pass" }] });
+    assert.equal(model.actionRequired!.headline, "Manual verification required");
+    // One asking is settled, so the quiet note is about the one that is not.
+    assert.match(model.actionRequired!.subtitle ?? "", /1 deferred check from 1 earlier stage/);
   });
 
   it("submitting is offered only once every outstanding check has a drafted result", async () => {

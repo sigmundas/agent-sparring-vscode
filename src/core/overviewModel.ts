@@ -23,7 +23,7 @@ import { agentConfigView, providerLabel, type AgentConfigView, type ConfigRole, 
 import { parseBriefGoal, parseBriefOpening } from "./brief";
 import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
-import { DEFERRED_VERIFICATION_REQUIRED, PUSH_AUTHORIZATION_REQUIRED, obligationResolved, parseHandoffBranch, type DeferredObligation, type PlanRunState, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
+import { DEFERRED_VERIFICATION_REQUIRED, PUSH_AUTHORIZATION_REQUIRED, obligationFailed, obligationResolved, parseHandoffBranch, type DeferredObligation, type PlanRunState, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
 import type { DeclaredRepository } from "./stageRepositories";
 import { deriveDeferredVerification, deriveVerification, draftKeyFor, HUMAN_FEEDBACK_HEADING, parseHumanEvidence, parseHumanFeedback, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
 import { categoryWord, checkNameList } from "./humanTask";
@@ -1366,7 +1366,7 @@ function deferredVerification(
   if (obligations.length === 0) {
     return undefined;
   }
-  const view = deriveDeferredVerification(obligations, parseHumanEvidence(artifacts.notesText), artifacts.humanChecks ?? {});
+  const view = deriveDeferredVerification(obligations, artifacts.humanChecks ?? {});
   const groups: DeferredGroup[] = obligations.map((obligation) => ({
     instanceId: obligation.gate.instanceId as string,
     stageId: obligation.stageId,
@@ -1376,9 +1376,14 @@ function deferredVerification(
     promoted: obligation.promoted,
     checkKeys: obligation.gate.checks.map((check) => draftKeyFor(check.id, obligation.gate.instanceId)),
   }));
-  const stages = new Set(obligations.map((obligation) => obligation.stageId));
-  const total = view.recorded.length + view.required.length;
-  const failedChecks = obligations.flatMap((obligation) => obligation.results.filter((result) => result.outcome === "fail"));
+  // What is still owed, not what was ever deferred. A check answered at an
+  // earlier visit to this checkpoint is done, and counting it here would ask
+  // a person to account for work they have already accounted for; it stays
+  // visible under "Previous evidence".
+  const outstandingStages = new Set(obligations.filter((obligation) => unansweredChecks(obligation).length > 0).map((obligation) => obligation.stageId));
+  const stages = outstandingStages.size > 0 ? outstandingStages : new Set(obligations.map((obligation) => obligation.stageId));
+  const total = view.required.length || view.recorded.length;
+  const failedChecks = obligations.filter(obligationFailed).flatMap((obligation) => obligation.results.filter((result) => result.outcome === "fail"));
 
   const submissionScope = stageScopeOf(run);
   const submission = sameStageScope(artifacts.submission && { runId: artifacts.submission.runId, stageId: artifacts.submission.stageId }, submissionScope) ? artifacts.submission : undefined;
@@ -1412,7 +1417,7 @@ function deferredVerification(
   const subtitle =
     awaiting.reason === "promoted"
       ? `A later review decided ${stages.size === 1 ? "this check" : "these checks"} can wait no longer. The run stopped before the next stage.`
-      : `${total} deferred ${total === 1 ? "check" : "checks"} from ${stages.size} earlier ${stages.size === 1 ? "stage" : "stages"}. Every stage is accepted; this is the verification the reviewers judged safe to leave until now.`;
+      : `${total} deferred ${total === 1 ? "check" : "checks"} from ${stages.size} earlier ${stages.size === 1 ? "stage" : "stages"}, owed ${checkpointWord(obligations)}. Every stage is accepted; this is the verification the reviewers judged safe to leave until now.`;
 
   return {
     ...view,
@@ -1454,6 +1459,34 @@ function deferredVerification(
  * It is never a "waiting for you" state — nothing is waiting, and the plan
  * is already on the next stage.
  */
+/**
+ * The checks of one obligation that are still owed.
+ *
+ * The engine's own rule (`deferred_gate.py`: `DeferredObligation.unanswered`),
+ * repeated rather than stored: only a `pass` settles a check. A `fail` leaves
+ * the obligation failed and a `blocked` records that no result could be
+ * obtained, and in both cases the run stays stopped on it — so both are still
+ * owed, and counting them as done would tell a person the opposite of what
+ * the engine is about to do.
+ */
+function unansweredChecks(obligation: DeferredObligation): { id: string }[] {
+  return obligation.gate.checks.filter((check) => obligation.results.find((result) => result.checkId === check.id)?.outcome !== "pass");
+}
+
+/**
+ * By when the answers are owed, from the obligations' own recorded
+ * checkpoint rather than from a sentence hardcoded here — so a checkpoint
+ * this version does not know is named rather than silently mislabelled as
+ * the one it does.
+ */
+function checkpointWord(obligations: DeferredObligation[]): string {
+  const kinds = new Set(obligations.map((entry) => entry.checkpoint));
+  if (kinds.size === 1 && kinds.has("before_plan_completion")) {
+    return "until plan completion";
+  }
+  return kinds.size === 1 ? `until ${[...kinds][0]}` : "until their recorded checkpoints";
+}
+
 function deferredNote(run: RunSnapshot, outcome: SparringOutcome | undefined): OverviewModel["deferredNote"] {
   if (run.kind !== "plan") {
     return undefined;
@@ -1467,10 +1500,16 @@ function deferredNote(run: RunSnapshot, outcome: SparringOutcome | undefined): O
   if (run.state.awaiting?.kind === DEFERRED_VERIFICATION_REQUIRED) {
     return undefined;
   }
-  const checks = owed.reduce((count, entry) => count + entry.gate.checks.length, 0);
+  // What is still owed, not what was ever deferred: two of three passed is
+  // one check outstanding, and saying three would be counting work already
+  // done.
+  const checks = owed.reduce((count, entry) => count + unansweredChecks(entry).length, 0);
+  if (checks === 0) {
+    return undefined;
+  }
   const raisedHere = outcome?.action === "READY" ? outcome.deferredHumanGate : undefined;
   return {
-    label: `Review passed — ${checks} manual ${checks === 1 ? "check" : "checks"} deferred until plan completion`,
+    label: `Review passed — ${checks} manual ${checks === 1 ? "check" : "checks"} deferred ${checkpointWord(owed)}`,
     detail: raisedHere
       ? `This stage's reviewer deferred "${raisedHere.gate.title}": ${raisedHere.rationale}`
       : `Raised by ${[...new Set(owed.map((entry) => entry.stageId))].join(", ")}. The engine will not report this plan complete until they are answered.`,
@@ -2381,7 +2420,12 @@ function currentLine(
         // Not "waiting for you" about a stage, because no stage is waiting:
         // every stage the plan could run is accepted, and what is left is
         // the verification earlier reviewers deliberately deferred.
-        const owed = run.state.awaiting.instanceIds.length;
+        // Checks, not askings: one obligation can carry three of them, and a
+        // banner saying "1 deferred check" beside a panel headed "3 deferred
+        // checks" is two different answers to the same question.
+        const owed = run.state.deferredHumanChecks
+          .filter((entry) => run.state.awaiting?.kind === DEFERRED_VERIFICATION_REQUIRED && run.state.awaiting.instanceIds.includes(entry.gate.instanceId ?? ""))
+          .reduce((count, entry) => count + unansweredChecks(entry).length, 0);
         return {
           stageLine:
             run.state.awaiting.reason === "promoted"

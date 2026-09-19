@@ -94,7 +94,10 @@ export interface ResumePlanInvocation extends PlanInvocation {
    * two askings at one checkpoint can own the same check id, and the engine
    * refuses an ambiguous reference rather than guessing. Sending the
    * qualified form always means the answer lands on the asking that was on
-   * screen, and on no other.
+   * screen, and on no other. A gate instance never contains a colon
+   * (`human_gate.py`: `_INSTANCE_ID_RE`), so the left half is unambiguous; a
+   * reviewer's check id may, and the engine reads the reference both ways to
+   * cover that.
    */
   deferredResults?: DeferredResultAnswer[];
 }

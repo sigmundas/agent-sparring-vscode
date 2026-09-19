@@ -847,6 +847,8 @@ function renderGateChecks(panel: ActionRequired, scope: string): string {
  * with the judgement that brought them here.
  */
 function renderDeferredChecks(panel: ActionRequired, scope: string): string {
+  // Position "3 of 5" counts the whole checkpoint, answered and not, because
+  // that is the list the person is working through.
   const total = panel.recorded.length + panel.required.length;
   const progress = total > 1 && panel.progress ? `<p class="muted small progress">${escapeHtml(panel.progress)}</p>` : "";
   const byKey = new Map(panel.required.map((item) => [item.draftKey, item] as const));

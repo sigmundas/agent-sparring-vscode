@@ -1026,10 +1026,15 @@ export function deriveVerification(plan: PlanChecks, outcome: SparringOutcome | 
  * raised it, and `gateInstanceId` says which asking it answers. Both travel
  * as far as the engine, which is addressed as `<instance>:<check id>`.
  *
- * `results` is the engine's ledger, not notes.md: an obligation the engine
- * already records an outcome for is shown as recorded even though the
- * evidence line lives in the originating stage's notes rather than in the
- * one this panel happens to be reading.
+ * `results` is the engine's ledger, not notes.md, and **only a `pass`
+ * settles a check**. That is the engine's rule, not a presentation choice: a
+ * `fail` leaves the obligation FAILED and a `blocked` leaves it unanswered
+ * (`deferred_gate.py`: `DeferredObligation.unanswered` / `status`), so in
+ * both cases the run stays stopped on it. Treating either as recorded took
+ * the check out of the list, left nothing to submit, and dead-ended the plan
+ * at a panel that said in one breath that the check must be answered again
+ * and that there was nothing further to send. So a non-pass result stays
+ * outstanding, with what was recorded shown beside it as history.
  */
 export function deriveDeferredVerification(
   obligations: {
@@ -1037,29 +1042,39 @@ export function deriveDeferredVerification(
     gate: HumanGate;
     results: { checkId: string; outcome: CheckOutcome; note?: string }[];
   }[],
-  evidence: EvidenceEntry[],
   drafts: Record<string, CheckRecord>,
 ): VerificationView {
   const items: CheckItem[] = [];
+  // The reviewer's own check id, which is what the engine is addressed with.
+  // `item.key` may be a hash of the instruction, for an id this panel cannot
+  // round-trip into a notes.md line — but nothing is written to notes.md
+  // here, and sending the hash would produce a reference the engine refuses.
+  const wireId = new Map<string, string>();
   for (const obligation of obligations) {
-    for (const item of gateItems(obligation.gate)) {
+    const rendered = gateItems(obligation.gate);
+    rendered.forEach((item, index) => {
       item.originStageId = obligation.stageId;
-      const recorded = obligation.results.find((result) => result.checkId === item.key);
-      if (recorded) {
-        // The ledger is the authority here. A person who already answered
-        // this at an earlier visit to the checkpoint must not be asked
-        // again, and must not have their answer re-sent.
-        item.evidence = {
-          excerpt: recorded.note ?? item.text,
-          outcome: recorded.outcome,
-          how: "id",
-        };
+      wireId.set(item.draftKey, obligation.gate.checks[index].id);
+      const recorded = obligation.results.find((result) => result.checkId === obligation.gate.checks[index].id);
+      if (recorded?.outcome === "pass") {
+        // Settled. A person who already passed this at an earlier visit to
+        // the checkpoint must not be asked again, and must not have their
+        // answer re-sent.
+        item.evidence = { excerpt: recorded.note ?? item.text, outcome: "pass", how: "id" };
       } else {
-        item.previous = evidenceForGateInstance(item, evidence, item.gateInstanceId).previous;
+        // Answered, and still owed. Shown as history so the person can see
+        // what they reported last time and why they are being asked again.
+        //
+        // The ledger is the only history read here, deliberately. The engine
+        // writes a deferred answer into the *originating* stage's notes.md,
+        // which is not the stage this panel is looking at, so mining this
+        // stage's `## Human evidence` would be looking in the wrong file and
+        // finding nothing — which reads like code that does something.
+        item.previous = recorded ? [{ excerpt: recorded.note ?? item.text, outcome: recorded.outcome, how: "id" }] : [];
         item.record = drafts[item.draftKey];
       }
       items.push(item);
-    }
+    });
   }
   const recorded = items.filter((item) => item.evidence);
   const required = items.filter((item) => !item.evidence);
@@ -1069,7 +1084,7 @@ export function deriveDeferredVerification(
       text: item.text,
       origin: item.origin,
       record: item.record as CheckRecord,
-      id: item.key,
+      id: wireId.get(item.draftKey) ?? item.key,
       gateInstanceId: item.gateInstanceId,
     }));
   return {
