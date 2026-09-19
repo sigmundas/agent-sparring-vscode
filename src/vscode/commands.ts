@@ -110,9 +110,17 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     }),
     vscode.commands.registerCommand("agentSparring._test.liveness", (runId: string) => {
       const liveness = controller.livenessFor(runId);
-      return { state: liveness.state, source: liveness.source, turnActive: liveness.turnActive, interrupted: liveness.interrupted, detail: liveness.detail, execution: liveness.execution };
+      return { state: liveness.state, source: liveness.source, turnActive: liveness.turnActive, interrupted: liveness.interrupted, stop: liveness.stop, detail: liveness.detail, execution: liveness.execution };
     }),
-    vscode.commands.registerCommand("agentSparring._test.stop", (runId: string) => controller.stopRunner(runId)),
+    // Stop, driven exactly as the webview drives it: an explicit execution
+    // id, resolved from the rendered model when the test does not name one.
+    vscode.commands.registerCommand("agentSparring._test.stop", async (runId: string, executionId?: string) => {
+      const target = executionId ?? controller.stopTargetFor(runId)?.executionId;
+      if (!target) {
+        return { requested: false, reason: "no-target", detail: "no exact runner could be identified for this run" };
+      }
+      return controller.requestStop(runId, target);
+    }),
     // What a window reload would find: the launches recorded in workspaceState,
     // including the ones already known to have ended.
     vscode.commands.registerCommand("agentSparring._test.persistedLaunches", () => controller.persistedLaunches()),
@@ -141,7 +149,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
       if (!run) {
         return undefined;
       }
-      const unknown = executionId === undefined ? ((await overview.buildModel()) as { unknownRunner?: { executionId: string; operationId?: string } }).unknownRunner : { executionId, operationId };
+      const unknown = executionId === undefined ? ((await overview.buildModel()) as { unknownRunner?: { executionId?: string; operationId?: string } }).unknownRunner : { executionId, operationId };
       if (!unknown) {
         return undefined;
       }
@@ -589,11 +597,6 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       return;
     case "continueAutomatically":
       await performContinueAutomatically(controller, overview, { confirm: true });
-      return;
-    case "stopRunner":
-      if (run && !controller.stopRunner(run.id)) {
-        void vscode.window.showInformationMessage("Agent Sparring: no runner observed from this window is alive for the selected stage.");
-      }
       return;
     case "openPlanSection": {
       if (!run) {

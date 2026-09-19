@@ -53,11 +53,51 @@ export class FakeElement {
 
 export class FakeTextArea extends FakeElement {}
 
+/**
+ * A `<details>` as the disclosure script sees it: an element with an `open`
+ * property whose change fires a `toggle` event, which is what a real
+ * browser does and what the shipped script listens for.
+ */
+export class FakeDetails extends FakeElement {
+  constructor(
+    tag: string,
+    attributes: Record<string, string>,
+    private readonly document: FakeDocument,
+    open = false,
+  ) {
+    super(tag, attributes);
+    this.openState = open;
+  }
+  private openState: boolean;
+  get open(): boolean {
+    return this.openState;
+  }
+  set open(value: boolean) {
+    this.openState = value;
+  }
+  /** What a person clicking the summary does: toggle, then the event. */
+  click(): void {
+    this.openState = !this.openState;
+    this.document.dispatch("toggle", this);
+  }
+}
+
 /** The document as the shipped script uses it: delegated listeners on one root. */
 export class FakeDocument {
   private readonly listeners = new Map<string, ((event: FakeEvent) => void)[]>();
+  /** The `<details data-disclose>` elements this document contains. */
+  readonly disclosures: FakeDetails[] = [];
   addEventListener(type: string, listener: (event: FakeEvent) => void): void {
     this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
+  /**
+   * Only the one selector the shipped script uses. Anything else would be a
+   * re-implementation of a query engine, and the integration suite runs the
+   * same document in a real Chromium webview.
+   */
+  querySelectorAll(selector: string): FakeDetails[] {
+    assert.equal(selector, "details[data-disclose]", "the shim only answers the selector the shipped script uses");
+    return this.disclosures;
   }
   /**
    * Dispatch to the delegated listeners, and report whether any of them
@@ -91,26 +131,91 @@ export interface FakeEvent {
  * itself to plus everything it posts. Nothing here is a re-implementation: the
  * listener under test is the string inside the rendered `<script>`.
  */
-export function runWebviewScript(html: string, nonce = "n"): { document: FakeDocument; posted: Posted[] } {
+/**
+ * The webview's own persistent state, which is what survives the host
+ * replacing `webview.html`. Passing one of these into two successive runs
+ * of the script is exactly what a rerender is, from the page's point of
+ * view, so a test can drive the real regression without a browser.
+ */
+export interface WebviewState {
+  value: unknown;
+}
+
+export interface ScriptRun {
+  document: FakeDocument;
+  posted: Posted[];
+  /** The persistent state the page kept; pass it into the next run to rerender. */
+  state: WebviewState;
+  /** Where the page scrolled itself to on load, if it did. */
+  scrolledTo?: number;
+  /** Scroll the page and let its throttled listener record the position. */
+  scroll(to: number): Promise<void>;
+}
+
+/**
+ * Run the script the document actually ships against a DOM built from that
+ * same document's `<details data-disclose>` elements.
+ *
+ * `state` carries the webview's `setState` store between runs. A second run
+ * with the same store is a host rerender: a fresh document, the same page
+ * state — which is the only way to observe whether an opened disclosure
+ * comes back.
+ */
+export function runWebviewScript(html: string, nonce = "n", state: WebviewState = { value: undefined }): ScriptRun {
   const script = new RegExp(`<script nonce="${nonce}">([\\s\\S]*?)</script>`).exec(html)?.[1];
   assert.ok(script, "the document ships a script");
   const document = new FakeDocument();
+  for (const [markup, key] of html.matchAll(/<details[^>]*\sdata-disclose="([^"]*)"[^>]*>/g)) {
+    document.disclosures.push(new FakeDetails("details", { "data-disclose": key }, document, / open[ >]/.test(markup)));
+  }
   const posted: Posted[] = [];
   const timers: ReturnType<typeof setTimeout>[] = [];
-  const run = new Function("document", "acquireVsCodeApi", "Element", "HTMLTextAreaElement", "setTimeout", "clearTimeout", script);
+  const run = new Function("document", "window", "acquireVsCodeApi", "Element", "HTMLTextAreaElement", "setTimeout", "clearTimeout", script);
+  const result: ScriptRun = {
+    document,
+    posted,
+    state,
+    scroll: async (to: number) => {
+      window.scrollY = to;
+      for (const listener of window.listeners.get("scroll") ?? []) {
+        listener();
+      }
+      // The listener throttles; let its timer fire.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    },
+  };
+  const window = {
+    scrollY: 0,
+    listeners: new Map<string, (() => void)[]>(),
+    addEventListener(type: string, listener: () => void) {
+      window.listeners.set(type, [...(window.listeners.get(type) ?? []), listener]);
+    },
+    scrollTo(_x: number, y: number) {
+      result.scrolledTo = y;
+    },
+  };
   run(
     document,
-    () => ({ postMessage: (message: Posted) => posted.push(message) }),
+    window,
+    () => ({
+      postMessage: (message: Posted) => posted.push(message),
+      // The real webview API: a store of the page's own, kept across a
+      // document replacement and never visible to the host.
+      getState: () => state.value,
+      setState: (next: unknown) => {
+        state.value = next;
+      },
+    }),
     FakeElement,
     FakeTextArea,
-    (fn: () => void) => {
-      const timer = setTimeout(fn, 0);
+    (fn: () => void, ms = 0) => {
+      const timer = setTimeout(fn, ms === 0 ? 0 : ms);
       timers.push(timer);
       return timer;
     },
     (timer: ReturnType<typeof setTimeout>) => clearTimeout(timer),
   );
-  return { document, posted };
+  return result;
 }
 
 /**

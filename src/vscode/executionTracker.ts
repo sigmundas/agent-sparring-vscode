@@ -155,6 +155,30 @@ export interface EngineFailure {
 /** A deliberate interruption (Ctrl-C, SIGTERM): not a failure to report. */
 const INTERRUPTED_EXITS: ReadonlySet<number> = new Set([130, 143]);
 
+/** ETX: what a terminal turns into SIGINT for its foreground process group. */
+const INTERRUPT = "\u0003";
+
+/** What the Overview needs to know to offer Stop: which execution, and how it would be reached. */
+export interface StopTarget {
+  executionId: string;
+  /** `terminal`: the person's own Ctrl-C in that terminal. `process`: SIGINT to the bound pid. */
+  via: "terminal" | "process";
+}
+
+/**
+ * What asking for a stop did. `requested` never means "it stopped": it
+ * means a graceful interrupt was delivered to a target that was positively
+ * this execution. Every `false` says what was *not* signalled, because the
+ * useful thing to know about a refused stop is that nothing else was hit.
+ */
+export type StopOutcome =
+  | { requested: true; via: "terminal" | "process" }
+  | { requested: false; reason: "not-found" | "already-ended" | "no-target" | "identity-changed" | "failed"; detail: string };
+
+/** Why a run whose fate is unknown is not offered a Stop button. */
+const UNKNOWN_RUNNER_TARGET =
+  "Agent Sparring cannot determine whether the previous runner is still active, so it cannot identify the exact process to interrupt.";
+
 interface Tracked {
   record: ExecutionRecord;
   kind: SparringSubcommand;
@@ -237,6 +261,15 @@ interface PersistedLaunch {
   enginePid?: number;
   generation?: string;
   /**
+   * When a person asked for this exact execution to be interrupted.
+   *
+   * Kept across a reload for the same reason the ended record is: without
+   * it the next window cannot tell a runner the person stopped from one
+   * that merely finished, and would offer the run back under the wrong
+   * word. It authorizes nothing and releases nothing.
+   */
+  stopRequestedAtMs?: number;
+  /**
    * Present only for a launch that had already ended when the window
    * reloaded. That a runner was seen to die is as much an observation as
    * that it was seen to start, and it is the more useful one: without it a
@@ -275,6 +308,13 @@ export class ExecutionTracker implements vscode.Disposable {
     /** Whether this platform can be asked about processes at all. */
     private readonly probeSupported: () => boolean = processProbeSupported,
     private readonly probeProcesses: () => Promise<ProcessInfo[]> = listProcesses,
+    /**
+     * Deliver a graceful interrupt to one process id. Injectable so the
+     * tests can assert *which* pid is signalled, and that nothing is
+     * signalled at all when identity cannot be re-established — the two
+     * things that decide whether Stop can ever hit the wrong process.
+     */
+    private readonly signal: (pid: number) => void = (pid) => process.kill(pid, "SIGINT"),
   ) {
     this.disposables.push(
       this.changeEmitter,
@@ -388,16 +428,175 @@ export class ExecutionTracker implements vscode.Disposable {
     return { confirmed: true };
   }
 
-  /** Send Ctrl-C to the exact terminal hosting this run's live execution. */
-  stop(runId: string): boolean {
+  /**
+   * What a Stop could interrupt for this run right now, if anything.
+   *
+   * Two rules, and the first one carries most of the safety: the execution
+   * must be `running` — which in this file means positive current evidence
+   * that *this* execution is alive, never "it was launched" or "telemetry
+   * says a turn started". An execution whose fate is `unknown` has no stop
+   * target at all, because the thing that would be signalled is exactly the
+   * thing that can no longer be identified.
+   *
+   * Then, in order of how directly the target is tied to the operation:
+   *
+   *  - the terminal this execution is in. A Ctrl-C written there is the
+   *    person's own Ctrl-C: the pty's line discipline raises SIGINT in that
+   *    terminal's foreground process group, which is this execution and the
+   *    provider it is waiting on, and nothing else on the machine;
+   *  - the pid positively bound to this run, with the birth time recorded
+   *    when it was seen alive. That is the case a window reload leaves: the
+   *    terminal object is gone but the process identity is not. The pid is
+   *    re-verified against its generation at the moment of the click, never
+   *    here.
+   *
+   * A run with neither — a runner found by a project-level probe, a
+   * reattached launch nothing could attribute, a pid with no recorded
+   * generation — has no target, and none is manufactured. A process that
+   * merely runs the same command line is not this operation (see
+   * operationRegistry.ts), and signalling one on that basis would interrupt
+   * a stranger's work.
+   */
+  stopTargetFor(runId: string): StopTarget | undefined {
     const item = this.liveItemFor(runId);
-    if (!item?.terminal) {
-      return false;
+    if (!item || item.record.state !== "running") {
+      return undefined;
     }
-    item.terminal.sendText("\u0003", false); // ETX, i.e. Ctrl-C
-    item.terminal.show(true);
-    this.log(`sent Ctrl-C to the terminal running ${describe(item)}`);
-    return true;
+    if (item.terminal) {
+      return { executionId: item.record.id, via: "terminal" };
+    }
+    if (item.enginePid !== undefined && item.generation !== undefined && this.probeSupported()) {
+      // The probe is part of the target, not an implementation detail of
+      // using it: the pid may only be signalled after the process table has
+      // confirmed it is still that process, so a platform that cannot be
+      // asked has no such target and must not show a button that would then
+      // refuse.
+      return { executionId: item.record.id, via: "process" };
+    }
+    return undefined;
+  }
+
+  /**
+   * Interrupt one exact execution, as gracefully as the platform allows.
+   *
+   * It takes the execution id the surface was rendered from, not just the
+   * run: a panel left open while a newer runner started must never be able
+   * to interrupt that newer one, and "the live execution of this run" is a
+   * different thing at click time than it was at render time.
+   *
+   * Nothing here concludes anything. The request is recorded against that
+   * execution and a graceful interrupt is delivered; the duplicate guard in
+   * the OperationRegistry is not touched, and no state is reset, deleted or
+   * rolled back. Whether the runner stopped is answered later by the
+   * evidence that answers it for every other ending.
+   */
+  async requestStop(runId: string, executionId: string): Promise<StopOutcome> {
+    const item = [...this.tracked.values()].find((candidate) => candidate.record.id === executionId && candidate.record.runId === runId);
+    if (!item) {
+      return { requested: false, reason: "not-found", detail: "That runner is no longer the one this run is waiting on, so nothing was interrupted." };
+    }
+    if (item.record.state === "ended") {
+      return { requested: false, reason: "already-ended", detail: "That runner had already ended, so nothing was interrupted." };
+    }
+    if (item.record.state !== "running") {
+      return {
+        requested: false,
+        reason: "no-target",
+        detail: `${UNKNOWN_RUNNER_TARGET} Nothing was signalled: interrupting a process Agent Sparring cannot identify could stop somebody else's work.`,
+      };
+    }
+    if (item.terminal) {
+      return this.interruptTerminal(item, item.terminal);
+    }
+    if (item.enginePid !== undefined && item.generation !== undefined) {
+      return this.interruptProcess(item, item.enginePid, item.generation);
+    }
+    return {
+      requested: false,
+      reason: "no-target",
+      detail:
+        "Agent Sparring has no terminal for this runner and never bound it to an exact process, so there is nothing it can safely interrupt. A process running the same command is not proof that it is this one.",
+    };
+  }
+
+  /**
+   * The person's own Ctrl-C, in the terminal this execution is in.
+   *
+   * The write is the only statement inside its own `try`: if it throws, the
+   * terminal was given nothing and that is positive knowledge, reportable
+   * as "nothing was interrupted". Once it has returned, the interrupt is
+   * delivered — so everything after it records that fact before doing
+   * anything that could fail, and revealing the terminal, which is
+   * cosmetic, comes last.
+   */
+  private interruptTerminal(item: Tracked, terminal: vscode.Terminal): StopOutcome {
+    try {
+      terminal.sendText(INTERRUPT, false); // ETX, i.e. Ctrl-C
+    } catch (error) {
+      return { requested: false, reason: "failed", detail: `Agent Sparring could not write to the terminal running this: ${(error as Error).message}. Nothing was interrupted.` };
+    }
+    this.markStopRequested(item, `Ctrl-C was sent to the terminal "${terminal.name}" running ${describe(item)}`);
+    try {
+      terminal.show(true);
+    } catch {
+      // Showing the terminal is a courtesy; the interrupt is already sent.
+    }
+    return { requested: true, via: "terminal" };
+  }
+
+  /**
+   * SIGINT to the one process positively bound to this run.
+   *
+   * The identity is re-established immediately before the signal and from a
+   * fresh reading of the process table: the pid must be there *and* carry
+   * the birth time recorded when it was last seen alive. A pid alone proves
+   * nothing — it is reused — so anything short of `alive` sends no signal at
+   * all. That verdict is the same one the registry releases a guard on, used
+   * here in the opposite direction.
+   */
+  private async interruptProcess(item: Tracked, pid: number, generation: string): Promise<StopOutcome> {
+    if (!this.probeSupported()) {
+      return { requested: false, reason: "no-target", detail: `No process probe is available on ${process.platform}, so the process recorded for this run cannot be confirmed to still be it. Nothing was signalled.` };
+    }
+    let processes: ProcessInfo[];
+    try {
+      processes = await this.probeProcesses();
+    } catch (error) {
+      return { requested: false, reason: "failed", detail: `The process table could not be read (${(error as Error).message}), so the process recorded for this run could not be confirmed. Nothing was signalled.` };
+    }
+    if (processGenerationVerdict(processes, pid, generation) !== "alive") {
+      return {
+        requested: false,
+        reason: "identity-changed",
+        detail: `The process recorded for this run (pid ${pid}) is no longer that process — it has gone, or that number now belongs to something else. Nothing was signalled, and this run's status is being re-established.`,
+      };
+    }
+    try {
+      this.signal(pid);
+    } catch (error) {
+      return { requested: false, reason: "failed", detail: `Agent Sparring could not interrupt process ${pid}: ${(error as Error).message}. Nothing else was signalled.` };
+    }
+    this.markStopRequested(item, `SIGINT was sent to process ${pid}, which was verified to still be the process running ${describe(item)}`);
+    return { requested: true, via: "process" };
+  }
+
+  /**
+   * Record that a person asked for this execution to stop.
+   *
+   * A request and nothing more: the record stays `running`, the operation
+   * guard is untouched, and only this execution's own ending can turn it
+   * into "Stopped". It is persisted so a window reload still knows the
+   * person asked, and can therefore still tell "Stopped" apart from a
+   * runner that merely finished.
+   */
+  private markStopRequested(item: Tracked, detail: string): void {
+    if (item.record.stopRequestedAtMs) {
+      return;
+    }
+    item.record = { ...item.record, stopRequestedAtMs: Date.now() };
+    this.log(`${detail}. Nothing is concluded from that: the run stays guarded until this exact execution is observed ending.`);
+    void this.persist();
+    this.changeEmitter.fire("changed");
   }
 
   /**
@@ -866,6 +1065,7 @@ export class ExecutionTracker implements vscode.Disposable {
         terminalName: item.terminal?.name ?? "",
         enginePid: item.enginePid,
         generation: item.generation,
+        stopRequestedAtMs: item.record.stopRequestedAtMs,
       };
       if (item.record.state === "ended") {
         ended.push({ ...common, ended: { atMs: item.record.endedAtMs ?? Date.now(), exitCode: item.record.exitCode, detail: item.record.detail } });
@@ -912,6 +1112,7 @@ export class ExecutionTracker implements vscode.Disposable {
           state: "unknown",
           startedAtMs: launch.startedAtMs,
           detail: launch.state === "unknown" && launch.detail ? launch.detail : "The window reloaded; looking for the terminal that hosted this run.",
+          stopRequestedAtMs: launch.stopRequestedAtMs,
         },
         kind: launch.kind,
         stageId: launch.stageId,

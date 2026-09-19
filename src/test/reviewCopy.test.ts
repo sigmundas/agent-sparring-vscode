@@ -28,6 +28,7 @@ import { isActionMessage, isCopyMessage, isHumanCheckMessage, renderOverviewHtml
 import { buildOverviewModel, type ManifestStageView, type OverviewArtifacts, type OverviewModel } from "../core/overviewModel";
 import { checkCopyText, namedValues, reviewCopyText, type ReviewCopySource } from "../core/reviewCopy";
 import { Workspace } from "./fixtures";
+import { FakeElement, runWebviewScript, type Posted } from "./webviewShim";
 
 const NOW = Date.parse("2026-09-15T09:00:00.000Z");
 const STAGE_3D = "stage-3d-snapshot-v2-and-attachment-export-import-transport";
@@ -414,61 +415,16 @@ describe("the copy controls, on the wire the webview actually uses", () => {
 
 // ---------------------------------------------------------------- the shipped script, against a DOM shim
 
-interface Posted {
-  type: string;
-  [field: string]: unknown;
-}
-
-/** Just enough of an element for the shipped listener: attributes, `closest`, `disabled`. */
-class FakeElement {
-  disabled = false;
-  value = "";
-  constructor(
-    readonly tag: string,
-    readonly attributes: Record<string, string>,
-  ) {}
-  getAttribute(name: string): string | null {
-    return this.attributes[name] ?? null;
-  }
-  hasAttribute(name: string): boolean {
-    return name in this.attributes;
-  }
-  closest(selector: string): FakeElement | null {
-    const [, tag, rest] = /^([a-z]+)((?:\[[^\]]+\])*)$/.exec(selector) ?? [];
-    const wanted = [...(rest ?? "").matchAll(/\[([^\]]+)\]/g)].map((match) => match[1]);
-    return this.tag === tag && wanted.every((attribute) => this.hasAttribute(attribute)) ? this : null;
-  }
-}
-
-class FakeTextArea extends FakeElement {}
-
-class FakeDocument {
-  private readonly listeners = new Map<string, ((event: { target: unknown }) => void)[]>();
-  addEventListener(type: string, listener: (event: { target: unknown }) => void): void {
-    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
-  }
-  dispatch(type: string, target: unknown): void {
-    for (const listener of this.listeners.get(type) ?? []) {
-      listener({ target });
-    }
-  }
-}
-
-/** Click every copy control the document rendered, through the script the document ships. */
+/**
+ * Click every copy control the document rendered, through the script the
+ * document ships.
+ *
+ * The shim is the shared one (webviewShim.ts): this file used to keep a
+ * second copy, which then had to be taught about every host global the
+ * script came to use, and fell behind the first time one was added.
+ */
 function clickEvery(html: string): Posted[] {
-  const script = /<script nonce="n">([\s\S]*?)<\/script>/.exec(html)?.[1];
-  assert.ok(script, "the document ships a script");
-  const document = new FakeDocument();
-  const posted: Posted[] = [];
-  const run = new Function("document", "acquireVsCodeApi", "Element", "HTMLTextAreaElement", "setTimeout", "clearTimeout", script);
-  run(
-    document,
-    () => ({ postMessage: (message: Posted) => posted.push(message) }),
-    FakeElement,
-    FakeTextArea,
-    () => 0,
-    () => undefined,
-  );
+  const { document, posted } = runWebviewScript(html);
   for (const markup of html.match(/<button[^>]*data-copy="[^"]*"[^>]*>/g) ?? []) {
     const attributes: Record<string, string> = {};
     for (const [, name, value] of markup.matchAll(/([a-z-]+)="([^"]*)"/g)) {

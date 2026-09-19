@@ -332,7 +332,7 @@ describe("overview HTML", () => {
     // In a managed plan the button says what the person is doing; the tooltip says who reads it.
     assert.match(html, /<button type="button" class="primary" data-action="submitForReview" title="[^"]*" disabled>Submit result and continue<\/button>/);
     assert.match(html, /data-action="openSparring"[^>]*>Open detailed review</);
-    assert.match(html, /<details class="more"><summary[^>]*>…<\/summary><div class="actions"><button type="button" class="quiet" data-action="resumePlan"[^>]*>Resume plan \(implementation\)</);
+    assert.match(html, /<details class="more"[^>]*><summary[^>]*>…<\/summary><div class="actions"><button type="button" class="quiet" data-action="resumePlan"[^>]*>Resume plan \(implementation\)</);
     assert.ok(!html.includes("Latest sparring result"), "the panel is the latest sparring result");
     assert.match(html, /<div class="run muted" title="[^"]*"><span class="plan">docs\/plans\/foo.md<\/span><span class="sep">›<\/span><span>Stage 2 — Schema &amp; API<\/span><\/div>/, "the header names the plan (its label when the document is not read), then the stage");
     assert.ok(!html.includes("Last activity"));

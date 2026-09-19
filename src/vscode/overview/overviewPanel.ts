@@ -21,6 +21,7 @@ import {
   isHumanFeedbackMessage,
   isAgentConfigMessage,
   isOpenPromptSourceMessage,
+  isStopMessage,
   renderOverviewHtml,
   type AgentConfigMessage,
   type AutoPushMessage,
@@ -30,9 +31,11 @@ import {
   type HumanFeedbackMessage,
   type OpenPromptSourceMessage,
   type OverviewAction,
+  type StopMessage,
 } from "../../core/overviewHtml";
 import { PROMPTS_DIRNAME, PROMPT_INDEX_FILENAME, latestCapture, parseCaptureIndex } from "../../core/promptInspector";
 import { buildOverviewModel, type AgentConfigOutcome, type CapturedPrompt, type ManagedPlanRun, type ManifestStageView, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
+import { outstanding as operationOutstanding } from "../operationRegistry";
 import { checkCopyText, reviewCopyText, type ReviewCopySource } from "../../core/reviewCopy";
 import { locateStage, parsePlanHeadings, type HeadingRef } from "../../core/planAssociation";
 import { planKey, planLabel } from "../../core/sparringCommand";
@@ -91,6 +94,8 @@ export class OverviewPanelManager implements vscode.Disposable {
         void this.recordHumanFeedback(message);
       } else if (isAutoPushMessage(message)) {
         void this.recordAutoPushChoice(message);
+      } else if (isStopMessage(message)) {
+        void this.requestStop(message);
       } else if (isCopyMessage(message)) {
         void this.copyForChat(message);
       } else if (isOpenPromptSourceMessage(message)) {
@@ -116,6 +121,27 @@ export class OverviewPanelManager implements vscode.Disposable {
   }
 
   private lastColumn: vscode.ViewColumn | undefined;
+
+  /**
+   * Interrupt the runner this page was drawn for.
+   *
+   * There is no confirmation dialog. Stopping a run interrupts it: the
+   * engine has already recorded everything it reached, nothing is deleted
+   * and Resume continues the same managed run — so a modal here would be
+   * ceremony over an action that is not destructive. What the person is
+   * told is the *outcome*, and only when it is not the ordinary one.
+   */
+  private async requestStop(message: StopMessage): Promise<void> {
+    const run = this.controller.currentSelection.selected;
+    if (!run) {
+      return;
+    }
+    const outcome = await this.controller.requestStop(run.id, message.executionId);
+    await this.update();
+    if (!outcome.requested) {
+      void vscode.window.showInformationMessage(`Agent Sparring: ${outcome.detail}`);
+    }
+  }
 
   /**
    * A Pass / Fail / Blocked click re-renders (the choice lights up); a note
@@ -324,6 +350,7 @@ export class OverviewPanelManager implements vscode.Disposable {
       repository = run.location.folderName;
       const stage = currentStageOf(run);
       const association = run.kind === "stage" ? this.controller.planAssociation(run.id) : undefined;
+      const guard = this.controller.guardFor(run.id);
       const [handoffText, sparring, briefText, notesText, planText, associatedText] = await Promise.all([
         readHead(path.join(stage.dir, HANDOFF_FILENAME), HANDOFF_READ_LIMIT),
         readHead(path.join(stage.dir, SPARRING_FILENAME), SPARRING_READ_LIMIT),
@@ -354,7 +381,12 @@ export class OverviewPanelManager implements vscode.Disposable {
         manifestStages: await this.manifestStages(run),
         managedPlanRun: await this.managedPlanRun(run),
         existingStageIds: this.existingStageIds(run),
-        guardedOperationId: this.controller.guardFor(run.id)?.id,
+        guardedOperationId: guard?.id,
+        // Read once, here, with the id above: what this surface offers has
+        // to act on the record it was built from, never on a fresh lookup
+        // when the click arrives.
+        guardOutstanding: guard !== undefined && operationOutstanding(guard),
+        stopTarget: this.controller.stopTargetFor(run.id),
         autoPushDraft: this.controller.autoPushDraft(run.id),
         agentConfig,
       };

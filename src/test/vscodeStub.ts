@@ -87,8 +87,20 @@ export class FakeTerminal {
   show(): void {
     this.shown += 1;
   }
-  sendText(): void {
-    throw new Error("a test terminal is never written to as text");
+  /** Every control character written into this terminal, in order. */
+  readonly written: string[] = [];
+  /**
+   * The only thing Agent Sparring may ever write into a terminal as text is
+   * an interrupt. A command line goes through shell integration's
+   * `executeCommand`, which is what gives the execution an identity to
+   * track; typing one instead would lose that identity and could land in
+   * whatever is in the foreground. So anything else still throws.
+   */
+  sendText(text: string): void {
+    if (text !== "\u0003") {
+      throw new Error(`a test terminal is never written to as text (got ${JSON.stringify(text)})`);
+    }
+    this.written.push(text);
   }
   dispose(): void {
     this.exitStatus = { code: 0 };

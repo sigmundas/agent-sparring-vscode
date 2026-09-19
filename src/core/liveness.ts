@@ -70,6 +70,18 @@ export interface ExecutionRecord {
   exitCode?: number;
   /** Why the state is what it is; shown in tooltips and the log. */
   detail?: string;
+  /**
+   * When a person asked Agent Sparring to interrupt *this exact* execution.
+   *
+   * A request, and never an outcome: it records that a graceful interrupt
+   * was delivered to this execution's own terminal or to the process
+   * positively bound to it, not that anything stopped. Whether it did is
+   * settled by the same evidence that settles every other ending — this
+   * execution's own end event, its terminal's exit code, or its bound pid
+   * leaving the process table. Until then the run is exactly as guarded as
+   * it was before the click.
+   */
+  stopRequestedAtMs?: number;
 }
 
 export type LivenessState = "running" | "stopped" | "unknown";
@@ -89,6 +101,20 @@ export interface RunnerLiveness {
   /** One sentence for tooltips: which observation the state rests on. */
   detail: string;
   execution?: ExecutionRecord;
+  /**
+   * Where a requested interruption of this exact execution stands.
+   *
+   *  - `requested`: a person asked for it and nothing has yet proved that
+   *    the execution ended. That is the honest state whether the runner
+   *    looks alive or its fate became unknown, and it changes no guard;
+   *  - `stopped`: the same evidence that ends any execution has since
+   *    ended *this* one, after the request. Only then may the run be
+   *    offered again.
+   *
+   * Absent when nobody asked, so an ordinary completion and an ordinary
+   * failure keep their own vocabulary and are never called "Stopped".
+   */
+  stop?: "requested" | "stopped";
 }
 
 /** After this long without any telemetry, a telemetry-only busy claim is presented as stale. */
@@ -108,6 +134,30 @@ const TELEMETRY_ONLY_DETAIL =
  * otherwise.
  */
 export function deriveLiveness(live: LiveState | undefined, execution: ExecutionRecord | undefined, nowMs: number): RunnerLiveness {
+  return { ...derive(live, execution, nowMs), stop: stopStanding(execution) };
+}
+
+/**
+ * Where a requested stop of this exact execution stands.
+ *
+ * `ended` is the one thing that turns a request into an outcome, and it is
+ * reached only by the evidence this file already trusts: the shell
+ * reporting that exact execution finishing, the pty host's exit code for a
+ * dedicated terminal's process, the bound pid leaving the table — or the
+ * person's own confirmation, which is recorded as their statement. A
+ * terminal that merely closed, a matcher that cannot attribute a process
+ * and a reload that lost the execution identity all leave the record
+ * `unknown`, and an unknown record after a stop request is still only a
+ * request.
+ */
+function stopStanding(execution: ExecutionRecord | undefined): "requested" | "stopped" | undefined {
+  if (!execution?.stopRequestedAtMs) {
+    return undefined;
+  }
+  return execution.state === "ended" ? "stopped" : "requested";
+}
+
+function derive(live: LiveState | undefined, execution: ExecutionRecord | undefined, nowMs: number): RunnerLiveness {
   const busy = Boolean(live && (live.stage.busy || live.sparrer.busy));
   const lastStart = live ? latestTurnStart(live) : 0;
 
@@ -196,6 +246,11 @@ function runningDetail(execution: ExecutionRecord): string {
 }
 
 function endedDetail(execution: ExecutionRecord): string {
+  if (execution.stopRequestedAtMs) {
+    // The person asked for this, and then it ended: that is the one case in
+    // which "stopped" is a fact rather than a guess about an exit code.
+    return "You stopped this runner and it has ended. The engine records its own state as it goes, so the run continues from what it had reached.";
+  }
   const how = execution.exitCode === undefined ? "ended without an exit code (Ctrl-C, a signal, or its terminal closed)" : execution.exitCode === 0 ? "exited normally" : `exited with code ${execution.exitCode}`;
   return execution.detail ? `${execution.detail} ` : `The Sparring runner ${how}.`;
 }

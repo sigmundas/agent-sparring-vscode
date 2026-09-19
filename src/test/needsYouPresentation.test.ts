@@ -189,13 +189,13 @@ describe("the NEEDS_YOU panel a person reads", () => {
     const notes = ["# Notes", "", "## Human evidence", "", `- Pass — ${INSTRUCTION} · check \`${CHECK_ID}\``, "  Ran it on the 2026.4 build.", ""].join("\n");
     const { model, html } = await managedStage3d({ notes });
     assert.equal(model.actionRequired!.recorded.length, 1);
-    assert.match(html, /<details class="prev"><summary>Previous evidence \(1\)<\/summary><ol class="checklist recorded">/);
+    assert.match(html, /<details class="prev"[^>]*><summary>Previous evidence \(1\)<\/summary><ol class="checklist recorded">/);
     assert.match(html, /Every check the reviewer asked for has a recorded result\./);
   });
 
   it("the reviewer's exact words, the gate id, the category and the plan source are all still there, one disclosure down", async () => {
     const { html } = await managedStage3d();
-    const tech = /<details class="tech"><summary>Show technical details<\/summary>([\s\S]*?)<\/details>/.exec(html)?.[1] ?? "";
+    const tech = /<details class="tech"[^>]*><summary>Show technical details<\/summary>([\s\S]*?)<\/details>/.exec(html)?.[1] ?? "";
     assert.ok(tech, "the technical layer exists");
     for (const kept of ["NEEDS_YOU", "DEVICE_MANUAL_CHECK", CHECK_ID, GATE_TITLE, REVIEWER_NOTE, SOURCE, "Fail if the whole feed is rejected as unsupported"]) {
       assert.ok(tech.includes(kept.replace(/&/g, "&amp;")), `${kept} is kept in the technical details`);
@@ -211,8 +211,8 @@ describe("the NEEDS_YOU panel a person reads", () => {
     const answered = await managedStage3d({ drafts: { [CHECK_ID]: { outcome: "pass", note: "Ran it on the 2026.4 build." } } });
     assert.equal(answered.model.actionRequired!.submit.enabled, true);
     assert.match(answered.html, /title="[^"]*resume-plan --evidence[^"]*"[^>]*>Submit result and continue</, "the tooltip still says who reads the evidence");
-    assert.ok(html.indexOf('data-action="submitForReview"') < html.indexOf('<details class="more">'), "the primary action comes first");
-    assert.match(html, /<details class="more"><summary[^>]*>…<\/summary><div class="actions"><button type="button" class="quiet" data-action="resumePlan"/);
+    assert.ok(html.indexOf('data-action="submitForReview"') < html.indexOf('<details class="more"'), "the primary action comes first");
+    assert.match(html, /<details class="more"[^>]*><summary[^>]*>…<\/summary><div class="actions"><button type="button" class="quiet" data-action="resumePlan"/);
   });
 });
 

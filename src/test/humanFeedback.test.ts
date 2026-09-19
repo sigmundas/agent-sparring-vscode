@@ -288,7 +288,7 @@ describe("sending feedback claims nothing about the checks", () => {
     const { view } = await stage4Gate();
     const panel = view({ notes }).model.actionRequired!;
     assert.deepEqual(panel.feedback.submitted, blocks, "and the panel shows what was already sent");
-    assert.match(view({ notes }).html, /<details class="prev"><summary>Feedback already sent \(2\)<\/summary>/);
+    assert.match(view({ notes }).html, /<details class="prev"[^>]*><summary>Feedback already sent \(2\)<\/summary>/);
   });
 
   it("the entry is the person's text verbatim, under a heading that is not a check", () => {
@@ -494,7 +494,7 @@ describe("the structured gate is unchanged by any of this", () => {
     assert.equal(panel.progress, "0 / 5 verified · 1 failed");
     assert.equal(panel.gateTitle, "Confirm the editor renders and guards reported statistics correctly");
     assert.match(html, new RegExp(`class="choice fail on" data-check="${CHECKS[0].id}"`));
-    assert.match(html, /<details class="tech"><summary>Show technical details<\/summary>/);
+    assert.match(html, /<details class="tech"[^>]*><summary>Show technical details<\/summary>/);
     assert.ok(html.indexOf('class="checklist gate"') < html.indexOf('class="feedback"'), "the freeform field sits below the checks");
     assert.ok(html.indexOf('class="feedback"') < html.indexOf('details class="tech"'), "and above the demoted technical layer");
   });
