@@ -1320,11 +1320,13 @@ function field(label: string, input: string): string {
  * into the field as a value nobody chose.
  */
 function control(item: AgentFieldControl, attrs: string): string {
-  // The value this control was rendered with, in the same spelling a message
-  // would carry it. The script compares against it before posting, so simply
-  // tabbing through a field -- or re-selecting what is already selected --
-  // runs no engine command at all.
-  const sent = ` data-sent="${escapeHtml(item.value === PROVIDER_DEFAULT_VALUE ? "null" : item.value)}"`;
+  // The value this control was rendered with. The script compares against
+  // it before posting, so simply tabbing through a field -- or re-selecting
+  // what is already selected -- runs no engine command at all. The leading
+  // "-" or "=" keeps "cleared" distinguishable from a value that happens to
+  // spell it, so a model actually named "null" or "default" can still be
+  // cleared.
+  const sent = ` data-sent="${escapeHtml(item.value === PROVIDER_DEFAULT_VALUE ? "-" : `=${item.value}`)}"`;
   const common = `${attrs} data-field="${escapeHtml(item.field)}" title="${escapeHtml(item.detail)}"${sent}`;
   if (item.fixedText !== undefined) {
     return `<span class="agentconfig-fixed" title="${escapeHtml(item.detail)}">${escapeHtml(item.fixedText)}</span>`;
@@ -1773,10 +1775,14 @@ const SCRIPT = `
     var isInput = node instanceof HTMLInputElement && node.type === 'text';
     if ((!isSelect && !isInput) || !node.hasAttribute('data-role') || !node.hasAttribute('data-field')) { return; }
     if (node.disabled) { return; }
-    var raw = node.value;
+    // A text field is trimmed, so emptying it -- including to a space -- is
+    // the clear it plainly means rather than a model name the engine would
+    // then have to refuse.
+    var raw = isInput ? node.value.trim() : node.value;
     var sent = raw === '' ? null : raw;
-    if (node.getAttribute('data-sent') === String(sent)) { return; }
-    node.setAttribute('data-sent', String(sent));
+    var stamp = sent === null ? '-' : '=' + sent;
+    if (node.getAttribute('data-sent') === stamp) { return; }
+    node.setAttribute('data-sent', stamp);
     node.disabled = true;
     vscode.postMessage({
       type: 'agentConfig',

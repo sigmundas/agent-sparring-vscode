@@ -523,8 +523,8 @@ describe("the rendered controls are self-describing", () => {
     }
     // The value each control was rendered with, so simply tabbing through a
     // field posts nothing.
-    assert.match(html, /data-field="model"[^>]*data-sent="opus"/);
-    assert.match(html, /data-field="effort"[^>]*data-sent="null"/);
+    assert.match(html, /data-field="model"[^>]*data-sent="=opus"/);
+    assert.match(html, /data-field="effort"[^>]*data-sent="-"/, "cleared is its own mark, not a value that could spell it");
   });
 
   it("says a change lands on the next turn only while a run is actually active", async () => {

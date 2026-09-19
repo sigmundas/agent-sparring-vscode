@@ -19,7 +19,7 @@
 
 import { execFile } from "node:child_process";
 import { stat } from "node:fs/promises";
-import { parseEngineConfig, type EffectiveConfig } from "../core/effectiveConfig";
+import { parseEngineConfig, type ConfigField, type ConfigRole, type EffectiveConfig } from "../core/effectiveConfig";
 import { PROJECT_CONFIG_FILENAME } from "../core/settingsTarget";
 import * as path from "node:path";
 import { planExecutable } from "../core/cli";
@@ -119,8 +119,8 @@ export async function writeAgentConfig(
   configured: string | undefined,
   projectDir: string,
   sparringDir: string,
-  role: string,
-  field: string,
+  role: ConfigRole,
+  field: ConfigField,
   value: string | null,
 ): Promise<ConfigWriteResult> {
   const planned = await planExecutable(configured, hostEnv(projectDir), false);
