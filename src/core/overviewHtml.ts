@@ -252,6 +252,10 @@ export interface AgentConfigMessage {
  * A model name is free text, so it is bounded here the way a note is: long
  * enough for any identifier a provider could plausibly have, short enough
  * that the message cannot be a payload. The engine validates what it means.
+ *
+ * No control on the page posts a model any more — the cards show it and
+ * project.toml changes it — but `set-config <role> --model` is still the
+ * engine's own mutation, so the wire keeps accepting and bounding one.
  */
 export const MODEL_MAX_LENGTH = 200;
 
@@ -1437,10 +1441,15 @@ function capitalize(word: string): string {
  * control that lies about being a control, and a second copy of the provider
  * name would be the duplication this layout exists to remove.
  *
- * Every control carries the role, the field and the scope it was rendered
- * with, so the message the webview posts is self-describing and the host
- * never has to infer which repository a change was meant for from whatever
- * happens to be selected when it arrives.
+ * The model is a row here but not a control: it is the value the engine
+ * resolved, read on the card and changed in project.toml. Nothing
+ * enumerates the models a CLI accepts, so a control could only be a box
+ * that takes any string and discovers on the next turn that it was wrong.
+ *
+ * Every actual control carries the role, the field and the scope it was
+ * rendered with, so the message the webview posts is self-describing and the
+ * host never has to infer which repository a change was meant for from
+ * whatever happens to be selected when it arrives.
  */
 function renderRoleControls(role: AgentRoleControls, scope: string): string {
   const attrs = `data-role="${escapeHtml(role.role)}" data-scope="${escapeHtml(scope)}"`;
@@ -1454,32 +1463,34 @@ function field(label: string, input: string): string {
 }
 
 /**
- * The input for one field.
+ * The control for one field: a dropdown, or text that is only read.
  *
  * A dropdown when the engine gave options — its entries are the engine's own
- * levels, so nothing here enumerates what a provider accepts. A plain text
- * input otherwise, because a model name is free-form on both installed CLIs
- * and a closed list would reject a model that exists. An empty text input is
- * the provider's default, spelled in the placeholder rather than written
- * into the field as a value nobody chose.
+ * levels and providers, so nothing here enumerates what a provider accepts.
+ * Read-only text otherwise, and that is every remaining case: a role with one
+ * provider has nothing to choose, and the model is shown rather than edited
+ * because no engine or CLI reports a list of models to choose from. A field
+ * that is neither is a control this renderer has no honest shape for, so it
+ * is left out rather than drawn as an empty box.
  */
 function control(item: AgentFieldControl, attrs: string): string {
+  if (item.fixedText !== undefined) {
+    // Shown, not chosen. The "novalue" case is the absence of an override --
+    // the words "Provider default" rather than a model the engine resolved --
+    // and is drawn quietly so it is never read as a configured value.
+    const quiet = item.value === PROVIDER_DEFAULT_VALUE ? " novalue" : "";
+    return `<span class="agentconfig-fixed${quiet}" title="${escapeHtml(item.detail)}">${escapeHtml(item.fixedText)}</span>`;
+  }
+  if (!item.options) {
+    return "";
+  }
   // The value this control was rendered with. The script compares against
   // it before posting, so simply tabbing through a field -- or re-selecting
   // what is already selected -- runs no engine command at all. The leading
   // "-" or "=" keeps "cleared" distinguishable from a value that happens to
-  // spell it, so a model actually named "null" or "default" can still be
-  // cleared.
+  // spell it, so a level actually named "default" can still be cleared.
   const sent = ` data-sent="${escapeHtml(item.value === PROVIDER_DEFAULT_VALUE ? "-" : `=${item.value}`)}"`;
-  const common = `${attrs} data-field="${escapeHtml(item.field)}" title="${escapeHtml(item.detail)}"${sent}`;
-  if (item.fixedText !== undefined) {
-    return `<span class="agentconfig-fixed" title="${escapeHtml(item.detail)}">${escapeHtml(item.fixedText)}</span>`;
-  }
-  if (item.options) {
-    return `<select ${common}>${options(item.options, item.value)}</select>`;
-  }
-  const placeholder = item.placeholder ? ` placeholder="${escapeHtml(item.placeholder)}"` : "";
-  return `<input type="text" ${common} value="${escapeHtml(item.value)}"${placeholder} maxlength="${MODEL_MAX_LENGTH}" spellcheck="false" autocomplete="off">`;
+  return `<select ${attrs} data-field="${escapeHtml(item.field)}" title="${escapeHtml(item.detail)}"${sent}>${options(item.options, item.value)}</select>`;
 }
 
 function options(items: readonly { value: string; label: string }[], selected: string): string {
@@ -1646,41 +1657,22 @@ pre.engineerror { margin: 6px 0 0; padding: 6px 8px; max-height: 9em; overflow: 
 .agentconfig-block { margin: 6px 0 2px; }
 .agentconfig-field { display: flex; align-items: center; gap: 8px; margin-top: 3px; font-size: 0.9em; }
 .agentconfig-field > .muted { min-width: 5.5em; }
-.agentconfig-field select,
-.agentconfig-field input[type="text"] {
-  flex: 1; min-width: 0; padding: 2px 4px; font: inherit; font-size: 0.95em;
-  color: var(--vscode-input-foreground);
-}
-/* A chooser is a filled box with the platform's own chevron; a free-form
-   field is a line you type on. They are styled apart deliberately: given the
-   same box, the model input reads as a dropdown whose options failed to
-   load, and its placeholder reads as a selected value. The model is free
-   text because both installed CLIs take free-form names and there is no list
-   of options to show -- so the control must not promise one. */
+/* Only a chooser is drawn as a control. It is the platform's own select,
+   filled and with its own chevron, so the one thing on the card that can be
+   changed here looks like the one thing that can be changed here. */
 .agentconfig-field select {
-  background: var(--vscode-input-background);
+  flex: 1; min-width: 0; padding: 2px 4px; font: inherit; font-size: 0.95em;
+  color: var(--vscode-input-foreground); background: var(--vscode-input-background);
   border: 1px solid var(--vscode-input-border, var(--line)); border-radius: 3px;
 }
-.agentconfig-field input[type="text"] {
-  background: none; border: none; border-bottom: 1px dashed var(--vscode-input-border, var(--line));
-  /* 5px is the select's 1px border plus its 4px padding, so the model name
-     and the effort level start on the same column in the card. */
-  border-radius: 0; padding-left: 5px;
-}
-.agentconfig-field input[type="text"]:hover:not(:disabled) { border-bottom-color: var(--vscode-input-foreground); }
-.agentconfig-field input[type="text"]:focus {
-  /* Focus keeps a real ring rather than only the underline, the same one the
-     freeform textarea uses: a 1px colour change is not a focus indicator a
-     keyboard user can rely on. */
-  outline: 1px solid var(--vscode-focusBorder); background: var(--vscode-input-background);
-  border-bottom-style: solid; border-bottom-color: var(--vscode-focusBorder);
-}
-/* The placeholder is the absence of an override, not a value: it stays
-   quieter than typed text so the two are never read as the same thing. */
-.agentconfig-field input[type="text"]::placeholder { color: var(--vscode-input-placeholderForeground, var(--vscode-descriptionForeground)); font-style: italic; opacity: 1; }
-.agentconfig-field select:disabled,
-.agentconfig-field input[type="text"]:disabled { opacity: 0.6; }
-.agentconfig-fixed { flex: 1; font-weight: 600; }
+.agentconfig-field select:disabled { opacity: 0.6; }
+/* A read value, not a control. 5px is the select's 1px border plus its 4px
+   padding, so a model name and an effort level still start on the same
+   column. */
+.agentconfig-fixed { flex: 1; min-width: 0; padding: 2px 4px 2px 5px; font-size: 0.95em; font-weight: 600; overflow-wrap: anywhere; }
+/* The absence of an override is not a value, so it never borrows a value's
+   weight. */
+.agentconfig-fixed.novalue { font-weight: 400; font-style: italic; color: var(--vscode-descriptionForeground); }
 
 /* The freeform channel: beside the checks, never inside one of them. */
 .feedback { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
@@ -2041,10 +2033,10 @@ const SCRIPT = `
     }
     agentConfigChanged(event.target);
   });
-  // The inline agent controls. An effort dropdown reports on change; a model
-  // field reports on blur and on Enter, never per keystroke -- each report
-  // runs an engine command, and one per character would be a queue of writes
-  // nobody asked for.
+  // The inline agent controls, which are dropdowns and nothing else: they
+  // report on change. The model is read-only text on the card and is changed
+  // in project.toml, so there is no text field here to save on blur or on
+  // Enter, and no keystroke path that could queue a write per character.
   //
   // Every message carries the scope the control was rendered with, so the
   // host can refuse one that belongs to a repository no longer on screen.
@@ -2053,15 +2045,12 @@ const SCRIPT = `
   // write over the first; the host's reply re-renders the page from the
   // engine's actual answer and the control comes back with that value in it.
   function agentConfigChanged(node) {
-    var isSelect = node instanceof HTMLSelectElement;
-    var isInput = node instanceof HTMLInputElement && node.type === 'text';
-    if ((!isSelect && !isInput) || !node.hasAttribute('data-role') || !node.hasAttribute('data-field')) { return; }
+    if (!(node instanceof HTMLSelectElement)) { return; }
+    if (!node.hasAttribute('data-role') || !node.hasAttribute('data-field')) { return; }
     if (node.disabled) { return; }
-    // A text field is trimmed, so emptying it -- including to a space -- is
-    // the clear it plainly means rather than a model name the engine would
-    // then have to refuse.
-    var raw = isInput ? node.value.trim() : node.value;
-    var sent = raw === '' ? null : raw;
+    // The empty option is the sentinel for "no override", which the host
+    // sends as null and the engine turns into its --*-default flag.
+    var sent = node.value === '' ? null : node.value;
     var stamp = sent === null ? '-' : '=' + sent;
     if (node.getAttribute('data-sent') === stamp) { return; }
     node.setAttribute('data-sent', stamp);
@@ -2074,13 +2063,6 @@ const SCRIPT = `
       scope: node.getAttribute('data-scope'),
     });
   }
-  document.addEventListener('keydown', function (event) {
-    if (event.key !== 'Enter') { return; }
-    var node = event.target;
-    if (!(node instanceof HTMLInputElement) || !node.hasAttribute('data-role')) { return; }
-    event.preventDefault();
-    agentConfigChanged(node);
-  });
   // Every text field is saved as it is typed (debounced) and on blur, so a
   // re-render of the page never loses what was typed; the extension stores it
   // as a draft. A check note carries the check's key; the freeform findings

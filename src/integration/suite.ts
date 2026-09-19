@@ -23,7 +23,7 @@ import { planKey } from "../core/sparringCommand";
 import { BINDING_VERSION, bindingFileName, manifestFileName, parseExecutionManifest, renderBindingRecord } from "../core/manifest";
 import { isActionMessage, isAgentConfigMessage, isAutoPushMessage, isCopyPromptMessage, isHumanCheckMessage, isHumanFeedbackMessage, isOpenPromptSourceMessage, renderOverviewHtml } from "../core/overviewHtml";
 import { withHumanCheck, type HumanCheckDrafts } from "../core/humanChecks";
-import { parseEngineConfig } from "../core/effectiveConfig";
+import { PROVIDER_DEFAULT_LABEL, parseEngineConfig } from "../core/effectiveConfig";
 import type { ExecutionRecord, LivenessState, RunnerLiveness } from "../core/liveness";
 import { buildOverviewModel, type CapturedPrompt, type ManifestStageView, type OverviewArtifacts } from "../core/overviewModel";
 import { ExecutionTracker } from "../vscode/executionTracker";
@@ -300,7 +300,7 @@ interface ModelReport {
       role: string;
       label: string;
       provider: { value: string; fixedText?: string; options?: { value: string; label: string }[] };
-      model: { value: string; options?: { value: string }[]; placeholder?: string };
+      model: { value: string; options?: { value: string }[]; fixedText?: string };
       effort?: { value: string; options?: { value: string; label: string }[] };
     }[];
     configPath?: string;
@@ -1152,15 +1152,12 @@ async function actorCardControlAssertions(): Promise<void> {
       var card = document.querySelector('.card.actor');
       var instr = card.querySelector('details.instr');
       var effort = card.querySelector('select[data-field="effort"]');
-      var modelField = card.querySelector('input[data-field="model"]');
       var levels = Array.prototype.map.call(effort.options, function (option) { return option.value; });
       // Open the instructions the way a person does, then use the controls.
       instr.querySelector('summary').click();
       var openedInstructions = instr.open;
       effort.value = 'glacial';
       effort.dispatchEvent(new Event('change', { bubbles: true }));
-      modelField.value = 'another-model';
-      modelField.dispatchEvent(new Event('focusout', { bubbles: true }));
       setTimeout(function () {
         // Measured rather than assumed: that the role really reads as the
         // heading, and that the controls really are laid out inside the
@@ -1169,6 +1166,10 @@ async function actorCardControlAssertions(): Promise<void> {
         var providerLine = card.querySelector('.provider');
         var cardBox = card.getBoundingClientRect();
         var effortBox = effort.getBoundingClientRect();
+        // The model as the page actually renders it: read-only text, with
+        // nothing focusable or typable behind it.
+        var modelText = card.querySelector('.agentconfig-fixed');
+        var modelBox = modelText.getBoundingClientRect();
         var size = function (node) { return parseFloat(getComputedStyle(node).fontSize); };
         __api.postMessage({
           type: 'cardProbe',
@@ -1185,6 +1186,12 @@ async function actorCardControlAssertions(): Promise<void> {
           providerColor: getComputedStyle(providerLine).color,
           roleAbove: rolename.getBoundingClientRect().top < providerLine.getBoundingClientRect().top,
           effortInsideCard: effortBox.top >= cardBox.top && effortBox.bottom <= cardBox.bottom && effortBox.left >= cardBox.left && effortBox.right <= cardBox.right,
+          modelTag: modelText.tagName,
+          modelValue: modelText.textContent,
+          modelEditable: card.querySelectorAll('input[data-field], [contenteditable]').length,
+          // Both start on the same column, which is the alignment the
+          // read-only value's padding exists to preserve.
+          modelAlignsWithEffort: Math.abs(modelBox.left - effortBox.left) < 1,
         });
       }, 50);
     </script>`;
@@ -1202,21 +1209,22 @@ async function actorCardControlAssertions(): Promise<void> {
     assert.ok((seen["roleSize"] as number) > (seen["providerSize"] as number), `the role is the larger text (${String(seen["roleSize"])} vs ${String(seen["providerSize"])})`);
     assert.notEqual(seen["roleColor"], seen["providerColor"], "the role carries the actor's colour; the provider is subdued");
     assert.equal(seen["effortInsideCard"], true, "the effort control is laid out inside its own role's card");
+    assert.equal(seen["modelTag"], "SPAN", "the model is text on the card, not a control");
+    assert.equal(seen["modelValue"], "a-model", "showing exactly what the engine resolved");
+    assert.equal(seen["modelEditable"], 0, "and nothing on the card can be typed into");
+    assert.equal(seen["modelAlignsWithEffort"], true, "the read value starts on the same column as the dropdown");
     console.log(`integration: role ${String(seen["roleSize"])}px ${String(seen["roleColor"])} over provider ${String(seen["providerSize"])}px ${String(seen["providerColor"])}`);
 
     const changes = posted.filter((message) => message["type"] === "agentConfig");
     assert.deepEqual(
       changes,
-      [
-        { type: "agentConfig", role: "stage", field: "effort", value: "glacial", scope: configPath },
-        { type: "agentConfig", role: "stage", field: "model", value: "another-model", scope: configPath },
-      ],
-      "both changes went out on the existing wire, carrying the project.toml the card was drawn from",
+      [{ type: "agentConfig", role: "stage", field: "effort", value: "glacial", scope: configPath }],
+      "the one change went out on the existing wire, carrying the project.toml the card was drawn from",
     );
     for (const change of changes) {
       assert.ok(isAgentConfigMessage(change), "and the host accepts each one");
     }
-    console.log("integration: the actor cards carry their own model and effort controls, built from the engine's levels, and using them leaves the card and its instructions exactly as the person left them");
+    console.log("integration: the actor cards state their own model and carry their own effort control, built from the engine's levels, and using it leaves the card and its instructions exactly as the person left them");
   } finally {
     panel.dispose();
     await fs.rm(root, { recursive: true, force: true });
@@ -3483,7 +3491,8 @@ async function agentConfigAssertions(report: DiscoveryDiagnostic, reportedRepo: 
   const sparrerControl = initial.agentConfig!.controls[1];
   assert.equal(stageControl.provider.fixedText, "Claude", "one provider for the role, so it is shown and not chosen");
   assert.equal(stageControl.provider.options, undefined);
-  assert.equal(stageControl.model.options, undefined, "a model is free-form, never a closed list");
+  assert.equal(stageControl.model.options, undefined, "a model is never a closed list: nothing enumerates them");
+  assert.equal(stageControl.model.fixedText, PROVIDER_DEFAULT_LABEL, "and with none configured it is read, not offered");
   // The dropdown's entries are the engine's levels: the two providers'
   // vocabularies differ, and the difference arrives from the engine.
   assert.deepEqual(
@@ -3497,6 +3506,9 @@ async function agentConfigAssertions(report: DiscoveryDiagnostic, reportedRepo: 
   assert.equal(stageControl.effort?.options?.[0].label, "Provider default");
 
   // A model change goes through the engine, and the engine writes the file.
+  // Driven here as a message rather than from a control: the cockpit shows
+  // the model and does not edit it, but `set-config --model` is still the
+  // engine's own mutation and the host still has to honour it correctly.
   await fs.rm(callsLog, { force: true });
   const set = await change({ type: "agentConfig", role: "stage", field: "model", value: "opus", scope });
   assert.deepEqual([set.applied, set.error], [true, undefined], `set model: ${JSON.stringify(set)}`);
