@@ -233,7 +233,7 @@ export function normalUi(html: string): string {
   return html
     .replace(/title="[^"]*"/g, "")
     .replace(/<dl class="facts">[\s\S]*?<\/dl>/g, "")
-    .replace(/<details class="tech">[\s\S]*?<\/details>/g, "");
+    .replace(/<details class="tech"[^>]*>[\s\S]*?<\/details>/g, "");
 }
 
 /**

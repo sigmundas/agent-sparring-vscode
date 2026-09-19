@@ -87,7 +87,7 @@ import {
 import { deriveStatus } from "../core/status";
 import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
 import { TerminalPool } from "./terminalPool";
-import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult } from "./executionTracker";
+import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult, type StopOutcome, type StopTarget } from "./executionTracker";
 import { OperationRegistry, runnerKey, type OperationView, type OverrideResult } from "./operationRegistry";
 import { ManifestReader, type BoundManifest } from "./manifestReader";
 import { ActiveRepositoryTracker, RealPaths } from "./activeRepository";
@@ -969,9 +969,26 @@ export class SparringController implements vscode.Disposable {
     return this.tracker.executionFor(runId);
   }
 
-  /** Send Ctrl-C to the exact terminal running this run; nothing else is signalled. */
-  stopRunner(runId: string): boolean {
-    return this.tracker.stop(runId);
+  /**
+   * Interrupt one exact execution of this run, gracefully, and nothing else.
+   *
+   * The execution id comes from the surface the person clicked, so a panel
+   * left open while a newer runner started can only ever aim at the runner
+   * it was showing — and `requestStop` refuses when that is no longer the
+   * one this run is waiting on. Nothing about the run, the stage or the
+   * plan is reset, and the duplicate guard is deliberately left exactly
+   * where it is: stopping is a request, and only evidence about that exact
+   * execution settles it.
+   */
+  async requestStop(runId: string, executionId: string): Promise<StopOutcome> {
+    const outcome = await this.tracker.requestStop(runId, executionId);
+    this.render();
+    return outcome;
+  }
+
+  /** What a Stop would interrupt for this run right now, if anything. */
+  stopTargetFor(runId: string | undefined): StopTarget | undefined {
+    return runId ? this.tracker.stopTargetFor(runId) : undefined;
   }
 
   /** Runner liveness for the selected run, combining process observation with the activity fold. */
@@ -1051,8 +1068,13 @@ export class SparringController implements vscode.Disposable {
    *  - claims nothing about whether the engine recorded the evidence. It is
    *    neither marked delivered nor marked failed to make buttons work.
    */
-  async confirmRunnerInactive(runId: string, executionId: string, operationId?: string): Promise<{ confirmed: boolean; reason?: "not-found" | "already-ended"; overrode: boolean; submission: boolean }> {
-    const ended = this.tracker.confirmInactive(runId, executionId);
+  async confirmRunnerInactive(runId: string, executionId: string | undefined, operationId?: string): Promise<{ confirmed: boolean; reason?: "not-found" | "already-ended"; overrode: boolean; submission: boolean }> {
+    // No execution at all: the run is being held by a duplicate guard and
+    // nothing else, so there is no liveness to end and the confirmation is
+    // about that guard alone. Passing an execution id that does not exist
+    // would answer "not-found" and settle nothing, which is how this case
+    // became a dead end.
+    const ended = executionId === undefined ? { confirmed: true as const } : this.tracker.confirmInactive(runId, executionId);
     const released = releaseGuardOnConfirmedInactive(ended, operationId, (id, note) => this.submissions.override(id, note));
     if (released.untouched) {
       this.log(`the duplicate guard was left alone: ${released.untouched}`);
@@ -1071,7 +1093,7 @@ export class SparringController implements vscode.Disposable {
     const overrode = released.overrode;
     const record = this.submissionFor(runId);
     let submission = false;
-    if (record && record.executionId === executionId && !record.failure && !record.unresolved) {
+    if (executionId !== undefined && record && record.executionId === executionId && !record.failure && !record.unresolved) {
       await this.context.workspaceState.update(
         SUBMISSIONS_KEY,
         withSubmissionUnresolved(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), runId, {
@@ -1082,7 +1104,7 @@ export class SparringController implements vscode.Disposable {
       submission = true;
     }
     this.log(
-      `You confirmed that the runner of ${runId.split("|").pop() ?? runId} is no longer active. That is your statement, not an observation: liveness is recorded as ended${
+      `You confirmed that the runner of ${runId.split("|").pop() ?? runId} is no longer active. That is your statement, not an observation: ${executionId === undefined ? "there was no execution to end" : "liveness is recorded as ended"}${
         overrode ? ", the duplicate guard for that exact operation is released as an override" : ""
       }${
         submission ? ", and the evidence you submitted is retryable with its text intact — Agent Sparring does not claim the engine recorded it" : ""

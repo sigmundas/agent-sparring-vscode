@@ -37,6 +37,8 @@ interface LivenessReport {
   source: RunnerLiveness["source"];
   turnActive: boolean;
   interrupted: boolean;
+  /** Where a requested interruption of this exact execution stands. */
+  stop?: RunnerLiveness["stop"];
   detail: string;
   execution?: ExecutionRecord;
 }
@@ -76,6 +78,7 @@ export async function run(): Promise<void> {
     ["gate", () => gateClickAssertions()],
     ["pushauth", () => pushAuthorizationAssertions()],
     ["prompt", () => promptInspectorAssertions()],
+    ["disclosure", () => disclosurePersistenceAssertions()],
     ["evidence", () => evidenceLaunchAssertions(reportedRepo, fixtureRoot)],
     ["advance", () => advancementAssertions(reportedRepo)],
     ["terminals", () => terminalReuseAssertions(report, reportedRepo)],
@@ -213,10 +216,39 @@ async function launchedRunnerAssertions(report: DiscoveryDiagnostic, reportedRep
   assert.notEqual(second.execution?.id, stopped.execution?.id);
   await waitFor(runId, (liveness) => liveness.turnActive, 10_000, "run 2 telemetry");
   await new Promise((resolve) => setTimeout(resolve, 1500));
-  assert.equal(await vscode.commands.executeCommand("agentSparring._test.stop", runId), true, "Stop reaches the hosting terminal");
+  // What the screen says while it is working, and what it offers.
+  const overview = async () => (await vscode.commands.executeCommand("agentSparring._test.overviewModel")) as ModelReport;
+  const working = await overview();
+  assert.equal(working.busyState?.label, "Working", "a runner observed alive reads Working");
+  assert.equal(working.busyState?.state, "running");
+  assert.equal(working.runner?.label, "Stop", "and Stop is offered beside it");
+  assert.equal(working.runner?.executionId, second.execution?.id, "bound to the execution on screen");
+  assert.equal(working.stageAction, undefined, "nothing that would start a second copy is offered");
+
+  // Stop names the exact execution it is aiming at, exactly as the rendered
+  // control does, and interrupts through that run's own terminal.
+  const target = second.execution?.id as string;
+  const requested = await vscode.commands.executeCommand<{ requested: boolean; via?: string }>("agentSparring._test.stop", runId, target);
+  assert.deepEqual(requested, { requested: true, via: "terminal" }, "Stop reaches the hosting terminal");
   const interrupted = await waitFor(runId, (liveness) => liveness.state === "stopped", 20_000, "Ctrl-C ends the execution");
   assert.equal(interrupted.interrupted, true);
   assert.equal(interrupted.turnActive, false);
+  // And only now — with that exact execution observed ending — is it Stopped.
+  assert.equal(interrupted.stop, "stopped", "a requested stop becomes Stopped only on the execution's own end");
+  assert.equal(interrupted.execution?.id, target, "and it is the execution Stop was aimed at");
+  // Stopping an execution that is no longer the live one changes nothing.
+  const stale = await vscode.commands.executeCommand<{ requested: boolean; reason?: string }>("agentSparring._test.stop", runId, target);
+  assert.equal(stale.requested, false, "a stale panel cannot interrupt anything");
+
+  // And what the screen says afterwards: stopped, with the same managed
+  // work offered again rather than a new one, and nothing left to stop.
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  const after = await overview();
+  assert.equal(after.status?.label, "Stopped — ready to resume");
+  assert.equal(after.runner, undefined, "there is nothing left to interrupt");
+  assert.equal(after.busyState, undefined, "and nothing claims it is still working");
+  assert.ok(after.stageAction, "the stage can be run again, because the guard was released by real evidence");
+  console.log(`integration: Stop → "${after.status?.label}", offering "${after.stageAction?.label}"`);
   console.log(`integration: Ctrl-C exit code reported as ${String(interrupted.execution?.exitCode)}`);
 }
 
@@ -274,6 +306,13 @@ interface ModelReport {
     note?: string;
     settings: { label: string; detail: string };
   };
+  /** The live-run pill: Working / Stop requested… / Run status unknown. */
+  busyState?: { label: string; detail: string; state: string };
+  /** The Stop control, present only when an exact operation can be interrupted. */
+  runner?: { alive: boolean; label: string; executionId: string; detail: string };
+  status?: { label: string; tone: string };
+  planAction?: { kind: string; label: string; primary: boolean };
+  unknownRunner?: { label: string; executionId: string; operationId?: string };
 }
 
 interface AgentConfigOutcome {
@@ -879,6 +918,134 @@ async function promptInspectorAssertions(): Promise<void> {
     assert.ok(copy, "and the copy button posted too");
     assert.deepEqual(copy, { type: "copyPrompt", role: "stage" });
     assert.ok(isCopyPromptMessage(copy), "which the host also accepts");
+  } finally {
+    panel.dispose();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------- what the person opened stays open across a rerender
+
+/**
+ * The reported bug, in a real Chromium webview: open "Show instructions"
+ * during a live run, and two or three seconds later the Overview rerenders
+ * and it closes again.
+ *
+ * The unit tests drive the shipped script against a DOM shim, which can
+ * show that the restore logic does what it says. Only this can show that it
+ * survives the thing that actually happens — the host assigning
+ * `webview.html`, which throws the whole document away and builds a new one
+ * in the same webview. What carries the state across that is the webview's
+ * own `setState` store, and whether *that* survives is a fact about VS Code
+ * rather than about this extension, so it is asserted where VS Code is
+ * real.
+ *
+ * Both halves matter and both are checked: the section the person opened
+ * comes back open, and a section they left closed comes back closed.
+ */
+async function disclosurePersistenceAssertions(): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "agent-sparring-disclosure-"));
+  const stage = "stage-7-disclosure";
+  const stages = path.join(root, ".sparring", "stages");
+  await fs.mkdir(path.join(stages, stage), { recursive: true });
+  await fs.writeFile(path.join(stages, stage, "state.json"), JSON.stringify({ status: "working", base_sha: null, candidate_sha: null, implementation_session_id: "impl", sparring_session_id: null }));
+
+  const brief = "## Stage brief\n\nImplement only this section.";
+  // Long enough that the renderer starts it collapsed, so the "left closed
+  // stays closed" half is about a real section rather than a contrivance.
+  const context = `## Project context\n\n${"Everything the agent should know. ".repeat(80)}`;
+  const text = `${brief}\n\n${context}\n`;
+  const capturedPrompts: CapturedPrompt[] = [
+    {
+      entry: {
+        seq: 1,
+        ts: new Date().toISOString(),
+        role: "stage",
+        stageId: stage,
+        turnKind: "original",
+        resumed: false,
+        expectedBranch: "feature/x",
+        file: "0001-stage-original.md",
+        chars: text.length,
+        sections: [
+          { heading: "Stage brief", origin: "file", source: `stages/${stage}/brief.md`, start: 0, end: brief.length },
+          { heading: "Project context", origin: "engine", start: brief.length + 2, end: text.length - 1 },
+        ],
+      },
+      text,
+    },
+  ];
+
+  const location = { sparringDir: path.join(root, ".sparring"), projectDir: root, repoRoot: root, workspaceFolder: root, folderName: path.basename(root) };
+  const selection = selectRun((await discoverRuns([location])).runs);
+  assert.ok(selection.selected, "the standalone stage is discovered");
+  const artifacts: OverviewArtifacts = { handoff: false, sparring: false, brief: false, plan: false, capturedPrompts };
+  const model = buildOverviewModel(selection, undefined, artifacts, Date.now());
+
+  const panel = vscode.window.createWebviewPanel("agentSparring.disclosureTest", "disclosure", { viewColumn: vscode.ViewColumn.Active, preserveFocus: true }, { enableScripts: true, localResourceRoots: [] });
+  try {
+    const reports: Record<string, unknown>[] = [];
+    const waitForProbe = (which: string) =>
+      new Promise<Record<string, unknown>>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`no ${which} probe arrived from the webview within 15s`)), 15_000);
+        const subscription = panel.webview.onDidReceiveMessage((message: Record<string, unknown>) => {
+          if (message?.["type"] === which) {
+            clearTimeout(timer);
+            subscription.dispose();
+            reports.push(message);
+            resolve(message);
+          }
+        });
+      });
+
+    /**
+     * The page, plus a probe. The shipped script calls `acquireVsCodeApi`,
+     * which may only be called once per document, so the probe borrows the
+     * handle the shipped script took.
+     */
+    const draw = (nonce: string, probe: string) => {
+      const shipped = `<script nonce="${nonce}">`;
+      const preamble = `<script nonce="${nonce}">var __api; var __acquire = acquireVsCodeApi; acquireVsCodeApi = function () { __api = __acquire(); return __api; };</script>`;
+      return renderOverviewHtml(model, nonce, panel.webview.cspSource).replace(shipped, `${preamble}${shipped}`).replace("</body>", `<script nonce="${nonce}">${probe}</script></body>`);
+    };
+
+    // First draw: open the actor card the way a person does, by clicking its
+    // summary, so the shipped `toggle` listener is what records it.
+    const openNonce = crypto.randomBytes(16).toString("base64");
+    const opening = waitForProbe("openedProbe");
+    panel.webview.html = draw(
+      openNonce,
+      `var card = document.querySelector('details.actor[data-disclose]');
+       var big = document.querySelector('details.promptsec:not([open])[data-disclose]');
+       card.querySelector('summary').click();
+       // A details element fires its toggle event asynchronously, and the
+       // shipped listener records the state from that event. Reporting in
+       // the same task as the click would be asking whether the state had
+       // been written before the browser had said it changed.
+       setTimeout(function () {
+         __api.postMessage({ type: 'openedProbe', cardOpen: card.open, cardKey: card.getAttribute('data-disclose'), bigOpen: big ? big.open : null, bigKey: big ? big.getAttribute('data-disclose') : null, state: __api.getState() });
+       }, 50);`,
+    );
+    const opened = await opening;
+    assert.equal(opened["cardOpen"], true, "the person opened Show instructions");
+    assert.equal(opened["bigOpen"], false, "and left the long section collapsed, as the renderer wrote it");
+
+    // The live run updates, so the host replaces the whole document. This is
+    // the exact line that caused the bug.
+    const redrawNonce = crypto.randomBytes(16).toString("base64");
+    const redrawn = waitForProbe("redrawnProbe");
+    panel.webview.html = draw(
+      redrawNonce,
+      `var card = document.querySelector('details.actor[data-disclose]');
+       var big = document.querySelector('details.promptsec[data-disclose="${String(opened["bigKey"])}"]');
+       __api.postMessage({ type: 'redrawnProbe', cardOpen: card.open, cardKey: card.getAttribute('data-disclose'), bigOpen: big ? big.open : null, state: __api.getState() });`,
+    );
+    const after = await redrawn;
+
+    console.log(`integration: disclosure state after open ${JSON.stringify(opened["state"])}, after redraw ${JSON.stringify(after["state"])}`);
+    assert.equal(after["cardKey"], opened["cardKey"], "the same section, under the same stable key");
+    assert.equal(after["cardOpen"], true, "Show instructions is still open after the rerender — the reported bug");
+    assert.equal(after["bigOpen"], false, "and a section the person never opened is still closed");
   } finally {
     panel.dispose();
     await fs.rm(root, { recursive: true, force: true });
@@ -2365,8 +2532,17 @@ async function closedTerminalAssertions(report: DiscoveryDiagnostic, reportedRep
   assert.equal(guardedAfter?.observationLost, true, "with the record saying that what was lost is the observation");
 
   // The way out is the person's, and it acts on the ids the panel carries.
-  const model = (await vscode.commands.executeCommand("agentSparring._test.overviewModel")) as { unknownRunner?: { executionId: string; operationId?: string } };
+  const model = (await vscode.commands.executeCommand("agentSparring._test.overviewModel")) as ModelReport;
   assert.ok(model.unknownRunner, "the Overview offers the explicit recovery where the person is");
+  // And the screen says the state and what it costs, before anything is
+  // clicked: the run may still be active, so a second copy is refused.
+  assert.equal(model.busyState?.label, "Run status unknown", "not Working, and not a failure");
+  assert.equal(model.busyState?.state, "unknown");
+  assert.match(model.busyState?.detail ?? "", /Run may still be active — starting another copy is blocked\./);
+  assert.equal(model.runner, undefined, "no Stop is offered against a process that can no longer be identified");
+  assert.equal(model.stageAction, undefined, "and nothing that would start a second copy");
+  assert.equal(model.planAction, undefined);
+  console.log(`integration: observation lost → "${model.busyState?.label}"; Stop withheld, a second copy withheld`);
   assert.equal(model.unknownRunner.executionId, lost.execution?.id, "naming the exact execution it was built from");
 
   // A stale pair — an execution id this run is not waiting on — must do

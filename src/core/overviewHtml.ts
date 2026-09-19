@@ -51,7 +51,6 @@ export type OverviewAction =
   | "startNextStage"
   | "continueAutomatically"
   | "openPlanRun"
-  | "stopRunner"
   | "openPlanSection"
   | "submitForReview"
   | "sendFeedbackForReview"
@@ -159,6 +158,30 @@ export function isOpenPromptSourceMessage(message: unknown): message is OpenProm
     return false;
   }
   return !source.split(/[\\/]/).some((part) => part === ".." || part === "");
+}
+
+/**
+ * A Stop click: interrupt one exact execution.
+ *
+ * It carries the execution id it was rendered with, and that is the whole
+ * point of its being its own message type rather than an action. An action
+ * says "the person pressed Stop" and the host would then have to work out
+ * *what* to stop — which, by the time the click arrives, may be a runner
+ * that started after this page was drawn. A panel can only ever ask for
+ * the runner it was showing, and the host refuses when that is no longer
+ * the one the run is waiting on.
+ */
+export interface StopMessage {
+  type: "stop";
+  executionId: string;
+}
+
+/** An execution id as this renderer writes it: `<epoch ms>-<counter>`. */
+const EXECUTION_ID = /^[0-9]{1,20}-[0-9]{1,10}$/;
+
+export function isStopMessage(message: unknown): message is StopMessage {
+  const record = asRecord(message);
+  return record !== undefined && record["type"] === "stop" && typeof record["executionId"] === "string" && EXECUTION_ID.test(record["executionId"] as string);
 }
 
 export interface CopyPromptMessage {
@@ -285,7 +308,6 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "startNextStage",
   "continueAutomatically",
   "openPlanRun",
-  "stopRunner",
   "openPlanSection",
   "submitForReview",
   "sendFeedbackForReview",
@@ -297,6 +319,44 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
 ];
 
 const ACTIONS: ReadonlySet<string> = new Set<string>(OVERVIEW_ACTIONS);
+
+/**
+ * The stable identity a disclosure's open/closed state is remembered
+ * under: what the section belongs to, never where it sits.
+ *
+ * `scope` is the stage the page is drawn for — the strongest identity the
+ * model carries, and the one that changes when the page starts describing
+ * different work. `what` names the section within it: the actor's role
+ * plus the kind of section, so the stage agent's instructions and the
+ * sparrer's are two keys and the run's technical details is a third.
+ *
+ * Position is deliberately not part of it. Keyed by index, the third
+ * prompt section of one stage would inherit the third of the next, and a
+ * new actor's card would open because the last one's was.
+ */
+function disclose(scope: string, ...what: (string | undefined)[]): string {
+  return ` data-disclose="${escapeHtml([scope, ...what.filter((part) => part !== undefined && part !== "")].join("/"))}"`;
+}
+
+/**
+ * What identifies the work this page is about, for disclosure keys.
+ *
+ * The repository as well as the stage, because a stage id is unique within
+ * a project and not across them: the same plan run in two worktrees has the
+ * same `stage-3d-…` on both sides, and keying on the stage alone would let
+ * one of them open the other's sections.
+ *
+ * The repository is named the way the page already names it — the folder,
+ * not its path — because this document deliberately carries no filesystem
+ * paths. That is weaker than the full-path identity attribution uses
+ * (operationRegistry.ts), and deliberately so: what is at stake here is
+ * whether a section is expanded, so two identically-named folders showing
+ * the same stage id sharing that is not worth a path in the markup.
+ */
+function discloseScope(model: OverviewModel): string {
+  const repository = model.repositoryContext?.repository ?? "";
+  return `${repository}:${model.stageId ?? model.title}`;
+}
 
 export function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch] as string);
@@ -370,6 +430,8 @@ ${model.agentConfig ? renderAgentConfig(model.agentConfig) : ""}
 <div class="actions">${button("showLog", "Show log")}</div>`;
   }
 
+  // One identity for every disclosure on this page (see `disclose`).
+  const scope = discloseScope(model);
   const parts: string[] = [];
   parts.push(renderRepositoryContext(model));
   parts.push(renderHeader(model));
@@ -383,9 +445,9 @@ ${model.agentConfig ? renderAgentConfig(model.agentConfig) : ""}
     parts.push(`<p class="autopush" title="${escapeHtml(model.autoPushEnabled.detail)}">${icon("check", "good")}${escapeHtml(model.autoPushEnabled.label)}</p>`);
   }
   if (model.pushAuthorization) {
-    parts.push(renderPushAuthorization(model.pushAuthorization));
+    parts.push(renderPushAuthorization(model.pushAuthorization, scope));
   } else if (model.actionRequired) {
-    parts.push(renderActionRequired(model, model.actionRequired));
+    parts.push(renderActionRequired(model, model.actionRequired, scope));
   } else if (model.banner) {
     parts.push(`<div class="banner ${model.banner.kind}">${escapeHtml(model.banner.text)}</div>`);
   }
@@ -396,7 +458,7 @@ ${model.agentConfig ? renderAgentConfig(model.agentConfig) : ""}
   }
   parts.push(renderStageCard(model));
   if (model.stageAgent && model.sparrer) {
-    parts.push(`<section class="actors">${renderActor(model.stageAgent)}${renderActor(model.sparrer)}</section>`);
+    parts.push(`<section class="actors">${renderActor(model.stageAgent, scope)}${renderActor(model.sparrer, scope)}</section>`);
   }
   if (model.agentConfig) {
     parts.push(renderAgentConfig(model.agentConfig));
@@ -528,12 +590,12 @@ function renderBranchGuard(guard: BranchGuard): string {
  * reachability — stay out of the normal layer entirely and live in the
  * details disclosure, where they belong.
  */
-function renderPushAuthorization(panel: PushAuthorization): string {
+function renderPushAuthorization(panel: PushAuthorization, scope: string): string {
   const toggle = `<label class="toggle" title="${escapeHtml(panel.autoPush.detail)}"><input type="checkbox" data-autopush="run"${panel.autoPush.checked ? " checked" : ""}> ${escapeHtml(panel.autoPush.label)}</label>`;
   // The same demoted layer, the same markup, as every other panel's: the
   // engine's vocabulary is one disclosure away, never deleted.
   const rows = panel.technical.map((row) => `<dt>${escapeHtml(row.label)}</dt><dd>${escapeHtml(row.value)}</dd>`).join("");
-  const details = panel.technical.length > 0 ? `<details class="tech"><summary>Show technical details</summary><dl class="techlist">${rows}</dl></details>` : "";
+  const details = panel.technical.length > 0 ? `<details class="tech"${disclose(scope, "push", "technical")}><summary>Show technical details</summary><dl class="techlist">${rows}</dl></details>` : "";
   return `<section class="card action push">
 <div class="actionhead"><h2>${icon("warn", "needs_you")}${escapeHtml(panel.headline)}</h2>
 <p class="summary">${escapeHtml(panel.text)}</p>
@@ -575,7 +637,7 @@ export const PUSH_HELPER =
  * sections and its explanatory prose are gone from the main flow all the
  * same.
  */
-function renderActionRequired(model: OverviewModel, panel: ActionRequired): string {
+function renderActionRequired(model: OverviewModel, panel: ActionRequired, scope: string): string {
   const gate = panel.gateTitle !== undefined;
   const summary = panel.subtitle ? `<p class="summary">${escapeHtml(panel.subtitle)}</p>` : panel.summary ? `<p class="summary">${escapeHtml(panel.summary)}</p>` : "";
   // With a structured gate the reviewer's own note is a restatement of the
@@ -584,7 +646,7 @@ function renderActionRequired(model: OverviewModel, panel: ActionRequired): stri
   const note = !gate && panel.reviewerNote ? `<p class="reason"><span class="tag reviewer">Reviewer note</span> ${escapeHtml(panel.reviewerNote)}</p>` : "";
   const failure = panel.reviewFailure ? `<p class="failure">${icon("warn", "escalate")}${escapeHtml(panel.reviewFailure)}</p>` : "";
   const submission = renderSubmissionState(panel);
-  const body = gate ? renderGateChecks(panel) : renderDerivedChecks(panel);
+  const body = gate ? renderGateChecks(panel, scope) : renderDerivedChecks(panel);
   const buttons: string[] = [];
   buttons.push(button("submitForReview", panel.submit.label, panel.submit.enabled, panel.submit.detail, "primary"));
   // The second submission path, beside the first: the two are alternatives,
@@ -620,15 +682,15 @@ function renderActionRequired(model: OverviewModel, panel: ActionRequired): stri
   // one disclosure away, never beside the button that answers the review.
   if (panel.resume) {
     buttons.push(
-      `<details class="more"><summary title="Other things that can be run from here">…</summary><div class="actions">${button(panel.resume.action, `${panel.resume.label} (implementation)`, true, panel.resume.detail, "quiet")}</div></details>`,
+      `<details class="more"${disclose(scope, "other-actions")}><summary title="Other things that can be run from here">…</summary><div class="actions">${button(panel.resume.action, `${panel.resume.label} (implementation)`, true, panel.resume.detail, "quiet")}</div></details>`,
     );
   }
   return `<section class="card action ${panel.kind}${panel.ready ? " ready" : ""}${gate ? " gate" : ""}">
 <div class="actionhead"><h2>${icon(panel.ready && panel.kind === "needs_you" ? "check" : "warn", panel.ready && panel.kind === "needs_you" ? "ready" : panel.kind)}${escapeHtml(panel.headline)}</h2>${summary}${note}${failure}</div>
 ${submission}
 ${body}
-${renderFeedbackField(panel)}
-${renderTechnical(panel)}
+${renderFeedbackField(panel, scope)}
+${renderTechnical(panel, scope)}
 <div class="actions">${buttons.join("")}</div>
 </section>`;
 }
@@ -642,11 +704,11 @@ ${renderTechnical(panel)}
  * it exists for — the crash on the way to the first check — arrives before
  * the person has any reason to go looking for a place to put it.
  */
-function renderFeedbackField(panel: ActionRequired): string {
+function renderFeedbackField(panel: ActionRequired, scope: string): string {
   const draft = panel.feedback.draft ?? "";
   const previous =
     panel.feedback.submitted.length > 0
-      ? `<details class="prev"><summary>Feedback already sent (${panel.feedback.submitted.length})</summary>${panel.feedback.submitted.map((entry) => `<pre class="sent">${escapeHtml(entry)}</pre>`).join("")}</details>`
+      ? `<details class="prev"${disclose(scope, "feedback-sent")}><summary>Feedback already sent (${panel.feedback.submitted.length})</summary>${panel.feedback.submitted.map((entry) => `<pre class="sent">${escapeHtml(entry)}</pre>`).join("")}</details>`
       : "";
   return `<div class="feedback">
 <h4>${escapeHtml(FEEDBACK_HEADING)}</h4>
@@ -710,7 +772,7 @@ ${error}
  * heading hierarchy, no counts, no provenance prose — a single check is a
  * single thing to do, and the panel already said that is what this is.
  */
-function renderGateChecks(panel: ActionRequired): string {
+function renderGateChecks(panel: ActionRequired, scope: string): string {
   const total = panel.recorded.length + panel.required.length;
   const title = panel.gateTitle ? `<p class="gatetitle">${escapeHtml(panel.gateTitle)}</p>` : "";
   // Two or more checks: say how far along the evidence is. One check has no
@@ -720,15 +782,15 @@ function renderGateChecks(panel: ActionRequired): string {
     panel.required.length > 0
       ? `<ol class="checklist gate">${panel.required.map((item, index) => renderTask(item, index + 1, total)).join("")}</ol>`
       : `<p class="muted">Every check the reviewer asked for has a recorded result.</p>`;
-  return `<div class="checks">${title}${progress}${required}${renderPreviousEvidence(panel)}</div>`;
+  return `<div class="checks">${title}${progress}${required}${renderPreviousEvidence(panel, scope)}</div>`;
 }
 
 /** Evidence already in notes.md, compact and collapsed; absent when there is none. */
-function renderPreviousEvidence(panel: ActionRequired): string {
+function renderPreviousEvidence(panel: ActionRequired, scope: string): string {
   if (panel.recorded.length === 0) {
     return "";
   }
-  return `<details class="prev"><summary>Previous evidence (${panel.recorded.length})</summary><ol class="checklist recorded">${panel.recorded.map(renderRecorded).join("")}</ol></details>`;
+  return `<details class="prev"${disclose(scope, "previous-evidence")}><summary>Previous evidence (${panel.recorded.length})</summary><ol class="checklist recorded">${panel.recorded.map(renderRecorded).join("")}</ol></details>`;
 }
 
 /**
@@ -757,12 +819,12 @@ function renderDerivedChecks(panel: ActionRequired): string {
 }
 
 /** The demoted layer. Collapsed, always available, never in the way. */
-function renderTechnical(panel: ActionRequired): string {
+function renderTechnical(panel: ActionRequired, scope: string): string {
   if (panel.technical.length === 0) {
     return "";
   }
   const rows = panel.technical.map((row) => `<dt>${escapeHtml(row.label)}</dt><dd>${escapeHtml(row.value)}</dd>`).join("");
-  return `<details class="tech"><summary>Show technical details</summary><dl class="techlist">${rows}</dl></details>`;
+  return `<details class="tech"${disclose(scope, "technical")}><summary>Show technical details</summary><dl class="techlist">${rows}</dl></details>`;
 }
 
 /**
@@ -943,7 +1005,13 @@ function renderStageCard(model: OverviewModel): string {
     buttons.push(`<span class="${cls}" title="${escapeHtml(model.busyState.detail)}">${icon(model.busyState.state === "running" ? "dot" : "warn", "dot")}${escapeHtml(model.busyState.label)}</span>`);
   }
   if (model.runner?.alive) {
-    buttons.push(button("stopRunner", model.runner.label, true, "Send Ctrl-C to the terminal running this stage", "danger"));
+    // The execution id travels with the control and comes back on the
+    // click, so this button can only ever ask for the runner it was drawn
+    // for. It is `quiet danger`, not the full danger treatment: stopping a
+    // run interrupts it, and deletes nothing.
+    buttons.push(
+      `<button class="quiet danger" data-stop="${escapeHtml(model.runner.executionId)}" title="${escapeHtml(model.runner.detail)}">${escapeHtml(model.runner.label)}</button>`,
+    );
   }
   if (model.unknownRunner) {
     // The only way out of an unknown runner, and it is here — next to the
@@ -1158,7 +1226,7 @@ function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
   return `<div class="block whatsnext"><h3>${icon("arrow", "accent")}What's next</h3>${heading}${summary}${text}${hints}<div class="actions">${buttons.join("")}</div></div>${current}`;
 }
 
-function renderActor(card: ActorCard): string {
+function renderActor(card: ActorCard, scope: string): string {
   const busy = card.activity === "Working" || card.activity === "Sparring";
   const duration = card.duration ? ` for ${escapeHtml(card.duration)}` : "";
   const quiet = card.quietFor ? ` <span class="muted">· no meaningful activity for ${escapeHtml(card.quietFor)}</span>` : "";
@@ -1183,9 +1251,9 @@ function renderActor(card: ActorCard): string {
     return `<div class="card actor">${identity}</div>`;
   }
   const role = card.role === "Stage agent" ? "stage" : "sparrer";
-  return `<details class="card actor" data-role="${role}">
+  return `<details class="card actor" data-role="${role}"${disclose(scope, role, "instructions")}>
 <summary>${identity}<span class="showinstr">Show instructions</span></summary>
-${renderInstructions(card.prompt, role)}
+${renderInstructions(card.prompt, role, scope)}
 </details>`;
 }
 
@@ -1202,7 +1270,7 @@ ${renderInstructions(card.prompt, role)}
  * each one came from, both of which the engine recorded, and escaping first
  * is what keeps arbitrary plan prose from reaching this webview as markup.
  */
-function renderInstructions(prompt: PromptView, role: string): string {
+function renderInstructions(prompt: PromptView, role: string, scope: string): string {
   const recency = prompt.live
     ? `<span class="turnchip live">This turn</span>`
     : `<span class="turnchip">Last turn</span>`;
@@ -1211,9 +1279,9 @@ function renderInstructions(prompt: PromptView, role: string): string {
 
   const body = prompt.sectionsUnavailable
     ? `<p class="note">${escapeHtml(prompt.sectionsUnavailable)}</p>`
-    : prompt.sections.map(renderPromptSection).join("");
+    : prompt.sections.map((section) => renderPromptSection(section, role, scope)).join("");
 
-  const exact = `<details class="promptsec exact"><summary><span class="sechead">View exact generated prompt</span><span class="secsrc muted">${prompt.exact.length.toLocaleString("en-US")} characters, as sent</span></summary><pre class="prompttext">${escapeHtml(prompt.exact)}</pre></details>`;
+  const exact = `<details class="promptsec exact"${disclose(scope, role, "prompt", "exact")}><summary><span class="sechead">View exact generated prompt</span><span class="secsrc muted">${prompt.exact.length.toLocaleString("en-US")} characters, as sent</span></summary><pre class="prompttext">${escapeHtml(prompt.exact)}</pre></details>`;
   const copy = `<div class="actions"><button class="quiet" data-copyprompt="${role}">Copy prompt</button></div>`;
   return `<div class="instructions">${head}${body}${exact}${copy}</div>`;
 }
@@ -1226,13 +1294,15 @@ function renderInstructions(prompt: PromptView, role: string): string {
  * the plan. Large sections start collapsed so that PROJECT.md, which is
  * routinely the longest thing in the prompt, does not bury the rest.
  */
-function renderPromptSection(section: PromptViewSection): string {
+function renderPromptSection(section: PromptViewSection, role: string, scope: string): string {
   const open = section.text.length <= PROMPT_SECTION_OPEN_MAX ? " open" : "";
   const source = section.source
     ? `<button class="linkish" data-openprompt="${escapeHtml(section.source)}" title="${escapeHtml(section.source)}">${escapeHtml(basename(section.source))}</button>`
     : `<span class="secsrc muted">Agent Sparring</span>`;
   const heading = section.heading || "(unnamed section)";
-  return `<details class="promptsec"${open}><summary><span class="sechead">${escapeHtml(heading)}</span>${source}</summary><pre class="prompttext">${escapeHtml(section.text)}</pre></details>`;
+  // Keyed by the section's own heading, so a section that appears in one
+  // turn and not the next cannot hand its state to a different section.
+  return `<details class="promptsec"${open}${disclose(scope, role, "prompt", heading)}><summary><span class="sechead">${escapeHtml(heading)}</span>${source}</summary><pre class="prompttext">${escapeHtml(section.text)}</pre></details>`;
 }
 
 /** Sections at or below this many characters start expanded. */
@@ -1709,10 +1779,112 @@ button.quiet { background: transparent; color: var(--vscode-descriptionForegroun
 }
 `;
 
+/**
+ * Everything the page needs to put itself back the way the person left it
+ * after the host replaces the document.
+ *
+ * The host rerenders by assigning `webview.html`, which is a fresh
+ * document: a `<details>` the person opened closes, and the scroll
+ * position goes back to the top. During a live run that happens every few
+ * seconds, so "Show instructions" could not be read at all.
+ *
+ * This is the smallest thing that fixes the class of problem rather than
+ * one instance of it. The webview's own `setState` survives a document
+ * replacement (and a hide/restore) and never reaches the host or the
+ * engine, which is exactly right: whether a section is open is
+ * presentation, and Agent Sparring's recorded state has no business
+ * knowing about it. Nothing is added to the host, no message crosses the
+ * wire, and there is no framework.
+ *
+ * Two rules make it correct rather than merely sticky:
+ *
+ *  - a disclosure is keyed by what it *is* — the run, the stage, the actor
+ *    and which section — written into the markup as `data-disclose`, never
+ *    by its position. Keying by position is how the third section of one
+ *    stage inherits the third section of the next one, and how a new
+ *    actor's card opens because the previous actor's was open;
+ *  - the store is bounded and pruned to what the page being drawn actually
+ *    contains, so a long session cannot accumulate the keys of every stage
+ *    it has ever shown.
+ *
+ * A key that is not in the store is left exactly as the renderer wrote it,
+ * so a section the renderer deliberately starts closed (a large prompt
+ * section) stays closed until somebody opens it.
+ */
+const DISCLOSURE_SCRIPT = `
+  // Restored before the first paint: this script is the last thing in the
+  // body, so the elements exist, and the page has not yet been shown.
+  var STORE = 'disclosures';
+  function state() {
+    try { return vscode.getState() || {}; } catch (error) { return {}; }
+  }
+  function remember(next) {
+    try { vscode.setState(next); } catch (error) { /* a webview with no state store still works */ }
+  }
+  function disclosures() {
+    var open = state()[STORE];
+    return open && typeof open === 'object' ? open : {};
+  }
+  function restore() {
+    var open = disclosures();
+    var kept = {};
+    var nodes = document.querySelectorAll('details[data-disclose]');
+    for (var i = 0; i < nodes.length; i++) {
+      var key = nodes[i].getAttribute('data-disclose');
+      if (Object.prototype.hasOwnProperty.call(open, key)) {
+        nodes[i].open = open[key] === true;
+        // Pruning to what this document has is what bounds the store: a
+        // disclosure belonging to a stage that is no longer on screen is
+        // dropped rather than kept for ever.
+        kept[key] = open[key];
+      }
+    }
+    var scrolled = state().scroll;
+    if (typeof scrolled === 'number' && scrolled > 0) {
+      window.scrollTo(0, scrolled);
+    }
+    var next = state();
+    next[STORE] = kept;
+    remember(next);
+  }
+  document.addEventListener('toggle', function (event) {
+    var node = event.target;
+    if (!node || !node.getAttribute || !node.hasAttribute('data-disclose')) { return; }
+    var next = state();
+    var open = next[STORE] && typeof next[STORE] === 'object' ? next[STORE] : {};
+    open[node.getAttribute('data-disclose')] = node.open === true;
+    next[STORE] = open;
+    remember(next);
+  }, true);
+  // Where the person had scrolled to, kept cheaply: the value is read back
+  // only when a fresh document is built, so a throttle of a frame is
+  // plenty and a scroll never costs a write per event.
+  var scrollTimer = null;
+  window.addEventListener('scroll', function () {
+    if (scrollTimer !== null) { return; }
+    scrollTimer = setTimeout(function () {
+      scrollTimer = null;
+      var next = state();
+      next.scroll = window.scrollY;
+      remember(next);
+    }, 100);
+  });
+  restore();
+`;
+
 const SCRIPT = `
 (function () {
   var vscode = acquireVsCodeApi();
   document.addEventListener('click', function (event) {
+    var element0 = event.target instanceof Element ? event.target : null;
+    var stop = element0 ? element0.closest('button[data-stop]') : null;
+    if (stop && !stop.disabled) {
+      // The execution this page was drawn for, carried back verbatim. The
+      // host refuses it if that is no longer the runner this run is
+      // waiting on, so a page left open cannot interrupt a newer one.
+      vscode.postMessage({ type: 'stop', executionId: stop.getAttribute('data-stop') });
+      return;
+    }
     var element = event.target instanceof Element ? event.target : null;
     var choice = element ? element.closest('button[data-check][data-outcome]') : null;
     if (choice && !choice.disabled) {
@@ -1833,5 +2005,6 @@ const SCRIPT = `
     clearTimeout(timers[timerKey(area)]);
     save(area);
   });
+${DISCLOSURE_SCRIPT}
 })();
 `;

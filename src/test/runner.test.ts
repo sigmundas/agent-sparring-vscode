@@ -166,23 +166,26 @@ describe("runner lifecycle presentation", () => {
   const running = (runId: string, startedAtMs: number): ExecutionRecord => ({ id: "e1", runId, kind: "run-loop", source: "launched", state: "running", startedAtMs });
   const ended = (runId: string, startedAtMs: number, endedAtMs: number, exitCode?: number): ExecutionRecord => ({ id: "e1", runId, kind: "run-loop", source: "launched", state: "ended", startedAtMs, endedAtMs, exitCode });
 
-  it("an observed-alive runner: Working for Xs, exact Running, Stop instead of Run", async () => {
+  it("an observed-alive runner: Working for Xs, and a Stop bound to that exact execution", async () => {
     const ws = await Workspace.create();
     await ws.writeStage("s", { status: "working" });
     const selection = selectRun((await discoverRuns([ws.location])).runs);
-    const model = buildOverviewModel(selection, busyLive(), ALL, T0 + 60_000, running(selection.selected!.id, T0 - 1000));
+    // The stop target names the exact execution, as the tracker resolves it.
+    const artifacts = { ...ALL, stopTarget: { executionId: "e1", via: "terminal" as const } };
+    const model = buildOverviewModel(selection, busyLive(), artifacts, T0 + 60_000, running(selection.selected!.id, T0 - 1000));
     assert.equal(model.stageAgent?.activity, "Working");
     assert.equal(model.stageAgent?.uncertain, false);
     assert.equal(model.activity?.kind, "active");
     assert.equal(model.activity?.text, "Working for 59s · Claude");
     assert.equal(model.stageAction, undefined);
-    assert.deepEqual(model.runner, { alive: true, label: "Stop (Ctrl-C)" });
-    assert.equal(model.busyState?.label, "Running");
+    assert.equal(model.runner?.label, "Stop");
+    assert.equal(model.runner?.executionId, "e1", "the control carries the execution it was drawn for");
+    assert.equal(model.busyState?.label, "Working");
     assert.equal(model.busyState?.state, "running");
     assert.match(model.busyState?.detail ?? "", /exact/);
     const html = renderOverviewHtml(model, "n", "c");
-    assert.match(html, /class="danger" data-action="stopRunner"/);
-    assert.match(html, /<span class="busy" title="[^"]*"><svg[^>]*>.*?<\/svg>Running<\/span>/);
+    assert.match(html, /class="quiet danger" data-stop="e1"/);
+    assert.match(html, /<span class="busy" title="[^"]*"><svg[^>]*>.*?<\/svg>Working<\/span>/);
     assert.ok(!html.includes('data-action="runStage"'));
     assert.match(html, /Claude<\/span> working for <span class="dur">59s<\/span>/);
   });
@@ -198,7 +201,7 @@ describe("runner lifecycle presentation", () => {
     assert.equal(model.stageAgent?.duration, undefined);
     assert.equal(model.sparrer?.activity, "Waiting");
     assert.deepEqual(model.activity, { kind: "stopped", text: "Stopped · last turn interrupted" });
-    assert.deepEqual(model.runner, { alive: false, label: "Runner stopped" });
+    assert.equal(model.runner, undefined, "an ended runner has nothing to interrupt");
     assert.equal(model.busyState, undefined);
     assert.equal(model.stageAction?.label, "Resume stage", "the loop can be resumed right away");
     assert.equal(model.stageStatus, "Stopped");

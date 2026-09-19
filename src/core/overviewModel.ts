@@ -167,6 +167,25 @@ export const HISTORY_MAX = 4;
  */
 export const UNKNOWN_RUNNER_EXPLANATION = "Agent Sparring cannot determine whether the previous runner is still active. Check it before allowing another attempt.";
 
+/**
+ * What a run whose fate cannot be established says, and what it says once a
+ * stop has been asked for and not answered.
+ *
+ * Both name the consequence rather than the internals, because the
+ * consequence is the only part a person has to act on: the run may still be
+ * doing work, so Agent Sparring will not start a second copy of it. Neither
+ * says or implies that anything failed.
+ */
+const RUN_UNKNOWN_DETAIL = "Run may still be active — starting another copy is blocked.";
+const STOP_UNPROVEN_DETAIL = "The interrupt was sent, but nothing has proved that runner ended. Run may still be active — starting another copy is blocked.";
+const STOP_REQUESTED_DETAIL = "An interrupt was sent to this runner. It is still reported as running; this will say Stopped once it has actually ended.";
+
+/** What Stop would do, by the target it would do it to. */
+const STOP_DETAIL: Readonly<Record<"terminal" | "process", string>> = {
+  terminal: "Interrupt this run the way Ctrl-C in its terminal would. The engine records its state as it goes, so nothing is reset and the run can be resumed.",
+  process: "Interrupt exactly the process running this run, after re-checking that it is still that process. The engine records its state as it goes, so nothing is reset and the run can be resumed.",
+};
+
 /** A Markdown plan the user associated with a standalone stage in VS Code (workspace state only). */
 export interface AssociatedPlan {
   path: string;
@@ -266,6 +285,26 @@ export interface OverviewArtifacts {
    * when the click arrives.
    */
   guardedOperationId?: string;
+  /**
+   * Whether this run's duplicate guard is one this window cannot account
+   * for by itself: a command a shell was given and never seen to start, an
+   * operation from before a reload, or one whose terminal is gone. That is
+   * the registry's own `outstanding` question (operationRegistry.ts), and
+   * it is exactly the condition under which starting the run again would
+   * risk doing the same engine operation twice.
+   *
+   * The Overview reads it so the refusal is on screen *before* the click.
+   * Without it the panel offered Run/Resume, the registry refused the
+   * launch, and the person learned about the guard from an error dialog.
+   */
+  guardOutstanding?: boolean;
+  /**
+   * The exact execution a Stop would interrupt, and how it would be
+   * reached, as the tracker resolved it when this panel was built. Absent
+   * whenever there is no target that is positively this operation, which
+   * is what keeps the button off the screen rather than letting it guess.
+   */
+  stopTarget?: { executionId: string; via: "terminal" | "process" };
   /**
    * What the engine says the two roles would run with, from
    * `sparring show-config --json` (see core/effectiveConfig.ts). Supplied by
@@ -656,8 +695,12 @@ export interface OverviewModel {
   followPlan?: { runId: string; label: string; text: string; detail: string };
   /** An Accept stage operation from this window is in flight. */
   accepting?: { label: string; detail: string };
-  /** A runner observed for this run: alive (Stop offered) or stopped. */
-  runner?: { alive: boolean; label: string };
+  /**
+   * The Stop control, present only when there is an exact operation to
+   * interrupt. It carries the execution id it was rendered for, so the
+   * click acts on the runner the person was looking at and on no other.
+   */
+  runner?: { alive: boolean; label: string; executionId: string; detail: string };
   /**
    * The way out of a runner whose fate nothing could establish.
    *
@@ -675,7 +718,7 @@ export interface OverviewModel {
    * so a panel left open while a newer run starts can only ever settle what it
    * was showing (`operationId` absent: there was no guard to release).
    */
-  unknownRunner?: { label: string; detail: string; executionId: string; operationId?: string };
+  unknownRunner?: { label: string; detail: string; executionId?: string; operationId?: string };
   /**
    * Non-action state shown instead of Run/Resume: `Running` only when a
    * process observation backs it; `Run status unknown` when telemetry alone
@@ -853,28 +896,70 @@ export function buildOverviewModel(
   } else if (liveness.stale) {
     model.activity = { kind: "stale", text: `${model.activity?.text ?? "Working"} · no meaningful activity for ${formatAge(nowMs - Date.parse(live?.lastMeaningful?.ts ?? live?.lastEventTs ?? ""))}` };
   }
-  if (liveness.state === "running") {
-    model.runner = { alive: true, label: "Stop (Ctrl-C)" };
-  } else if (liveness.interrupted) {
-    model.runner = { alive: false, label: "Runner stopped" };
+  // Stop is offered only for a target that is positively this run's live
+  // execution, and only for the execution the panel is actually showing:
+  // the id is carried into the control and back on the click, so a panel
+  // left open while a newer runner started cannot interrupt that one.
+  // Asking twice is not offered either — the first request stands until
+  // this exact execution is observed ending.
+  if (liveness.state === "running" && liveness.stop === undefined && artifacts.stopTarget && artifacts.stopTarget.executionId === liveness.execution?.id) {
+    model.runner = { alive: true, label: "Stop", executionId: artifacts.stopTarget.executionId, detail: STOP_DETAIL[artifacts.stopTarget.via] };
   }
-  if (liveness.execution && liveness.execution.state === "unknown") {
+  const loopEligible = run.kind === "plan" || (stage.state?.status !== "accepted" && stage.state?.status !== "frozen");
+  // The exact question, asked once: is starting this run again a risk of
+  // doing the same engine operation twice? The one authority on that is the
+  // registry's `outstanding` (operationRegistry.ts), read when this panel
+  // was built. It is true for a command a shell was given and never seen to
+  // start, for anything restored from before a reload, and for anything
+  // whose terminal is gone — every case in which nobody here can account
+  // for what may be running.
+  const guarded = artifacts.guardOutstanding === true;
+  // The way out, wherever the run is being held: an execution whose fate
+  // could not be established, a duplicate guard this window cannot account
+  // for, or both at once.
+  //
+  // It is offered for the guard *on its own* as well, which it was not
+  // before. Nothing withheld an action for a guard alone back then — the
+  // person pressed Run, the registry refused the launch, and the refusal
+  // dialog carried the override. Now the screen withholds the action, so
+  // the screen has to carry the way out too, or an unaccountable guard
+  // would be a dead end with nothing on it to press.
+  if ((liveness.execution && liveness.execution.state === "unknown") || guarded) {
+    const execution = liveness.execution?.state === "unknown" ? liveness.execution : undefined;
     model.unknownRunner = {
       label: "I checked — runner is no longer active",
-      detail: `${UNKNOWN_RUNNER_EXPLANATION} Confirming records your statement: it releases this run's actions and lets you send your evidence again. It does not claim the engine did, or did not, do anything.`,
-      executionId: liveness.execution.id,
+      detail: `${UNKNOWN_RUNNER_EXPLANATION} Confirming records your statement: it releases this run's actions${execution ? " and lets you send your evidence again" : ""}. It does not claim the engine did, or did not, do anything.`,
+      // Absent when there is no execution to end: then the only thing the
+      // confirmation settles is the guard, and it says so rather than
+      // naming an execution it would not be about.
+      executionId: execution?.id,
       operationId: artifacts.guardedOperationId,
     };
   }
-  const loopEligible = run.kind === "plan" || (stage.state?.status !== "accepted" && stage.state?.status !== "frozen");
   if (artifacts.accepting) {
     model.accepting = { label: "Accepting stage…", detail: "sparring freeze-candidate, then sparring accept-candidate, are running in a terminal of this window." };
   } else if (!halted && loopEligible && liveness.state === "running") {
-    model.busyState = { label: "Running", detail: liveness.detail, state: "running" };
-  } else if (!halted && loopEligible && liveness.turnActive) {
-    // Telemetry alone: no second loop from the button, and no certain claim either.
-    model.busyState = { label: "Run status unknown", detail: liveness.detail, state: "unknown" };
-  } else if (liveness.state !== "running" && !branchGuard) {
+    // "Working" rests on positive current evidence that *this* execution is
+    // alive: its shell execution has not ended, its dedicated terminal's
+    // process has not exited, or its bound pid was found under it. Never on
+    // the plan record saying `running`, on activity.jsonl having changed, or
+    // on the launch having succeeded.
+    model.busyState =
+      liveness.stop === "requested"
+        ? { label: "Stop requested…", detail: `${STOP_REQUESTED_DETAIL} ${liveness.detail}`, state: "running" }
+        : { label: "Working", detail: liveness.detail, state: "running" };
+  } else if (!halted && loopEligible && (liveness.turnActive || guarded)) {
+    // Recorded as active, and neither alive nor ended can be established.
+    // Two ways in, and they are said differently: the person asked for this
+    // to stop and the answer never came, or nothing was asked and the run
+    // simply cannot be accounted for. Both keep the guard, and the sentence
+    // says so rather than implying a failure.
+    model.busyState = {
+      label: liveness.stop === "requested" ? "Stop requested · status unknown" : "Run status unknown",
+      detail: `${liveness.stop === "requested" ? STOP_UNPROVEN_DETAIL : RUN_UNKNOWN_DETAIL} ${liveness.detail}`,
+      state: "unknown",
+    };
+  } else if (liveness.state !== "running" && !guarded && !branchGuard) {
     // On the wrong branch nothing is offered: every loop command passes
     // --expected-branch and the engine's own guard would refuse the run.
     if (run.kind === "stage") {
@@ -1521,10 +1606,13 @@ function blockedDetail(model: OverviewModel): string {
   if (model.unknownRunner) {
     return `${UNKNOWN_RUNNER_EXPLANATION} Confirm it with "${model.unknownRunner.label}" above and this is offered again, with everything you entered still here.`;
   }
+  if (model.busyState?.label === "Stop requested…") {
+    return "You asked this runner to stop and it is still reported as running; this is offered again once it has actually ended.";
+  }
   if (model.runner?.alive === true || model.busyState?.state === "running") {
     return "A runner is alive for this run; wait for it to finish.";
   }
-  return "Agent Sparring cannot determine whether the previous runner is still active. Check it before allowing another attempt.";
+  return `${UNKNOWN_RUNNER_EXPLANATION} ${RUN_UNKNOWN_DETAIL}`;
 }
 
 // ---------------------------------------------------------------- pieces
@@ -1547,6 +1635,13 @@ function isFreshStage(run: RunSnapshot, stage: StageSnapshot, presentation: Stag
 }
 
 function runStatus(run: RunSnapshot, presentation: StagePresentation, liveness: RunnerLiveness): RunStatus {
+  // A run the person stopped, and whose runner has since been observed
+  // ending, is named for what happened and for what can be done about it.
+  // An ordinary completion and an ordinary failure keep their own words:
+  // `stop` is set only when somebody actually asked.
+  if (liveness.stop === "stopped") {
+    return { label: "Stopped — ready to resume", tone: "warn" };
+  }
   if (run.kind === "plan") {
     switch (run.state.status) {
       case "running":
