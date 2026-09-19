@@ -105,7 +105,7 @@ async function throughShell(shell: string, line: string, cwd: string): Promise<{
   return { argv: [...result.stdout.matchAll(/<([^]*?)>\n/g)].map((match) => match[1]), exitCode: result.exitCode };
 }
 
-const SHELLS = ["/bin/sh", "/bin/bash", "/bin/zsh"];
+const SHELLS = ["/bin/bash", "/bin/zsh"];
 
 describe("handing a free-text argument to a shell", () => {
   it("VS Code's own escaping turns a gate check's evidence into shell syntax — the reported failure", async () => {
@@ -129,7 +129,7 @@ describe("handing a free-text argument to a shell", () => {
     it(`a command line built here survives ${shell} exactly`, async () => {
       const { dir, file } = await argvReporter();
       const args = buildResumePlanArgs({ source: "manifest", manifest: path.join(dir, "m.json"), repoRoot: dir, expectedBranch: "feature/x", evidence: realEvidence() });
-      const line = shellCommandLine(file, args, "posix");
+      const line = shellCommandLine(file, args, "posix-ansi");
       assert.ok(line, "a POSIX shell is one this extension can quote for");
       const seen = await throughShell(shell, line, dir);
       assert.deepEqual(seen.argv, args, "every argument reaches the process byte for byte");
@@ -148,7 +148,7 @@ describe("handing a free-text argument to a shell", () => {
       "\t\ttabs\t",
       "$(rm -rf /) — must arrive as text",
     ];
-    const line = shellCommandLine(file, nasty, "posix");
+    const line = shellCommandLine(file, nasty, "posix-ansi");
     assert.ok(line);
     for (const shell of SHELLS) {
       assert.deepEqual((await throughShell(shell, line, dir)).argv, nasty, `${shell} passes it through unchanged`);
@@ -176,7 +176,7 @@ describe("handing a free-text argument to a shell", () => {
     for (const safe of ["resume-plan", "--evidence", "/Users/me/Code/repo/.sparring", "feature/x", "stage-a_b.c", "/with space/plan.md", "æøå-ünïcode"]) {
       assert.equal(vscodeQuotingIsFaithful(safe), true, safe);
     }
-    for (const unsafe of ["", "it's", "`id`", 'say "hi"', "a\nb", "$HOME", "with space and $var", "a;b", "a&b", "a|b", "a*b", "~/x", "a!b", "with space and !bang"]) {
+    for (const unsafe of ["", "it's", "`id`", 'say "hi"', "a\nb", "$HOME", "with space and $var", "a;b", "a&b", "a|b", "a*b", "~/x", "a!b", "with space and !bang", "a\tb", "a\u001bb"]) {
       assert.equal(vscodeQuotingIsFaithful(unsafe), false, JSON.stringify(unsafe));
     }
   });
@@ -184,7 +184,7 @@ describe("handing a free-text argument to a shell", () => {
   it("the launcher's decision, for the exact invocation that failed", async () => {
     const { dir, file } = await argvReporter();
     const args = buildResumePlanArgs({ source: "manifest", manifest: path.join(dir, "m.json"), repoRoot: dir, expectedBranch: "feature/x", evidence: realEvidence() });
-    const handover = planShellHandover(file, args, "posix");
+    const handover = planShellHandover(file, args, "posix-ansi");
     assert.equal(handover.via, "command-line", "the evidence launch is quoted here, not by VS Code");
     assert.deepEqual((await throughShell("/bin/zsh", (handover as { commandLine: string }).commandLine, dir)).argv, args);
 
@@ -196,12 +196,16 @@ describe("handing a free-text argument to a shell", () => {
 
   it("quotes for the POSIX shells and refuses to guess for the rest", () => {
     assert.equal(posixQuote("it's"), "'it'\\''s'");
-    assert.equal(shellFamily("/bin/zsh", "darwin"), "posix");
+    assert.equal(shellFamily("/bin/zsh", "darwin"), "posix-ansi");
     assert.equal(shellFamily("/usr/local/bin/fish", "linux"), "posix");
     assert.equal(shellFamily("C:\\Program Files\\PowerShell\\7\\pwsh.exe", "win32"), "cmd");
     assert.equal(shellFamily("C:\\Windows\\System32\\cmd.exe", "win32"), "cmd");
-    assert.equal(shellFamily("C:\\Program Files\\Git\\bin\\bash.exe", "win32"), "posix", "Git Bash on Windows is still a POSIX shell");
+    assert.equal(shellFamily("C:\\Program Files\\Git\\bin\\bash.exe", "win32"), "posix-ansi", "Git Bash on Windows is still a POSIX shell");
     assert.equal(shellFamily(undefined, "darwin"), "posix");
+    for (const shell of ["/bin/sh", "/bin/dash", "/bin/ash", "/bin/fish", undefined]) {
+      assert.deepEqual(planShellHandover("sparring", ["--evidence", "first\nsecond"], shellFamily(shell, "linux")), { via: "no-shell" }, "unknown ANSI-C support takes the existing direct route before any handoff");
+    }
+    assert.deepEqual(planShellHandover("sparring", ["--evidence", "text\0tail"], "posix-ansi"), { via: "no-shell" }, "NUL must never be silently truncated");
     assert.equal(
       shellCommandLine("sparring", ["resume-plan", "--evidence", "it's"], "cmd"),
       undefined,

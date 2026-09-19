@@ -19,6 +19,8 @@ import * as os from "node:os";
 import type { DiscoveryDiagnostic } from "../core/diagnose";
 import { discoverRuns, selectRun } from "../core/discovery";
 import { stageScopeKey, stageScopeOf } from "../core/stageScope";
+import { buildResumePlanArgs } from "../core/cli";
+import { fourCheckEvidence } from "../test/fixtures/fourCheckEvidence";
 import { planKey } from "../core/sparringCommand";
 import { BINDING_VERSION, bindingFileName, manifestFileName, parseExecutionManifest, renderBindingRecord } from "../core/manifest";
 import { isActionMessage, isAgentConfigMessage, isAutoPushMessage, isCopyPromptMessage, isHumanCheckMessage, isHumanFeedbackMessage, isOpenPromptSourceMessage, renderOverviewHtml } from "../core/overviewHtml";
@@ -83,6 +85,7 @@ export async function run(): Promise<void> {
     ["disclosure", () => disclosurePersistenceAssertions()],
     ["actorcards", () => actorCardControlAssertions()],
     ["evidence", () => evidenceLaunchAssertions(reportedRepo, fixtureRoot)],
+    ["fourchecks", () => fourChecksZshAssertions(fixtureRoot)],
     ["stagescope", () => stageScopeAssertions(reportedRepo)],
     ["advance", () => advancementAssertions(reportedRepo)],
     ["terminals", () => terminalReuseAssertions(report, reportedRepo)],
@@ -3060,7 +3063,7 @@ function overviewHtmlFor(model: ModelReport, nonce: string, cspSource: string): 
 
 /**
  * The reported regression, in the shape it was reported in: a managed
- * manifest plan run at a structured NEEDS_YOU, one gate check recorded PASS,
+ * Markdown plan run at a structured NEEDS_YOU, one gate check recorded PASS,
  * and Submit result and continue pressed. The engine is the fixture's fake,
  * configured as an absolute path exactly as the user configures theirs, and
  * it records the argv it was given.
@@ -3078,14 +3081,14 @@ async function evidenceLaunchAssertions(reportedRepo: string, fixtureRoot: strin
     return;
   }
   const sparring = path.join(reportedRepo, ".sparring");
-  const argvLog = path.join(fixtureRoot, "fake-argv.log");
+  const argvLog = path.join(fixtureRoot, "fake-resume-argv.log");
   await fs.mkdir(path.join(sparring, "stages", GATE_STAGE), { recursive: true });
   await fs.writeFile(path.join(sparring, "stages", GATE_STAGE, "state.json"), JSON.stringify({ status: "working", base_sha: null, candidate_sha: null, implementation_session_id: "impl", sparring_session_id: "spar" }));
   await fs.writeFile(path.join(sparring, "stages", GATE_STAGE, "sparring.md"), gateSparring());
   await fs.mkdir(path.join(sparring, "plans"), { recursive: true });
   await fs.writeFile(
     path.join(sparring, "plans", `${GATE_PLAN_KEY}.json`),
-    JSON.stringify({ current_stage: GATE_STAGE, current_stage_index: 0, expected_branch: "feature/reported-statistics", plan: GATE_PLAN_LABEL, plan_digest: "0".repeat(64), source: "manifest", status: "paused" }),
+    JSON.stringify({ current_stage: GATE_STAGE, current_stage_index: 0, expected_branch: "feature/reported-statistics", plan: GATE_PLAN_LABEL, plan_digest: "0".repeat(64), source: "markdown", status: "paused" }),
   );
   await fs.mkdir(path.join(reportedRepo, "plans"), { recursive: true });
   await fs.writeFile(path.join(reportedRepo, "plans", "reported-statistics.md"), "# Reported statistics\n\n## Stage 3D — Snapshot v2 and attachment/export/import transport\n\nThe transport.\n");
@@ -3098,8 +3101,11 @@ async function evidenceLaunchAssertions(reportedRepo: string, fixtureRoot: strin
   const runId = report.runs.find((run) => run.id.startsWith(`${reportedRepo}|`) && run.id.includes("plan:"))?.id;
   assert.ok(runId, "the managed plan run is discovered");
   assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
-  const recorded = await vscode.commands.executeCommand("agentSparring._test.recordHumanCheck", GATE_CHECK_ID, "pass", "Checked on the reviewer's build; the placeholder doesn't flash.");
+  const recorded = await vscode.commands.executeCommand("agentSparring._test.recordHumanCheck", draftKeyFor(GATE_CHECK_ID, GATE_INSTANCE), "pass", "Checked on the reviewer's build; the placeholder doesn't flash.");
   assert.deepEqual(recorded, { outcome: "pass", note: "Checked on the reviewer's build; the placeholder doesn't flash." }, "the gate check is recorded PASS, as clicking Pass records it");
+
+  const ready = (await vscode.commands.executeCommand("agentSparring._test.overviewModel")) as ModelReport;
+  assert.equal(ready.actionRequired?.submit.enabled, true, ready.actionRequired?.submit.detail);
 
   const beforeNotFound = await vscode.commands.executeCommand("agentSparring._test.lastCommandNotFound");
   const restore = stubDialogs("feature/reported-statistics", "Submit for review");
@@ -3111,12 +3117,12 @@ async function evidenceLaunchAssertions(reportedRepo: string, fixtureRoot: strin
     const args = [...argv.matchAll(/<([^]*?)>\n/g)].map((match) => match[1]);
 
     assert.equal(executable, vscode.workspace.getConfiguration("agentSparring").get<string>("executable"), "the exact configured absolute executable ran");
-    assert.equal(args.length, 9, `resume-plan carries nine arguments, not a sentence split into words: ${JSON.stringify(args)}`);
+    assert.equal(args.length, 8, `resume-plan carries eight arguments, not a sentence split into words: ${JSON.stringify(args)}`);
     assert.equal(args[0], "resume-plan");
-    assert.deepEqual([args[1], args[3], args[5], args[7]], ["--manifest", "--repo-root", "--expected-branch", "--evidence"], "each flag with its own value");
-    assert.equal(args[4], reportedRepo);
-    assert.equal(args[6], "feature/reported-statistics");
-    const evidence = args[8];
+    assert.deepEqual([args[2], args[4], args[6]], ["--repo-root", "--expected-branch", "--evidence"], "each flag with its own value");
+    assert.equal(args[3], reportedRepo);
+    assert.equal(args[5], "feature/reported-statistics");
+    const evidence = args[7];
     assert.match(evidence, new RegExp(`check \\\`${GATE_CHECK_ID}\\\``), "the backticked gate id arrives as text, not as command substitution");
     assert.match(evidence, /Checked on the reviewer's build; the placeholder doesn't flash\./, "apostrophes and the semicolon survive");
     assert.ok(evidence.includes("\n"), "and it is still one multi-line entry");
@@ -3133,10 +3139,45 @@ async function evidenceLaunchAssertions(reportedRepo: string, fixtureRoot: strin
       beforeNotFound,
       "and nothing claims the shell could not find an executable it just ran",
     );
-    console.log("integration: resume-plan --evidence reached the configured executable as 9 arguments; its 127 was reported as an engine failure");
+    console.log("integration: resume-plan --evidence reached the configured executable as 8 arguments; its 127 was reported as an engine failure");
   } finally {
     restore();
     await fs.writeFile(path.join(sparring, "fake-runner.conf"), "sleep_for=3\nexit_with=0\n");
+  }
+}
+
+/** The incident's longer, four-check payload through a real interactive zsh. */
+async function fourChecksZshAssertions(fixtureRoot: string): Promise<void> {
+  if (process.platform === "win32") {
+    console.log("integration: zsh four-check scenario skipped on Windows");
+    return;
+  }
+  const cwd = path.join(fixtureRoot, "four-check-evidence");
+  await fs.mkdir(cwd, { recursive: true });
+  const reporter = path.join(cwd, "sparring");
+  const argvFile = path.join(cwd, "argv.txt");
+  await fs.writeFile(reporter, `#!/bin/sh
+for a in "$@"; do printf '<%s>\\n' "$a"; done > '${argvFile}'
+printf '[end]\\n' >> '${argvFile}'
+`, { mode: 0o755 });
+  const terminal = vscode.window.createTerminal({ name: "four-check evidence regression", cwd, shellPath: "/bin/zsh" });
+  const integration = await shellIntegrationFor(terminal, 8000);
+  assert.ok(integration, "the explicit zsh terminal must expose shell integration");
+  const { lease } = bypassLease(terminal);
+  const logged: string[] = [];
+  const { tracker, dispose } = trackerOver(lease, logged);
+  try {
+    const planPath = path.join(cwd, "reviewed-plans", "continuations", "2026-09-19-add-reference-dialog-redesign-continuation.md");
+    const args = buildResumePlanArgs({ source: "markdown", planPath, repoRoot: cwd, expectedBranch: "feature/add-reference-dialog-redesign", evidence: fourCheckEvidence() });
+    assert.equal(args.length, 8);
+    const result = await tracker.launch({ configured: reporter, args, cwd, name: "four-check evidence", runId: "four-check-evidence", kind: "resume-plan", planPath, reveal: false });
+    assert.equal(result.ok, true, `the complete command must start, never remain at quote>: ${logged.join("\n")}`);
+    const output = await waitForFile(argvFile, 5000, "the four-check command records its arguments");
+    assert.deepEqual([...output.matchAll(/<([^]*?)>\n/g)].map(match => match[1]), args, "newlines, backticks, dashes and all four check/gate identities survive the real terminal");
+    console.log("integration: the real four-check multiline payload started in zsh and arrived as exactly eight intact arguments");
+  } finally {
+    dispose();
+    terminal.dispose();
   }
 }
 
