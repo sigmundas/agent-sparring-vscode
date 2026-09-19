@@ -39,6 +39,10 @@ export class FakeElement {
   hasAttribute(name: string): boolean {
     return name in this.attributes;
   }
+  /** The shipped script stamps the value it sent onto the control itself. */
+  setAttribute(name: string, value: string): void {
+    this.attributes[name] = value;
+  }
   /** `button[data-check][data-outcome]` and friends: a tag plus required attributes, walked up the parents. */
   closest(selector: string): FakeElement | null {
     const [, tag, rest] = /^([a-z]+)((?:\[[^\]]+\])*)$/.exec(selector) ?? [];
@@ -52,6 +56,18 @@ export class FakeElement {
 }
 
 export class FakeTextArea extends FakeElement {}
+
+/**
+ * The two inline configuration controls, as the shipped script tests for
+ * them: it branches on `instanceof HTMLSelectElement` / `HTMLInputElement`,
+ * so a shim that does not provide them cannot run a change at all.
+ */
+export class FakeSelect extends FakeElement {}
+export class FakeInput extends FakeElement {
+  /** The script only acts on `type === 'text'`; the autopush box is a checkbox. */
+  type = "text";
+  checked = false;
+}
 
 /**
  * A `<details>` as the disclosure script sees it: an element with an `open`
@@ -170,7 +186,7 @@ export function runWebviewScript(html: string, nonce = "n", state: WebviewState 
   }
   const posted: Posted[] = [];
   const timers: ReturnType<typeof setTimeout>[] = [];
-  const run = new Function("document", "window", "acquireVsCodeApi", "Element", "HTMLTextAreaElement", "setTimeout", "clearTimeout", script);
+  const run = new Function("document", "window", "acquireVsCodeApi", "Element", "HTMLTextAreaElement", "HTMLSelectElement", "HTMLInputElement", "setTimeout", "clearTimeout", script);
   const result: ScriptRun = {
     document,
     posted,
@@ -208,6 +224,8 @@ export function runWebviewScript(html: string, nonce = "n", state: WebviewState 
     }),
     FakeElement,
     FakeTextArea,
+    FakeSelect,
+    FakeInput,
     (fn: () => void, ms = 0) => {
       const timer = setTimeout(fn, ms === 0 ? 0 : ms);
       timers.push(timer);
@@ -230,5 +248,17 @@ export function elementFrom(html: string, tag: string, pattern: RegExp, what: st
   for (const [, name, value] of markup.matchAll(/([a-z-]+)="([^"]*)"/g)) {
     attributes[name] = value;
   }
-  return tag === "textarea" ? new FakeTextArea(tag, attributes) : new FakeElement(tag, attributes);
+  if (tag === "textarea") {
+    return new FakeTextArea(tag, attributes);
+  }
+  if (tag === "select") {
+    return new FakeSelect(tag, attributes);
+  }
+  if (tag === "input") {
+    const input = new FakeInput(tag, attributes);
+    input.type = attributes["type"] ?? "text";
+    input.value = attributes["value"] ?? "";
+    return input;
+  }
+  return new FakeElement(tag, attributes);
 }

@@ -251,6 +251,23 @@ export interface AgentRoleControls {
   effort?: AgentFieldControl;
 }
 
+/**
+ * The provider's human name for one role's controls.
+ *
+ * Taken from whatever the engine put in the control — the fixed text when
+ * the role has exactly one provider, the matching option's label when it has
+ * several — and falling back to the canonical id. There is no table of
+ * vendor names here, and there must not be: a provider the engine gains is
+ * named by the engine.
+ */
+export function providerLabel(controls: AgentRoleControls): string {
+  if (controls.provider.fixedText) {
+    return controls.provider.fixedText;
+  }
+  const chosen = controls.provider.options?.find((option) => option.value === controls.provider.value);
+  return chosen?.label ?? controls.provider.value;
+}
+
 /** What the Overview shows for the effective configuration, if anything. */
 export interface AgentConfigView {
   lines: AgentConfigLine[];

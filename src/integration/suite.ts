@@ -21,8 +21,9 @@ import { discoverRuns, selectRun } from "../core/discovery";
 import { stageScopeKey, stageScopeOf } from "../core/stageScope";
 import { planKey } from "../core/sparringCommand";
 import { BINDING_VERSION, bindingFileName, manifestFileName, parseExecutionManifest, renderBindingRecord } from "../core/manifest";
-import { isActionMessage, isAutoPushMessage, isCopyPromptMessage, isHumanCheckMessage, isHumanFeedbackMessage, isOpenPromptSourceMessage, renderOverviewHtml } from "../core/overviewHtml";
+import { isActionMessage, isAgentConfigMessage, isAutoPushMessage, isCopyPromptMessage, isHumanCheckMessage, isHumanFeedbackMessage, isOpenPromptSourceMessage, renderOverviewHtml } from "../core/overviewHtml";
 import { withHumanCheck, type HumanCheckDrafts } from "../core/humanChecks";
+import { parseEngineConfig } from "../core/effectiveConfig";
 import type { ExecutionRecord, LivenessState, RunnerLiveness } from "../core/liveness";
 import { buildOverviewModel, type CapturedPrompt, type ManifestStageView, type OverviewArtifacts } from "../core/overviewModel";
 import { ExecutionTracker } from "../vscode/executionTracker";
@@ -80,6 +81,7 @@ export async function run(): Promise<void> {
     ["pushauth", () => pushAuthorizationAssertions()],
     ["prompt", () => promptInspectorAssertions()],
     ["disclosure", () => disclosurePersistenceAssertions()],
+    ["actorcards", () => actorCardControlAssertions()],
     ["evidence", () => evidenceLaunchAssertions(reportedRepo, fixtureRoot)],
     ["stagescope", () => stageScopeAssertions(reportedRepo)],
     ["advance", () => advancementAssertions(reportedRepo)],
@@ -906,7 +908,7 @@ async function promptInspectorAssertions(): Promise<void> {
     const shipped = `<script nonce="${nonce}">`;
     const preamble = `<script nonce="${nonce}">var __api; var __acquire = acquireVsCodeApi; acquireVsCodeApi = function () { __api = __acquire(); return __api; };</script>`;
     const probe = `<script nonce="${nonce}">
-      var card = document.querySelector('details.actor');
+      var card = document.querySelector('.card.actor details.instr');
       var section = document.querySelector('details.promptsec');
       card.open = true;
       section.open = true;
@@ -1029,7 +1031,7 @@ async function disclosurePersistenceAssertions(): Promise<void> {
     const opening = waitForProbe("openedProbe");
     panel.webview.html = draw(
       openNonce,
-      `var card = document.querySelector('details.actor[data-disclose]');
+      `var card = document.querySelector('.card.actor details.instr[data-disclose]');
        var big = document.querySelector('details.promptsec:not([open])[data-disclose]');
        card.querySelector('summary').click();
        // A details element fires its toggle event asynchronously, and the
@@ -1050,7 +1052,7 @@ async function disclosurePersistenceAssertions(): Promise<void> {
     const redrawn = waitForProbe("redrawnProbe");
     panel.webview.html = draw(
       redrawNonce,
-      `var card = document.querySelector('details.actor[data-disclose]');
+      `var card = document.querySelector('.card.actor details.instr[data-disclose]');
        var big = document.querySelector('details.promptsec[data-disclose="${String(opened["bigKey"])}"]');
        __api.postMessage({ type: 'redrawnProbe', cardOpen: card.open, cardKey: card.getAttribute('data-disclose'), bigOpen: big ? big.open : null, state: __api.getState() });`,
     );
@@ -1060,6 +1062,161 @@ async function disclosurePersistenceAssertions(): Promise<void> {
     assert.equal(after["cardKey"], opened["cardKey"], "the same section, under the same stable key");
     assert.equal(after["cardOpen"], true, "Show instructions is still open after the rerender — the reported bug");
     assert.equal(after["bigOpen"], false, "and a section the person never opened is still closed");
+  } finally {
+    panel.dispose();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+}
+
+// ---------------------------------------------------------------- the controls that now live inside an actor card
+
+/**
+ * The model and effort controls, in a real Chromium webview, inside the card
+ * whose role they configure.
+ *
+ * This is the behaviour that decided the markup. While the whole card was a
+ * `<details>`, a control inside it sat inside a `<summary>`, and clicking a
+ * dropdown there is an activation of the summary: the card would collapse
+ * under the person's cursor as they changed a model. That is invisible in a
+ * rendered snapshot and cannot be observed in a DOM shim, because it is
+ * Chromium's own `<summary>` behaviour — so it is asserted here, where the
+ * webview is real.
+ *
+ * What is checked is what a person does: open the instructions, change the
+ * effort, type a model. The page must post both changes, with the scope it
+ * was drawn from, and the section they opened must still be open.
+ */
+async function actorCardControlAssertions(): Promise<void> {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "agent-sparring-actorcard-"));
+  const stage = "stage-2-schema-and-api";
+  const stages = path.join(root, ".sparring", "stages");
+  await fs.mkdir(path.join(stages, stage), { recursive: true });
+  await fs.writeFile(path.join(stages, stage, "state.json"), JSON.stringify({ status: "working", base_sha: null, candidate_sha: null, implementation_session_id: "impl-1", sparring_session_id: null }));
+
+  const text = "## Stage brief\n\nDo the bounded thing.\n";
+  const capturedPrompts: CapturedPrompt[] = [
+    {
+      entry: {
+        seq: 1,
+        ts: new Date().toISOString(),
+        role: "stage",
+        stageId: stage,
+        turnKind: "original",
+        resumed: false,
+        file: "0001-stage-original.md",
+        chars: text.length,
+        sections: [{ heading: "Stage brief", origin: "file", source: `stages/${stage}/brief.md`, start: 0, end: text.length - 1 }],
+      },
+      text,
+    },
+  ];
+
+  // The engine's own answer, with a level no provider ships, so an option
+  // that appears can only have come from this JSON.
+  const configPath = path.join(root, ".sparring", "project.toml");
+  const report = parseEngineConfig(
+    JSON.stringify({
+      config_path: configPath,
+      config_exists: true,
+      project: "demo",
+      error: null,
+      stage: { role: "stage", provider: "claude-cli", provider_display_name: "Claude", provider_source: "project", model: "a-model", model_source: "project", effort: null, effort_source: "provider-default", effort_supported: true, effort_levels: ["brisk", "glacial"] },
+      sparring: { role: "sparring", provider: "codex-cli", provider_display_name: "Codex", provider_source: "project", model: null, model_source: "provider-default", effort: null, effort_source: "provider-default", effort_supported: true, effort_levels: ["minimal"] },
+    }),
+  );
+  assert.ok(report, "the engine payload parses");
+
+  const location = { sparringDir: path.join(root, ".sparring"), projectDir: root, repoRoot: root, workspaceFolder: root, folderName: path.basename(root) };
+  const selection = selectRun((await discoverRuns([location])).runs);
+  assert.ok(selection.selected, "the standalone stage is discovered");
+  const artifacts: OverviewArtifacts = { handoff: false, sparring: false, brief: false, plan: false, capturedPrompts, agentConfig: { kind: "report", report } };
+  const model = buildOverviewModel(selection, undefined, artifacts, Date.now());
+
+  const nonce = crypto.randomBytes(16).toString("base64");
+  const panel = vscode.window.createWebviewPanel("agentSparring.actorCardTest", "actor cards", { viewColumn: vscode.ViewColumn.Active, preserveFocus: true }, { enableScripts: true, localResourceRoots: [] });
+  try {
+    const posted: Record<string, unknown>[] = [];
+    const probed = new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("no probe arrived from the webview within 15s")), 15_000);
+      panel.webview.onDidReceiveMessage((message: Record<string, unknown>) => {
+        posted.push(message);
+        if (message?.["type"] === "cardProbe") {
+          clearTimeout(timer);
+          resolve(message);
+        }
+      });
+    });
+    const shipped = `<script nonce="${nonce}">`;
+    const preamble = `<script nonce="${nonce}">var __api; var __acquire = acquireVsCodeApi; acquireVsCodeApi = function () { __api = __acquire(); return __api; };</script>`;
+    const probe = `<script nonce="${nonce}">
+      var card = document.querySelector('.card.actor');
+      var instr = card.querySelector('details.instr');
+      var effort = card.querySelector('select[data-field="effort"]');
+      var modelField = card.querySelector('input[data-field="model"]');
+      var levels = Array.prototype.map.call(effort.options, function (option) { return option.value; });
+      // Open the instructions the way a person does, then use the controls.
+      instr.querySelector('summary').click();
+      var openedInstructions = instr.open;
+      effort.value = 'glacial';
+      effort.dispatchEvent(new Event('change', { bubbles: true }));
+      modelField.value = 'another-model';
+      modelField.dispatchEvent(new Event('focusout', { bubbles: true }));
+      setTimeout(function () {
+        // Measured rather than assumed: that the role really reads as the
+        // heading, and that the controls really are laid out inside the
+        // card, are facts about the rendered box tree.
+        var rolename = card.querySelector('.rolename');
+        var providerLine = card.querySelector('.provider');
+        var cardBox = card.getBoundingClientRect();
+        var effortBox = effort.getBoundingClientRect();
+        var size = function (node) { return parseFloat(getComputedStyle(node).fontSize); };
+        __api.postMessage({
+          type: 'cardProbe',
+          role: rolename.textContent,
+          provider: providerLine.textContent,
+          levels: levels,
+          openedInstructions: openedInstructions,
+          stillOpen: instr.open,
+          panels: document.querySelectorAll('.agentconfig').length,
+          cards: document.querySelectorAll('.card.actor').length,
+          roleSize: size(rolename),
+          providerSize: size(providerLine),
+          roleColor: getComputedStyle(rolename).color,
+          providerColor: getComputedStyle(providerLine).color,
+          roleAbove: rolename.getBoundingClientRect().top < providerLine.getBoundingClientRect().top,
+          effortInsideCard: effortBox.top >= cardBox.top && effortBox.bottom <= cardBox.bottom && effortBox.left >= cardBox.left && effortBox.right <= cardBox.right,
+        });
+      }, 50);
+    </script>`;
+    panel.webview.html = renderOverviewHtml(model, nonce, panel.webview.cspSource).replace(shipped, `${preamble}${shipped}`).replace("</body>", `${probe}</body>`);
+    const seen = await probed;
+
+    assert.equal(seen["role"], "Stage agent", "the role is the card's heading");
+    assert.equal(seen["provider"], "Claude", "and the provider is the line under it");
+    assert.deepEqual(seen["levels"], ["", "brisk", "glacial"], "every option came from the engine's JSON");
+    assert.equal(seen["panels"], 0, "there is no separate Agents panel any more");
+    assert.equal(seen["openedInstructions"], true, "the person opened Show instructions");
+    assert.equal(seen["stillOpen"], true, "and using the card's own controls did not collapse it");
+    assert.equal(seen["cards"], 2, "two cards, one per role");
+    assert.equal(seen["roleAbove"], true, "the role is above the provider, not beside it in brackets");
+    assert.ok((seen["roleSize"] as number) > (seen["providerSize"] as number), `the role is the larger text (${String(seen["roleSize"])} vs ${String(seen["providerSize"])})`);
+    assert.notEqual(seen["roleColor"], seen["providerColor"], "the role carries the actor's colour; the provider is subdued");
+    assert.equal(seen["effortInsideCard"], true, "the effort control is laid out inside its own role's card");
+    console.log(`integration: role ${String(seen["roleSize"])}px ${String(seen["roleColor"])} over provider ${String(seen["providerSize"])}px ${String(seen["providerColor"])}`);
+
+    const changes = posted.filter((message) => message["type"] === "agentConfig");
+    assert.deepEqual(
+      changes,
+      [
+        { type: "agentConfig", role: "stage", field: "effort", value: "glacial", scope: configPath },
+        { type: "agentConfig", role: "stage", field: "model", value: "another-model", scope: configPath },
+      ],
+      "both changes went out on the existing wire, carrying the project.toml the card was drawn from",
+    );
+    for (const change of changes) {
+      assert.ok(isAgentConfigMessage(change), "and the host accepts each one");
+    }
+    console.log("integration: the actor cards carry their own model and effort controls, built from the engine's levels, and using them leaves the card and its instructions exactly as the person left them");
   } finally {
     panel.dispose();
     await fs.rm(root, { recursive: true, force: true });

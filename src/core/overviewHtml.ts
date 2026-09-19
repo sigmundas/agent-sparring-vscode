@@ -419,7 +419,7 @@ function renderBody(model: OverviewModel): string {
     return `${renderRepositoryContext(model)}
 <header class="top"><div><h1>Agent Sparring</h1><div class="run muted">${escapeHtml(model.title)}</div></div></header>
 ${(model.emptyLines ?? []).map((line) => `<p class="muted">${escapeHtml(line)}</p>`).join("\n")}
-${model.agentConfig ? renderAgentConfig(model.agentConfig) : ""}
+${renderActors(model, discloseScope(model))}
 <div class="actions">${button("runPlan", "Run plan…")}${button("showLog", "Show log")}</div>`;
   }
   if (model.kind === "ambiguous") {
@@ -457,12 +457,7 @@ ${model.agentConfig ? renderAgentConfig(model.agentConfig) : ""}
     parts.push(`<p class="muted note">${escapeHtml(model.timelineNote)}</p>`);
   }
   parts.push(renderStageCard(model));
-  if (model.stageAgent && model.sparrer) {
-    parts.push(`<section class="actors">${renderActor(model.stageAgent, scope)}${renderActor(model.sparrer, scope)}</section>`);
-  }
-  if (model.agentConfig) {
-    parts.push(renderAgentConfig(model.agentConfig));
-  }
+  parts.push(renderActors(model, scope));
   if (model.history && model.history.length > 0) {
     const rows = model.history
       .map((entry) => `<li><span class="time">${escapeHtml(entry.time)}</span><span class="who ${whoClass(entry.who)}">${escapeHtml(entry.who)}</span><span>${escapeHtml(entry.description)}</span></li>`)
@@ -1231,35 +1226,107 @@ function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
   return `<div class="block whatsnext"><h3>${icon("arrow", "accent")}What's next</h3>${heading}${summary}${text}${hints}<div class="actions">${buttons.join("")}</div></div>${current}`;
 }
 
-function renderActor(card: ActorCard, scope: string): string {
+/**
+ * The two actor cards, each its own configuration surface, and the one
+ * shared Settings action beside them.
+ *
+ * There is no second Agents panel: model and effort belong to the role they
+ * configure, and one of the two places was always going to be the stale one.
+ * The controls are joined onto the card here rather than carried in the
+ * model, so the model keeps one description of the configuration and this
+ * file decides where on the page it is drawn.
+ */
+function renderActors(model: OverviewModel, scope: string): string {
+  const config = model.agentConfig;
+  const configScope = config?.scope;
+  const controlsFor = (role: ConfigRole): AgentRoleControls | undefined =>
+    configScope ? config?.controls.find((entry) => entry.role === role) : undefined;
+  const cards = [model.stageAgent, model.sparrer]
+    .filter((card): card is ActorCard => card !== undefined)
+    .map((card) => renderActor(card, scope, controlsFor(card.configRole), configScope))
+    .join("");
+  const section = cards ? `<section class="actors">${cards}</section>` : "";
+  return `${section}${config ? renderAgentsBar(config, cards !== "") : ""}`;
+}
+
+/**
+ * One actor: what it is, what it is configured with, what it is doing.
+ *
+ * The role heads the card because the role is the concept — a stage agent
+ * and a sparrer are different jobs, and which provider is filling one today
+ * is a setting. The provider is therefore read underneath it, quietly, and
+ * the model and effort controls follow as the settings of that role.
+ *
+ * The instructions disclosure is nested rather than wrapped around the whole
+ * card: a `<summary>` activates on click, and a model field or effort
+ * dropdown living inside one would be a control that collapses the card it
+ * is in as often as not.
+ */
+function renderActor(card: ActorCard, scope: string, controls: AgentRoleControls | undefined, configScope: string | undefined): string {
   const busy = card.activity === "Working" || card.activity === "Sparring";
   const duration = card.duration ? ` for ${escapeHtml(card.duration)}` : "";
   const quiet = card.quietFor ? ` <span class="muted">· no meaningful activity for ${escapeHtml(card.quietFor)}</span>` : "";
   const uncertain = busy && card.uncertain ? ` <span class="muted">· runner status unknown</span>` : "";
-  const session = card.sessionLabel ? `${capitalize(card.sessionKind)}: ${escapeHtml(card.sessionLabel)}` : `No ${card.sessionKind} yet`;
   const who = whoClass(card.provider);
   // A telemetry-only turn reads "Working? (turn observed 3m ago)": the duration is
   // time since the observed start, not a claim that work is happening now.
-  const word = busy && card.uncertain ? `${card.activity}?` : card.activity;
+  const word = busy && card.uncertain ? `${card.activity}?` : (card.activity ?? "");
   const span = busy && card.uncertain ? (card.duration ? ` <span class="muted">(turn observed ${escapeHtml(card.duration)} ago)</span>` : "") : duration;
-  const identity = `<span class="avatar ${who}">${escapeHtml(card.provider.charAt(0).toUpperCase())}</span>
-<div class="who">
-<div><span class="provider ${who}">${escapeHtml(card.provider)}</span> <span class="muted">(${escapeHtml(card.role)})</span></div>
-<div class="activity ${card.activity.toLowerCase()}${busy && card.uncertain ? " uncertain" : ""}">${icon("dot", "dot")}${escapeHtml(word)}${busy ? span : ""}${uncertain}${quiet}</div>
-<div class="session muted">${session}</div>
-</div>`;
+  const identity = `<div class="identity"><span class="avatar ${who}">${escapeHtml(card.provider.charAt(0).toUpperCase())}</span>
+<div class="who"><div class="rolename ${who}">${escapeHtml(card.role)}</div><div class="provider muted">${escapeHtml(card.provider)}</div></div></div>`;
+  const settings = controls && configScope ? renderRoleControls(controls, configScope) : "";
+  // No run, no stage: the card is a configuration surface and says nothing
+  // about activity. With a stage, the session line appears only once the
+  // engine has recorded one — an absent id is left off rather than shown as
+  // a placeholder for a value that does not exist yet.
+  const activity = card.activity
+    ? `<div class="activity ${card.activity.toLowerCase()}${busy && card.uncertain ? " uncertain" : ""}">${icon("dot", "dot")}${escapeHtml(word)}${busy ? span : ""}${uncertain}${quiet}</div>`
+    : "";
+  const session =
+    card.sessionLabel && card.sessionKind
+      ? `<div class="session muted">${capitalize(card.sessionKind)}: ${escapeHtml(card.sessionLabel)}</div>`
+      : "";
+  const body = `${identity}${settings}${activity}${session}`;
   // No captured prompt means the engine has not run a turn for this actor
   // since prompt capture existed. An ordinary state, so the card simply
   // stays a card rather than offering a disclosure that would open on
   // nothing.
   if (!card.prompt) {
-    return `<div class="card actor">${identity}</div>`;
+    return `<div class="card actor">${body}</div>`;
   }
   const role = card.role === "Stage agent" ? "stage" : "sparrer";
-  return `<details class="card actor" data-role="${role}"${disclose(scope, role, "instructions")}>
-<summary>${identity}<span class="showinstr">Show instructions</span></summary>
+  return `<div class="card actor">${body}
+<details class="instr" data-role="${role}"${disclose(scope, role, "instructions")}>
+<summary><span class="showinstr">Show instructions</span></summary>
 ${renderInstructions(card.prompt, role, scope)}
-</details>`;
+</details></div>`;
+}
+
+/**
+ * The shared line beside the cards: Settings, and whatever the engine said
+ * about the configuration as a whole.
+ *
+ * It is a line, not a panel. The only things it carries are the ones that
+ * belong to both roles at once — the project.toml the cards were drawn from,
+ * the engine's own note when it could not resolve a configuration, and the
+ * fact that a change lands on the next turn while a run is active. When
+ * there are no controls to put in the cards, the engine's read-only role
+ * lines are shown here instead of being replaced by empty controls.
+ */
+function renderAgentsBar(section: AgentConfigSection, hasCards: boolean): string {
+  const settings = button("openSettings", section.settings.label, true, section.settings.detail, "quiet");
+  const lines =
+    section.controls.length === 0 || !section.scope || !hasCards
+      ? section.lines
+          .map(
+            (line) =>
+              `<div class="agentconfig-role" title="${escapeHtml(line.detail)}"><span class="muted">${escapeHtml(line.role)}</span><span class="agentconfig-value">${escapeHtml(line.text)}</span></div>`,
+          )
+          .join("")
+      : "";
+  const active = section.activeRunNote ? `<p class="muted note">${escapeHtml(section.activeRunNote)}</p>` : "";
+  const note = section.note ? `<p class="muted note">${escapeHtml(section.note)}</p>` : "";
+  return `<div class="agentsbar">${lines}${active}${note}<div class="actions">${settings}</div></div>`;
 }
 
 /**
@@ -1334,39 +1401,14 @@ function capitalize(word: string): string {
 }
 
 /**
- * What the next provider turn would run with, and the one way to change it.
+ * One role's settings, inside that role's own card: model, effort, and the
+ * provider only when there is genuinely a choice to make.
  *
- * Every value here is the engine's answer as reported, down to the words
- * "provider default": the cockpit does not name a model the engine did not
- * name. A configuration error is shown as a note and the role lines are
- * withheld rather than replaced by plausible-looking ones, and the section
- * still offers Settings, because that is what a person needs at exactly
- * that moment. There are no inline model or effort controls: the file is
- * the edit surface.
- */
-function renderAgentConfig(section: AgentConfigSection): string {
-  // With controls, the read-only lines would say the same thing twice; they
-  // remain the whole answer when the engine could not resolve a
-  // configuration and there is nothing to put in a control.
-  const body =
-    section.controls.length > 0 && section.scope
-      ? section.controls.map((role) => renderRoleControls(role, section.scope as string)).join("")
-      : section.lines
-          .map(
-            (line) =>
-              `<div class="agentconfig-role" title="${escapeHtml(line.detail)}"><span class="muted">${escapeHtml(line.role)}</span><span class="agentconfig-value">${escapeHtml(line.text)}</span></div>`,
-          )
-          .join("");
-  const note = section.note ? `<p class="muted note">${escapeHtml(section.note)}</p>` : "";
-  const active = section.activeRunNote
-    ? `<p class="muted note">${escapeHtml(section.activeRunNote)}</p>`
-    : "";
-  const settings = button("openSettings", section.settings.label, true, section.settings.detail, "quiet");
-  return `<section class="agentconfig"><div class="agentconfig-head"><h3>${icon("gear")}Agents</h3>${settings}</div>${body}${active}${note}</section>`;
-}
-
-/**
- * One role's compact block: provider, model, effort.
+ * The role is not repeated here — it is the card's heading — and neither is
+ * a provider the engine reports as the only one for the role, which the card
+ * already names underneath that heading. A dropdown of one would be a
+ * control that lies about being a control, and a second copy of the provider
+ * name would be the duplication this layout exists to remove.
  *
  * Every control carries the role, the field and the scope it was rendered
  * with, so the message the webview posts is self-describing and the host
@@ -1375,9 +1417,9 @@ function renderAgentConfig(section: AgentConfigSection): string {
  */
 function renderRoleControls(role: AgentRoleControls, scope: string): string {
   const attrs = `data-role="${escapeHtml(role.role)}" data-scope="${escapeHtml(scope)}"`;
-  const items = [role.provider, role.model, ...(role.effort ? [role.effort] : [])];
+  const items = [...(role.provider.options ? [role.provider] : []), role.model, ...(role.effort ? [role.effort] : [])];
   const rows = items.map((item) => field(item.label, control(item, attrs))).join("");
-  return `<div class="agentconfig-block"><div class="agentconfig-rolename">${escapeHtml(role.label)}</div>${rows}</div>`;
+  return `<div class="agentconfig-block">${rows}</div>`;
 }
 
 function field(label: string, input: string): string {
@@ -1566,16 +1608,15 @@ pre.engineerror { margin: 6px 0 0; padding: 6px 8px; max-height: 9em; overflow: 
 .autopush { display: inline-flex; align-items: center; gap: 6px; margin: 0 0 8px; color: var(--good); font-weight: 600; }
 
 /* What the next turn would run with. Compact by design: the file is the editor. */
-.agentconfig { margin: 10px 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; }
-.agentconfig-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.agentconfig-head h3 { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-size: 0.95em; }
-.agentconfig-role { display: flex; align-items: baseline; gap: 8px; margin-top: 4px; font-size: 0.92em; }
+/* The shared line beside the two cards: Settings, and anything the engine
+   said about the configuration as a whole. Deliberately not a panel. */
+.agentsbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 10px; }
+.agentsbar .note { margin: 0; flex: 1 1 18em; }
+.agentsbar .actions { margin-left: auto; }
+.agentconfig-role { display: flex; align-items: baseline; gap: 8px; font-size: 0.92em; }
 .agentconfig-role .muted { min-width: 8.5em; }
 .agentconfig-value { font-weight: 600; overflow-wrap: anywhere; }
-.agentconfig .note { margin: 6px 0 0; }
-.agentconfig-block { margin-top: 6px; }
-.agentconfig-block + .agentconfig-block { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); }
-.agentconfig-rolename { font-weight: 600; font-size: 0.92em; margin-bottom: 3px; }
+.agentconfig-block { margin: 6px 0 2px; }
 .agentconfig-field { display: flex; align-items: center; gap: 8px; margin-top: 3px; font-size: 0.9em; }
 .agentconfig-field > .muted { min-width: 5.5em; }
 .agentconfig-field select,
@@ -1701,30 +1742,34 @@ p { margin: 0 0 4px; line-height: 1.45; }
 .time { font-family: var(--vscode-editor-font-family); font-size: 0.92em; }
 
 .actors { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 0 0 10px; }
-.actor { display: flex; gap: 12px; align-items: flex-start; padding: 10px 12px; line-height: 1.45; }
+.actor { display: block; padding: 10px 12px; line-height: 1.45; }
+.actor .identity { display: flex; gap: 12px; align-items: center; }
 .avatar { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 50%; font-weight: 700; font-size: 1.05em; color: var(--vscode-editor-background); background: var(--line); }
 .avatar.claude { background: var(--claude); }
 .avatar.codex { background: var(--codex); }
-.provider { font-weight: 600; font-size: 1.05em; }
-.provider.claude { color: var(--claude); }
-.provider.codex { color: var(--codex); }
+/* The role is the heading; the provider filling it today is secondary. */
+.rolename { font-weight: 600; font-size: 1.05em; }
+.rolename.claude { color: var(--claude); }
+.rolename.codex { color: var(--codex); }
+.actor .provider { font-size: 0.88em; }
 .activity { display: flex; align-items: center; }
 .activity .icon.dot { color: var(--vscode-descriptionForeground); }
 .activity.working, .activity.sparring { color: var(--good); font-weight: 600; }
 .activity.working .icon.dot, .activity.sparring .icon.dot { color: var(--good); }
 .session { font-family: var(--vscode-editor-font-family); font-size: 0.85em; }
 
-/* An actor card that carries a captured prompt is a disclosure. Opening it
-   spans the full width of the grid, so the prompt is read at the width of
-   the rest of the UI instead of in a half-width column. */
-details.actor { display: block; padding: 0; }
-details.actor > summary { display: flex; gap: 12px; align-items: flex-start; padding: 10px 12px; line-height: 1.45; cursor: pointer; list-style: none; }
-details.actor > summary::-webkit-details-marker { display: none; }
-details.actor > summary .who { flex: 1 1 auto; min-width: 0; }
-details.actor[open] { grid-column: 1 / -1; }
-.showinstr { flex: none; align-self: center; font-size: 0.85em; color: var(--vscode-textLink-foreground); }
-details.actor[open] .showinstr::after { content: ' ▾'; }
-details.actor:not([open]) .showinstr::after { content: ' ▸'; }
+/* The captured prompt is a disclosure inside the card rather than the card
+   itself: the card holds live controls, and a <summary> around them would
+   collapse the card whenever one was clicked. Opening it spans the full
+   width of the grid, so the prompt is read at the width of the rest of the
+   UI instead of in a half-width column. */
+details.instr { margin: 6px -12px -10px; }
+details.instr > summary { padding: 4px 12px 8px; cursor: pointer; list-style: none; }
+details.instr > summary::-webkit-details-marker { display: none; }
+.card.actor:has(> details.instr[open]) { grid-column: 1 / -1; }
+.showinstr { font-size: 0.85em; color: var(--vscode-textLink-foreground); }
+details.instr[open] .showinstr::after { content: ' ▾'; }
+details.instr:not([open]) .showinstr::after { content: ' ▸'; }
 
 .instructions { padding: 0 12px 12px; border-top: 1px solid var(--line); }
 .turnline { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 0; font-size: 1.02em; }
