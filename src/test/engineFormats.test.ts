@@ -145,6 +145,8 @@ describe("sparring.md routing outcome", () => {
       // shown in the status bar, quoted whole by the copy-for-chat surface.
       findings: "Long findings that must never reach the status bar.",
       humanGate: undefined,
+      // Only a READY verdict is looked at for one, and this is NEEDS_YOU.
+      deferredHumanGate: undefined,
     });
   });
 

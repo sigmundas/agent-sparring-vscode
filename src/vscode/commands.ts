@@ -10,7 +10,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { acceptStage, type AcceptStageResult } from "../core/acceptance";
-import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, readGitBranch } from "../core/cli";
+import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, readGitBranch, type DeferredResultAnswer } from "../core/cli";
 import {
   BINDING_VERSION,
   adoptionGaps,
@@ -45,10 +45,10 @@ import { stageScopeOf } from "../core/stageScope";
 import { FOLLOW_ACTIVE_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
 import { parseHandoffBranch, parsePlanStages, type PlanRunSource } from "../core/engineFormats";
-import { appendHumanEvidence, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
+import { appendHumanEvidence, OUTCOME_WORDS, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
 import { blocksLaunch } from "../core/liveness";
 import type { OverviewAction } from "../core/overviewHtml";
-import { UNKNOWN_RUNNER_EXPLANATION, type PlanContinuation } from "../core/overviewModel";
+import { UNKNOWN_RUNNER_EXPLANATION, type ActionRequired, type PlanContinuation } from "../core/overviewModel";
 import { createStage, proposeNextStage, renderNextStageBrief, type NewStageResult } from "../core/nextStage";
 import { buildStageIndex, locateStage, parsePlanHeadings, sectionSummary, type HeadingRef, type PlanHeading, type StageEntry } from "../core/planAssociation";
 import { stageMatchRows, type StageMatchRow, type StageToMatch } from "../core/stageMatches";
@@ -948,6 +948,10 @@ async function submitForReviewCommand(controller: SparringController, overview: 
     void vscode.window.showInformationMessage(`Agent Sparring: ${panel.submit.detail}`);
     return;
   }
+  if (panel.kind === "deferred_verification") {
+    await submitDeferredVerification(controller, overview, run, panel);
+    return;
+  }
   const recorded = submittableChecks(panel);
   const entry = renderHumanEvidence(recorded, new Date(), model.planName);
   if (!entry) {
@@ -973,6 +977,90 @@ async function submitForReviewCommand(controller: SparringController, overview: 
       entry,
       results: count,
       stageId: run.kind === "plan" ? run.currentStage.stageId : run.stage.stageId,
+    });
+  }
+  await overview.update();
+}
+
+/**
+ * Answer the plan's deferred-verification checkpoint.
+ *
+ * Deliberately a different path from every other submission here, because
+ * what is being answered is different: not a stage's review, but the run's
+ * own obligations, which the engine keeps in its ledger and addresses by
+ * *asking* rather than by stage. So the results go through
+ * `resume-plan --deferred-result <gate instance>:<check id>=<outcome>[=note]`
+ * and nothing is written to notes.md from here — the engine records each
+ * answer in its ledger *and* in the originating stage's notes, which is the
+ * one place it can attribute them correctly. The extension writing a second
+ * copy would be guessing which stage each result belonged to.
+ *
+ * The qualified reference is always sent. A bare check id can belong to two
+ * askings at the same checkpoint, and the engine refuses an ambiguous one
+ * rather than guessing; sending the asking the panel was rendered from means
+ * the answer lands where the person was looking and nowhere else.
+ */
+async function submitDeferredVerification(
+  controller: SparringController,
+  overview: OverviewPanelManager,
+  run: RunSnapshot,
+  panel: ActionRequired,
+): Promise<void> {
+  if (run.kind !== "plan") {
+    return;
+  }
+  const answers: DeferredResultAnswer[] = [];
+  for (const check of submittableChecks(panel)) {
+    const outcome = check.record.outcome;
+    if (!check.id || !check.gateInstanceId || !outcome) {
+      // Without both identities the engine cannot attribute the answer, and
+      // an answer attributed to the wrong asking is worse than one that was
+      // never sent. Refuse the whole submission rather than send part of it.
+      void vscode.window.showWarningMessage(
+        "Agent Sparring: one of these deferred checks does not carry the asking it belongs to, so its result could not be addressed to the engine. Nothing was submitted; reopen the panel to refresh it from the engine's own state.",
+      );
+      return;
+    }
+    answers.push({ gateInstanceId: check.gateInstanceId, checkId: check.id, outcome, note: check.record.note });
+  }
+  if (answers.length === 0) {
+    void vscode.window.showInformationMessage("Agent Sparring: record Pass, Fail or Can't test for the remaining deferred checks first.");
+    return;
+  }
+  const failing = answers.filter((answer) => answer.outcome !== "pass").length;
+  const summary = answers.map((answer) => `${OUTCOME_WORDS[answer.outcome]} — ${answer.checkId}${answer.note ? `: ${answer.note}` : ""}`).join("\n");
+  const consequence =
+    failing === 0
+      ? "Every deferred check passes, so the engine completes the plan. Nothing already accepted is re-run."
+      : `${failing} of them ${failing === 1 ? "is not a pass" : "are not passes"}, so the plan stays open. A Fail is written into the stage that raised the check, where that stage's agents read it; Can't test records that no result could be obtained.`;
+  const choice = await vscode.window.showInformationMessage(
+    "Submit deferred verification?",
+    { modal: true, detail: [`${answers.length} result${answers.length === 1 ? "" : "s"} will be recorded against the askings that raised them.`, "", summary, "", consequence].join("\n") },
+    "Submit verification",
+  );
+  if (choice !== "Submit verification") {
+    return;
+  }
+  const expectedBranch = await resolveExpectedBranch(run.location, run.state.expectedBranch);
+  if (!expectedBranch) {
+    return;
+  }
+  const input = await planInvocationFor(controller, run);
+  if (!input) {
+    return;
+  }
+  const args = buildResumePlanArgs({ ...input, repoRoot: run.location.repoRoot, expectedBranch, sparringDir: run.location.sparringDir, deferredResults: answers });
+  controller.log(`Submit deferred verification: ${answers.length} result(s) passed to resume-plan --deferred-result`);
+  const result = await launch(controller, run.location, args, "resume-plan", run.planPath, "manifest" in input ? input.manifest : undefined);
+  if (result.ok) {
+    await controller.beginSubmission({
+      runId: run.id,
+      channel: "checks",
+      executionId: result.record.id,
+      startedAtMs: Date.now(),
+      entry: summary,
+      results: answers.length,
+      stageId: run.currentStage.stageId,
     });
   }
   await overview.update();

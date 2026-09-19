@@ -478,6 +478,18 @@ ${renderActors(model, discloseScope(model))}
     // choice living there rather than in this window.
     parts.push(`<p class="autopush" title="${escapeHtml(model.autoPushEnabled.detail)}">${icon("check", "good")}${escapeHtml(model.autoPushEnabled.label)}</p>`);
   }
+  if (model.deferredNote) {
+    // Said quietly, beside the run's other standing facts, and never as an
+    // action: a stage accepted with a deferral is accepted *and* still owes
+    // a check, and a panel that shows only the first half claims the second.
+    // The journey continues; this is a note, not a stop.
+    const entries = model.deferredNote.entries
+      .map((entry) => `<li><strong>${escapeHtml(entry.title)}</strong> <span class="muted small">(${escapeHtml(entry.stageId)})</span><br><span class="muted small">Deferred by the reviewer: ${escapeHtml(entry.rationale)}</span></li>`)
+      .join("");
+    parts.push(
+      `<details class="deferrednote"${disclose(scope, "deferred-owed")}><summary title="${escapeHtml(model.deferredNote.detail)}">${icon("check", "good")}${escapeHtml(model.deferredNote.label)}</summary><ul class="owed">${entries}</ul></details>`,
+    );
+  }
   if (model.pushAuthorization) {
     parts.push(renderPushAuthorization(model.pushAuthorization, scope));
   } else if (model.actionRequired) {
@@ -675,13 +687,21 @@ function renderActionRequired(model: OverviewModel, panel: ActionRequired, scope
   const note = !gate && panel.reviewerNote ? `<p class="reason"><span class="tag reviewer">Reviewer note</span> ${escapeHtml(panel.reviewerNote)}</p>` : "";
   const failure = panel.reviewFailure ? `<p class="failure">${icon("warn", "escalate")}${escapeHtml(panel.reviewFailure)}</p>` : "";
   const submission = renderSubmissionState(panel);
-  const body = gate ? renderGateChecks(panel, scope) : renderDerivedChecks(panel);
+  const deferred = panel.kind === "deferred_verification";
+  const body = deferred ? renderDeferredChecks(panel, scope) : gate ? renderGateChecks(panel, scope) : renderDerivedChecks(panel);
   const buttons: string[] = [];
   buttons.push(button("submitForReview", panel.submit.label, panel.submit.enabled, panel.submit.detail, "primary"));
   // The second submission path, beside the first: the two are alternatives,
   // and a person who found a blocking bug instead of a check result has to
   // be able to see that there is somewhere for it to go.
-  buttons.push(button("sendFeedbackForReview", panel.feedback.send.label, panel.feedback.send.enabled, panel.feedback.send.detail));
+  //
+  // Not at the deferred checkpoint, where there is no candidate under review
+  // to send an observation about: every stage is accepted, and the way to
+  // report that something is wrong is a Fail with a note, which reaches the
+  // stage that raised the check.
+  if (!deferred) {
+    buttons.push(button("sendFeedbackForReview", panel.feedback.send.label, panel.feedback.send.enabled, panel.feedback.send.detail));
+  }
   if (panel.planSection) {
     buttons.push(button("openPlanSection", "Open plan section", true, `Open the document ${model.planName ?? "the plan"} at this stage's section`));
   }
@@ -714,11 +734,12 @@ function renderActionRequired(model: OverviewModel, panel: ActionRequired, scope
       `<details class="more"${disclose(scope, "other-actions")}><summary title="Other things that can be run from here">…</summary><div class="actions">${button(panel.resume.action, `${panel.resume.label} (implementation)`, true, panel.resume.detail, "quiet")}</div></details>`,
     );
   }
-  return `<section class="card action ${panel.kind}${panel.ready ? " ready" : ""}${gate ? " gate" : ""}">
-<div class="actionhead"><h2>${icon(panel.ready && panel.kind === "needs_you" ? "check" : "warn", panel.ready && panel.kind === "needs_you" ? "ready" : panel.kind)}${escapeHtml(panel.headline)}</h2>${summary}${note}${failure}</div>
+  const settled = panel.ready && panel.kind !== "escalate";
+  return `<section class="card action ${panel.kind}${panel.ready ? " ready" : ""}${gate || deferred ? " gate" : ""}">
+<div class="actionhead"><h2>${icon(settled ? "check" : "warn", settled ? "ready" : panel.kind === "escalate" ? "escalate" : "needs_you")}${escapeHtml(panel.headline)}</h2>${summary}${note}${failure}</div>
 ${submission}
 ${body}
-${renderFeedbackField(panel, scope)}
+${deferred ? "" : renderFeedbackField(panel, scope)}
 ${renderTechnical(panel, scope)}
 <div class="actions">${buttons.join("")}</div>
 </section>`;
@@ -812,6 +833,40 @@ function renderGateChecks(panel: ActionRequired, scope: string): string {
       ? `<ol class="checklist gate">${panel.required.map((item, index) => renderTask(item, index + 1, total)).join("")}</ol>`
       : `<p class="muted">Every check the reviewer asked for has a recorded result.</p>`;
   return `<div class="checks">${title}${progress}${required}${renderPreviousEvidence(panel, scope)}</div>`;
+}
+
+/**
+ * The plan's deferred-verification checkpoint: one section per obligation,
+ * each headed by the stage that raised it and the reviewer's own reason for
+ * deferring, with that obligation's checks under it.
+ *
+ * Grouped rather than flattened, and the rationale shown rather than
+ * demoted, because the question a person arriving here actually has is why
+ * they are being asked about a stage that finished some time ago. The answer
+ * is the reviewer's sentence, and it is the record that lets them disagree
+ * with the judgement that brought them here.
+ */
+function renderDeferredChecks(panel: ActionRequired, scope: string): string {
+  const total = panel.recorded.length + panel.required.length;
+  const progress = total > 1 && panel.progress ? `<p class="muted small progress">${escapeHtml(panel.progress)}</p>` : "";
+  const byKey = new Map(panel.required.map((item) => [item.draftKey, item] as const));
+  let position = 0;
+  const sections = (panel.deferredGroups ?? []).map((group) => {
+    const items = group.checkKeys.map((key) => byKey.get(key)).filter((item): item is NonNullable<typeof item> => item !== undefined);
+    const list =
+      items.length > 0
+        ? `<ol class="checklist gate">${items.map((item) => renderTask(item, ++position, total)).join("")}</ol>`
+        : `<p class="muted small">Answered.</p>`;
+    const promoted = group.promoted ? `<p class="muted small">A later review decided this one could not wait.</p>` : "";
+    return `<div class="part deferredgroup">
+<h4>${escapeHtml(group.title)}</h4>
+<p class="muted small">${escapeHtml(group.category)} · raised by ${escapeHtml(group.stageId)}</p>
+<p class="criterion parent">Deferred by the reviewer: ${escapeHtml(group.rationale)}</p>
+${promoted}
+${list}
+</div>`;
+  });
+  return `<div class="checks">${progress}${sections.join("")}${renderPreviousEvidence(panel, scope)}</div>`;
 }
 
 /** Evidence already in notes.md, compact and collapsed; absent when there is none. */
@@ -1765,6 +1820,11 @@ pre.engineerror { margin: 6px 0 0; padding: 6px 8px; max-height: 9em; overflow: 
 .pushchoice .toggle { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
 .pushchoice .toggle input { margin: 0; }
 .autopush { display: inline-flex; align-items: center; gap: 6px; margin: 0 0 8px; color: var(--good); font-weight: 600; }
+.deferrednote { margin: 0 0 10px; }
+.deferrednote > summary { display: flex; align-items: center; gap: 6px; cursor: pointer; font-weight: 600; }
+.deferrednote ul.owed { margin: 6px 0 0; padding-left: 18px; }
+.deferrednote ul.owed li { margin: 4px 0; }
+.deferredgroup + .deferredgroup { margin-top: 12px; }
 
 /* What the next turn would run with. Compact by design: the file is the editor. */
 /* The shared line beside the two cards: Settings, and anything the engine

@@ -86,6 +86,28 @@ export interface ResumePlanInvocation extends PlanInvocation {
   evidence?: string;
   /** Present only when the person has just allowed a push; see `PushAuthorizationRequest`. */
   allowPush?: PushAuthorizationRequest;
+  /**
+   * Answers to the deferred manual checks the run is stopped on, one per
+   * `--deferred-result`.
+   *
+   * Always addressed as `<gate instance>:<check id>`, never as the bare id:
+   * two askings at one checkpoint can own the same check id, and the engine
+   * refuses an ambiguous reference rather than guessing. Sending the
+   * qualified form always means the answer lands on the asking that was on
+   * screen, and on no other.
+   */
+  deferredResults?: DeferredResultAnswer[];
+}
+
+/** One answer to one deferred check, as the engine's `--deferred-result` takes it. */
+export interface DeferredResultAnswer {
+  /** The engine-minted asking this answers. */
+  gateInstanceId: string;
+  /** The reviewer's own check id. */
+  checkId: string;
+  outcome: "pass" | "fail" | "blocked";
+  /** Optional; recorded with the result in the originating stage's notes.md. */
+  note?: string;
 }
 
 export function buildResumePlanArgs(invocation: ResumePlanInvocation): string[] {
@@ -93,6 +115,14 @@ export function buildResumePlanArgs(invocation: ResumePlanInvocation): string[] 
   const args = [...globalArgs(invocation), "resume-plan", ...planInput(invocation), ...loopArgs(invocation)];
   if (invocation.evidence && invocation.evidence.trim()) {
     args.push("--evidence", invocation.evidence.trim());
+  }
+  for (const answer of invocation.deferredResults ?? []) {
+    // `<ref>=<outcome>[=<note>]`, and the engine splits at most twice, so a
+    // note may contain `=` freely. Newlines are collapsed: the value is one
+    // shell argument, and a note is a sentence, not a document.
+    const note = answer.note?.trim().replace(/\s+/g, " ");
+    const ref = `${answer.gateInstanceId}:${answer.checkId}`;
+    args.push("--deferred-result", note ? `${ref}=${answer.outcome}=${note}` : `${ref}=${answer.outcome}`);
   }
   if (invocation.allowPush) {
     args.push("--allow-push-candidate", invocation.allowPush.candidateSha);

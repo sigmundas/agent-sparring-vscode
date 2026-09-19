@@ -844,6 +844,25 @@ export interface CheckItem {
   gateId?: string;
   /** The reviewer's own pass/fail criteria; gate checks only. */
   passCriteria?: string;
+  /**
+   * The asking this check belongs to, when the gate named one.
+   *
+   * `draftKey` already encodes it, but it is needed *by itself* by anything
+   * that has to address the check back to the engine — a deferred result is
+   * sent as `<gate instance>:<check id>`, because the same check id can be
+   * owed by two different askings at the same checkpoint and the engine
+   * refuses to guess between them.
+   */
+  gateInstanceId?: string;
+  /**
+   * The stage whose review raised this check, for a deferred obligation.
+   *
+   * Absent for an immediate gate, where the check belongs to the stage in
+   * front of the person by construction. Present at the plan's verification
+   * checkpoint, where the whole point is that these came from stages that
+   * finished some time ago.
+   */
+  originStageId?: string;
   /** Where the full test is defined, as the reviewer named it; gate checks only. */
   source?: string;
   /** Plan line for plan checks. */
@@ -992,6 +1011,80 @@ export function deriveVerification(plan: PlanChecks, outcome: SparringOutcome | 
  * with different wording — which is the whole reason the engine requires a
  * stable id.
  */
+/**
+ * The panel's lists for the plan's **deferred-verification checkpoint**.
+ *
+ * Same machinery as {@link deriveVerification}, and deliberately so: these
+ * are gate checks, with reviewer ids, pass criteria and askings, and
+ * inventing a second evidence system for them would mean a second set of
+ * rules about which recorded answer counts — the exact thing the gate
+ * instance exists to settle. What differs is only that the checks come from
+ * *several* gates, raised by *several* stages, gathered into one checkpoint
+ * so a person is interrupted once rather than four times.
+ *
+ * Provenance is kept per check: `originStageId` says which stage's review
+ * raised it, and `gateInstanceId` says which asking it answers. Both travel
+ * as far as the engine, which is addressed as `<instance>:<check id>`.
+ *
+ * `results` is the engine's ledger, not notes.md: an obligation the engine
+ * already records an outcome for is shown as recorded even though the
+ * evidence line lives in the originating stage's notes rather than in the
+ * one this panel happens to be reading.
+ */
+export function deriveDeferredVerification(
+  obligations: {
+    stageId: string;
+    gate: HumanGate;
+    results: { checkId: string; outcome: CheckOutcome; note?: string }[];
+  }[],
+  evidence: EvidenceEntry[],
+  drafts: Record<string, CheckRecord>,
+): VerificationView {
+  const items: CheckItem[] = [];
+  for (const obligation of obligations) {
+    for (const item of gateItems(obligation.gate)) {
+      item.originStageId = obligation.stageId;
+      const recorded = obligation.results.find((result) => result.checkId === item.key);
+      if (recorded) {
+        // The ledger is the authority here. A person who already answered
+        // this at an earlier visit to the checkpoint must not be asked
+        // again, and must not have their answer re-sent.
+        item.evidence = {
+          excerpt: recorded.note ?? item.text,
+          outcome: recorded.outcome,
+          how: "id",
+        };
+      } else {
+        item.previous = evidenceForGateInstance(item, evidence, item.gateInstanceId).previous;
+        item.record = drafts[item.draftKey];
+      }
+      items.push(item);
+    }
+  }
+  const recorded = items.filter((item) => item.evidence);
+  const required = items.filter((item) => !item.evidence);
+  const submittable: RecordedCheck[] = required
+    .filter((item) => item.record?.outcome)
+    .map((item) => ({
+      text: item.text,
+      origin: item.origin,
+      record: item.record as CheckRecord,
+      id: item.key,
+      gateInstanceId: item.gateInstanceId,
+    }));
+  return {
+    source: "gate",
+    parents: [],
+    explicitCount: 0,
+    reviewerCount: 0,
+    recorded,
+    required,
+    progress: progressText(items),
+    submittable,
+    ready: submittable.length > 0 && submittable.length === required.length,
+  };
+}
+
 function gateItems(gate: HumanGate): CheckItem[] {
   return gate.checks.map((check) => {
     // The reviewer's id, unless it is a shape the panel cannot round-trip —
@@ -1003,6 +1096,7 @@ function gateItems(gate: HumanGate): CheckItem[] {
     return {
       key,
       draftKey: draftKeyFor(key, gate.instanceId),
+      gateInstanceId: gate.instanceId,
       askingIdentified: gate.instanceId !== undefined,
       gateId: usable ? check.id : undefined,
       text: check.instruction,
