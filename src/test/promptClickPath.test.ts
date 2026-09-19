@@ -138,6 +138,6 @@ describe("what the card shows", () => {
 
     assert.equal(model.stageAgent?.prompt, undefined);
     assert.ok(!html.includes("Show instructions"), "no disclosure that would open on nothing");
-    assert.match(html, /<div class="card actor">/);
+    assert.match(html, /<div class="card actor [a-z]+" data-role="stage">/, "still a card, just one with no toggle on it");
   });
 });

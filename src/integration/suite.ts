@@ -908,15 +908,15 @@ async function promptInspectorAssertions(): Promise<void> {
     const shipped = `<script nonce="${nonce}">`;
     const preamble = `<script nonce="${nonce}">var __api; var __acquire = acquireVsCodeApi; acquireVsCodeApi = function () { __api = __acquire(); return __api; };</script>`;
     const probe = `<script nonce="${nonce}">
-      var card = document.querySelector('.card.actor details.instr');
+      var card = document.querySelector('.instrpanel[data-instrpanel]');
       var section = document.querySelector('details.promptsec');
-      card.open = true;
+      card.hidden = false;
       section.open = true;
       var openBefore = section.open;
       document.querySelector('button[data-openprompt]').click();
       var afterOpenSource = section.open;
       document.querySelector('button[data-copyprompt]').click();
-      __api.postMessage({ type: 'promptProbe', openBefore: openBefore, afterOpenSource: afterOpenSource, cardStillOpen: card.open });
+      __api.postMessage({ type: 'promptProbe', openBefore: openBefore, afterOpenSource: afterOpenSource, cardStillOpen: !card.hidden });
     </script>`;
     panel.webview.html = renderOverviewHtml(model, nonce, panel.webview.cspSource).replace(shipped, `${preamble}${shipped}`).replace("</body>", `${probe}</body>`);
     const report = await probed;
@@ -1031,15 +1031,15 @@ async function disclosurePersistenceAssertions(): Promise<void> {
     const opening = waitForProbe("openedProbe");
     panel.webview.html = draw(
       openNonce,
-      `var card = document.querySelector('.card.actor details.instr[data-disclose]');
+      `var card = document.querySelector('.instrpanel[data-disclose]');
        var big = document.querySelector('details.promptsec:not([open])[data-disclose]');
-       card.querySelector('summary').click();
-       // A details element fires its toggle event asynchronously, and the
-       // shipped listener records the state from that event. Reporting in
-       // the same task as the click would be asking whether the state had
-       // been written before the browser had said it changed.
+       document.querySelector('button[aria-controls="' + card.id + '"]').click();
+       // The prompt sections are <details>, which fire their toggle event
+       // asynchronously, and the shipped listener records the state from
+       // that event. Reporting in the same task would be asking whether the
+       // state had been written before the browser had said it changed.
        setTimeout(function () {
-         __api.postMessage({ type: 'openedProbe', cardOpen: card.open, cardKey: card.getAttribute('data-disclose'), bigOpen: big ? big.open : null, bigKey: big ? big.getAttribute('data-disclose') : null, state: __api.getState() });
+         __api.postMessage({ type: 'openedProbe', cardOpen: !card.hidden, cardKey: card.getAttribute('data-disclose'), bigOpen: big ? big.open : null, bigKey: big ? big.getAttribute('data-disclose') : null, state: __api.getState() });
        }, 50);`,
     );
     const opened = await opening;
@@ -1052,15 +1052,17 @@ async function disclosurePersistenceAssertions(): Promise<void> {
     const redrawn = waitForProbe("redrawnProbe");
     panel.webview.html = draw(
       redrawNonce,
-      `var card = document.querySelector('.card.actor details.instr[data-disclose]');
+      `var card = document.querySelector('.instrpanel[data-disclose]');
        var big = document.querySelector('details.promptsec[data-disclose="${String(opened["bigKey"])}"]');
-       __api.postMessage({ type: 'redrawnProbe', cardOpen: card.open, cardKey: card.getAttribute('data-disclose'), bigOpen: big ? big.open : null, state: __api.getState() });`,
+       var toggle = document.querySelector('button[aria-controls="' + card.id + '"]');
+       __api.postMessage({ type: 'redrawnProbe', cardOpen: !card.hidden, expanded: toggle.getAttribute('aria-expanded'), cardKey: card.getAttribute('data-disclose'), bigOpen: big ? big.open : null, state: __api.getState() });`,
     );
     const after = await redrawn;
 
     console.log(`integration: disclosure state after open ${JSON.stringify(opened["state"])}, after redraw ${JSON.stringify(after["state"])}`);
     assert.equal(after["cardKey"], opened["cardKey"], "the same section, under the same stable key");
     assert.equal(after["cardOpen"], true, "Show instructions is still open after the rerender — the reported bug");
+    assert.equal(after["expanded"], "true", "and the card's own toggle was restored with it");
     assert.equal(after["bigOpen"], false, "and a section the person never opened is still closed");
   } finally {
     panel.dispose();
@@ -1150,12 +1152,18 @@ async function actorCardControlAssertions(): Promise<void> {
     const preamble = `<script nonce="${nonce}">var __api; var __acquire = acquireVsCodeApi; acquireVsCodeApi = function () { __api = __acquire(); return __api; };</script>`;
     const probe = `<script nonce="${nonce}">
       var card = document.querySelector('.card.actor');
-      var instr = card.querySelector('details.instr');
+      var instr = document.querySelector('.instrpanel[data-instrpanel="stage"]');
       var effort = card.querySelector('select[data-field="effort"]');
       var levels = Array.prototype.map.call(effort.options, function (option) { return option.value; });
+      // Where both cards sit before anything is opened, so "the cards stay
+      // where they are" is measured rather than asserted about the markup.
+      var cardsBefore = [].map.call(document.querySelectorAll('.card.actor'), function (node) {
+        var r = node.getBoundingClientRect();
+        return Math.round(r.top) + ',' + Math.round(r.left) + ',' + Math.round(r.width);
+      });
       // Open the instructions the way a person does, then use the controls.
-      instr.querySelector('summary').click();
-      var openedInstructions = instr.open;
+      card.querySelector('button[data-instr]').click();
+      var openedInstructions = !instr.hidden;
       effort.value = 'glacial';
       effort.dispatchEvent(new Event('change', { bubbles: true }));
       setTimeout(function () {
@@ -1177,7 +1185,7 @@ async function actorCardControlAssertions(): Promise<void> {
           provider: providerLine.textContent,
           levels: levels,
           openedInstructions: openedInstructions,
-          stillOpen: instr.open,
+          stillOpen: !instr.hidden,
           panels: document.querySelectorAll('.agentconfig').length,
           cards: document.querySelectorAll('.card.actor').length,
           roleSize: size(rolename),
@@ -1192,6 +1200,14 @@ async function actorCardControlAssertions(): Promise<void> {
           // Both start on the same column, which is the alignment the
           // read-only value's padding exists to preserve.
           modelAlignsWithEffort: Math.abs(modelBox.left - effortBox.left) < 1,
+          cardsBefore: cardsBefore,
+          cardsAfter: [].map.call(document.querySelectorAll('.card.actor'), function (node) {
+            var r = node.getBoundingClientRect();
+            return Math.round(r.top) + ',' + Math.round(r.left) + ',' + Math.round(r.width);
+          }),
+          // The panel is below both cards and as wide as the pair of them.
+          panelBelowBothCards: instr.getBoundingClientRect().top >= Math.max.apply(null, [].map.call(document.querySelectorAll('.card.actor'), function (node) { return node.getBoundingClientRect().bottom; })) - 1,
+          panelWiderThanCard: instr.getBoundingClientRect().width > cardBox.width * 1.5,
         });
       }, 50);
     </script>`;
@@ -1213,6 +1229,11 @@ async function actorCardControlAssertions(): Promise<void> {
     assert.equal(seen["modelValue"], "a-model", "showing exactly what the engine resolved");
     assert.equal(seen["modelEditable"], 0, "and nothing on the card can be typed into");
     assert.equal(seen["modelAlignsWithEffort"], true, "the read value starts on the same column as the dropdown");
+    // The reported bug: opening one actor's instructions moved the other
+    // actor's card. Both cards' boxes are measured either side of the click.
+    assert.deepEqual(seen["cardsAfter"], seen["cardsBefore"], "opening the instructions moved neither card");
+    assert.equal(seen["panelBelowBothCards"], true, "what it opened is below both cards");
+    assert.equal(seen["panelWiderThanCard"], true, "and is read at the width of the page, not of one column");
     console.log(`integration: role ${String(seen["roleSize"])}px ${String(seen["roleColor"])} over provider ${String(seen["providerSize"])}px ${String(seen["providerColor"])}`);
 
     const changes = posted.filter((message) => message["type"] === "agentConfig");

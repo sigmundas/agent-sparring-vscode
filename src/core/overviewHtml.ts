@@ -1272,11 +1272,15 @@ function renderActors(model: OverviewModel, scope: string): string {
   const configScope = config?.scope;
   const controlsFor = (role: ConfigRole): AgentRoleControls | undefined =>
     configScope ? config?.controls.find((entry) => entry.role === role) : undefined;
-  const cards = [model.stageAgent, model.sparrer]
-    .filter((card): card is ActorCard => card !== undefined)
-    .map((card) => renderActor(card, scope, controlsFor(card.configRole), configScope))
-    .join("");
-  const section = cards ? `<section class="actors">${cards}</section>` : "";
+  const actors = [model.stageAgent, model.sparrer].filter((card): card is ActorCard => card !== undefined);
+  const cards = actors.map((card) => renderActor(card, controlsFor(card.configRole), configScope)).join("");
+  // Every panel is laid out after every card, so the cards keep their row
+  // whichever of them is open, and an opened panel appears below both of
+  // them at the width of the rest of the page rather than in a half-width
+  // column. Each panel names the actor it belongs to and carries that
+  // actor's colour, and the card it came from is marked while it is open.
+  const panels = actors.map((card) => renderInstructionsPanel(card, scope)).join("");
+  const section = cards ? `<section class="actors">${cards}${panels}</section>` : "";
   return `${section}${config ? renderAgentsBar(config, cards !== "") : ""}`;
 }
 
@@ -1288,12 +1292,14 @@ function renderActors(model: OverviewModel, scope: string): string {
  * is a setting. The provider is therefore read underneath it, quietly, and
  * the model and effort controls follow as the settings of that role.
  *
- * The instructions disclosure is nested rather than wrapped around the whole
- * card: a `<summary>` activates on click, and a model field or effort
- * dropdown living inside one would be a control that collapses the card it
- * is in as often as not.
+ * The card carries the toggle for its instructions but not the instructions
+ * themselves: those are a panel after both cards, so opening one actor's
+ * does not move the other actor's card out of its row. The toggle is a
+ * button and not a `<summary>` for the same reason it was never wrapped
+ * around the card -- a summary activates on click, and an effort dropdown
+ * inside one would collapse the card it is in as often as not.
  */
-function renderActor(card: ActorCard, scope: string, controls: AgentRoleControls | undefined, configScope: string | undefined): string {
+function renderActor(card: ActorCard, controls: AgentRoleControls | undefined, configScope: string | undefined): string {
   const busy = card.activity === "Working" || card.activity === "Sparring";
   const duration = card.duration ? ` for ${escapeHtml(card.duration)}` : "";
   const quiet = card.quietFor ? ` <span class="muted">· no meaningful activity for ${escapeHtml(card.quietFor)}</span>` : "";
@@ -1303,7 +1309,7 @@ function renderActor(card: ActorCard, scope: string, controls: AgentRoleControls
   // time since the observed start, not a claim that work is happening now.
   const word = busy && card.uncertain ? `${card.activity}?` : (card.activity ?? "");
   const span = busy && card.uncertain ? (card.duration ? ` <span class="muted">(turn observed ${escapeHtml(card.duration)} ago)</span>` : "") : duration;
-  const role = card.role === "Stage agent" ? "stage" : "sparrer";
+  const role = actorRole(card);
   const identity = `<div class="identity"><span class="avatar ${who}">${avatarGlyph(role)}</span>
 <div class="who"><div class="rolename ${who}">${escapeHtml(card.role)}</div><div class="provider muted">${escapeHtml(card.provider)}</div></div></div>`;
   const settings = controls && configScope ? renderRoleControls(controls, configScope) : "";
@@ -1324,13 +1330,52 @@ function renderActor(card: ActorCard, scope: string, controls: AgentRoleControls
   // stays a card rather than offering a disclosure that would open on
   // nothing.
   if (!card.prompt) {
-    return `<div class="card actor">${body}</div>`;
+    return `<div class="card actor ${who}" data-role="${role}">${body}</div>`;
   }
-  return `<div class="card actor">${body}
-<details class="instr" data-role="${role}"${disclose(scope, role, "instructions")}>
-<summary><span class="showinstr">Show instructions</span></summary>
-${renderInstructions(card.prompt, role, scope)}
-</details></div>`;
+  // The toggle stays on the card; what it opens is rendered after both cards
+  // (see `renderActors`), so opening one actor's instructions never moves the
+  // other actor's card. `aria-controls` is the only thing tying the two
+  // together in the document, and the script relies on the same pairing.
+  return `<div class="card actor ${who}" data-role="${role}">${body}
+<button type="button" class="showinstr" data-instr="${role}" aria-controls="${instrPanelId(role)}" aria-expanded="false">Show instructions</button></div>`;
+}
+
+/** The id the card's toggle points at, and the panel answers to. */
+function instrPanelId(role: string): string {
+  return `instr-${role}`;
+}
+
+/**
+ * Which actor a card is for, in the vocabulary the markup uses. One
+ * definition, because the card's `aria-controls` and the panel's id are
+ * derived from it and a disagreement would be a toggle that opens nothing.
+ */
+function actorRole(card: ActorCard): "stage" | "sparrer" {
+  return card.role === "Stage agent" ? "stage" : "sparrer";
+}
+
+/**
+ * One actor's instructions, as a panel below the cards rather than inside
+ * the card that opens it.
+ *
+ * It is a plain element and not a `<details>` because the control that opens
+ * it lives in the card and a `<summary>` cannot be separated from its own
+ * `<details>`. Its open state is still remembered the way every disclosure
+ * on this page is — `data-disclose`, keyed by what the section is — so
+ * nothing new is stored and a reload restores it with the rest.
+ *
+ * The panel repeats the actor's role, because two open panels stack and the
+ * colour alone would be the only thing telling them apart.
+ */
+function renderInstructionsPanel(card: ActorCard, scope: string): string {
+  if (!card.prompt) {
+    return "";
+  }
+  const role = actorRole(card);
+  const who = whoClass(card.provider);
+  return `<div class="instrpanel ${who}" id="${instrPanelId(role)}" data-instrpanel="${role}"${disclose(scope, role, "instructions")} hidden>
+<div class="instrhead ${who}">${escapeHtml(card.role)} <span class="muted">· instructions</span></div>
+${renderInstructions(card.prompt, role, scope)}</div>`;
 }
 
 /**
@@ -1809,20 +1854,53 @@ p { margin: 0 0 4px; line-height: 1.45; }
 .activity.working .icon.dot, .activity.sparring .icon.dot { color: var(--good); }
 .session { font-family: var(--vscode-editor-font-family); font-size: 0.85em; }
 
-/* The captured prompt is a disclosure inside the card rather than the card
-   itself: the card holds live controls, and a <summary> around them would
-   collapse the card whenever one was clicked. Opening it spans the full
-   width of the grid, so the prompt is read at the width of the rest of the
-   UI instead of in a half-width column. */
-details.instr { margin: 6px -12px -10px; }
-details.instr > summary { padding: 4px 12px 8px; cursor: pointer; list-style: none; }
-details.instr > summary::-webkit-details-marker { display: none; }
-.card.actor:has(> details.instr[open]) { grid-column: 1 / -1; }
-.showinstr { font-size: 0.85em; color: var(--vscode-textLink-foreground); }
-details.instr[open] .showinstr::after { content: ' ▾'; }
-details.instr:not([open]) .showinstr::after { content: ' ▸'; }
+/* The captured prompt opens below both cards, never inside the card that
+   opens it: a card that grew would push the other actor's card out of its
+   row, which is the one thing a person reading two actors side by side does
+   not want. The card is the tab and the panel is what the tab opens, so the
+   prompt is also read at the width of the rest of the page. */
+.showinstr {
+  display: block; margin: 6px -12px -10px; padding: 4px 12px 8px; width: calc(100% + 24px);
+  font: inherit; font-size: 0.85em; text-align: left; cursor: pointer;
+  color: var(--vscode-textLink-foreground); background: none; border: none;
+}
+.showinstr::after { content: ' ▸'; }
+.showinstr[aria-expanded="true"]::after { content: ' ▾'; }
+.showinstr:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+/* While its panel is open the card is the selected tab: it carries the
+   actor's own colour along the edge the panel is on, and gives up the
+   rounding there so the two read as one surface. The colour is painted
+   inside the existing border rather than widening it, so selecting a tab
+   cannot change the height of the card it is on. */
+.card.actor:has(> .showinstr[aria-expanded="true"]) { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+.card.actor.claude:has(> .showinstr[aria-expanded="true"]) { box-shadow: inset 0 -2px 0 var(--claude); }
+.card.actor.codex:has(> .showinstr[aria-expanded="true"]) { box-shadow: inset 0 -2px 0 var(--codex); }
 
-.instructions { padding: 0 12px 12px; border-top: 1px solid var(--line); }
+.instrpanel {
+  grid-column: 1 / -1; position: relative; margin-top: -4px;
+  border: 1px solid var(--line); border-top-width: 2px; border-radius: 6px;
+  background: var(--card);
+}
+.instrpanel.claude { border-top-color: var(--claude); }
+.instrpanel.codex { border-top-color: var(--codex); }
+.instrhead { padding: 8px 12px 0; font-weight: 600; }
+.instrhead.claude { color: var(--claude); }
+.instrhead.codex { color: var(--codex); }
+/* The notch points at the card this panel came from -- a quarter of the way
+   across for the left card, three quarters for the right one. Only the panel
+   directly under the cards gets one: a second open panel sits under the
+   first, where an arrow would point at the panel above it rather than at any
+   card. */
+.instrpanel::before {
+  content: ''; position: absolute; top: -7px; width: 12px; height: 12px;
+  background: var(--card); border-left: 2px solid; border-top: 2px solid; border-color: inherit;
+  transform: rotate(45deg);
+}
+.instrpanel[data-instrpanel="stage"]::before { left: 25%; }
+.instrpanel[data-instrpanel="sparrer"]::before { left: 75%; }
+.instrpanel:not([hidden]) ~ .instrpanel:not([hidden])::before { display: none; }
+
+.instructions { padding: 0 12px 12px; }
 .turnline { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 0; font-size: 1.02em; }
 .turnchip { flex: none; padding: 1px 8px; border: 1px solid var(--line); border-radius: 10px; font-size: 0.8em; color: var(--vscode-descriptionForeground); }
 .turnchip.live { border-color: var(--good); color: var(--good); font-weight: 600; }
@@ -1878,6 +1956,10 @@ button.quiet { background: transparent; color: var(--vscode-descriptionForegroun
   .columns { grid-template-columns: 1fr; }
   .col.right { border-left: none; padding-left: 0; border-top: 1px solid var(--line); padding-top: 8px; }
   .actors { grid-template-columns: 1fr; }
+  /* One column: the cards are stacked, so a notch a quarter of the way
+     across would point at neither of them. The panel's coloured edge and
+     its heading are what say whose it is. */
+  .instrpanel::before { display: none; }
 }
 `;
 
@@ -1927,14 +2009,23 @@ const DISCLOSURE_SCRIPT = `
     var open = state()[STORE];
     return open && typeof open === 'object' ? open : {};
   }
+  // A disclosure is a <details>, or a panel whose control lives elsewhere on
+  // the page -- the instructions, opened from its actor's card. Both are
+  // remembered the same way, under the same keys.
+  function show(node, isOpen) {
+    if (node.tagName === 'DETAILS') { node.open = isOpen; return; }
+    node.hidden = !isOpen;
+    var toggle = document.querySelector('[aria-controls="' + node.id + '"]');
+    if (toggle) { toggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false'); }
+  }
   function restore() {
     var open = disclosures();
     var kept = {};
-    var nodes = document.querySelectorAll('details[data-disclose]');
+    var nodes = document.querySelectorAll('[data-disclose]');
     for (var i = 0; i < nodes.length; i++) {
       var key = nodes[i].getAttribute('data-disclose');
       if (Object.prototype.hasOwnProperty.call(open, key)) {
-        nodes[i].open = open[key] === true;
+        show(nodes[i], open[key] === true);
         // Pruning to what this document has is what bounds the store: a
         // disclosure belonging to a stage that is no longer on screen is
         // dropped rather than kept for ever.
@@ -1949,15 +2040,32 @@ const DISCLOSURE_SCRIPT = `
     next[STORE] = kept;
     remember(next);
   }
+  function record(node, isOpen) {
+    var next = state();
+    var open = next[STORE] && typeof next[STORE] === 'object' ? next[STORE] : {};
+    open[node.getAttribute('data-disclose')] = isOpen === true;
+    next[STORE] = open;
+    remember(next);
+  }
   document.addEventListener('toggle', function (event) {
     var node = event.target;
     if (!node || !node.getAttribute || !node.hasAttribute('data-disclose')) { return; }
-    var next = state();
-    var open = next[STORE] && typeof next[STORE] === 'object' ? next[STORE] : {};
-    open[node.getAttribute('data-disclose')] = node.open === true;
-    next[STORE] = open;
-    remember(next);
+    record(node, node.open === true);
   }, true);
+  // The instructions toggle. The panel it opens is laid out after both actor
+  // cards, so opening one actor's instructions leaves the other actor's card
+  // exactly where it was; the button and the panel are tied by aria-controls
+  // and nothing else.
+  document.addEventListener('click', function (event) {
+    var element = event.target instanceof Element ? event.target : null;
+    var toggle = element ? element.closest('button[data-instr]') : null;
+    if (!toggle) { return; }
+    var panel = document.getElementById(toggle.getAttribute('aria-controls'));
+    if (!panel) { return; }
+    var isOpen = panel.hidden;
+    show(panel, isOpen);
+    if (panel.hasAttribute('data-disclose')) { record(panel, isOpen); }
+  });
   // Where the person had scrolled to, kept cheaply: the value is read back
   // only when a fresh document is built, so a throttle of a frame is
   // plenty and a scroll never costs a write per event.

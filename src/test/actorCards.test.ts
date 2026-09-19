@@ -108,9 +108,23 @@ function artifacts(agentConfig: EffectiveConfig | undefined, capturedPrompts?: C
 function card(html: string, role: "Stage agent" | "Sparrer"): string {
   const section = /<section class="actors">([\s\S]*?)<\/section>/.exec(html)?.[1];
   assert.ok(section, "the page has an actors section");
-  const pieces = section.split('<div class="card actor">').filter((piece) => piece.trim() !== "");
+  // Every card comes before every instructions panel, so the cards end where
+  // the first panel begins. That ordering is the layout: it is what keeps a
+  // card in its row when the other actor's instructions are opened.
+  const cards = section.split('<div class="instrpanel')[0];
+  const pieces = cards.split('<div class="card actor ').filter((piece) => piece.trim() !== "");
   const found = pieces.find((piece) => piece.includes(`>${role}</div>`));
   assert.ok(found, `a card headed ${role}`);
+  return found;
+}
+
+/** One instructions panel, which lives after the cards rather than in one. */
+function panel(html: string, role: "stage" | "sparrer"): string {
+  const section = /<section class="actors">([\s\S]*?)<\/section>/.exec(html)?.[1];
+  assert.ok(section, "the page has an actors section");
+  const pieces = section.split('<div class="instrpanel ').slice(1);
+  const found = pieces.find((piece) => piece.includes(`data-instrpanel="${role}"`));
+  assert.ok(found, `an instructions panel for ${role}`);
   return found;
 }
 
@@ -227,26 +241,50 @@ describe("each actor card is its own configuration surface", () => {
     assert.doesNotMatch(html, /class="session muted"/, "no session yet means no line, not a placeholder");
   });
 
-  it("11. keeps Show instructions, keyed so it survives a rerender", async () => {
+  it("11. keeps Show instructions on the card, opening a panel that is keyed so it survives a rerender", async () => {
     const selection = await planSelection();
     const model = buildOverviewModel(selection, undefined, artifacts(parsed(), [captured(FOO_STAGE_IDS[0])]), NOW);
     const html = renderOverviewHtml(model, "n", "c");
 
-    // The disclosure is inside the card, not wrapped around its controls: a
-    // <summary> around a model field would collapse the card on every click.
-    assert.match(card(html, "Stage agent"), /<details class="instr" data-role="stage" data-disclose="[^"]*"/);
-    assert.match(html, /<span class="showinstr">Show instructions<\/span>/);
+    // The toggle is in the card and the panel is not: a card that grew would
+    // push the other actor's card out of the row they share.
+    assert.match(card(html, "Stage agent"), /<button type="button" class="showinstr" data-instr="stage" aria-controls="instr-stage" aria-expanded="false">Show instructions<\/button>/);
+    assert.doesNotMatch(card(html, "Stage agent"), /class="instructions"/, "what the toggle opens is not inside the card");
+    assert.match(panel(html, "stage"), /id="instr-stage" data-instrpanel="stage" data-disclose="[^"]*\/stage\/instructions" hidden/);
+    assert.match(panel(html, "stage"), /class="instructions"/, "and it is the panel that holds them");
 
     const first = runWebviewScript(html);
     const disclosure = first.document.disclosures.find((node) => (node.getAttribute("data-disclose") ?? "").endsWith("/stage/instructions"));
     assert.ok(disclosure, "the instructions disclosure is keyed by role, not by position");
+    assert.equal(disclosure.open, false, "closed until somebody opens it");
+    // Clicks the card's button, which is the only way the page opens it.
     disclosure.click();
     assert.equal(disclosure.open, true);
+    assert.equal(first.document.toggles[0]?.getAttribute("aria-expanded"), "true", "and the card's toggle says so");
 
     // The host rerenders during a live run by replacing the whole document.
     const second = runWebviewScript(renderOverviewHtml(model, "n", "c"), "n", first.state);
     const again = second.document.disclosures.find((node) => node.getAttribute("data-disclose") === disclosure.getAttribute("data-disclose"));
     assert.equal(again?.open, true, "what the person opened is still open after the rerender");
+    assert.equal(second.document.toggles[0]?.getAttribute("aria-expanded"), "true", "and the restored panel's toggle agrees with it");
+  });
+
+  it("11b. opening one actor's instructions leaves the other actor's card and panel alone", async () => {
+    const selection = await planSelection();
+    const captures = [captured(FOO_STAGE_IDS[0]), { ...captured(FOO_STAGE_IDS[0]), entry: { ...captured(FOO_STAGE_IDS[0]).entry, seq: 2, role: "sparrer" as const } }];
+    const html = renderOverviewHtml(buildOverviewModel(selection, undefined, artifacts(parsed(), captures), NOW), "n", "c");
+
+    const run = runWebviewScript(html);
+    const sparrer = run.document.disclosures.find((node) => (node.getAttribute("data-disclose") ?? "").endsWith("/sparrer/instructions"));
+    const stage = run.document.disclosures.find((node) => (node.getAttribute("data-disclose") ?? "").endsWith("/stage/instructions"));
+    assert.ok(sparrer && stage, "both actors have one");
+
+    sparrer.click();
+    assert.deepEqual([stage.open, sparrer.open], [false, true], "only the one that was asked for");
+    stage.click();
+    assert.deepEqual([stage.open, sparrer.open], [true, true], "and both can be open at once");
+    sparrer.click();
+    assert.deepEqual([stage.open, sparrer.open], [true, false], "closing one leaves the other exactly as it was");
   });
 
   it("12. a change during a live run goes out on the existing set-config wire, for the next turn", async () => {
