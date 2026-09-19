@@ -1162,8 +1162,26 @@ async function actorCardControlAssertions(): Promise<void> {
         return Math.round(r.top) + ',' + Math.round(r.left) + ',' + Math.round(r.width);
       });
       // Open the instructions the way a person does, then use the controls.
-      card.querySelector('button[data-instr]').click();
+      var instrToggle = card.querySelector('button[data-instr]');
+      instrToggle.click();
       var openedInstructions = !instr.hidden;
+      var labelWhenOpen = instrToggle.textContent;
+      // Opening the other actor's closes this one: one panel at a time.
+      var otherToggle = document.querySelector('button[data-instr="sparrer"]');
+      var otherPanel = document.querySelector('.instrpanel[data-instrpanel="sparrer"]');
+      var exclusive = null;
+      if (otherToggle && otherPanel) {
+        otherToggle.click();
+        exclusive = instr.hidden && !otherPanel.hidden;
+        otherToggle.click();
+        instrToggle.click();
+      }
+      // And pressing the open one's own control closes it, which is the
+      // thing that was reported as impossible.
+      instrToggle.click();
+      var closedAgain = instr.hidden;
+      var labelWhenClosed = instrToggle.textContent;
+      instrToggle.click();
       effort.value = 'glacial';
       effort.dispatchEvent(new Event('change', { bubbles: true }));
       setTimeout(function () {
@@ -1200,6 +1218,10 @@ async function actorCardControlAssertions(): Promise<void> {
           // Both start on the same column, which is the alignment the
           // read-only value's padding exists to preserve.
           modelAlignsWithEffort: Math.abs(modelBox.left - effortBox.left) < 1,
+          labelWhenOpen: labelWhenOpen,
+          labelWhenClosed: labelWhenClosed,
+          closedAgain: closedAgain,
+          exclusive: exclusive,
           cardsBefore: cardsBefore,
           cardsAfter: [].map.call(document.querySelectorAll('.card.actor'), function (node) {
             var r = node.getBoundingClientRect();
@@ -1234,6 +1256,14 @@ async function actorCardControlAssertions(): Promise<void> {
     assert.deepEqual(seen["cardsAfter"], seen["cardsBefore"], "opening the instructions moved neither card");
     assert.equal(seen["panelBelowBothCards"], true, "what it opened is below both cards");
     assert.equal(seen["panelWiderThanCard"], true, "and is read at the width of the page, not of one column");
+    // The control has to say what pressing it does, and pressing it has to
+    // do that: the reported bug was instructions that could not be put away.
+    assert.equal(seen["labelWhenOpen"], "Hide instructions", "while they are shown the control offers to hide them");
+    assert.equal(seen["closedAgain"], true, "and pressing it hides them");
+    assert.equal(seen["labelWhenClosed"], "Show instructions", "after which it offers to show them again");
+    if (seen["exclusive"] !== null) {
+      assert.equal(seen["exclusive"], true, "opening the other actor's instructions closed this one: one panel at a time");
+    }
     console.log(`integration: role ${String(seen["roleSize"])}px ${String(seen["roleColor"])} over provider ${String(seen["providerSize"])}px ${String(seen["providerColor"])}`);
 
     const changes = posted.filter((message) => message["type"] === "agentConfig");

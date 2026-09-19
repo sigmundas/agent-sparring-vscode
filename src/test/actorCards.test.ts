@@ -248,7 +248,11 @@ describe("each actor card is its own configuration surface", () => {
 
     // The toggle is in the card and the panel is not: a card that grew would
     // push the other actor's card out of the row they share.
-    assert.match(card(html, "Stage agent"), /<button type="button" class="showinstr" data-instr="stage" aria-controls="instr-stage" aria-expanded="false">Show instructions<\/button>/);
+    assert.match(
+      card(html, "Stage agent"),
+      /<button type="button" class="showinstr" data-instr="stage" aria-controls="instr-stage" aria-expanded="false" data-show="Show instructions" data-hide="Hide instructions">Show instructions<\/button>/,
+      "the control says what pressing it will do, and carries the word for the other state",
+    );
     assert.doesNotMatch(card(html, "Stage agent"), /class="instructions"/, "what the toggle opens is not inside the card");
     assert.match(panel(html, "stage"), /id="instr-stage" data-instrpanel="stage" data-disclose="[^"]*\/stage\/instructions" hidden/);
     assert.match(panel(html, "stage"), /class="instructions"/, "and it is the panel that holds them");
@@ -261,6 +265,14 @@ describe("each actor card is its own configuration surface", () => {
     disclosure.click();
     assert.equal(disclosure.open, true);
     assert.equal(first.document.toggles[0]?.getAttribute("aria-expanded"), "true", "and the card's toggle says so");
+    assert.equal(first.document.toggles[0]?.textContent, "Hide instructions", "and now offers to put them away again");
+
+    // Pressing it again closes them: the toggle is the only control, so if
+    // it did not close them nothing would.
+    disclosure.click();
+    assert.equal(disclosure.open, false);
+    assert.equal(first.document.toggles[0]?.textContent, "Show instructions");
+    disclosure.click();
 
     // The host rerenders during a live run by replacing the whole document.
     const second = runWebviewScript(renderOverviewHtml(model, "n", "c"), "n", first.state);
@@ -269,7 +281,7 @@ describe("each actor card is its own configuration surface", () => {
     assert.equal(second.document.toggles[0]?.getAttribute("aria-expanded"), "true", "and the restored panel's toggle agrees with it");
   });
 
-  it("11b. opening one actor's instructions leaves the other actor's card and panel alone", async () => {
+  it("11b. is a tab strip: opening one actor's instructions closes the other's", async () => {
     const selection = await planSelection();
     const captures = [captured(FOO_STAGE_IDS[0]), { ...captured(FOO_STAGE_IDS[0]), entry: { ...captured(FOO_STAGE_IDS[0]).entry, seq: 2, role: "sparrer" as const } }];
     const html = renderOverviewHtml(buildOverviewModel(selection, undefined, artifacts(parsed(), captures), NOW), "n", "c");
@@ -282,9 +294,21 @@ describe("each actor card is its own configuration surface", () => {
     sparrer.click();
     assert.deepEqual([stage.open, sparrer.open], [false, true], "only the one that was asked for");
     stage.click();
-    assert.deepEqual([stage.open, sparrer.open], [true, true], "and both can be open at once");
-    sparrer.click();
-    assert.deepEqual([stage.open, sparrer.open], [true, false], "closing one leaves the other exactly as it was");
+    assert.deepEqual([stage.open, sparrer.open], [true, false], "opening one closes the other: only one is ever open");
+    assert.deepEqual(
+      run.document.toggles.map((toggle) => toggle.textContent),
+      ["Hide instructions", "Show instructions"],
+      "and each card's control says what it will do next",
+    );
+    stage.click();
+    assert.deepEqual([stage.open, sparrer.open], [false, false], "pressing the open one closes it and leaves none open");
+
+    // A store written before the panels were exclusive can name both. The
+    // page must not come back in a state its own controls cannot produce.
+    const both = { value: { disclosures: { [stage.getAttribute("data-disclose") as string]: true, [sparrer.getAttribute("data-disclose") as string]: true } } };
+    const reopened = runWebviewScript(html, "n", both);
+    const restored = reopened.document.disclosures.filter((node) => (node.getAttribute("data-instrpanel") ?? "") !== "" && node.open);
+    assert.equal(restored.length, 1, "at most one instructions panel is restored");
   });
 
   it("12. a change during a live run goes out on the existing set-config wire, for the next turn", async () => {

@@ -1277,8 +1277,9 @@ function renderActors(model: OverviewModel, scope: string): string {
   // Every panel is laid out after every card, so the cards keep their row
   // whichever of them is open, and an opened panel appears below both of
   // them at the width of the rest of the page rather than in a half-width
-  // column. Each panel names the actor it belongs to and carries that
-  // actor's colour, and the card it came from is marked while it is open.
+  // column. They behave as a tab strip: at most one is open, each names the
+  // actor it belongs to and carries that actor's colour, and the card it
+  // came from is marked while it is open.
   const panels = actors.map((card) => renderInstructionsPanel(card, scope)).join("");
   const section = cards ? `<section class="actors">${cards}${panels}</section>` : "";
   return `${section}${config ? renderAgentsBar(config, cards !== "") : ""}`;
@@ -1337,8 +1338,16 @@ function renderActor(card: ActorCard, controls: AgentRoleControls | undefined, c
   // other actor's card. `aria-controls` is the only thing tying the two
   // together in the document, and the script relies on the same pairing.
   return `<div class="card actor ${who}" data-role="${role}">${body}
-<button type="button" class="showinstr" data-instr="${role}" aria-controls="${instrPanelId(role)}" aria-expanded="false">Show instructions</button></div>`;
+<button type="button" class="showinstr" data-instr="${role}" aria-controls="${instrPanelId(role)}" aria-expanded="false" data-show="${SHOW_INSTRUCTIONS}" data-hide="${HIDE_INSTRUCTIONS}">${SHOW_INSTRUCTIONS}</button></div>`;
 }
+
+/**
+ * The toggle's two labels. They live here rather than in the page's script
+ * because they are wording, and the script should carry behaviour only; it
+ * reads whichever one the current state calls for off the button.
+ */
+const SHOW_INSTRUCTIONS = "Show instructions";
+const HIDE_INSTRUCTIONS = "Hide instructions";
 
 /** The id the card's toggle points at, and the panel answers to. */
 function instrPanelId(role: string): string {
@@ -1364,8 +1373,9 @@ function actorRole(card: ActorCard): "stage" | "sparrer" {
  * on this page is — `data-disclose`, keyed by what the section is — so
  * nothing new is stored and a reload restores it with the rest.
  *
- * The panel repeats the actor's role, because two open panels stack and the
- * colour alone would be the only thing telling them apart.
+ * The panel names the actor it belongs to. Only one is ever open, but it is
+ * read well below the card that opened it, so the heading says whose it is
+ * without a reader having to remember which tab they pressed.
  */
 function renderInstructionsPanel(card: ActorCard, scope: string): string {
   if (!card.prompt) {
@@ -1887,10 +1897,8 @@ p { margin: 0 0 4px; line-height: 1.45; }
 .instrhead.claude { color: var(--claude); }
 .instrhead.codex { color: var(--codex); }
 /* The notch points at the card this panel came from -- a quarter of the way
-   across for the left card, three quarters for the right one. Only the panel
-   directly under the cards gets one: a second open panel sits under the
-   first, where an arrow would point at the panel above it rather than at any
-   card. */
+   across for the left card, three quarters for the right one. At most one
+   panel is open, so it always points at a card. */
 .instrpanel::before {
   content: ''; position: absolute; top: -7px; width: 12px; height: 12px;
   background: var(--card); border-left: 2px solid; border-top: 2px solid; border-color: inherit;
@@ -1898,7 +1906,6 @@ p { margin: 0 0 4px; line-height: 1.45; }
 }
 .instrpanel[data-instrpanel="stage"]::before { left: 25%; }
 .instrpanel[data-instrpanel="sparrer"]::before { left: 75%; }
-.instrpanel:not([hidden]) ~ .instrpanel:not([hidden])::before { display: none; }
 
 .instructions { padding: 0 12px 12px; }
 .turnline { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 0; font-size: 1.02em; }
@@ -2016,20 +2023,35 @@ const DISCLOSURE_SCRIPT = `
     if (node.tagName === 'DETAILS') { node.open = isOpen; return; }
     node.hidden = !isOpen;
     var toggle = document.querySelector('[aria-controls="' + node.id + '"]');
-    if (toggle) { toggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false'); }
+    if (!toggle) { return; }
+    toggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+    // The control says what pressing it will do. Both labels are written on
+    // the button by the renderer, so no wording is invented here.
+    var label = toggle.getAttribute(isOpen ? 'data-hide' : 'data-show');
+    if (label) { toggle.textContent = label; }
   }
   function restore() {
     var open = disclosures();
     var kept = {};
+    // At most one instructions panel is open, here too: a store written
+    // before the panels became a tab strip can name both, and restoring it
+    // as written would put the page into a state its own controls cannot
+    // produce. The first one wins and the rest are recorded closed.
+    var alreadyOpen = false;
     var nodes = document.querySelectorAll('[data-disclose]');
     for (var i = 0; i < nodes.length; i++) {
       var key = nodes[i].getAttribute('data-disclose');
       if (Object.prototype.hasOwnProperty.call(open, key)) {
-        show(nodes[i], open[key] === true);
+        var wanted = open[key] === true;
+        if (wanted && nodes[i].hasAttribute('data-instrpanel')) {
+          if (alreadyOpen) { wanted = false; }
+          alreadyOpen = alreadyOpen || wanted;
+        }
+        show(nodes[i], wanted);
         // Pruning to what this document has is what bounds the store: a
         // disclosure belonging to a stage that is no longer on screen is
         // dropped rather than kept for ever.
-        kept[key] = open[key];
+        kept[key] = wanted;
       }
     }
     var scrolled = state().scroll;
@@ -2056,6 +2078,20 @@ const DISCLOSURE_SCRIPT = `
   // cards, so opening one actor's instructions leaves the other actor's card
   // exactly where it was; the button and the panel are tied by aria-controls
   // and nothing else.
+  //
+  // A tab strip, so at most one panel is open: opening one closes the other,
+  // and pressing the open one's own toggle closes it and leaves none open.
+  // Both changes are recorded, or the closed one would come back on the next
+  // rerender and there would be two again.
+  function closeOthers(panel) {
+    var panels = document.querySelectorAll('[data-instrpanel]');
+    for (var i = 0; i < panels.length; i++) {
+      if (panels[i] !== panel && !panels[i].hidden) {
+        show(panels[i], false);
+        if (panels[i].hasAttribute('data-disclose')) { record(panels[i], false); }
+      }
+    }
+  }
   document.addEventListener('click', function (event) {
     var element = event.target instanceof Element ? event.target : null;
     var toggle = element ? element.closest('button[data-instr]') : null;
@@ -2063,6 +2099,7 @@ const DISCLOSURE_SCRIPT = `
     var panel = document.getElementById(toggle.getAttribute('aria-controls'));
     if (!panel) { return; }
     var isOpen = panel.hidden;
+    if (isOpen) { closeOthers(panel); }
     show(panel, isOpen);
     if (panel.hasAttribute('data-disclose')) { record(panel, isOpen); }
   });

@@ -30,6 +30,8 @@ export class FakeElement {
   get tagName(): string {
     return this.tag.toUpperCase();
   }
+  /** The toggle's label, which the shipped script rewrites as the panel opens and closes. */
+  textContent = "";
   constructor(
     readonly tag: string,
     attributes: Record<string, string>,
@@ -160,7 +162,10 @@ export class FakeDocument {
    * same document in a real Chromium webview.
    */
   querySelectorAll(selector: string): (FakeDetails | FakePanel)[] {
-    assert.equal(selector, "[data-disclose]", "the shim only answers the selector the shipped script uses");
+    if (selector === "[data-instrpanel]") {
+      return this.disclosures.filter((node): node is FakePanel => node instanceof FakePanel);
+    }
+    assert.equal(selector, "[data-disclose]", "the shim only answers the selectors the shipped script uses");
     return this.disclosures;
   }
   /** `document.getElementById(toggle.getAttribute('aria-controls'))`, as the script calls it. */
@@ -246,8 +251,10 @@ export function runWebviewScript(html: string, nonce = "n", state: WebviewState 
     document.disclosures.push(new FakeDetails("details", { "data-disclose": key }, document, / open[ >]/.test(markup)));
   }
   // The instructions panels and the buttons in the cards that open them.
-  for (const [markup] of html.matchAll(/<button[^>]*\sdata-instr="[^"]*"[^>]*>/g)) {
-    document.toggles.push(new FakeElement("button", attributesOf(markup)));
+  for (const [markup] of html.matchAll(/<button[^>]*\sdata-instr="[^"]*"[^>]*>([\s\S]*?)<\/button>/g)) {
+    const toggle = new FakeElement("button", attributesOf(markup));
+    toggle.textContent = /<button[^>]*>([\s\S]*?)<\/button>/.exec(markup)?.[1] ?? "";
+    document.toggles.push(toggle);
   }
   for (const [markup] of html.matchAll(/<div[^>]*\sdata-instrpanel="[^"]*"[^>]*>/g)) {
     document.disclosures.push(new FakePanel("div", attributesOf(markup), document, /\shidden[\s>]/.test(markup)));
