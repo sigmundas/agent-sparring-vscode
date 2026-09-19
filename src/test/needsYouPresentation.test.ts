@@ -21,6 +21,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import { discoverRuns, selectRun } from "../core/discovery";
 import { HUMAN_GATE_MARKER } from "../core/engineFormats";
+import { draftKeyFor } from "../core/humanChecks";
 import { humanTask, sentences, splitPassCriteria } from "../core/humanTask";
 import { parseExecutionManifest } from "../core/manifest";
 import { renderOverviewHtml } from "../core/overviewHtml";
@@ -47,8 +48,11 @@ const SOURCE = "docs/reference-data/measurement-content-contract.md — 7. Snaps
 const SUMMARY = "Both repository candidates satisfy the Stage 3D implementation scope; the required real-desktop v2 feed compatibility check is the sole acceptance blocker.";
 const REVIEWER_NOTE = "DEVICE/MANUAL CHECK -- verify the oldest supported pre-activation desktop accepts a complete observation-use feed containing snapshot v2.";
 
+/** Which asking of the gate this fixture records (human_gate.py: `instance_id`). */
+const GATE_INSTANCE = "gate1";
+
 function sparringWithGate(): string {
-  const gate = { category: "DEVICE_MANUAL_CHECK", title: GATE_TITLE, checks: [{ id: CHECK_ID, instruction: INSTRUCTION, pass_criteria: PASS_CRITERIA, source: SOURCE }] };
+  const gate = { category: "DEVICE_MANUAL_CHECK", title: GATE_TITLE, checks: [{ id: CHECK_ID, instruction: INSTRUCTION, pass_criteria: PASS_CRITERIA, source: SOURCE }], instance_id: GATE_INSTANCE };
   return [
     "# Sparring: stage 3d",
     "",
@@ -186,7 +190,7 @@ describe("the NEEDS_YOU panel a person reads", () => {
   });
 
   it("recorded evidence is one compact, expandable line", async () => {
-    const notes = ["# Notes", "", "## Human evidence", "", `- Pass — ${INSTRUCTION} · check \`${CHECK_ID}\``, "  Ran it on the 2026.4 build.", ""].join("\n");
+    const notes = ["# Notes", "", "## Human evidence", "", `- Pass — ${INSTRUCTION} · check \`${CHECK_ID}\` · gate \`${GATE_INSTANCE}\``, "  Ran it on the 2026.4 build.", ""].join("\n");
     const { model, html } = await managedStage3d({ notes });
     assert.equal(model.actionRequired!.recorded.length, 1);
     assert.match(html, /<details class="prev"[^>]*><summary>Previous evidence \(1\)<\/summary><ol class="checklist recorded">/);
@@ -208,7 +212,7 @@ describe("the NEEDS_YOU panel a person reads", () => {
     const { model, html } = await managedStage3d();
     assert.equal(model.actionRequired!.submit.label, "Submit result and continue");
     assert.match(html, /class="primary" data-action="submitForReview"[^>]*>Submit result and continue</);
-    const answered = await managedStage3d({ drafts: { [CHECK_ID]: { outcome: "pass", note: "Ran it on the 2026.4 build." } } });
+    const answered = await managedStage3d({ drafts: { [draftKeyFor(CHECK_ID, GATE_INSTANCE)]: { outcome: "pass", note: "Ran it on the 2026.4 build." } } });
     assert.equal(answered.model.actionRequired!.submit.enabled, true);
     assert.match(answered.html, /title="[^"]*resume-plan --evidence[^"]*"[^>]*>Submit result and continue</, "the tooltip still says who reads the evidence");
     assert.ok(html.indexOf('data-action="submitForReview"') < html.indexOf('<details class="more"'), "the primary action comes first");

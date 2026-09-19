@@ -39,6 +39,7 @@ import {
   HUMAN_FEEDBACK_HEADING,
   humanFeedbackFor,
   parseHumanEvidence,
+  draftKeyFor,
   parseHumanFeedback,
   renderHumanEvidence,
   renderHumanFeedback,
@@ -76,8 +77,11 @@ const CHECKS = [
 
 const OUTSTANDING = CHECKS.length;
 
+/** Which asking of the gate this fixture records (human_gate.py: `instance_id`). */
+const GATE_INSTANCE = "gate1";
+
 function sparring(action = "NEEDS_YOU"): string {
-  const gate = { category: "UI_MANUAL_CHECK", title: "Confirm the editor renders and guards reported statistics correctly", checks: CHECKS.map((check) => ({ ...check, source: null })) };
+  const gate = { category: "UI_MANUAL_CHECK", title: "Confirm the editor renders and guards reported statistics correctly", checks: CHECKS.map((check) => ({ ...check, source: null })), instance_id: GATE_INSTANCE };
   return [
     "# Sparring: stage 4",
     "",
@@ -254,12 +258,22 @@ describe("sending feedback claims nothing about the checks", () => {
       entries.map((entry) => entry.feedback),
       [false],
     );
-    assert.equal(view({ notes: asProse }).model.actionRequired?.recorded.length, 1, "a plain paragraph still matches by overlap");
+    // It still matches by overlap — the sub-heading is what excludes
+    // feedback, not a weakened matcher. It lands as *previous* evidence
+    // rather than as this gate's answer, because a paragraph names no
+    // asking and so can never be shown to answer the one in front of you.
+    const matched = view({ notes: asProse }).model.actionRequired!;
+    assert.equal(matched.recorded.length, 0, "a paragraph answers no particular asking");
+    assert.equal(
+      matched.required.filter((item) => item.previous.some((entry) => entry.how === "prose")).length,
+      1,
+      "a plain paragraph still matches by overlap, and is kept as history",
+    );
   });
 
   it("structured results already recorded keep their own place when feedback is added beside them", async () => {
     const { view } = await stage4Gate();
-    const result = renderHumanEvidence([{ text: CHECKS[0].instruction, origin: "gate", id: CHECKS[0].id, record: { outcome: "pass", note: "Three rows, all columns filled." } }], new Date(NOW))!;
+    const result = renderHumanEvidence([{ text: CHECKS[0].instruction, origin: "gate", id: CHECKS[0].id, gateInstanceId: GATE_INSTANCE, record: { outcome: "pass", note: "Three rows, all columns filled." } }], new Date(NOW))!;
     const notes = appendHumanEvidence(appendHumanEvidence("# Notes: stage 4\n", result), renderHumanFeedback(CRASH, new Date(NOW))!);
     const panel = view({ notes }).model.actionRequired!;
     assert.deepEqual(
@@ -472,7 +486,7 @@ describe("copy for chat tells submitted from draft", () => {
 describe("the structured gate is unchanged by any of this", () => {
   it("answering all five checks still reaches Evidence ready, with feedback in the box or not", async () => {
     const { view } = await stage4Gate();
-    const drafts = Object.fromEntries(CHECKS.map((check) => [check.id, { outcome: "pass" as const }]));
+    const drafts = Object.fromEntries(CHECKS.map((check) => [draftKeyFor(check.id, GATE_INSTANCE), { outcome: "pass" as const }]));
     for (const feedback of [undefined, CRASH]) {
       const { model, html } = view({ drafts, feedback });
       const panel = model.actionRequired!;
@@ -489,11 +503,12 @@ describe("the structured gate is unchanged by any of this", () => {
 
   it("a failing check is still a failing check, and the panel's own layers are where they were", async () => {
     const { view } = await stage4Gate();
-    const { model, html } = view({ drafts: { [CHECKS[0].id]: { outcome: "fail", note: "The third column is empty." } }, feedback: CRASH });
+    const { model, html } = view({ drafts: { [draftKeyFor(CHECKS[0].id, GATE_INSTANCE)]: { outcome: "fail", note: "The third column is empty." } }, feedback: CRASH });
     const panel = model.actionRequired!;
     assert.equal(panel.progress, "0 / 5 verified · 1 failed · 4 remaining");
     assert.equal(panel.gateTitle, "Confirm the editor renders and guards reported statistics correctly");
-    assert.match(html, new RegExp(`class="choice fail on" data-check="${CHECKS[0].id}"`));
+    // The control carries the *draft* key: this asking, and this check.
+    assert.match(html, new RegExp(`class="choice fail on" data-check="${draftKeyFor(CHECKS[0].id, GATE_INSTANCE)}"`));
     assert.match(html, /<details class="tech"[^>]*><summary>Show technical details<\/summary>/);
     assert.ok(html.indexOf('class="checklist gate"') < html.indexOf('class="feedback"'), "the freeform field sits below the checks");
     assert.ok(html.indexOf('class="feedback"') < html.indexOf('details class="tech"'), "and above the demoted technical layer");

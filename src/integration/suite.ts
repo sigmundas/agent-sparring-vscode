@@ -22,7 +22,7 @@ import { stageScopeKey, stageScopeOf } from "../core/stageScope";
 import { planKey } from "../core/sparringCommand";
 import { BINDING_VERSION, bindingFileName, manifestFileName, parseExecutionManifest, renderBindingRecord } from "../core/manifest";
 import { isActionMessage, isAgentConfigMessage, isAutoPushMessage, isCopyPromptMessage, isHumanCheckMessage, isHumanFeedbackMessage, isOpenPromptSourceMessage, renderOverviewHtml } from "../core/overviewHtml";
-import { withHumanCheck, type HumanCheckDrafts } from "../core/humanChecks";
+import { appendHumanEvidence, draftKeyFor, renderHumanEvidence, submittableChecks, withHumanCheck, type HumanCheckDrafts } from "../core/humanChecks";
 import { PROVIDER_DEFAULT_LABEL, parseEngineConfig } from "../core/effectiveConfig";
 import type { ExecutionRecord, LivenessState, RunnerLiveness } from "../core/liveness";
 import { buildOverviewModel, type CapturedPrompt, type ManifestStageView, type OverviewArtifacts } from "../core/overviewModel";
@@ -585,6 +585,10 @@ const GATE_PLAN_LABEL = "plans/reported-statistics.md";
 const GATE_PLAN_KEY = planKey(GATE_PLAN_LABEL);
 /** The reviewer's stable check id: a slug, which is exactly the shape the host used to refuse. */
 const GATE_CHECK_ID = "pre-activation-desktop-v2-feed";
+/** Which asking of the gate the fixture records (human_gate.py: `instance_id`). */
+const GATE_INSTANCE = "gatea1b2c3";
+/** The second asking of the same check, after the reviewer found the first answer insufficient. */
+const GATE_INSTANCE_2 = "gated4e5f6";
 
 /**
  * The one thing a rendered snapshot cannot show: that clicking Pass — or
@@ -636,7 +640,8 @@ async function gateClickAssertions(): Promise<void> {
   };
 
   const before = view({});
-  assert.equal(before.actionRequired?.required[0]?.key, GATE_CHECK_ID, "the gate's own id is the control's key");
+  assert.equal(before.actionRequired?.required[0]?.key, GATE_CHECK_ID, "the gate's own id names the check");
+  assert.equal(before.actionRequired?.required[0]?.draftKey, draftKeyFor(GATE_CHECK_ID, GATE_INSTANCE), "and the control is keyed by the asking as well");
   assert.equal(before.actionRequired?.progress, "0 / 1 verified · 1 remaining");
   assert.equal(before.actionRequired?.submit.enabled, false);
 
@@ -659,7 +664,7 @@ async function gateClickAssertions(): Promise<void> {
     panel.webview.html = renderOverviewHtml(before, nonce, panel.webview.cspSource).replace("</body>", `${clicker}</body>`);
     const message = await received;
 
-    assert.deepEqual(message, { type: "humanCheck", key: GATE_CHECK_ID, outcome: "pass" }, "the click posted the gate's id and the outcome");
+    assert.deepEqual(message, { type: "humanCheck", key: draftKeyFor(GATE_CHECK_ID, GATE_INSTANCE), outcome: "pass" }, "the click posted this asking's draft key and the outcome");
     assert.ok(isHumanCheckMessage(message), "and the host accepts it — this is what silently failed");
 
     const after = view(withHumanCheck({}, scope, message.key as string, { outcome: "pass" }));
@@ -667,7 +672,7 @@ async function gateClickAssertions(): Promise<void> {
     assert.equal(after.actionRequired?.progress, "1 / 1 verified");
     assert.equal(after.actionRequired?.submit.enabled, true);
     const html = renderOverviewHtml(after, nonce, panel.webview.cspSource);
-    assert.match(html, new RegExp(`class="choice pass on" data-check="${GATE_CHECK_ID}"`), "Pass is visibly selected on the next render");
+    assert.match(html, new RegExp(`class="choice pass on" data-check="${draftKeyFor(GATE_CHECK_ID, GATE_INSTANCE)}"`), "Pass is visibly selected on the next render");
     assert.match(html, /data-action="submitForReview" title="[^"]*">Submit result and continue</, "and Submit result and continue is enabled");
 
     // The other half of the gate, on the same real wire: a multi-line
@@ -700,6 +705,70 @@ async function gateClickAssertions(): Promise<void> {
     assert.equal(withFeedback.actionRequired?.feedback.send.enabled, true);
     assert.equal(withFeedback.actionRequired?.progress, "0 / 1 verified · 1 remaining", "and it claims nothing about the check");
     assert.equal(withFeedback.actionRequired?.submit.enabled, false);
+
+    // ---- the re-issued check, end to end -------------------------------
+    //
+    // The reported bug, on the real wire. The person's Pass is recorded in
+    // notes.md; the reviewer reads it, finds it insufficient, and re-issues
+    // the *same check id* with a stricter instruction. The panel used to
+    // find that Pass by id, report "1 / 1 verified" and "Evidence ready for
+    // review", and then refuse to submit anything — leaving a check the
+    // reviewer had deliberately asked again with no way to answer it.
+    const recorded = appendHumanEvidence(
+      "# Notes: stage 3d\n",
+      renderHumanEvidence([{ text: "Run the oldest supported desktop build against a feed containing one snapshot_version 2 row.", origin: "gate", id: GATE_CHECK_ID, gateInstanceId: GATE_INSTANCE, record: { outcome: "pass" } }], new Date())!,
+    );
+    await fs.writeFile(path.join(stages, GATE_STAGE, "notes.md"), recorded);
+    const stricter = "Run it on the oldest build you actually have, and say which build that was — a bare Pass does not identify it.";
+    await fs.writeFile(path.join(stages, GATE_STAGE, "sparring.md"), gateSparring(GATE_INSTANCE_2, stricter));
+
+    const reasked = selectRun((await discoverRuns([location])).runs);
+    const atSecond = (drafts: HumanCheckDrafts) =>
+      buildOverviewModel(
+        reasked,
+        undefined,
+        { handoff: false, sparring: true, brief: false, plan: false, git: { branch: "feature/x" }, humanChecks: drafts[stageScopeKey(stageScopeOf(reasked.selected!))] ?? {}, notesText: recorded, manifestStages },
+        Date.now(),
+      );
+
+    const reopened = atSecond({}).actionRequired!;
+    assert.equal(reopened.recorded.length, 0, "the earlier Pass does not answer the new asking");
+    assert.equal(reopened.required.length, 1, "so the check is answerable again");
+    assert.equal(reopened.required[0].text, stricter, "in the reviewer's new words");
+    assert.equal(reopened.required[0].previous.length, 1, "with the earlier Pass kept and shown");
+    assert.equal(reopened.ready, false, "and nothing claims the evidence is complete");
+    assert.equal(reopened.submit.enabled, false);
+    assert.deepEqual(submittableChecks(reopened), [], "the panel and the submit path agree: nothing to send yet");
+
+    // A real click on the re-issued check, in the real webview. The control
+    // carries the new asking's key, and the host must accept it.
+    const secondNonce = crypto.randomBytes(16).toString("base64");
+    const gotSecond = new Promise<Record<string, unknown>>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("no message arrived for the re-issued check within 15s")), 15_000);
+      panel.webview.onDidReceiveMessage((message: Record<string, unknown>) => {
+        if (message?.["type"] === "humanCheck" && message["key"] === draftKeyFor(GATE_CHECK_ID, GATE_INSTANCE_2)) {
+          clearTimeout(timer);
+          resolve(message);
+        }
+      });
+    });
+    const secondHtml = renderOverviewHtml(atSecond({}), secondNonce, panel.webview.cspSource);
+    assert.match(secondHtml, /<div class="previous"[^>]*>/, "the previous answer is on the page");
+    assert.match(secondHtml, new RegExp(`data-check="${draftKeyFor(GATE_CHECK_ID, GATE_INSTANCE_2)}" data-outcome="pass"`), "and so is a live control for the new asking");
+    panel.webview.html = secondHtml.replace("</body>", `<script nonce="${secondNonce}">document.querySelector('button[data-outcome="pass"]').click();</script></body>`);
+    const secondMessage = await gotSecond;
+
+    assert.ok(isHumanCheckMessage(secondMessage), "the host accepts the composite key — a guard that refused it would leave the button inert");
+    const answeredAgain = atSecond(withHumanCheck({}, stageScopeKey(stageScopeOf(reasked.selected!)), secondMessage["key"] as string, { outcome: "pass", note: "2026.4.1, the oldest build we still sign." })).actionRequired!;
+    assert.equal(answeredAgain.ready, true, "answering the asking in front of you completes it");
+    assert.equal(answeredAgain.submit.enabled, true);
+    const sending = submittableChecks(answeredAgain);
+    assert.equal(sending.length, 1, "and there is exactly one result to send");
+    assert.equal(sending[0].gateInstanceId, GATE_INSTANCE_2, "attributed to the asking it answers");
+    const written = renderHumanEvidence(sending, new Date())!;
+    assert.match(written, new RegExp(`· check \`${GATE_CHECK_ID}\` · gate \`${GATE_INSTANCE_2}\``));
+    assert.match(written, /2026\.4\.1, the oldest build we still sign\./);
+    assert.ok(!written.includes(GATE_INSTANCE), "the answer the reviewer rejected is not resubmitted as this one");
   } finally {
     panel.dispose();
     await fs.rm(root, { recursive: true, force: true });
@@ -3108,11 +3177,12 @@ async function waitFor127(): Promise<unknown> {
   }
 }
 
-function gateSparring(): string {
+function gateSparring(instanceId = GATE_INSTANCE, instruction = "Run the oldest supported desktop build against a feed containing one snapshot_version 2 row."): string {
   const gate = {
     category: "DEVICE_MANUAL_CHECK",
     title: "Confirm the supported pre-activation desktop reads snapshot-v2 feeds safely",
-    checks: [{ id: GATE_CHECK_ID, instruction: "Run the oldest supported desktop build against a feed containing one snapshot_version 2 row.", pass_criteria: "Pass if the feed loads and the row keeps its details.", source: null }],
+    checks: [{ id: GATE_CHECK_ID, instruction, pass_criteria: "Pass if the feed loads and the row keeps its details.", source: null }],
+    instance_id: instanceId,
   };
   return [
     "# Sparring: stage 3d",

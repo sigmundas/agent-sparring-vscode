@@ -19,7 +19,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { discoverRuns, selectRun } from "../core/discovery";
 import { HUMAN_GATE_MARKER, parseSparringOutcome } from "../core/engineFormats";
-import { OUTCOME_WORDS, PROGRESS_UNTESTED_WORD, deriveVerification, parseHumanEvidence, renderHumanEvidence, submittableChecks, type CheckOutcome, type CheckRecord } from "../core/humanChecks";
+import { OUTCOME_WORDS, PROGRESS_UNTESTED_WORD, deriveVerification, draftKeyFor, parseHumanEvidence, renderHumanEvidence, submittableChecks, type CheckOutcome, type CheckRecord } from "../core/humanChecks";
 import { OUTCOME_LABELS, renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel, type OverviewArtifacts, type OverviewModel } from "../core/overviewModel";
 import { Workspace, normalUi } from "./fixtures";
@@ -37,11 +37,15 @@ const CHECKS = [
   { id: "pre-migration-reject", instruction: "Confirm a deployed pre-migration server rejects the enhanced write." },
 ];
 
+/** Which asking of the gate this fixture records (human_gate.py: `instance_id`). */
+const GATE_INSTANCE = "gate1";
+
 function sparring(): string {
   const gate = {
     category: "DEVICE_MANUAL_CHECK",
     title: "Live cloud behaviour has to be seen by a person",
     checks: CHECKS.map((check) => ({ id: check.id, instruction: check.instruction, pass_criteria: "It behaves as the plan describes." })),
+    instance_id: GATE_INSTANCE,
   };
   return [
     "# Sparring: x",
@@ -80,7 +84,7 @@ async function gate() {
 function marked(outcome: CheckOutcome, count = CHECKS.length, from = 0): Record<string, CheckRecord> {
   const drafts: Record<string, CheckRecord> = {};
   for (const check of CHECKS.slice(from, from + count)) {
-    drafts[check.id] = { outcome };
+    drafts[draftKeyFor(check.id, GATE_INSTANCE)] = { outcome };
   }
   return drafts;
 }
@@ -134,7 +138,7 @@ describe("the summary counts what the person actually said", () => {
 describe("Can't test does not look like a failure", () => {
   it("6. the recorded check, the chosen button and the word all read as absence, not as a problem", async () => {
     const view = await gate();
-    const html = view({ [CHECKS[0].id]: { outcome: "blocked" }, [CHECKS[1].id]: { outcome: "fail" } }).html;
+    const html = view({ [draftKeyFor(CHECKS[0].id, GATE_INSTANCE)]: { outcome: "blocked" }, [draftKeyFor(CHECKS[1].id, GATE_INSTANCE)]: { outcome: "fail" } }).html;
 
     // The chosen buttons carry the outcome as a class, and the stylesheet
     // gives each a different treatment: red for a failure, the editor's own
@@ -153,8 +157,8 @@ describe("Can't test does not look like a failure", () => {
     // that could not be performed, ✓ only for a pass.
     const notes = `# Notes\n\n## Human evidence\n\n${renderHumanEvidence(
       [
-        { text: CHECKS[0].instruction, origin: "gate", id: CHECKS[0].id, record: { outcome: "blocked" } },
-        { text: CHECKS[1].instruction, origin: "gate", id: CHECKS[1].id, record: { outcome: "fail" } },
+        { text: CHECKS[0].instruction, origin: "gate", id: CHECKS[0].id, gateInstanceId: GATE_INSTANCE, record: { outcome: "blocked" } },
+        { text: CHECKS[1].instruction, origin: "gate", id: CHECKS[1].id, gateInstanceId: GATE_INSTANCE, record: { outcome: "fail" } },
       ],
       new Date(NOW),
     )}\n`;

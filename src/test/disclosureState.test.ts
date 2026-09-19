@@ -94,6 +94,7 @@ async function gatePanel(): Promise<{ html: string }> {
       { id: "done-one", instruction: "Open the widget on a device.", pass_criteria: "It renders.", source: null },
       { id: "todo-one", instruction: "Rotate the device.", pass_criteria: "It does not crash.", source: null },
     ],
+    instance_id: "gate1",
   };
   const sparring = [
     "# Sparring: gate",
@@ -126,7 +127,7 @@ async function gatePanel(): Promise<{ html: string }> {
       plan: false,
       // One check answered, so "Previous evidence" has something in it, and
       // one note already sent, so "Feedback already sent" renders.
-      humanChecks: { "done-one": { outcome: "pass", note: "Rendered fine." } },
+      humanChecks: { "gate1::done-one": { outcome: "pass", note: "Rendered fine." } },
       // notes.md as the engine records it: one check already answered, so
       // "Previous evidence" has something in it, and one piece of freeform
       // feedback already sent, so that disclosure renders too.
@@ -137,7 +138,7 @@ async function gatePanel(): Promise<{ html: string }> {
         "",
         "2026-02-01 — manual verification recorded in VS Code:",
         "",
-        "- Pass — Open the widget on a device. · reviewer request",
+        "- Pass — Open the widget on a device. · check `done-one` · gate `gate1`",
         "  Rendered fine on the test handset.",
         "",
         "### Additional human feedback",

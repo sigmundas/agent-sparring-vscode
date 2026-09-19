@@ -24,7 +24,7 @@ import {
   type ConfigField,
   type ConfigRole,
 } from "./effectiveConfig";
-import { CHECK_OUTCOMES, isCheckKey, type CheckItem, type CheckOutcome } from "./humanChecks";
+import { CHECK_OUTCOMES, isCheckKey, isDraftKey, type CheckItem, type CheckOutcome } from "./humanChecks";
 import { checkName, humanTask, splitPassCriteria } from "./humanTask";
 import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type AgentConfigSection, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type PushAuthorization, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { MatchSource } from "./planAssociation";
@@ -214,7 +214,10 @@ export function isActionMessage(message: unknown): message is ActionMessage {
 
 export function isHumanCheckMessage(message: unknown): message is HumanCheckMessage {
   const record = asRecord(message);
-  if (!record || record["type"] !== "humanCheck" || !isCheckKey(record["key"])) {
+  // A draft key, not a check key: the control carries the asking as well as
+  // the check (see CheckItem.draftKey), and a guard that only knew the
+  // narrower shape would drop the message and leave the button inert.
+  if (!record || record["type"] !== "humanCheck" || !isDraftKey(record["key"])) {
     return false;
   }
   const outcome = record["outcome"];
@@ -869,6 +872,7 @@ function renderTask(item: CheckItem, position: number, total: number): string {
   const source = item.source ? `<p class="muted small source"><span class="lead">Defined in:</span> ${escapeHtml(item.source)}</p>` : "";
   return `<li class="check task${item.record?.outcome ? ` ${item.record.outcome}` : ""}">
 <div class="checkbody">${steps}${passIf}${source}</div>
+${renderEarlierAnswers(item)}
 ${renderRecordControls(item)}
 ${renderCheckMeta(item, position, total)}
 </li>`;
@@ -902,12 +906,44 @@ const NAME_TITLE = "The reviewer's own stable id for this check; it is what a re
 /** Pass / Fail / Can't test, plus the optional note; the same controls wherever a check is shown. */
 function renderRecordControls(item: CheckItem): string {
   const outcome = item.record?.outcome;
+  // `draftKey`, not `key`: a draft belongs to the asking it was typed for.
+  // See CheckItem.draftKey — with a re-issued check the two differ, and
+  // storing under the bare check id would offer the previous asking's unsent
+  // answer as this one's.
+  const key = escapeHtml(item.draftKey);
   const choices = CHECK_OUTCOMES.map(
     (candidate) =>
-      `<button type="button" class="choice ${candidate}${outcome === candidate ? " on" : ""}" data-check="${escapeHtml(item.key)}" data-outcome="${candidate}" aria-pressed="${outcome === candidate}" title="${escapeHtml(OUTCOME_TITLES[candidate])}">${OUTCOME_LABELS[candidate]}</button>`,
+      `<button type="button" class="choice ${candidate}${outcome === candidate ? " on" : ""}" data-check="${key}" data-outcome="${candidate}" aria-pressed="${outcome === candidate}" title="${escapeHtml(OUTCOME_TITLES[candidate])}">${OUTCOME_LABELS[candidate]}</button>`,
   ).join("");
-  return `<div class="record"><span class="choices">${choices}</span><textarea class="note" data-check="${escapeHtml(item.key)}" rows="1" placeholder="Evidence or note (optional)">${escapeHtml(item.record?.note ?? "")}</textarea></div>`;
+  return `<div class="record"><span class="choices">${choices}</span><textarea class="note" data-check="${key}" rows="1" placeholder="Evidence or note (optional)">${escapeHtml(item.record?.note ?? "")}</textarea></div>`;
 }
+
+/**
+ * What this check was answered with before, when the reviewer has asked it
+ * again.
+ *
+ * Shown, and shown as *previous*, because both halves are information the
+ * person needs: that they have answered this before (so the question is not
+ * a mistake), and that the earlier answer is not what is being asked for now
+ * (so they do not assume the panel has lost it). The entries stay in
+ * notes.md exactly as recorded; nothing here rewrites or resubmits them.
+ */
+function renderEarlierAnswers(item: CheckItem): string {
+  if (item.previous.length === 0) {
+    return "";
+  }
+  const rows = item.previous
+    .map((entry) => {
+      const word = entry.outcome ? `<span class="outcome ${entry.outcome}">${OUTCOME_LABELS[entry.outcome]}</span> ` : "";
+      return `<li>${word}<span class="muted">${escapeHtml(entry.excerpt)}</span></li>`;
+    })
+    .join("");
+  const what = item.previous.length === 1 ? "Your previous answer" : `Your ${item.previous.length} previous answers`;
+  return `<div class="previous" title="${escapeHtml(PREVIOUS_TITLE)}"><p class="lead muted small">${what} to this check — the reviewer has asked it again, so it needs an answer for this round:</p><ul class="prevlist">${rows}</ul></div>`;
+}
+
+const PREVIOUS_TITLE =
+  "Recorded in notes.md for an earlier asking of this same check. It is kept there and still goes to the reviewer; it is not counted as this round's answer, because the reviewer asked again.";
 
 /**
  * The words on the three buttons. `blocked` is the engine's own value and
@@ -954,6 +990,7 @@ function renderRequired(item: CheckItem, position: number, total: number): strin
   const outcome = item.record?.outcome;
   return `<li class="check${outcome ? ` ${outcome}` : ""}">
 <div class="checkrow"><span class="mark">○</span><div class="checkbody"><p class="criterion">${escapeHtml(item.text)} ${originTag(item)}</p>${checkDetail(item)}</div></div>
+${renderEarlierAnswers(item)}
 ${renderRecordControls(item)}
 ${renderCheckMeta(item, position, total)}
 </li>`;
@@ -1686,6 +1723,13 @@ h1 { font-size: 1.35em; font-weight: 600; margin: 0; }
 .outcome.fail { color: var(--bad); }
 .outcome.blocked { color: var(--vscode-descriptionForeground); }
 .evidence { margin: 0; font-family: var(--vscode-editor-font-family); }
+/* History, and styled as history: set back with the controls it sits above,
+   quoted rather than boxed, so it reads as context for the question and
+   never as an answer already given to it. */
+.previous { margin: 6px 0 0 28px; padding: 4px 10px; border-left: 2px solid var(--vscode-panel-border); background: var(--vscode-textBlockQuote-background); }
+.previous .lead { margin: 0; }
+.previous .prevlist { margin: 2px 0 0; padding-left: 18px; }
+.previous .prevlist li { margin: 0; font-size: 0.95em; }
 .record { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0 0 28px; flex-wrap: wrap; }
 .choices { display: inline-flex; gap: 0; flex: none; }
 button.choice { border-radius: 0; margin-left: -1px; }

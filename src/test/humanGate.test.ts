@@ -16,7 +16,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import { discoverRuns, selectRun } from "../core/discovery";
 import { HUMAN_GATE_MARKER, parseHumanGate, parseSparringOutcome } from "../core/engineFormats";
-import { checkKey, deriveVerification, parseHumanEvidence, renderHumanEvidence, submittableChecks, type CheckRecord } from "../core/humanChecks";
+import { checkKey, deriveVerification, draftKeyFor, parseHumanEvidence, renderHumanEvidence, submittableChecks, type CheckRecord } from "../core/humanChecks";
 import { renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel, type OverviewArtifacts } from "../core/overviewModel";
 import { Workspace, normalUi } from "./fixtures";
@@ -31,9 +31,22 @@ const INSTRUCTION =
 const PASS_CRITERIA = "The library loads, the v2 reference appears with its legacy values, and no error or data loss is reported in the sync log.";
 const SOURCE = "docs/plans/active/reported-statistics.md > Stage 3D — Snapshot v2 and attachment/export/import transport";
 
-/** What sparring_exchange.py renders for the Stage 3D verdict. */
-function sparringWithGate(checks = [{ id: CHECK_ID, instruction: INSTRUCTION, pass_criteria: PASS_CRITERIA, source: SOURCE }]): string {
-  const gate = { category: "DEVICE_MANUAL_CHECK", title: "A pre-activation desktop must survive a feed containing snapshot v2", checks };
+/**
+ * The identity the engine mints for one asking of a gate
+ * (human_gate.py: `instance_id`). Fixed here so a test can say which asking
+ * it means; the engine's own are random.
+ */
+const GATE_INSTANCE = "gate1";
+
+/**
+ * What sparring_exchange.py renders for the Stage 3D verdict.
+ *
+ * `instanceId` is which asking this is. It defaults to one, because every
+ * gate the engine records now carries one; pass `null` for the shape a run
+ * recorded before gate instances existed.
+ */
+function sparringWithGate(checks = [{ id: CHECK_ID, instruction: INSTRUCTION, pass_criteria: PASS_CRITERIA, source: SOURCE }], instanceId: string | null = GATE_INSTANCE): string {
+  const gate = { category: "DEVICE_MANUAL_CHECK", title: "A pre-activation desktop must survive a feed containing snapshot v2", checks, ...(instanceId ? { instance_id: instanceId } : {}) };
   return [
     "# Sparring: x",
     "",
@@ -129,7 +142,23 @@ describe("reading the structured gate out of sparring.md", () => {
       category: "DEVICE_MANUAL_CHECK",
       title: "A pre-activation desktop must survive a feed containing snapshot v2",
       checks: [{ id: CHECK_ID, instruction: INSTRUCTION, passCriteria: PASS_CRITERIA, source: SOURCE }],
+      instanceId: GATE_INSTANCE,
     });
+  });
+
+  it("a gate recorded before instances existed reads with none, rather than one being invented", () => {
+    const gate = parseHumanGate(sparringWithGate(undefined, null))!;
+    assert.equal(gate.instanceId, undefined);
+    assert.equal(gate.checks.length, 1, "the rest of the gate is unaffected");
+  });
+
+  it("an instance id the engine could not have written is read as absent", () => {
+    // Not a reason to drop the gate and hide the checks: which asking it is
+    // becomes unknown, which is what absent already means.
+    const mangled = sparringWithGate(undefined, null).replace('"checks"', '"instance_id": "has space",\n  "checks"');
+    const gate = parseHumanGate(mangled)!;
+    assert.equal(gate.instanceId, undefined);
+    assert.equal(gate.checks.length, 1);
   });
 
   it("a result recorded before gates existed simply has none", () => {
@@ -186,19 +215,24 @@ describe("the Stage 3D pattern: exactly one control", () => {
   });
 
   it("recording it makes the evidence complete and enables Submit for review", async () => {
-    const { model } = await stage({ drafts: { [CHECK_ID]: { outcome: "pass", note: "Ran it on a 2026.8 build." } } });
+    // The draft belongs to the asking it was typed for, so it is stored
+    // under the gate instance as well as the check id.
+    const { model } = await stage({ drafts: { [draftKeyFor(CHECK_ID, GATE_INSTANCE)]: { outcome: "pass", note: "Ran it on a 2026.8 build." } } });
     const panel = model.actionRequired!;
     assert.equal(panel.ready, true);
     assert.equal(panel.headline, "Evidence ready for review");
     assert.equal(panel.submit.enabled, true);
     assert.equal(panel.progress, "1 / 1 verified");
     const entry = renderHumanEvidence(submittableChecks(panel), new Date(NOW))!;
-    assert.match(entry, new RegExp(`- Pass — ${INSTRUCTION.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} · check \`${CHECK_ID}\``));
+    // The line names the check *and* the asking it answered.
+    assert.match(entry, new RegExp(`- Pass — ${INSTRUCTION.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} · check \`${CHECK_ID}\` · gate \`${GATE_INSTANCE}\``));
     assert.match(entry, /\n {2}Ran it on a 2026\.8 build\./);
   });
 
   it("a recorded result is found again by its id even after the reviewer rewords the check", async () => {
-    const entry = renderHumanEvidence([{ text: INSTRUCTION, origin: "gate", id: CHECK_ID, record: { outcome: "pass" } }], new Date(NOW))!;
+    // Same asking, reworded. The id is what carries the result across the
+    // rewording, and that is still exactly what it is for.
+    const entry = renderHumanEvidence([{ text: INSTRUCTION, origin: "gate", id: CHECK_ID, gateInstanceId: GATE_INSTANCE, record: { outcome: "pass" } }], new Date(NOW))!;
     const reworded = sparringWithGate([{ id: CHECK_ID, instruction: "Test a pre-activation desktop against a v2 feed.", pass_criteria: "No error.", source: null as unknown as string }]);
     const { model } = await stage({ sparring: reworded, notes: `# Notes\n\n## Human evidence\n\n${entry}\n` });
     const panel = model.actionRequired!;
@@ -208,12 +242,35 @@ describe("the Stage 3D pattern: exactly one control", () => {
     assert.equal(panel.recorded[0].evidence?.outcome, "pass");
   });
 
-  it("evidence recorded before gates existed still counts, by its wording", async () => {
+  it("evidence recorded before gates existed is kept and shown, but does not answer a gate that cannot say which asking it is", async () => {
+    const legacy = ["# Notes", "", "## Human evidence", "", `- Pass — ${INSTRUCTION}`, ""].join("\n");
+    // Both sides predate instances, so nothing here can tell a first asking
+    // from a fourth. The conservative reading is the only honest one: the
+    // Pass is preserved and shown, and the check can be answered again.
+    // Being asked something twice costs a person a minute; a check that
+    // cannot be answered at all costs them the stage.
+    const { model } = await stage({ notes: legacy, sparring: sparringWithGate(undefined, null) });
+    const panel = model.actionRequired!;
+    assert.equal(panel.recorded.length, 0, "not claimed as this gate's answer");
+    assert.equal(panel.required.length, 1);
+    assert.equal(panel.required[0].previous.length, 1, "kept, as history");
+    assert.equal(panel.required[0].previous[0].outcome, "pass");
+    assert.equal(panel.ready, false);
+  });
+
+  it("the same wording-matched result does not answer a *later* asking of the check", async () => {
+    // The engine has since recorded a fresh gate, so this Pass answered an
+    // earlier one. It stays visible as history and the check reopens; the
+    // alternative is a check the reviewer deliberately re-issued that can
+    // never be answered.
     const legacy = ["# Notes", "", "## Human evidence", "", `- Pass — ${INSTRUCTION}`, ""].join("\n");
     const { model } = await stage({ notes: legacy });
     const panel = model.actionRequired!;
-    assert.equal(panel.recorded.length, 1);
-    assert.equal(panel.recorded[0].evidence?.how, "exact");
+    assert.equal(panel.recorded.length, 0, "not an answer to this asking");
+    assert.equal(panel.required.length, 1, "and so the check is answerable again");
+    assert.equal(panel.required[0].previous.length, 1, "shown as what it is: a previous answer");
+    assert.equal(panel.required[0].previous[0].outcome, "pass");
+    assert.equal(panel.ready, false);
   });
 
   it("two checks yield two controls, in the reviewer's order", async () => {

@@ -1328,6 +1328,13 @@ function actionRequired(
     submitDetail = `Switch to ${branchGuard.expected} first; the engine refuses to review a candidate from another branch.`;
   } else if (view.recorded.length === 0 && view.required.length === 0) {
     submitDetail = "No requested check is listed, so there is no recorded evidence to send.";
+  } else if (view.required.length === 0) {
+    // Every check of *this* asking is already recorded in notes.md, so there
+    // is nothing left to send and the reviewer has it. Previously this state
+    // enabled the button — `required.every(…)` is vacuously true over an
+    // empty list — and Submit then refused with a message about remaining
+    // checks it was itself reporting as done.
+    submitDetail = "Every requested check already has a recorded result in notes.md. There is nothing further to send; the reviewer rules on what is already there.";
   } else if (!ready) {
     // The reviewer's own ids, when the checks have them: "all 2 remaining
     // checks" makes a person go and work out which two, and the names that
