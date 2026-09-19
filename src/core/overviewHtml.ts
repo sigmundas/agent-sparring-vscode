@@ -24,7 +24,7 @@ import {
   type ConfigField,
   type ConfigRole,
 } from "./effectiveConfig";
-import { CHECK_OUTCOMES, isCheckKey, type CheckItem, type CheckOutcome } from "./humanChecks";
+import { CHECK_OUTCOMES, isCheckKey, isDraftKey, type CheckItem, type CheckOutcome } from "./humanChecks";
 import { checkName, humanTask, splitPassCriteria } from "./humanTask";
 import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type AgentConfigSection, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type PushAuthorization, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { MatchSource } from "./planAssociation";
@@ -214,7 +214,10 @@ export function isActionMessage(message: unknown): message is ActionMessage {
 
 export function isHumanCheckMessage(message: unknown): message is HumanCheckMessage {
   const record = asRecord(message);
-  if (!record || record["type"] !== "humanCheck" || !isCheckKey(record["key"])) {
+  // A draft key, not a check key: the control carries the asking as well as
+  // the check (see CheckItem.draftKey), and a guard that only knew the
+  // narrower shape would drop the message and leave the button inert.
+  if (!record || record["type"] !== "humanCheck" || !isDraftKey(record["key"])) {
     return false;
   }
   const outcome = record["outcome"];
@@ -869,6 +872,7 @@ function renderTask(item: CheckItem, position: number, total: number): string {
   const source = item.source ? `<p class="muted small source"><span class="lead">Defined in:</span> ${escapeHtml(item.source)}</p>` : "";
   return `<li class="check task${item.record?.outcome ? ` ${item.record.outcome}` : ""}">
 <div class="checkbody">${steps}${passIf}${source}</div>
+${renderEarlierAnswers(item)}
 ${renderRecordControls(item)}
 ${renderCheckMeta(item, position, total)}
 </li>`;
@@ -902,12 +906,53 @@ const NAME_TITLE = "The reviewer's own stable id for this check; it is what a re
 /** Pass / Fail / Can't test, plus the optional note; the same controls wherever a check is shown. */
 function renderRecordControls(item: CheckItem): string {
   const outcome = item.record?.outcome;
+  // `draftKey`, not `key`: a draft belongs to the asking it was typed for.
+  // See CheckItem.draftKey — with a re-issued check the two differ, and
+  // storing under the bare check id would offer the previous asking's unsent
+  // answer as this one's.
+  const key = escapeHtml(item.draftKey);
   const choices = CHECK_OUTCOMES.map(
     (candidate) =>
-      `<button type="button" class="choice ${candidate}${outcome === candidate ? " on" : ""}" data-check="${escapeHtml(item.key)}" data-outcome="${candidate}" aria-pressed="${outcome === candidate}" title="${escapeHtml(OUTCOME_TITLES[candidate])}">${OUTCOME_LABELS[candidate]}</button>`,
+      `<button type="button" class="choice ${candidate}${outcome === candidate ? " on" : ""}" data-check="${key}" data-outcome="${candidate}" aria-pressed="${outcome === candidate}" title="${escapeHtml(OUTCOME_TITLES[candidate])}">${OUTCOME_LABELS[candidate]}</button>`,
   ).join("");
-  return `<div class="record"><span class="choices">${choices}</span><textarea class="note" data-check="${escapeHtml(item.key)}" rows="1" placeholder="Evidence or note (optional)">${escapeHtml(item.record?.note ?? "")}</textarea></div>`;
+  return `<div class="record"><span class="choices">${choices}</span><textarea class="note" data-check="${key}" rows="1" placeholder="Evidence or note (optional)">${escapeHtml(item.record?.note ?? "")}</textarea></div>`;
 }
+
+/**
+ * What this check was answered with before, when the reviewer has asked it
+ * again.
+ *
+ * Shown, and shown as *previous*, because both halves are information the
+ * person needs: that they have answered this before (so the question is not
+ * a mistake), and that the earlier answer is not what is being asked for now
+ * (so they do not assume the panel has lost it). The entries stay in
+ * notes.md exactly as recorded; nothing here rewrites or resubmits them.
+ */
+function renderEarlierAnswers(item: CheckItem): string {
+  if (item.previous.length === 0) {
+    return "";
+  }
+  const rows = item.previous
+    .map((entry) => {
+      const word = entry.outcome ? `<span class="outcome ${entry.outcome}">${OUTCOME_LABELS[entry.outcome]}</span> ` : "";
+      return `<li>${word}<span class="muted">${escapeHtml(entry.excerpt)}</span></li>`;
+    })
+    .join("");
+  const what = item.previous.length === 1 ? "Your previous answer" : `Your ${item.previous.length} previous answers`;
+  // Only say the reviewer asked again when the gate actually says so. A
+  // gate recorded before instances existed names no asking, so "asked it
+  // again" would be this panel inventing a fact about the reviewer; what is
+  // true in that case is narrower, and is what it says instead.
+  const why = item.askingIdentified ? "the reviewer has asked it again, so it needs an answer for this round" : "this gate does not record which round it is, so it needs an answer for this one";
+  const title = item.askingIdentified ? PREVIOUS_TITLE : PREVIOUS_TITLE_UNATTRIBUTED;
+  return `<div class="previous" title="${escapeHtml(title)}"><p class="lead muted small">${what} to this check — ${why}:</p><ul class="prevlist">${rows}</ul></div>`;
+}
+
+const PREVIOUS_TITLE =
+  "Recorded in notes.md for an earlier asking of this same check. It is kept there and still goes to the reviewer; it is not counted as this round's answer, because the reviewer asked again.";
+
+const PREVIOUS_TITLE_UNATTRIBUTED =
+  "Recorded in notes.md for this check, by a version of the engine that did not record which round a gate is. It is kept there and still goes to the reviewer; it is not counted as this round's answer, because nothing can show which round it answered.";
 
 /**
  * The words on the three buttons. `blocked` is the engine's own value and
@@ -954,6 +999,7 @@ function renderRequired(item: CheckItem, position: number, total: number): strin
   const outcome = item.record?.outcome;
   return `<li class="check${outcome ? ` ${outcome}` : ""}">
 <div class="checkrow"><span class="mark">○</span><div class="checkbody"><p class="criterion">${escapeHtml(item.text)} ${originTag(item)}</p>${checkDetail(item)}</div></div>
+${renderEarlierAnswers(item)}
 ${renderRecordControls(item)}
 ${renderCheckMeta(item, position, total)}
 </li>`;
@@ -1303,29 +1349,45 @@ function renderActors(model: OverviewModel, scope: string): string {
 function renderActor(card: ActorCard, controls: AgentRoleControls | undefined, configScope: string | undefined): string {
   const busy = card.activity === "Working" || card.activity === "Sparring";
   const duration = card.duration ? ` for ${escapeHtml(card.duration)}` : "";
-  const quiet = card.quietFor ? ` <span class="muted">· no meaningful activity for ${escapeHtml(card.quietFor)}</span>` : "";
-  const uncertain = busy && card.uncertain ? ` <span class="muted">· runner status unknown</span>` : "";
+  // Read on their own line under the state, so neither carries the leading
+  // separator it needed when all of this was one sentence.
+  const quiet = card.quietFor ? `no meaningful activity for ${escapeHtml(card.quietFor)}` : "";
+  const uncertain = busy && card.uncertain ? `runner status unknown` : "";
   const who = whoClass(card.provider);
   // A telemetry-only turn reads "Working? (turn observed 3m ago)": the duration is
   // time since the observed start, not a claim that work is happening now.
   const word = busy && card.uncertain ? `${card.activity}?` : (card.activity ?? "");
-  const span = busy && card.uncertain ? (card.duration ? ` <span class="muted">(turn observed ${escapeHtml(card.duration)} ago)</span>` : "") : duration;
+  // The pill carries the state and, when the runner is confirmed, how long it
+  // has been true. The age of a turn nothing has confirmed is a different
+  // claim, so it reads as a note rather than lengthening the pill until it
+  // pushes the role name onto two lines.
+  const span = busy && card.uncertain ? "" : duration;
+  const observed = busy && card.uncertain && card.duration ? `turn observed ${escapeHtml(card.duration)} ago` : "";
   const role = actorRole(card);
-  const identity = `<div class="identity"><span class="avatar ${who}">${avatarGlyph(role)}</span>
-<div class="who"><div class="rolename ${who}">${escapeHtml(card.role)}</div><div class="provider muted">${escapeHtml(card.provider)}</div></div></div>`;
-  const settings = controls && configScope ? renderRoleControls(controls, configScope) : "";
   // No run, no stage: the card is a configuration surface and says nothing
-  // about activity. With a stage, the session line appears only once the
-  // engine has recorded one — an absent id is left off rather than shown as
-  // a placeholder for a value that does not exist yet.
+  // about activity, so the corner is empty rather than filled with a word
+  // for a state nothing is in.
+  //
+  // What the actor is doing is the first thing a person looks at, so it sits
+  // in the card's top corner on the role's own line. The word and how long
+  // it has been true are the state; the caveats that qualify it — a turn
+  // nothing has confirmed, a turn that has gone quiet — are true but
+  // secondary, and read underneath it rather than lengthening it.
+  const notes = [observed, uncertain, quiet].filter((note) => note !== "").join(" · ");
+  // The word and its duration are one text node inside the pill: the pill is
+  // a flex container, and a space between two of its children would be
+  // collapsed away, leaving "Working?for 12s".
   const activity = card.activity
-    ? `<div class="activity ${card.activity.toLowerCase()}${busy && card.uncertain ? " uncertain" : ""}">${icon("dot", "dot")}${escapeHtml(word)}${busy ? span : ""}${uncertain}${quiet}</div>`
+    ? `<span class="statepill ${card.activity.toLowerCase()}${busy && card.uncertain ? " uncertain" : ""}">${icon("dot", "dot")}<span>${escapeHtml(word)}${busy ? span : ""}</span></span>`
     : "";
-  const session =
-    card.sessionLabel && card.sessionKind
-      ? `<div class="session muted">${capitalize(card.sessionKind)}: ${escapeHtml(card.sessionLabel)}</div>`
-      : "";
-  const body = `${identity}${settings}${activity}${session}`;
+  // The caveats get the card's whole width on their own row. Kept in the
+  // corner with the pill they were the widest thing in the header, and a
+  // header sized by its longest caveat put the role name on two lines.
+  const statenote = notes ? `<div class="statenote">${notes}</div>` : "";
+  const identity = `<div class="identity"><span class="avatar ${who}">${avatarGlyph(role)}</span>
+<div class="who"><div class="rolename ${who}">${escapeHtml(card.role)}</div><div class="provider muted">${escapeHtml(card.provider)}</div></div>${activity}</div>${statenote}`;
+  const settings = controls && configScope ? renderRoleControls(controls, configScope) : "";
+  const body = `${identity}${settings}`;
   // No captured prompt means the engine has not run a turn for this actor
   // since prompt capture existed. An ordinary state, so the card simply
   // stays a card rather than offering a disclosure that would open on
@@ -1482,9 +1544,6 @@ function whoClass(name: string): string {
   return "other";
 }
 
-function capitalize(word: string): string {
-  return word.charAt(0).toUpperCase() + word.slice(1);
-}
 
 /**
  * One role's settings, inside that role's own card: model, effort, and the
@@ -1673,6 +1732,13 @@ h1 { font-size: 1.35em; font-weight: 600; margin: 0; }
 .outcome.fail { color: var(--bad); }
 .outcome.blocked { color: var(--vscode-descriptionForeground); }
 .evidence { margin: 0; font-family: var(--vscode-editor-font-family); }
+/* History, and styled as history: set back with the controls it sits above,
+   quoted rather than boxed, so it reads as context for the question and
+   never as an answer already given to it. */
+.previous { margin: 6px 0 0 28px; padding: 4px 10px; border-left: 2px solid var(--vscode-panel-border); background: var(--vscode-textBlockQuote-background); }
+.previous .lead { margin: 0; }
+.previous .prevlist { margin: 2px 0 0; padding-left: 18px; }
+.previous .prevlist li { margin: 0; font-size: 0.95em; }
 .record { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0 0 28px; flex-wrap: wrap; }
 .choices { display: inline-flex; gap: 0; flex: none; }
 button.choice { border-radius: 0; margin-left: -1px; }
@@ -1844,6 +1910,7 @@ p { margin: 0 0 4px; line-height: 1.45; }
 .actors { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 0 0 10px; }
 .actor { display: block; padding: 10px 12px; line-height: 1.45; }
 .actor .identity { display: flex; gap: 12px; align-items: center; }
+.actor .who { min-width: 0; }
 /* 2.8em is the height of the two-line column beside the avatar (the 1.05em
    role name and the 0.88em provider name, both at line-height 1.45), so the
    circle reads at the height of the identity row it sits in. Width and height
@@ -1858,11 +1925,17 @@ p { margin: 0 0 4px; line-height: 1.45; }
 .rolename.claude { color: var(--claude); }
 .rolename.codex { color: var(--codex); }
 .actor .provider { font-size: 0.88em; }
-.activity { display: flex; align-items: center; }
-.activity .icon.dot { color: var(--vscode-descriptionForeground); }
-.activity.working, .activity.sparring { color: var(--good); font-weight: 600; }
-.activity.working .icon.dot, .activity.sparring .icon.dot { color: var(--good); }
-.session { font-family: var(--vscode-editor-font-family); font-size: 0.85em; }
+/* What the actor is doing, in the card's top corner. Aligning it to the
+   start of the row puts it on the role name's line rather than centring it
+   against the two-line block, which is what makes the two read as one row.
+   It never wraps and never grows, so the role name keeps its own line. */
+.statepill { flex: none; margin-left: auto; align-self: flex-start; display: inline-flex; align-items: center; padding: 1px 8px; border: 1px solid var(--line); border-radius: 10px; font-size: 0.92em; white-space: nowrap; }
+.statepill .icon.dot { color: var(--vscode-descriptionForeground); }
+.statepill.working, .statepill.sparring { border-color: var(--good); color: var(--good); font-weight: 600; }
+.statepill.working .icon.dot, .statepill.sparring .icon.dot { color: var(--good); }
+/* The caveats: true, and deliberately quieter than the state they qualify.
+   Right-aligned so they read as trailing from the pill above them. */
+.statenote { margin-top: 4px; text-align: right; font-size: 0.82em; line-height: 1.35; color: var(--vscode-descriptionForeground); }
 
 /* The captured prompt opens below both cards, never inside the card that
    opens it: a card that grew would push the other actor's card out of its
@@ -1939,8 +2012,8 @@ button.quiet { background: transparent; color: var(--vscode-descriptionForegroun
 .busy.unknown { border-color: var(--warn); color: var(--warn); }
 .busy.accepting { border-color: var(--info); color: var(--info); }
 .stopped, .stale, .inferred { display: flex; align-items: center; color: var(--warn); }
-.activity.uncertain { color: var(--warn); }
-.activity.uncertain .icon.dot { color: var(--warn); }
+.statepill.uncertain { border-color: var(--warn); color: var(--warn); }
+.statepill.uncertain .icon.dot { color: var(--warn); }
 
 .facts { display: grid; grid-template-columns: max-content 1fr; gap: 1px 12px; margin: 0; padding-top: 8px; border-top: 1px solid var(--line); font-size: 0.82em; color: var(--vscode-descriptionForeground); }
 .facts dt { color: var(--vscode-descriptionForeground); }

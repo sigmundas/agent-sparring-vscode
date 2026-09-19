@@ -221,24 +221,50 @@ describe("each actor card is its own configuration surface", () => {
     assert.ok(html.indexOf('<section class="actors">') < html.indexOf('data-action="openSettings"'));
   });
 
-  it("10. still says what each actor is doing, and names its session or thread", async () => {
+  it("10. says what each actor is doing, in the card's top corner on the role's own line", async () => {
     const live = foldEvents([event("stage", "turn.started", { provider: "claude-cli" })]);
     const model = buildOverviewModel(await planSelection(), live, artifacts(parsed()), Date.parse(live.lastEventTs!) + 1000);
     const html = renderOverviewHtml(model, "n", "c");
 
     assert.equal(model.stageAgent?.activity, "Working");
-    assert.match(card(html, "Stage agent"), /<div class="activity working[^"]*">[\s\S]*?Working/);
-    assert.match(card(html, "Stage agent"), /<div class="session muted">Session: 82ab1234…<\/div>/);
-    assert.match(card(html, "Sparrer"), /<div class="session muted">Thread: 019d<\/div>/);
+    // Inside the identity row, after the role and provider: that is what puts
+    // it in the corner beside the role rather than under the controls.
+    assert.match(
+      card(html, "Stage agent"),
+      /<div class="rolename claude">Stage agent<\/div><div class="provider muted">Claude<\/div><\/div><span class="statepill working[^"]*"><svg[^>]*>.*?<\/svg><span>Working\??[^<]*<\/span><\/span><\/div>/,
+      "the state is the last thing in the header row",
+    );
+    assert.match(card(html, "Sparrer"), /<span class="statepill waiting">/);
+
+    // Nothing has confirmed this runner, so the word carries the question and
+    // the pill stays short: the age of an unconfirmed turn is a note, not the
+    // duration of a state.
+    assert.match(card(html, "Stage agent"), /<span>Working\?<\/span>/);
+    assert.match(card(html, "Stage agent"), /<div class="statenote">turn observed [^<]*ago · runner status unknown<\/div>/);
   });
 
-  it("10b. omits the session line entirely rather than inventing one", async () => {
-    const ws = await Workspace.create();
-    await ws.writeStage("stage-1", { status: "working" });
-    const selection = selectRun((await discoverRuns([ws.location])).runs);
-    const html = renderOverviewHtml(buildOverviewModel(selection, undefined, artifacts(parsed()), NOW), "n", "c");
+  it("10b. the session and thread ids are not repeated on the card; the footer carries them", async () => {
+    const live = foldEvents([event("stage", "turn.started", { provider: "claude-cli" })]);
+    const model = buildOverviewModel(await planSelection(), live, artifacts(parsed()), Date.parse(live.lastEventTs!) + 1000);
+    const html = renderOverviewHtml(model, "n", "c");
 
-    assert.doesNotMatch(html, /class="session muted"/, "no session yet means no line, not a placeholder");
+    assert.doesNotMatch(html, /class="session muted"/, "the card does not carry a shorter copy of it");
+    // The same ids, longer, under a label that says which is which.
+    assert.match(html, /<dt>Stage session<\/dt><dd>82ab12345678<\/dd>/);
+    assert.match(html, /<dt>Sparring thread<\/dt><dd>019d<\/dd>/);
+  });
+
+  it("10c. keeps a caveat about the state, on its own row under the header", async () => {
+    const live = foldEvents([event("stage", "turn.started", { provider: "claude-cli" })]);
+    const stale = Date.parse(live.lastEventTs!) + 40 * 60 * 1000;
+    const html = renderOverviewHtml(buildOverviewModel(await planSelection(), live, artifacts(parsed()), stale), "n", "c");
+
+    const stage = card(html, "Stage agent");
+    assert.match(stage, /<span class="statepill working[^"]*">/, "the state stays the headline");
+    assert.match(stage, /<div class="statenote">[^<]*no meaningful activity for [^<]*<\/div>/, "and the caveat is quieter, below it");
+    // Outside the header row, or the longest caveat would size the header and
+    // push the role name onto two lines.
+    assert.match(stage, /<\/span><\/div><div class="statenote">/);
   });
 
   it("11. keeps Show instructions on the card, opening a panel that is keyed so it survives a rerender", async () => {
@@ -371,8 +397,8 @@ describe("the cards before anything is running", () => {
     const html = renderOverviewHtml(model, "n", "c");
     assert.match(card(html, "Stage agent"), /Model<\/span><span class="agentconfig-fixed/);
     assert.match(card(html, "Sparrer"), /data-role="sparring"[^>]*data-field="effort"/);
-    assert.doesNotMatch(html, /class="activity/, "no Working/Idle word for a run that does not exist");
-    assert.doesNotMatch(html, /class="session muted"/);
+    assert.doesNotMatch(html, /class="statepill/, "no Working/Idle word for a run that does not exist");
+    assert.doesNotMatch(html, /class="statenote/);
     assert.match(html, /data-action="openSettings"/);
     assert.match(html, /No project.toml yet/);
   });

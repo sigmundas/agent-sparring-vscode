@@ -142,10 +142,18 @@ describe("NEEDS_YOU → evidence ready transition", () => {
     )!;
     const { model } = await stage({ notes: appendHumanEvidence("# Notes: x\n", entry) });
     const panel = model.actionRequired!;
-    assert.equal(panel.required.length, 0);
-    assert.equal(panel.ready, true, "nothing is outstanding, so the evidence is ready to go back");
-    assert.equal(panel.headline, "Evidence ready for review");
+    assert.equal(panel.required.length, 0, "nothing is outstanding: notes.md already answers both");
     assert.deepEqual(submittableChecks(panel), [], "already-recorded results are not written a second time");
+    // And therefore *not* ready, which is the whole point. "Ready" used to
+    // mean "no check is unanswered", which is vacuously true when there are
+    // no outstanding checks at all — so the panel said "Evidence ready for
+    // review", the button was enabled, and pressing it answered "record a
+    // result for the remaining checks first" about checks it was itself
+    // reporting as done. Readiness now means there is evidence to send.
+    assert.equal(panel.ready, false, "there is nothing to send, so nothing is ready to send");
+    assert.equal(panel.submit.enabled, false);
+    assert.match(panel.submit.detail, /already has a recorded result/);
+    assert.notEqual(panel.headline, "Evidence ready for review");
   });
 
   it("a reviewer that asks for something new after the last submission goes back to Needs you", async () => {

@@ -212,7 +212,9 @@ describe("active duration", () => {
     assert.equal(model.sparrer?.duration, "12s");
     const html = renderOverviewHtml(model, "n", "c");
     assert.match(html, /Current activity<\/h3><p class="now"><span class="who codex">Codex<\/span> sparring for <span class="dur">12s<\/span><\/p>/);
-    assert.match(html, /<div class="activity sparring"><svg[^>]*>.*?<\/svg>Sparring for 12s<\/div>/);
+    // A confirmed turn: the pill carries the state and how long it has been
+    // true, in the card's corner.
+    assert.match(html, /<span class="statepill sparring"><svg[^>]*>.*?<\/svg><span>Sparring for 12s<\/span><\/span>/);
     assert.match(html, /<span class="avatar codex"><svg class="glyph"[^>]*>.*?<\/svg><\/span>/);
     assert.match(html, /<span class="hpill good"><svg[^>]*>.*?<\/svg>Working<\/span>/, "standalone working stage status pill");
   });

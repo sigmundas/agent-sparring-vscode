@@ -460,6 +460,18 @@ export interface HumanGate {
   category: string;
   title: string;
   checks: HumanGateCheck[];
+  /**
+   * Which *asking* of this gate the file records (human_gate.py:
+   * `instance_id`, minted by the engine in `record_sparring`).
+   *
+   * A check's `id` says what question it is; this says which turn asked it.
+   * A reviewer re-issues a check under the same id precisely when the
+   * recorded answer was not enough — "a Pass alone does not identify which
+   * option you chose" — and a recorded answer belongs to one asking rather
+   * than to the id forever. Absent for a gate recorded before the engine
+   * minted these, which is the one case where attribution cannot be proven.
+   */
+  instanceId?: string;
 }
 
 /**
@@ -540,8 +552,17 @@ export function parseHumanGate(markdown: string): HumanGate | undefined {
     const source = typeof entry["source"] === "string" && entry["source"].trim() ? entry["source"].trim() : undefined;
     checks.push({ id, instruction, passCriteria, source });
   }
-  return { category, title, checks };
+  // A malformed instance is read as *absent*, never as a made-up value and
+  // never as a reason to discard the gate: "which asking this is" is
+  // unknown, which the caller already has a conservative answer for, whereas
+  // dropping the gate would hide the checks a person has to do.
+  const rawInstance = raw["instance_id"];
+  const instanceId = typeof rawInstance === "string" && GATE_INSTANCE_ID_RE.test(rawInstance.trim()) ? rawInstance.trim() : undefined;
+  return { category, title, checks, instanceId };
 }
+
+/** The engine's own shape for a gate instance id (human_gate.py: `_INSTANCE_ID_RE`). */
+const GATE_INSTANCE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 /**
  * Read the `## Routing outcome` bullets the engine renders into

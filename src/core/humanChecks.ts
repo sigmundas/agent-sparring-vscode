@@ -216,6 +216,34 @@ export function isCheckKey(value: unknown): value is string {
 // eslint-disable-next-line no-control-regex -- refusing control characters is precisely the point
 const UNUSABLE_IN_KEY = /[\u0060\u0000-\u001f\u007f]/;
 
+/**
+ * The separator between a gate instance and a check key in a draft key.
+ * Two characters the engine allows in neither half, so the halves can never
+ * be confused for one another.
+ */
+export const DRAFT_KEY_SEPARATOR = "::";
+
+/** A gate instance (the engine caps these at 128), the separator, and a check key. */
+export const DRAFT_KEY_MAX_LENGTH = 128 + DRAFT_KEY_SEPARATOR.length + CHECK_KEY_MAX_LENGTH;
+
+/**
+ * Is this a key a check's controls could have been rendered with?
+ *
+ * Separate from {@link isCheckKey}, and longer, because a draft key is a
+ * *composite*: a gate check's draft is stored under its asking as well as
+ * its id (see `CheckItem.draftKey`). Reusing the 128-character check-key
+ * limit here would refuse the composite for any reviewer id over 94
+ * characters — and a refused message is a button that does nothing, which is
+ * the exact failure {@link isCheckKey}'s own note describes.
+ *
+ * The one definition of the shape, used by the renderer, which must never
+ * emit a control the host would drop, and by the host's guard on messages
+ * arriving from the webview.
+ */
+export function isDraftKey(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= DRAFT_KEY_MAX_LENGTH && !UNUSABLE_IN_KEY.test(value);
+}
+
 /** djb2 over the whitespace-normalised, case-folded text; short hex. */
 export function checkKey(text: string): string {
   const normalised = normalise(text);
@@ -534,6 +562,12 @@ export interface EvidenceEntry {
   checkText?: string;
   /** The gate check's stable id, when the line names one (`· check `pre-activation-desktop``). */
   checkId?: string;
+  /**
+   * Which asking of the gate this line answered (`· gate `5b22…``), when it
+   * names one. Absent on every line written before results were attributed
+   * to a gate instance, and on a line whose gate had no instance to name.
+   */
+  gateInstanceId?: string;
   /** The entry says something is still pending / not claimed; it is not evidence of completion. */
   negative: boolean;
   /**
@@ -549,11 +583,16 @@ export interface EvidenceEntry {
 const NEGATIVE_RE = /\b(still pending|not claimed|not yet|cannot|can no longer|could not|unverified|not (?:done|verified|observed|run|tested|checked|exercised)|remains? (?:pending|open|outstanding|unverified)|outstanding:)\b/i;
 /**
  * A result line this panel wrote: the outcome, the check's own wording, and
- * an optional origin marker. `· check \`<id>\`` carries the gate check's
- * stable id, which is what makes a recorded result survive the reviewer
- * rewording the same check on a later turn.
+ * optional markers. `· check \`<id>\`` carries the gate check's stable id,
+ * which is what makes a recorded result survive the reviewer rewording the
+ * same check on a later turn; `· gate \`<id>\`` carries the gate instance
+ * the result answered, which is what keeps it from answering a *later*
+ * asking of the same check.
+ *
+ * Both suffixes are optional and the gate one is last, so every line written
+ * before gate instances existed still parses exactly as it did.
  */
-const STRUCTURED_RE = /^(Pass|Fail|Blocked)\s+—\s+(.+?)(?:\s+·\s+check\s+`([^`]+)`)?(?:\s+·\s+reviewer request)?$/;
+const STRUCTURED_RE = /^(Pass|Fail|Blocked)\s+—\s+(.+?)(?:\s+·\s+check\s+`([^`]+)`)?(?:\s+·\s+reviewer request)?(?:\s+·\s+gate\s+`([^`]+)`)?$/;
 
 /** The `## Human evidence` section of notes.md as entries; empty when absent. */
 export function parseHumanEvidence(notes: string | undefined): EvidenceEntry[] {
@@ -583,6 +622,7 @@ export function parseHumanEvidence(notes: string | undefined): EvidenceEntry[] {
       outcome: structured ? (structured[1].toLowerCase() as CheckOutcome) : undefined,
       checkText: structured ? structured[2] : undefined,
       checkId: structured ? structured[3] : undefined,
+      gateInstanceId: structured ? structured[4] : undefined,
       negative: NEGATIVE_RE.test(text),
       feedback,
     });
@@ -699,8 +739,10 @@ export interface RecordedEvidence {
  * EVIDENCE_MATCH_MIN_OVERLAP, uniquely, and not itself negative. The
  * excerpt is shown so the reader can see why the check counts as recorded.
  *
- * A gate check falls back to text and prose matching too, so evidence
- * recorded before the reviewer supplied structured gates still counts.
+ * This is the **derived** path: the legacy plan/prose checks, which are not
+ * a reviewer's structured gate and so have no asking to belong to. A gate
+ * check is resolved by {@link evidenceForGateInstance} instead, which is
+ * stricter because a gate can be asked more than once.
  */
 export function recordedEvidenceFor(check: { text: string; key?: string; origin?: CheckOrigin }, entries: EvidenceEntry[]): RecordedEvidence | undefined {
   // Freeform feedback is not a result for anything, however much of a check's
@@ -720,6 +762,61 @@ export function recordedEvidenceFor(check: { text: string; key?: string; origin?
   const prose = candidates.filter((entry) => entry.checkText === undefined && !entry.negative);
   const at = matchReviewerRequest(prose, check.text, EVIDENCE_MATCH_MIN_OVERLAP);
   return at === undefined ? undefined : { excerpt: excerpt(prose[at].text), how: "prose" };
+}
+
+/**
+ * Split the recorded evidence for **one gate check** into the answer to the
+ * asking in front of the person, and the answers to earlier askings.
+ *
+ * This is the whole of the re-issued-check fix, and the rule is short: an
+ * entry answers *this* gate only if it names this gate instance. A reviewer
+ * re-issues a check under the same id exactly when the answer it got was
+ * insufficient, so matching on the check id alone hands back the answer the
+ * reviewer has already rejected and reports the question as settled — after
+ * which there is nothing to submit and no way to answer. The check id still
+ * does its job: it is what gathers the earlier answers under the right
+ * question, as history.
+ *
+ * When the gate names no instance, nothing can be *proven* to answer it, so
+ * nothing does. That is the conservative reading and the only honest one: a
+ * gate recorded before instances existed may be a first asking or a fourth,
+ * and this cannot tell. The cost is asking a person to answer something they
+ * may have answered before, with their earlier answer shown to them; the
+ * alternative cost is the unanswerable check this exists to remove. Their
+ * earlier answers are never rewritten either way.
+ */
+export function evidenceForGateInstance(
+  check: { text: string; key?: string; origin?: CheckOrigin },
+  entries: EvidenceEntry[],
+  gateInstance: string | undefined,
+): { current?: RecordedEvidence; previous: RecordedEvidence[] } {
+  const candidates = entries.filter((entry) => !entry.feedback);
+  const structured = candidates.filter((entry) => entry.outcome !== undefined && matchesCheck(check, entry));
+  const current = gateInstance === undefined ? undefined : structured.filter((entry) => entry.gateInstanceId === gateInstance).pop();
+  const previous: RecordedEvidence[] = structured
+    .filter((entry) => entry !== current)
+    .map((entry) => ({ excerpt: excerpt(entry.text), outcome: entry.outcome, how: entry.checkId === check.key ? ("id" as const) : ("exact" as const) }));
+  // A `## Human evidence` paragraph that names this check but carries no
+  // outcome and no ids. It cannot be attributed to an asking, so it is never
+  // the current answer — but it is still somebody's report about this check,
+  // and dropping it would lose information this panel used to show.
+  const prose = candidates.filter((entry) => entry.checkText === undefined && entry.outcome === undefined && !entry.negative);
+  const at = matchReviewerRequest(prose, check.text, EVIDENCE_MATCH_MIN_OVERLAP);
+  if (at !== undefined) {
+    previous.push({ excerpt: excerpt(prose[at].text), how: "prose" });
+  }
+  return {
+    current: current ? { excerpt: excerpt(current.text), outcome: current.outcome, how: "id" } : undefined,
+    previous,
+  };
+}
+
+/** Whether a structured entry is about this check: by the reviewer's stable id, else by the check's exact wording. */
+function matchesCheck(check: { text: string; key?: string }, entry: EvidenceEntry): boolean {
+  if (entry.checkId !== undefined) {
+    return entry.checkId === check.key;
+  }
+  return entry.checkText !== undefined && normalise(entry.checkText) === normalise(check.text);
 }
 
 export const EXCERPT_MAX_LENGTH = 160;
@@ -751,10 +848,46 @@ export interface CheckItem {
   source?: string;
   /** Plan line for plan checks. */
   line?: number;
-  /** The user's unsubmitted draft. */
+  /**
+   * Where this check's draft is stored, which is **not** `key`.
+   *
+   * A draft belongs to the asking it was typed for. Keying it on the check
+   * id alone would carry an unsent draft from one asking of a check to the
+   * next, which is the same mistake as carrying the evidence across — the
+   * reviewer asked again because the last answer was not enough, so the
+   * last answer must not be pre-filled as this one. For a gate check with
+   * an instance this is `<instance>::<key>`; otherwise it is `key`.
+   *
+   * One consequence, accepted: a draft typed before this existed is stored
+   * under the bare key, so it is still read for a gate that names no
+   * asking, and is *not* read once the engine records one that does. That
+   * loses an unsent draft — a round of typing, once, for a person who was
+   * mid-answer when the extension updated. The alternative is reading a
+   * draft as the answer to a question it was not typed for, which is the
+   * defect this whole key exists to prevent.
+   */
+  draftKey: string;
+  /**
+   * Whether the gate this check came from said which asking it is.
+   *
+   * False for a gate recorded before instances existed, and for a derived
+   * check. It changes nothing about the rules — unattributable evidence is
+   * previous either way — but it changes what the panel may *say*: with no
+   * asking recorded, "the reviewer has asked this again" is a claim nothing
+   * here can support.
+   */
+  askingIdentified: boolean;
+  /** The user's unsubmitted draft for *this* asking. */
   record?: CheckRecord;
-  /** Evidence already in notes.md; present ⇒ the check is no longer outstanding. */
+  /** Evidence in notes.md that answers *this* asking; present ⇒ not outstanding. */
   evidence?: RecordedEvidence;
+  /**
+   * Answers to earlier askings of this same check, oldest first. Shown as
+   * history so a person can see what they already reported and why they are
+   * being asked again; never counted as answering the current gate, never
+   * re-submitted, and never removed from notes.md.
+   */
+  previous: RecordedEvidence[];
 }
 
 export interface VerificationView {
@@ -764,22 +897,40 @@ export interface VerificationView {
    * plan/prose path, for a result recorded before gates existed.
    */
   source: "gate" | "derived";
-  /** The gate's own category and title, when the reviewer supplied one. */
-  gate?: { category: string; title: string };
+  /** The gate's own category and title, when the reviewer supplied one, and which asking it is. */
+  gate?: { category: string; title: string; instanceId?: string };
   /** Prose requirements from the plan, verbatim (legacy path only). */
   parents: ManualCheck[];
   explicitCount: number;
   reviewerCount: number;
-  /** Checks with recorded evidence in notes.md. */
+  /** Checks the current gate instance already has recorded evidence for. */
   recorded: CheckItem[];
-  /** Checks still outstanding, with the user's drafts. */
+  /** Checks still outstanding for the current gate instance, with the user's drafts. */
   required: CheckItem[];
   /** `N / M verified`; undefined without checks. */
   progress?: string;
   /**
-   * Every check has an outcome — recorded in notes.md or drafted here — and
-   * there is at least one. The evidence the reviewer asked for is complete,
-   * so it can go back for review; nothing about the stage is decided by it.
+   * Exactly what Submit would write: the outstanding checks that have a
+   * drafted outcome, in the reviewer's order.
+   *
+   * It lives on the view rather than being recomputed by the submit command
+   * because the panel and the command disagreeing about it is a bug this
+   * code has already had. `ready` below is defined in terms of *this array*,
+   * so "the panel says the evidence is complete" and "the command has
+   * something to send" cannot come apart: they are one fact.
+   */
+  submittable: RecordedCheck[];
+  /**
+   * There is evidence to send, and it answers every outstanding check.
+   *
+   * Both halves matter. The second is the obvious one. The first is what was
+   * missing: with no outstanding checks at all, `required.every(...)` is
+   * vacuously true, so the panel reported the evidence complete while the
+   * submit path had an empty list and refused — the split-brain state. An
+   * empty `submittable` is never ready, whatever else is true.
+   *
+   * Readiness says the reviewer's evidence is complete enough to send back.
+   * It decides nothing about the stage; the reviewer rules on it.
    */
   ready: boolean;
 }
@@ -800,23 +951,38 @@ export function deriveVerification(plan: PlanChecks, outcome: SparringOutcome | 
   const gate = outcome?.humanGate;
   const items = gate ? gateItems(gate) : derivedItems(plan, outcome);
   for (const item of items) {
-    item.evidence = recordedEvidenceFor(item, evidence);
+    if (item.origin === "gate") {
+      // A gate check answers one asking. Everything else about it is history.
+      const split = evidenceForGateInstance(item, evidence, gate?.instanceId);
+      item.evidence = split.current;
+      item.previous = split.previous;
+    } else {
+      // The derived path has no askings: a plan check is a standing
+      // requirement, not a question a reviewer put twice.
+      item.evidence = recordedEvidenceFor(item, evidence);
+    }
     if (!item.evidence) {
-      item.record = drafts[item.key];
+      item.record = drafts[item.draftKey];
     }
   }
   const recorded = items.filter((item) => item.evidence);
   const required = items.filter((item) => !item.evidence);
+  const submittable: RecordedCheck[] = required
+    .filter((item) => item.record?.outcome)
+    .map((item) => ({ text: item.text, origin: item.origin, record: item.record as CheckRecord, id: item.origin === "gate" ? item.key : undefined, gateInstanceId: item.origin === "gate" ? gate?.instanceId : undefined }));
   return {
     source: gate ? "gate" : "derived",
-    gate: gate ? { category: gate.category, title: gate.title } : undefined,
+    gate: gate ? { category: gate.category, title: gate.title, instanceId: gate.instanceId } : undefined,
     parents: gate ? [] : plan.parents,
     explicitCount: gate ? 0 : plan.explicit.length,
     reviewerCount: gate ? 0 : items.filter((item) => item.origin === "reviewer").length,
     recorded,
     required,
     progress: progressText(items),
-    ready: items.length > 0 && required.every((item) => item.record?.outcome !== undefined),
+    submittable,
+    // One definition, and it is this line. Both halves: something to send,
+    // and nothing outstanding left unanswered.
+    ready: submittable.length > 0 && submittable.length === required.length,
   };
 }
 
@@ -833,27 +999,42 @@ function gateItems(gate: HumanGate): CheckItem[] {
     // result is matched by its wording instead. A check whose button does
     // nothing is worse than one whose result is matched less precisely.
     const usable = isCheckKey(check.id);
+    const key = usable ? check.id : checkKey(check.instruction);
     return {
-      key: usable ? check.id : checkKey(check.instruction),
+      key,
+      draftKey: draftKeyFor(key, gate.instanceId),
+      askingIdentified: gate.instanceId !== undefined,
       gateId: usable ? check.id : undefined,
       text: check.instruction,
       origin: "gate" as const,
       passCriteria: check.passCriteria,
       source: check.source,
+      previous: [],
     };
   });
 }
 
+/**
+ * Where a check's draft is stored. Scoped to the asking when there is one,
+ * so an unsent draft never answers a question it was not typed for; bare
+ * when there is not, which keeps every draft written before this readable
+ * exactly where it already is.
+ */
+export function draftKeyFor(key: string, gateInstanceId: string | undefined): string {
+  return gateInstanceId ? `${gateInstanceId}${DRAFT_KEY_SEPARATOR}${key}` : key;
+}
+
 function derivedItems(plan: PlanChecks, outcome: SparringOutcome | undefined): CheckItem[] {
-  const items: CheckItem[] = plan.explicit.map((check) => ({ key: check.key, text: check.text, origin: "plan", line: check.line }));
+  const items: CheckItem[] = plan.explicit.map((check) => ({ key: check.key, draftKey: check.key, askingIdentified: false, text: check.text, origin: "plan", line: check.line, previous: [] }));
   for (const text of reviewerChecks(outcome)) {
     if (plan.explicit.length > 0 && matchReviewerRequest(plan.explicit, text) !== undefined) {
       continue;
     }
-    items.push({ key: checkKey(text), text, origin: "reviewer" });
+    const key = checkKey(text);
+    items.push({ key, draftKey: key, askingIdentified: false, text, origin: "reviewer", previous: [] });
   }
   if (items.length === 0) {
-    items.push(...plan.parents.map((check): CheckItem => ({ key: check.key, text: check.text, origin: "plan", line: check.line })));
+    items.push(...plan.parents.map((check): CheckItem => ({ key: check.key, draftKey: check.key, askingIdentified: false, text: check.text, origin: "plan", line: check.line, previous: [] })));
   }
   return items;
 }
@@ -906,6 +1087,13 @@ export interface RecordedCheck {
   record: CheckRecord;
   /** The gate check's stable id, written into the line so the result is matched by id next turn. */
   id?: string;
+  /**
+   * The gate instance this result answers, written into the line so a later
+   * asking of the same check can tell this result apart from its own. Absent
+   * when the gate named no instance, which is what makes the result
+   * unattributable — and so, next turn, history rather than an answer.
+   */
+  gateInstanceId?: string;
 }
 
 /**
@@ -927,7 +1115,10 @@ export function renderHumanEvidence(checks: RecordedCheck[], date: Date, planNam
   const lines = [`${day} — manual verification recorded in VS Code${against}:`, ""];
   for (const check of recorded) {
     const suffix = check.id ? ` · check \`${check.id}\`` : check.origin === "reviewer" ? " · reviewer request" : "";
-    lines.push(`- ${OUTCOME_WORDS[check.record.outcome as CheckOutcome]} — ${check.text}${suffix}`);
+    // Which asking this answered. Last, and only when there is one, so every
+    // line this has ever written still parses and still reads the same.
+    const gate = check.id && check.gateInstanceId ? ` · gate \`${check.gateInstanceId}\`` : "";
+    lines.push(`- ${OUTCOME_WORDS[check.record.outcome as CheckOutcome]} — ${check.text}${suffix}${gate}`);
     if (check.record.note?.trim()) {
       for (const noteLine of check.record.note.trim().split(/\r?\n/)) {
         lines.push(`  ${noteLine}`);
@@ -956,15 +1147,20 @@ export function renderHumanFeedback(text: string, date: Date): string | undefine
   return [HUMAN_FEEDBACK_HEADING, "", `${day} — reported in VS Code by the human this stage is waiting on, alongside the requested checks:`, "", body].join("\n");
 }
 
-/** The checks Submit for review will write: outstanding checks with a drafted outcome. */
+/**
+ * The checks Submit for review will write.
+ *
+ * An accessor, deliberately: this used to recompute the list from
+ * `view.required`, and the panel's `ready` flag was computed separately from
+ * the same array. The two agreed until a gate arrived whose checks were all
+ * already recorded — then `required` was empty, `ready` was vacuously true,
+ * the panel said "Evidence ready for review" and this returned nothing, so
+ * Submit answered "record a result for the remaining checks first" about
+ * checks it was simultaneously reporting as done. One array, derived once,
+ * in {@link deriveVerification}; there is nothing left here to disagree with.
+ */
 export function submittableChecks(view: VerificationView): RecordedCheck[] {
-  const out: RecordedCheck[] = [];
-  for (const item of view.required) {
-    if (item.record?.outcome) {
-      out.push({ text: item.text, origin: item.origin, record: item.record, id: item.origin === "gate" ? item.key : undefined });
-    }
-  }
-  return out;
+  return view.submittable;
 }
 
 /**
