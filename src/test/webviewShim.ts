@@ -26,6 +26,12 @@ export class FakeElement {
   readonly attributes: Record<string, string>;
   disabled = false;
   value = "";
+  /** The shipped disclosure script branches on this to tell a panel from a `<details>`. */
+  get tagName(): string {
+    return this.tag.toUpperCase();
+  }
+  /** The toggle's label, which the shipped script rewrites as the panel opens and closes. */
+  textContent = "";
   constructor(
     readonly tag: string,
     attributes: Record<string, string>,
@@ -38,6 +44,10 @@ export class FakeElement {
   }
   hasAttribute(name: string): boolean {
     return name in this.attributes;
+  }
+  /** The shipped script stamps the value it sent onto the control itself. */
+  setAttribute(name: string, value: string): void {
+    this.attributes[name] = value;
   }
   /** `button[data-check][data-outcome]` and friends: a tag plus required attributes, walked up the parents. */
   closest(selector: string): FakeElement | null {
@@ -52,6 +62,18 @@ export class FakeElement {
 }
 
 export class FakeTextArea extends FakeElement {}
+
+/**
+ * The two inline configuration controls, as the shipped script tests for
+ * them: it branches on `instanceof HTMLSelectElement` / `HTMLInputElement`,
+ * so a shim that does not provide them cannot run a change at all.
+ */
+export class FakeSelect extends FakeElement {}
+export class FakeInput extends FakeElement {
+  /** The script only acts on `type === 'text'`; the autopush box is a checkbox. */
+  type = "text";
+  checked = false;
+}
 
 /**
  * A `<details>` as the disclosure script sees it: an element with an `open`
@@ -82,11 +104,55 @@ export class FakeDetails extends FakeElement {
   }
 }
 
+/**
+ * A disclosure whose control is somewhere else on the page: the instructions
+ * panel, which sits after both actor cards and is opened by a button inside
+ * one of them. The shipped script shows and hides it through `hidden`, so
+ * that is what the shim models; `open` is the same fact read the way the
+ * tests and the `<details>` above both read it.
+ */
+export class FakePanel extends FakeElement {
+  constructor(
+    tag: string,
+    attributes: Record<string, string>,
+    private readonly document: FakeDocument,
+    hidden = true,
+  ) {
+    super(tag, attributes);
+    this.hiddenState = hidden;
+  }
+  private hiddenState: boolean;
+  get hidden(): boolean {
+    return this.hiddenState;
+  }
+  set hidden(value: boolean) {
+    this.hiddenState = value;
+  }
+  get open(): boolean {
+    return !this.hiddenState;
+  }
+  get id(): string {
+    return this.getAttribute("id") ?? "";
+  }
+  /**
+   * What a person does: click the card's button, not the panel. The shipped
+   * click listener is what decides the panel's state, so the shim never sets
+   * it directly.
+   */
+  click(): void {
+    const toggle = this.document.toggleFor(this.id);
+    assert.ok(toggle, `a card carries the toggle for ${this.id}`);
+    this.document.dispatch("click", toggle);
+  }
+}
+
 /** The document as the shipped script uses it: delegated listeners on one root. */
 export class FakeDocument {
   private readonly listeners = new Map<string, ((event: FakeEvent) => void)[]>();
-  /** The `<details data-disclose>` elements this document contains. */
-  readonly disclosures: FakeDetails[] = [];
+  /** Every `[data-disclose]` this document contains: `<details>` and panels alike. */
+  readonly disclosures: (FakeDetails | FakePanel)[] = [];
+  /** The `button[data-instr]` toggles, which live in the cards and point at the panels. */
+  readonly toggles: FakeElement[] = [];
   addEventListener(type: string, listener: (event: FakeEvent) => void): void {
     this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
   }
@@ -95,9 +161,25 @@ export class FakeDocument {
    * re-implementation of a query engine, and the integration suite runs the
    * same document in a real Chromium webview.
    */
-  querySelectorAll(selector: string): FakeDetails[] {
-    assert.equal(selector, "details[data-disclose]", "the shim only answers the selector the shipped script uses");
+  querySelectorAll(selector: string): (FakeDetails | FakePanel)[] {
+    if (selector === "[data-instrpanel]") {
+      return this.disclosures.filter((node): node is FakePanel => node instanceof FakePanel);
+    }
+    assert.equal(selector, "[data-disclose]", "the shim only answers the selectors the shipped script uses");
     return this.disclosures;
+  }
+  /** `document.getElementById(toggle.getAttribute('aria-controls'))`, as the script calls it. */
+  getElementById(id: string): FakePanel | null {
+    return this.disclosures.find((node): node is FakePanel => node instanceof FakePanel && node.id === id) ?? null;
+  }
+  /** `document.querySelector('[aria-controls="..."]')`, which is how the script finds a panel's toggle. */
+  querySelector(selector: string): FakeElement | null {
+    const id = /^\[aria-controls="([^"]*)"\]$/.exec(selector)?.[1];
+    assert.ok(id !== undefined, `the shim only answers the selector the shipped script uses, not ${selector}`);
+    return this.toggleFor(id);
+  }
+  toggleFor(id: string): FakeElement | null {
+    return this.toggles.find((node) => node.getAttribute("aria-controls") === id) ?? null;
   }
   /**
    * Dispatch to the delegated listeners, and report whether any of them
@@ -168,9 +250,18 @@ export function runWebviewScript(html: string, nonce = "n", state: WebviewState 
   for (const [markup, key] of html.matchAll(/<details[^>]*\sdata-disclose="([^"]*)"[^>]*>/g)) {
     document.disclosures.push(new FakeDetails("details", { "data-disclose": key }, document, / open[ >]/.test(markup)));
   }
+  // The instructions panels and the buttons in the cards that open them.
+  for (const [markup] of html.matchAll(/<button[^>]*\sdata-instr="[^"]*"[^>]*>([\s\S]*?)<\/button>/g)) {
+    const toggle = new FakeElement("button", attributesOf(markup));
+    toggle.textContent = /<button[^>]*>([\s\S]*?)<\/button>/.exec(markup)?.[1] ?? "";
+    document.toggles.push(toggle);
+  }
+  for (const [markup] of html.matchAll(/<div[^>]*\sdata-instrpanel="[^"]*"[^>]*>/g)) {
+    document.disclosures.push(new FakePanel("div", attributesOf(markup), document, /\shidden[\s>]/.test(markup)));
+  }
   const posted: Posted[] = [];
   const timers: ReturnType<typeof setTimeout>[] = [];
-  const run = new Function("document", "window", "acquireVsCodeApi", "Element", "HTMLTextAreaElement", "setTimeout", "clearTimeout", script);
+  const run = new Function("document", "window", "acquireVsCodeApi", "Element", "HTMLTextAreaElement", "HTMLSelectElement", "HTMLInputElement", "setTimeout", "clearTimeout", script);
   const result: ScriptRun = {
     document,
     posted,
@@ -208,6 +299,8 @@ export function runWebviewScript(html: string, nonce = "n", state: WebviewState 
     }),
     FakeElement,
     FakeTextArea,
+    FakeSelect,
+    FakeInput,
     (fn: () => void, ms = 0) => {
       const timer = setTimeout(fn, ms === 0 ? 0 : ms);
       timers.push(timer);
@@ -223,6 +316,14 @@ export function runWebviewScript(html: string, nonce = "n", state: WebviewState 
  * carries the attributes the shipped page really has — not attributes a test
  * chose. `pattern` must match the element's opening tag.
  */
+function attributesOf(markup: string): Record<string, string> {
+  const attributes: Record<string, string> = {};
+  for (const [, name, value] of markup.matchAll(/([a-z-]+)="([^"]*)"/g)) {
+    attributes[name] = value;
+  }
+  return attributes;
+}
+
 export function elementFrom(html: string, tag: string, pattern: RegExp, what: string): FakeElement {
   const markup = pattern.exec(html)?.[0];
   assert.ok(markup, `the document has ${what}`);
@@ -230,5 +331,17 @@ export function elementFrom(html: string, tag: string, pattern: RegExp, what: st
   for (const [, name, value] of markup.matchAll(/([a-z-]+)="([^"]*)"/g)) {
     attributes[name] = value;
   }
-  return tag === "textarea" ? new FakeTextArea(tag, attributes) : new FakeElement(tag, attributes);
+  if (tag === "textarea") {
+    return new FakeTextArea(tag, attributes);
+  }
+  if (tag === "select") {
+    return new FakeSelect(tag, attributes);
+  }
+  if (tag === "input") {
+    const input = new FakeInput(tag, attributes);
+    input.type = attributes["type"] ?? "text";
+    input.value = attributes["value"] ?? "";
+    return input;
+  }
+  return new FakeElement(tag, attributes);
 }

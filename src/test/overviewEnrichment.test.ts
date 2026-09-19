@@ -213,7 +213,7 @@ describe("active duration", () => {
     const html = renderOverviewHtml(model, "n", "c");
     assert.match(html, /Current activity<\/h3><p class="now"><span class="who codex">Codex<\/span> sparring for <span class="dur">12s<\/span><\/p>/);
     assert.match(html, /<div class="activity sparring"><svg[^>]*>.*?<\/svg>Sparring for 12s<\/div>/);
-    assert.match(html, /<span class="avatar codex">C<\/span>/);
+    assert.match(html, /<span class="avatar codex"><svg class="glyph"[^>]*>.*?<\/svg><\/span>/);
     assert.match(html, /<span class="hpill good"><svg[^>]*>.*?<\/svg>Working<\/span>/, "standalone working stage status pill");
   });
 

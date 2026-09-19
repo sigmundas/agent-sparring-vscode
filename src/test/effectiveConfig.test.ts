@@ -295,7 +295,7 @@ describe("the Overview shows the configuration and offers Settings", () => {
     const model = buildOverviewModel(await planSelection(), undefined, artifacts(parsed()), NOW);
     const html = renderOverviewHtml(model, "nonce", "csp:");
     assert.match(html, /data-action="openSettings"/);
-    assert.match(html, /<input type="text" data-role="stage"[^>]*data-field="model"[^>]*value="opus"/);
+    assert.match(html, /<span class="agentconfig-fixed"[^>]*>opus<\/span>/, "the model is read on the card, not edited on it");
     assert.match(html, /<select data-role="stage"[^>]*data-field="effort"/);
     assert.match(html, /<select data-role="sparring"[^>]*data-field="effort"/);
   });
@@ -353,13 +353,21 @@ describe("the inline agent config selector", () => {
     return found;
   }
 
-  it("offers a free-form model control carrying the engine's current value", () => {
+  it("reports the engine's model as text, with no control to choose one", () => {
     assert.equal(role("stage").model.value, "opus");
     assert.equal(role("sparring").model.value, "gpt-5.6-terra");
-    // No options: a closed list would reject a model the provider has and
-    // the extension has not heard of.
+    // Neither a list nor a field. No engine or CLI enumerates the models a
+    // provider accepts, so the cockpit shows the resolved one and sends the
+    // reader to project.toml to change it.
     assert.equal(role("stage").model.options, undefined);
-    assert.equal(role("stage").model.placeholder, PROVIDER_DEFAULT_LABEL);
+    assert.equal(role("stage").model.fixedText, "opus");
+    assert.match(role("stage").model.detail, /project\.toml/);
+  });
+
+  it("says the words for no override rather than naming a model nobody chose", () => {
+    const none = role("stage", { stage: { ...JSON.parse(report()).stage, model: null } });
+    assert.equal(none.model.fixedText, PROVIDER_DEFAULT_LABEL);
+    assert.equal(none.model.value, "", "and the sentinel is still the empty string, never those words");
   });
 
   it("accepts a model identifier the extension has never seen", () => {
@@ -459,7 +467,6 @@ describe("the inline agent config selector", () => {
     assert.equal(model.kind, "empty");
     assert.equal(model.agentConfig?.controls.length, 2);
     const html = renderOverviewHtml(model, "nonce", "csp:");
-    assert.match(html, /data-role="stage"[^>]*data-field="model"/);
     assert.match(html, /data-role="sparring"[^>]*data-field="effort"/);
     assert.match(html, /data-action="openSettings"/, "and the file is still one click away");
   });
@@ -518,12 +525,11 @@ describe("the rendered controls are self-describing", () => {
     const html = renderOverviewHtml(model, "nonce", "csp:");
     assert.match(html, /data-scope="\/repo\/\.sparring\/project\.toml"/);
     for (const role of ["stage", "sparring"]) {
-      assert.match(html, new RegExp(`data-role="${role}"[^>]*data-field="model"`));
       assert.match(html, new RegExp(`data-role="${role}"[^>]*data-field="effort"`));
     }
-    // The value each control was rendered with, so simply tabbing through a
-    // field posts nothing.
-    assert.match(html, /data-field="model"[^>]*data-sent="=opus"/);
+    // Read-only text is not a control and carries no wire attributes at all:
+    // nothing on the page can post a model change.
+    assert.doesNotMatch(html, /data-field="model"/);
     assert.match(html, /data-field="effort"[^>]*data-sent="-"/, "cleared is its own mark, not a value that could spell it");
   });
 

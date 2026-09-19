@@ -6,7 +6,8 @@
  *
  * Icons are small inline SVGs (the CSP allows no remote images or fonts) and
  * every colour is a VS Code theme variable, so the page follows the user's
- * theme. No provider logos: providers get a lettered avatar.
+ * theme. No provider logos: an actor's avatar carries a role glyph instead
+ * (spectacles-and-pens for the stage agent, gloves for the sparrer).
  *
  * Layout: header with status pills; plan journey; the current-stage card
  * (Goal + latest sparring result on the left, current activity + last
@@ -251,6 +252,10 @@ export interface AgentConfigMessage {
  * A model name is free text, so it is bounded here the way a note is: long
  * enough for any identifier a provider could plausibly have, short enough
  * that the message cannot be a payload. The engine validates what it means.
+ *
+ * No control on the page posts a model any more — the cards show it and
+ * project.toml changes it — but `set-config <role> --model` is still the
+ * engine's own mutation, so the wire keeps accepting and bounding one.
  */
 export const MODEL_MAX_LENGTH = 200;
 
@@ -410,6 +415,32 @@ function icon(name: keyof typeof ICON, cls = ""): string {
   return `<svg class="icon ${cls}" viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">${ICON[name]}</svg>`;
 }
 
+// Role glyphs drawn inside the actor avatar circle: spectacles-and-pens for the
+// stage agent, gloves for the sparrer. Traced from icons/sstage.svg and
+// icons/sparring.svg; each keeps that file's viewBox and group transform, and
+// is filled with currentColor so the circle's foreground colour applies.
+const AVATAR_GLYPH: Record<"stage" | "sparrer", { viewBox: string; body: string }> = {
+  stage: {
+    viewBox: "0 0 82.85601 88.02034",
+    body:
+      '<g transform="translate(67.803234,-237.29847)" fill="currentColor">' +
+      '<path d="m -49.634473,325.07045 c -0.2227,-0.36034 0.30085,-1.26018 0.92873,-1.59621 0.30867,-0.16519 0.5231,-0.55332 0.5231,-0.94681 0,-0.36677 0.67491,-1.8211 1.499799,-3.23184 2.11796,-3.6222 2.35444,-3.89425 3.29883,-3.79519 0.76539,0.0803 0.78452,0.0551 0.62096,-0.81671 -0.20201,-1.07681 19.04271,-20.31037 20.32216,-20.31037 0.18487,0 1.34447,1.09133 2.57688,2.42518 1.23241,1.33385 2.38957,2.5755 2.57148,2.75923 0.63043,0.63675 0.31559,1.08233 -2.77813,3.93184 -1.70987,1.57489 -4.29948,4.0153 -5.75469,5.42314 -9.92858,9.60541 -15.84124,13.96201 -21.034369,15.49866 -0.3638,0.10765 -0.89631,0.35828 -1.18335,0.55696 -0.61048,0.42256 -1.36349,0.47088 -1.5914,0.10212 z m 39.221099,-25.5092 c -0.96408,-0.73185 -0.47983,-1.33901 6.5984604,-8.2731 6.53631,-6.40317 7.03688,-6.95808 6.68277,-7.40834 -0.90826,-1.15483 -1.05747,-1.08849 -4.01412,1.78483 -15.2292304,14.79998 -13.7826304,13.75646 -15.6486104,11.28836 -0.79764,-1.05503 -1.99495,-2.44904 -2.66068,-3.0978 -1.43492,-1.39834 -1.46575,-1.60125 -0.38192,-2.51324 0.45568,-0.38343 2.86669,-2.6469 5.35781,-5.02994 4.08282,-3.90567 7.4227804,-6.85773 12.3577804,-10.92256 1.46130005,-1.20364 1.83984005,-1.38907 2.83560005,-1.38907 1.02439995,0 1.31222995,-0.15317 2.65088995,-1.41076 2.83373,-2.6621 3.72629,-2.89987 5.23233,-1.39382 1.5955796,1.59558 1.12919,3.0957 -1.85906,5.97958 -1.23371,1.19063 -1.23371,1.19063 -1.06416,4.23334 0.21338,3.8292 0.0724,4.06947 -5.40071995,9.2008 -2.13034005,1.99732 -5.17849005,4.91141 -6.77367005,6.47576 -3.02359,2.96516 -3.15702,3.0496 -3.9127004,2.47596 z m -39.621349,-30.44839 c -5.98001,-1.37824 -11.3909,-6.61034 -12.3206,-11.91351 -0.38427,-2.19194 -0.71618,-2.51354 -2.59415,-2.51354 -3.920911,0 -3.744961,-4.81424 0.17961,-4.91398 0.90104,-0.0229 1.76418,-0.0577 1.91808,-0.0774 0.15389,-0.0196 0.49288,-0.54175 0.7533,-1.16021 5.70264,-13.54282 21.429029,-15.18412 29.325479,-3.06059 0.87406,1.34197 1.4445,1.98457 1.63213,1.83861 1.43733,-1.11814 5.51535,-1.40551 7.96844,-0.56152 1.94159,0.668 2.19963,0.57788 3.13806,-1.09597 6.63664,-11.83759 29.5309004,-9.26572 29.5309004,3.31741 0,0.43151 0.8509896,1.00045 1.3920496,0.93068 2.4496,-0.31586 4.1642,0.72407 4.1642,2.52565 0,1.27727 -0.95682,2.25729 -2.20386,2.25729 -2.00029,0 -2.53384,0.25362 -2.71095,1.28864 -3.2086796,18.75086 -31.31134,17.3899 -32.0727,-1.55322 -0.1229,-3.05773 -0.19916,-3.23285 -1.75308,-4.0256 -1.89137,-0.9649 -4.67995,-0.65997 -6.17243,0.67495 -0.52917,0.47331 -0.59563,0.78458 -0.59818,2.80145 -0.0123,9.76507 -9.90794,17.46915 -19.576299,15.24083 z m 6.766709,-3.44089 c 6.22836,-1.62228 10.64769,-8.9933 8.9419,-14.91419 -3.08051,-10.69258 -15.286309,-13.4499 -22.141749,-5.00187 -7.51524,9.26111 1.55657,22.94875 13.199849,19.91606 z m 40.6878004,-0.0277 c 6.64627,-1.71137 11.15168,-9.88448 8.75773,-15.88711 -3.71312,-9.31035 -14.2012,-11.95198 -20.8991604,-5.26388 -9.23208,9.2185 -0.51208,24.40918 12.1414304,21.15099 z"/>' +
+      "</g>",
+  },
+  sparrer: {
+    viewBox: "0 0 97.584854 81.122635",
+    body:
+      '<g transform="translate(-76.921671,-237.31213)" fill="currentColor">' +
+      '<path d="m 103.98368,316.53251 c -7.679331,-5.2402 -17.699747,-15.72719 -17.699747,-18.52386 0,-1.7009 1.006268,-2.6436 1.792138,-1.67895 0.258076,0.31678 1.25188,1.53864 2.208454,2.71525 5.695597,7.00562 11.106275,11.81421 13.611145,12.09654 3.38615,0.38167 9.21074,-5.47741 9.43946,-9.49533 0.11257,-1.97713 0.13382,-1.98657 2.73418,-1.21277 5.75785,1.71338 6.9533,3.2937 4.48449,5.92831 -1.06334,1.13474 -2.35687,2.58154 -2.87451,3.21509 -0.51763,0.63357 -1.01779,1.22598 -1.11144,1.31649 -0.0937,0.0906 -1.49407,1.61929 -3.11203,3.39729 -4.52882,4.97677 -5.22342,5.14117 -9.47214,2.24194 z m 35.8655,0.70312 c -2.287,-2.0055 -12.10986,-12.7235 -12.08158,-13.18258 0.007,-0.12972 1.57833,-1.49475 3.48965,-3.03337 3.52118,-2.83461 7.64723,-6.93386 11.17694,-11.10437 2.78329,-3.28853 2.90819,-3.4513 4.20873,-5.48439 0.64807,-1.01308 1.29122,-1.84129 1.42924,-1.84046 0.29226,10e-4 2.3902,1.92041 2.3902,2.18591 0,0.7527 -6.25161,8.24975 -9.70267,11.63562 -5.23031,5.13154 -5.21959,6.46366 0.0933,11.58527 5.29195,5.10146 9.54822,2.9788 18.77574,-9.36371 2.62169,-3.5067 2.74586,-3.59059 3.5341,-2.38757 1.58535,2.41954 -4.57055,10.43016 -13.48052,17.54207 -6.46323,5.15893 -7.47642,5.51417 -9.8331,3.44758 z m -37.15421,-9.62274 c -4.100492,-2.71606 -15.091215,-15.42453 -11.885623,-13.74325 2.237598,1.17359 6.697026,2.75405 9.955883,3.52845 11.12871,2.64454 11.74707,3.49606 6.44959,8.88152 -2.60456,2.64782 -2.55661,2.63368 -4.51985,1.33328 z m 40.92893,-0.75134 c -1.6235,-1.42206 -3.50128,-3.64183 -3.85041,-4.55166 -0.12607,-0.32853 0.49602,-1.17775 1.80158,-2.45934 1.09678,-1.07663 2.98845,-3.14236 4.20371,-4.59048 1.21526,-1.44813 2.41391,-2.84662 2.66365,-3.10776 0.24976,-0.26112 1.26866,-1.55703 2.26425,-2.87979 2.16535,-2.87693 1.54853,-2.85075 4.61185,-0.19568 5.2959,4.59012 5.28381,4.01299 0.21591,10.29723 -6.61374,8.20111 -9.22311,9.84148 -11.91054,7.48748 z m -19.49115,-5.61718 c -0.45253,-0.23623 -1.78548,-0.96464 -2.96208,-1.61869 -2.31798,-1.28855 -5.27602,-2.29072 -8.39256,-2.84338 -17.144494,-3.04022 -23.163212,-5.57013 -29.403305,-12.3594 -3.186274,-3.46669 -3.626185,-11.04933 -0.641029,-11.04933 1.708896,0 7.828727,4.0528 7.828727,5.1845 0,1.72901 2.235335,3.23795 2.762309,1.86467 1.253376,-3.26624 -0.533841,-5.38567 -7.369995,-8.73994 -7.269835,-3.56709 -9.063728,-5.78044 -9.032754,-11.14492 0.04441,-7.68029 10.812528,-19.22294 20.551968,-22.03009 0.814568,-0.23477 1.910423,-0.5577 2.435232,-0.71759 7.305537,-2.22587 17.040407,3.41013 25.985207,15.04409 0.56969,0.74097 2.34868,2.92208 3.95329,4.84693 1.60462,1.92484 3.60402,4.44685 4.44312,5.60445 6.74066,9.29928 6.3662,8.73435 8.86838,13.37911 0.63385,1.1766 1.42557,2.53241 1.75938,3.01288 0.82721,1.19071 0.7945,1.35469 -0.71314,3.5748 -2.92579,4.30841 -7.38877,9.18538 -12.60533,13.77461 -5.59478,4.92198 -5.84582,5.06374 -7.46742,4.2173 z M 96.0869,247.32765 c 5.6246,-3.65996 10.88746,-3.39742 15.40705,0.76859 1.68332,1.55164 2.92128,1.56194 3.30639,0.0275 0.57105,-2.27522 -6.55148,-6.33024 -11.13926,-6.34182 -5.962522,-0.0151 -15.647304,6.3107 -11.205917,7.31931 0.686258,0.15585 0.607468,0.19432 3.631737,-1.77359 z m 57.50211,35.9857 c -0.90509,-0.86424 -2.38612,-2.10878 -3.29121,-2.76567 -2.1904,-1.58974 -3.1685,-2.69087 -4.36962,-4.9193 -2.36673,-4.39094 -8.60573,-13.64209 -9.62517,-14.27214 -0.53295,-0.32937 -0.36247,-1.48178 0.25403,-1.71715 0.31678,-0.12091 1.41718,-0.69481 2.44536,-1.27526 2.08923,-1.17947 2.09335,-1.17801 3.36505,1.18669 5.20473,9.67816 18.06421,15.26033 24.71548,10.72876 3.65355,-2.4892 2.34914,-4.81893 -1.39497,-2.49147 -4.87744,3.03199 -10.50082,1.40806 -16.81552,-4.85603 -5.67102,-5.62558 -6.51082,-9.39215 -4.00347,-17.95613 0.50153,-1.713 0.18478,-2.53937 -0.97333,-2.53937 -1.0085,0 -1.9904,1.12124 -1.9904,2.27283 0,0.96139 -0.47714,1.08808 -1.32582,0.35202 -0.4139,-0.35897 -1.32352,-0.80642 -2.02139,-0.99434 -2.52077,-0.67877 0.88616,-3.81074 6.73618,-6.19252 1.81942,-0.74076 7.50164,-0.29975 8.60746,0.66804 0.17196,0.1505 0.49297,0.27364 0.71333,0.27364 1.4662,0 9.05663,5.40904 12.54836,8.94213 11.2745,11.40802 9.70615,20.44345 -5.67546,32.69711 -0.90509,0.72102 -1.71966,1.38704 -1.81017,1.48003 -3.02915,3.11244 -4.03419,3.33991 -6.08872,1.37813 z m -22.38017,-28.58481 c -3.58148,-4.41097 -3.91016,-5.02994 -3.02228,-5.69143 3.82521,-2.8498 9.57298,-3.33026 11.56196,-0.96649 2.55014,3.03067 0.72148,7.10381 -4.02094,8.95621 -2.02688,0.79172 -1.99783,0.80649 -4.51874,-2.29829 z"/>' +
+      "</g>",
+  },
+};
+
+function avatarGlyph(role: "stage" | "sparrer"): string {
+  const glyph = AVATAR_GLYPH[role];
+  return `<svg class="glyph" viewBox="${glyph.viewBox}" width="22" height="22" aria-hidden="true">${glyph.body}</svg>`;
+}
+
 // ---------------------------------------------------------------- body
 
 function renderBody(model: OverviewModel): string {
@@ -419,7 +450,7 @@ function renderBody(model: OverviewModel): string {
     return `${renderRepositoryContext(model)}
 <header class="top"><div><h1>Agent Sparring</h1><div class="run muted">${escapeHtml(model.title)}</div></div></header>
 ${(model.emptyLines ?? []).map((line) => `<p class="muted">${escapeHtml(line)}</p>`).join("\n")}
-${model.agentConfig ? renderAgentConfig(model.agentConfig) : ""}
+${renderActors(model, discloseScope(model))}
 <div class="actions">${button("runPlan", "Run plan…")}${button("showLog", "Show log")}</div>`;
   }
   if (model.kind === "ambiguous") {
@@ -457,12 +488,7 @@ ${model.agentConfig ? renderAgentConfig(model.agentConfig) : ""}
     parts.push(`<p class="muted note">${escapeHtml(model.timelineNote)}</p>`);
   }
   parts.push(renderStageCard(model));
-  if (model.stageAgent && model.sparrer) {
-    parts.push(`<section class="actors">${renderActor(model.stageAgent, scope)}${renderActor(model.sparrer, scope)}</section>`);
-  }
-  if (model.agentConfig) {
-    parts.push(renderAgentConfig(model.agentConfig));
-  }
+  parts.push(renderActors(model, scope));
   if (model.history && model.history.length > 0) {
     const rows = model.history
       .map((entry) => `<li><span class="time">${escapeHtml(entry.time)}</span><span class="who ${whoClass(entry.who)}">${escapeHtml(entry.who)}</span><span>${escapeHtml(entry.description)}</span></li>`)
@@ -1231,35 +1257,162 @@ function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
   return `<div class="block whatsnext"><h3>${icon("arrow", "accent")}What's next</h3>${heading}${summary}${text}${hints}<div class="actions">${buttons.join("")}</div></div>${current}`;
 }
 
-function renderActor(card: ActorCard, scope: string): string {
+/**
+ * The two actor cards, each its own configuration surface, and the one
+ * shared Settings action beside them.
+ *
+ * There is no second Agents panel: model and effort belong to the role they
+ * configure, and one of the two places was always going to be the stale one.
+ * The controls are joined onto the card here rather than carried in the
+ * model, so the model keeps one description of the configuration and this
+ * file decides where on the page it is drawn.
+ */
+function renderActors(model: OverviewModel, scope: string): string {
+  const config = model.agentConfig;
+  const configScope = config?.scope;
+  const controlsFor = (role: ConfigRole): AgentRoleControls | undefined =>
+    configScope ? config?.controls.find((entry) => entry.role === role) : undefined;
+  const actors = [model.stageAgent, model.sparrer].filter((card): card is ActorCard => card !== undefined);
+  const cards = actors.map((card) => renderActor(card, controlsFor(card.configRole), configScope)).join("");
+  // Every panel is laid out after every card, so the cards keep their row
+  // whichever of them is open, and an opened panel appears below both of
+  // them at the width of the rest of the page rather than in a half-width
+  // column. They behave as a tab strip: at most one is open, each names the
+  // actor it belongs to and carries that actor's colour, and the card it
+  // came from is marked while it is open.
+  const panels = actors.map((card) => renderInstructionsPanel(card, scope)).join("");
+  const section = cards ? `<section class="actors">${cards}${panels}</section>` : "";
+  return `${section}${config ? renderAgentsBar(config, cards !== "") : ""}`;
+}
+
+/**
+ * One actor: what it is, what it is configured with, what it is doing.
+ *
+ * The role heads the card because the role is the concept — a stage agent
+ * and a sparrer are different jobs, and which provider is filling one today
+ * is a setting. The provider is therefore read underneath it, quietly, and
+ * the model and effort controls follow as the settings of that role.
+ *
+ * The card carries the toggle for its instructions but not the instructions
+ * themselves: those are a panel after both cards, so opening one actor's
+ * does not move the other actor's card out of its row. The toggle is a
+ * button and not a `<summary>` for the same reason it was never wrapped
+ * around the card -- a summary activates on click, and an effort dropdown
+ * inside one would collapse the card it is in as often as not.
+ */
+function renderActor(card: ActorCard, controls: AgentRoleControls | undefined, configScope: string | undefined): string {
   const busy = card.activity === "Working" || card.activity === "Sparring";
   const duration = card.duration ? ` for ${escapeHtml(card.duration)}` : "";
   const quiet = card.quietFor ? ` <span class="muted">· no meaningful activity for ${escapeHtml(card.quietFor)}</span>` : "";
   const uncertain = busy && card.uncertain ? ` <span class="muted">· runner status unknown</span>` : "";
-  const session = card.sessionLabel ? `${capitalize(card.sessionKind)}: ${escapeHtml(card.sessionLabel)}` : `No ${card.sessionKind} yet`;
   const who = whoClass(card.provider);
   // A telemetry-only turn reads "Working? (turn observed 3m ago)": the duration is
   // time since the observed start, not a claim that work is happening now.
-  const word = busy && card.uncertain ? `${card.activity}?` : card.activity;
+  const word = busy && card.uncertain ? `${card.activity}?` : (card.activity ?? "");
   const span = busy && card.uncertain ? (card.duration ? ` <span class="muted">(turn observed ${escapeHtml(card.duration)} ago)</span>` : "") : duration;
-  const identity = `<span class="avatar ${who}">${escapeHtml(card.provider.charAt(0).toUpperCase())}</span>
-<div class="who">
-<div><span class="provider ${who}">${escapeHtml(card.provider)}</span> <span class="muted">(${escapeHtml(card.role)})</span></div>
-<div class="activity ${card.activity.toLowerCase()}${busy && card.uncertain ? " uncertain" : ""}">${icon("dot", "dot")}${escapeHtml(word)}${busy ? span : ""}${uncertain}${quiet}</div>
-<div class="session muted">${session}</div>
-</div>`;
+  const role = actorRole(card);
+  const identity = `<div class="identity"><span class="avatar ${who}">${avatarGlyph(role)}</span>
+<div class="who"><div class="rolename ${who}">${escapeHtml(card.role)}</div><div class="provider muted">${escapeHtml(card.provider)}</div></div></div>`;
+  const settings = controls && configScope ? renderRoleControls(controls, configScope) : "";
+  // No run, no stage: the card is a configuration surface and says nothing
+  // about activity. With a stage, the session line appears only once the
+  // engine has recorded one — an absent id is left off rather than shown as
+  // a placeholder for a value that does not exist yet.
+  const activity = card.activity
+    ? `<div class="activity ${card.activity.toLowerCase()}${busy && card.uncertain ? " uncertain" : ""}">${icon("dot", "dot")}${escapeHtml(word)}${busy ? span : ""}${uncertain}${quiet}</div>`
+    : "";
+  const session =
+    card.sessionLabel && card.sessionKind
+      ? `<div class="session muted">${capitalize(card.sessionKind)}: ${escapeHtml(card.sessionLabel)}</div>`
+      : "";
+  const body = `${identity}${settings}${activity}${session}`;
   // No captured prompt means the engine has not run a turn for this actor
   // since prompt capture existed. An ordinary state, so the card simply
   // stays a card rather than offering a disclosure that would open on
   // nothing.
   if (!card.prompt) {
-    return `<div class="card actor">${identity}</div>`;
+    return `<div class="card actor ${who}" data-role="${role}">${body}</div>`;
   }
-  const role = card.role === "Stage agent" ? "stage" : "sparrer";
-  return `<details class="card actor" data-role="${role}"${disclose(scope, role, "instructions")}>
-<summary>${identity}<span class="showinstr">Show instructions</span></summary>
-${renderInstructions(card.prompt, role, scope)}
-</details>`;
+  // The toggle stays on the card; what it opens is rendered after both cards
+  // (see `renderActors`), so opening one actor's instructions never moves the
+  // other actor's card. `aria-controls` is the only thing tying the two
+  // together in the document, and the script relies on the same pairing.
+  return `<div class="card actor ${who}" data-role="${role}">${body}
+<button type="button" class="showinstr" data-instr="${role}" aria-controls="${instrPanelId(role)}" aria-expanded="false" data-show="${SHOW_INSTRUCTIONS}" data-hide="${HIDE_INSTRUCTIONS}">${SHOW_INSTRUCTIONS}</button></div>`;
+}
+
+/**
+ * The toggle's two labels. They live here rather than in the page's script
+ * because they are wording, and the script should carry behaviour only; it
+ * reads whichever one the current state calls for off the button.
+ */
+const SHOW_INSTRUCTIONS = "Show instructions";
+const HIDE_INSTRUCTIONS = "Hide instructions";
+
+/** The id the card's toggle points at, and the panel answers to. */
+function instrPanelId(role: string): string {
+  return `instr-${role}`;
+}
+
+/**
+ * Which actor a card is for, in the vocabulary the markup uses. One
+ * definition, because the card's `aria-controls` and the panel's id are
+ * derived from it and a disagreement would be a toggle that opens nothing.
+ */
+function actorRole(card: ActorCard): "stage" | "sparrer" {
+  return card.role === "Stage agent" ? "stage" : "sparrer";
+}
+
+/**
+ * One actor's instructions, as a panel below the cards rather than inside
+ * the card that opens it.
+ *
+ * It is a plain element and not a `<details>` because the control that opens
+ * it lives in the card and a `<summary>` cannot be separated from its own
+ * `<details>`. Its open state is still remembered the way every disclosure
+ * on this page is — `data-disclose`, keyed by what the section is — so
+ * nothing new is stored and a reload restores it with the rest.
+ *
+ * The panel names the actor it belongs to. Only one is ever open, but it is
+ * read well below the card that opened it, so the heading says whose it is
+ * without a reader having to remember which tab they pressed.
+ */
+function renderInstructionsPanel(card: ActorCard, scope: string): string {
+  if (!card.prompt) {
+    return "";
+  }
+  const role = actorRole(card);
+  const who = whoClass(card.provider);
+  return `<div class="instrpanel ${who}" id="${instrPanelId(role)}" data-instrpanel="${role}"${disclose(scope, role, "instructions")} hidden>
+<div class="instrhead ${who}">${escapeHtml(card.role)} <span class="muted">· instructions</span></div>
+${renderInstructions(card.prompt, role, scope)}</div>`;
+}
+
+/**
+ * The shared line beside the cards: Settings, and whatever the engine said
+ * about the configuration as a whole.
+ *
+ * It is a line, not a panel. The only things it carries are the ones that
+ * belong to both roles at once — the project.toml the cards were drawn from,
+ * the engine's own note when it could not resolve a configuration, and the
+ * fact that a change lands on the next turn while a run is active. When
+ * there are no controls to put in the cards, the engine's read-only role
+ * lines are shown here instead of being replaced by empty controls.
+ */
+function renderAgentsBar(section: AgentConfigSection, hasCards: boolean): string {
+  const settings = button("openSettings", section.settings.label, true, section.settings.detail, "quiet");
+  const lines =
+    section.controls.length === 0 || !section.scope || !hasCards
+      ? section.lines
+          .map(
+            (line) =>
+              `<div class="agentconfig-role" title="${escapeHtml(line.detail)}"><span class="muted">${escapeHtml(line.role)}</span><span class="agentconfig-value">${escapeHtml(line.text)}</span></div>`,
+          )
+          .join("")
+      : "";
+  const active = section.activeRunNote ? `<p class="muted note">${escapeHtml(section.activeRunNote)}</p>` : "";
+  const note = section.note ? `<p class="muted note">${escapeHtml(section.note)}</p>` : "";
+  return `<div class="agentsbar">${lines}${active}${note}<div class="actions">${settings}</div></div>`;
 }
 
 /**
@@ -1334,50 +1487,30 @@ function capitalize(word: string): string {
 }
 
 /**
- * What the next provider turn would run with, and the one way to change it.
+ * One role's settings, inside that role's own card: model, effort, and the
+ * provider only when there is genuinely a choice to make.
  *
- * Every value here is the engine's answer as reported, down to the words
- * "provider default": the cockpit does not name a model the engine did not
- * name. A configuration error is shown as a note and the role lines are
- * withheld rather than replaced by plausible-looking ones, and the section
- * still offers Settings, because that is what a person needs at exactly
- * that moment. There are no inline model or effort controls: the file is
- * the edit surface.
- */
-function renderAgentConfig(section: AgentConfigSection): string {
-  // With controls, the read-only lines would say the same thing twice; they
-  // remain the whole answer when the engine could not resolve a
-  // configuration and there is nothing to put in a control.
-  const body =
-    section.controls.length > 0 && section.scope
-      ? section.controls.map((role) => renderRoleControls(role, section.scope as string)).join("")
-      : section.lines
-          .map(
-            (line) =>
-              `<div class="agentconfig-role" title="${escapeHtml(line.detail)}"><span class="muted">${escapeHtml(line.role)}</span><span class="agentconfig-value">${escapeHtml(line.text)}</span></div>`,
-          )
-          .join("");
-  const note = section.note ? `<p class="muted note">${escapeHtml(section.note)}</p>` : "";
-  const active = section.activeRunNote
-    ? `<p class="muted note">${escapeHtml(section.activeRunNote)}</p>`
-    : "";
-  const settings = button("openSettings", section.settings.label, true, section.settings.detail, "quiet");
-  return `<section class="agentconfig"><div class="agentconfig-head"><h3>${icon("gear")}Agents</h3>${settings}</div>${body}${active}${note}</section>`;
-}
-
-/**
- * One role's compact block: provider, model, effort.
+ * The role is not repeated here — it is the card's heading — and neither is
+ * a provider the engine reports as the only one for the role, which the card
+ * already names underneath that heading. A dropdown of one would be a
+ * control that lies about being a control, and a second copy of the provider
+ * name would be the duplication this layout exists to remove.
  *
- * Every control carries the role, the field and the scope it was rendered
- * with, so the message the webview posts is self-describing and the host
- * never has to infer which repository a change was meant for from whatever
- * happens to be selected when it arrives.
+ * The model is a row here but not a control: it is the value the engine
+ * resolved, read on the card and changed in project.toml. Nothing
+ * enumerates the models a CLI accepts, so a control could only be a box
+ * that takes any string and discovers on the next turn that it was wrong.
+ *
+ * Every actual control carries the role, the field and the scope it was
+ * rendered with, so the message the webview posts is self-describing and the
+ * host never has to infer which repository a change was meant for from
+ * whatever happens to be selected when it arrives.
  */
 function renderRoleControls(role: AgentRoleControls, scope: string): string {
   const attrs = `data-role="${escapeHtml(role.role)}" data-scope="${escapeHtml(scope)}"`;
-  const items = [role.provider, role.model, ...(role.effort ? [role.effort] : [])];
+  const items = [...(role.provider.options ? [role.provider] : []), role.model, ...(role.effort ? [role.effort] : [])];
   const rows = items.map((item) => field(item.label, control(item, attrs))).join("");
-  return `<div class="agentconfig-block"><div class="agentconfig-rolename">${escapeHtml(role.label)}</div>${rows}</div>`;
+  return `<div class="agentconfig-block">${rows}</div>`;
 }
 
 function field(label: string, input: string): string {
@@ -1385,32 +1518,34 @@ function field(label: string, input: string): string {
 }
 
 /**
- * The input for one field.
+ * The control for one field: a dropdown, or text that is only read.
  *
  * A dropdown when the engine gave options — its entries are the engine's own
- * levels, so nothing here enumerates what a provider accepts. A plain text
- * input otherwise, because a model name is free-form on both installed CLIs
- * and a closed list would reject a model that exists. An empty text input is
- * the provider's default, spelled in the placeholder rather than written
- * into the field as a value nobody chose.
+ * levels and providers, so nothing here enumerates what a provider accepts.
+ * Read-only text otherwise, and that is every remaining case: a role with one
+ * provider has nothing to choose, and the model is shown rather than edited
+ * because no engine or CLI reports a list of models to choose from. A field
+ * that is neither is a control this renderer has no honest shape for, so it
+ * is left out rather than drawn as an empty box.
  */
 function control(item: AgentFieldControl, attrs: string): string {
+  if (item.fixedText !== undefined) {
+    // Shown, not chosen. The "novalue" case is the absence of an override --
+    // the words "Provider default" rather than a model the engine resolved --
+    // and is drawn quietly so it is never read as a configured value.
+    const quiet = item.value === PROVIDER_DEFAULT_VALUE ? " novalue" : "";
+    return `<span class="agentconfig-fixed${quiet}" title="${escapeHtml(item.detail)}">${escapeHtml(item.fixedText)}</span>`;
+  }
+  if (!item.options) {
+    return "";
+  }
   // The value this control was rendered with. The script compares against
   // it before posting, so simply tabbing through a field -- or re-selecting
   // what is already selected -- runs no engine command at all. The leading
   // "-" or "=" keeps "cleared" distinguishable from a value that happens to
-  // spell it, so a model actually named "null" or "default" can still be
-  // cleared.
+  // spell it, so a level actually named "default" can still be cleared.
   const sent = ` data-sent="${escapeHtml(item.value === PROVIDER_DEFAULT_VALUE ? "-" : `=${item.value}`)}"`;
-  const common = `${attrs} data-field="${escapeHtml(item.field)}" title="${escapeHtml(item.detail)}"${sent}`;
-  if (item.fixedText !== undefined) {
-    return `<span class="agentconfig-fixed" title="${escapeHtml(item.detail)}">${escapeHtml(item.fixedText)}</span>`;
-  }
-  if (item.options) {
-    return `<select ${common}>${options(item.options, item.value)}</select>`;
-  }
-  const placeholder = item.placeholder ? ` placeholder="${escapeHtml(item.placeholder)}"` : "";
-  return `<input type="text" ${common} value="${escapeHtml(item.value)}"${placeholder} maxlength="${MODEL_MAX_LENGTH}" spellcheck="false" autocomplete="off">`;
+  return `<select ${attrs} data-field="${escapeHtml(item.field)}" title="${escapeHtml(item.detail)}"${sent}>${options(item.options, item.value)}</select>`;
 }
 
 function options(items: readonly { value: string; label: string }[], selected: string): string {
@@ -1566,27 +1701,33 @@ pre.engineerror { margin: 6px 0 0; padding: 6px 8px; max-height: 9em; overflow: 
 .autopush { display: inline-flex; align-items: center; gap: 6px; margin: 0 0 8px; color: var(--good); font-weight: 600; }
 
 /* What the next turn would run with. Compact by design: the file is the editor. */
-.agentconfig { margin: 10px 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; }
-.agentconfig-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.agentconfig-head h3 { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-size: 0.95em; }
-.agentconfig-role { display: flex; align-items: baseline; gap: 8px; margin-top: 4px; font-size: 0.92em; }
+/* The shared line beside the two cards: Settings, and anything the engine
+   said about the configuration as a whole. Deliberately not a panel. */
+.agentsbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 10px; }
+.agentsbar .note { margin: 0; flex: 1 1 18em; }
+.agentsbar .actions { margin-left: auto; }
+.agentconfig-role { display: flex; align-items: baseline; gap: 8px; font-size: 0.92em; }
 .agentconfig-role .muted { min-width: 8.5em; }
 .agentconfig-value { font-weight: 600; overflow-wrap: anywhere; }
-.agentconfig .note { margin: 6px 0 0; }
-.agentconfig-block { margin-top: 6px; }
-.agentconfig-block + .agentconfig-block { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); }
-.agentconfig-rolename { font-weight: 600; font-size: 0.92em; margin-bottom: 3px; }
+.agentconfig-block { margin: 6px 0 2px; }
 .agentconfig-field { display: flex; align-items: center; gap: 8px; margin-top: 3px; font-size: 0.9em; }
 .agentconfig-field > .muted { min-width: 5.5em; }
-.agentconfig-field select,
-.agentconfig-field input[type="text"] {
+/* Only a chooser is drawn as a control. It is the platform's own select,
+   filled and with its own chevron, so the one thing on the card that can be
+   changed here looks like the one thing that can be changed here. */
+.agentconfig-field select {
   flex: 1; min-width: 0; padding: 2px 4px; font: inherit; font-size: 0.95em;
   color: var(--vscode-input-foreground); background: var(--vscode-input-background);
   border: 1px solid var(--vscode-input-border, var(--line)); border-radius: 3px;
 }
-.agentconfig-field select:disabled,
-.agentconfig-field input[type="text"]:disabled { opacity: 0.6; }
-.agentconfig-fixed { flex: 1; font-weight: 600; }
+.agentconfig-field select:disabled { opacity: 0.6; }
+/* A read value, not a control. 5px is the select's 1px border plus its 4px
+   padding, so a model name and an effort level still start on the same
+   column. */
+.agentconfig-fixed { flex: 1; min-width: 0; padding: 2px 4px 2px 5px; font-size: 0.95em; font-weight: 600; overflow-wrap: anywhere; }
+/* The absence of an override is not a value, so it never borrows a value's
+   weight. */
+.agentconfig-fixed.novalue { font-weight: 400; font-style: italic; color: var(--vscode-descriptionForeground); }
 
 /* The freeform channel: beside the checks, never inside one of them. */
 .feedback { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
@@ -1701,32 +1842,72 @@ p { margin: 0 0 4px; line-height: 1.45; }
 .time { font-family: var(--vscode-editor-font-family); font-size: 0.92em; }
 
 .actors { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 0 0 10px; }
-.actor { display: flex; gap: 12px; align-items: flex-start; padding: 10px 12px; line-height: 1.45; }
-.avatar { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 50%; font-weight: 700; font-size: 1.05em; color: var(--vscode-editor-background); background: var(--line); }
+.actor { display: block; padding: 10px 12px; line-height: 1.45; }
+.actor .identity { display: flex; gap: 12px; align-items: center; }
+/* 2.8em is the height of the two-line column beside the avatar (the 1.05em
+   role name and the 0.88em provider name, both at line-height 1.45), so the
+   circle reads at the height of the identity row it sits in. Width and height
+   are the same em length rather than stretched, so the circle stays round and
+   still scales with the editor font size. */
+.avatar { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 2.8em; height: 2.8em; border-radius: 50%; color: var(--vscode-editor-background); background: var(--line); }
+.avatar .glyph { width: 62%; height: 62%; display: block; }
 .avatar.claude { background: var(--claude); }
 .avatar.codex { background: var(--codex); }
-.provider { font-weight: 600; font-size: 1.05em; }
-.provider.claude { color: var(--claude); }
-.provider.codex { color: var(--codex); }
+/* The role is the heading; the provider filling it today is secondary. */
+.rolename { font-weight: 600; font-size: 1.05em; }
+.rolename.claude { color: var(--claude); }
+.rolename.codex { color: var(--codex); }
+.actor .provider { font-size: 0.88em; }
 .activity { display: flex; align-items: center; }
 .activity .icon.dot { color: var(--vscode-descriptionForeground); }
 .activity.working, .activity.sparring { color: var(--good); font-weight: 600; }
 .activity.working .icon.dot, .activity.sparring .icon.dot { color: var(--good); }
 .session { font-family: var(--vscode-editor-font-family); font-size: 0.85em; }
 
-/* An actor card that carries a captured prompt is a disclosure. Opening it
-   spans the full width of the grid, so the prompt is read at the width of
-   the rest of the UI instead of in a half-width column. */
-details.actor { display: block; padding: 0; }
-details.actor > summary { display: flex; gap: 12px; align-items: flex-start; padding: 10px 12px; line-height: 1.45; cursor: pointer; list-style: none; }
-details.actor > summary::-webkit-details-marker { display: none; }
-details.actor > summary .who { flex: 1 1 auto; min-width: 0; }
-details.actor[open] { grid-column: 1 / -1; }
-.showinstr { flex: none; align-self: center; font-size: 0.85em; color: var(--vscode-textLink-foreground); }
-details.actor[open] .showinstr::after { content: ' ▾'; }
-details.actor:not([open]) .showinstr::after { content: ' ▸'; }
+/* The captured prompt opens below both cards, never inside the card that
+   opens it: a card that grew would push the other actor's card out of its
+   row, which is the one thing a person reading two actors side by side does
+   not want. The card is the tab and the panel is what the tab opens, so the
+   prompt is also read at the width of the rest of the page. */
+.showinstr {
+  display: block; margin: 6px -12px -10px; padding: 4px 12px 8px; width: calc(100% + 24px);
+  font: inherit; font-size: 0.85em; text-align: left; cursor: pointer;
+  color: var(--vscode-textLink-foreground); background: none; border: none;
+}
+.showinstr::after { content: ' ▸'; }
+.showinstr[aria-expanded="true"]::after { content: ' ▾'; }
+.showinstr:focus-visible { outline: 1px solid var(--vscode-focusBorder); }
+/* While its panel is open the card is the selected tab: it carries the
+   actor's own colour along the edge the panel is on, and gives up the
+   rounding there so the two read as one surface. The colour is painted
+   inside the existing border rather than widening it, so selecting a tab
+   cannot change the height of the card it is on. */
+.card.actor:has(> .showinstr[aria-expanded="true"]) { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+.card.actor.claude:has(> .showinstr[aria-expanded="true"]) { box-shadow: inset 0 -2px 0 var(--claude); }
+.card.actor.codex:has(> .showinstr[aria-expanded="true"]) { box-shadow: inset 0 -2px 0 var(--codex); }
 
-.instructions { padding: 0 12px 12px; border-top: 1px solid var(--line); }
+.instrpanel {
+  grid-column: 1 / -1; position: relative; margin-top: -4px;
+  border: 1px solid var(--line); border-top-width: 2px; border-radius: 6px;
+  background: var(--card);
+}
+.instrpanel.claude { border-top-color: var(--claude); }
+.instrpanel.codex { border-top-color: var(--codex); }
+.instrhead { padding: 8px 12px 0; font-weight: 600; }
+.instrhead.claude { color: var(--claude); }
+.instrhead.codex { color: var(--codex); }
+/* The notch points at the card this panel came from -- a quarter of the way
+   across for the left card, three quarters for the right one. At most one
+   panel is open, so it always points at a card. */
+.instrpanel::before {
+  content: ''; position: absolute; top: -7px; width: 12px; height: 12px;
+  background: var(--card); border-left: 2px solid; border-top: 2px solid; border-color: inherit;
+  transform: rotate(45deg);
+}
+.instrpanel[data-instrpanel="stage"]::before { left: 25%; }
+.instrpanel[data-instrpanel="sparrer"]::before { left: 75%; }
+
+.instructions { padding: 0 12px 12px; }
 .turnline { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 0; font-size: 1.02em; }
 .turnchip { flex: none; padding: 1px 8px; border: 1px solid var(--line); border-radius: 10px; font-size: 0.8em; color: var(--vscode-descriptionForeground); }
 .turnchip.live { border-color: var(--good); color: var(--good); font-weight: 600; }
@@ -1782,6 +1963,10 @@ button.quiet { background: transparent; color: var(--vscode-descriptionForegroun
   .columns { grid-template-columns: 1fr; }
   .col.right { border-left: none; padding-left: 0; border-top: 1px solid var(--line); padding-top: 8px; }
   .actors { grid-template-columns: 1fr; }
+  /* One column: the cards are stacked, so a notch a quarter of the way
+     across would point at neither of them. The panel's coloured edge and
+     its heading are what say whose it is. */
+  .instrpanel::before { display: none; }
 }
 `;
 
@@ -1831,18 +2016,42 @@ const DISCLOSURE_SCRIPT = `
     var open = state()[STORE];
     return open && typeof open === 'object' ? open : {};
   }
+  // A disclosure is a <details>, or a panel whose control lives elsewhere on
+  // the page -- the instructions, opened from its actor's card. Both are
+  // remembered the same way, under the same keys.
+  function show(node, isOpen) {
+    if (node.tagName === 'DETAILS') { node.open = isOpen; return; }
+    node.hidden = !isOpen;
+    var toggle = document.querySelector('[aria-controls="' + node.id + '"]');
+    if (!toggle) { return; }
+    toggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+    // The control says what pressing it will do. Both labels are written on
+    // the button by the renderer, so no wording is invented here.
+    var label = toggle.getAttribute(isOpen ? 'data-hide' : 'data-show');
+    if (label) { toggle.textContent = label; }
+  }
   function restore() {
     var open = disclosures();
     var kept = {};
-    var nodes = document.querySelectorAll('details[data-disclose]');
+    // At most one instructions panel is open, here too: a store written
+    // before the panels became a tab strip can name both, and restoring it
+    // as written would put the page into a state its own controls cannot
+    // produce. The first one wins and the rest are recorded closed.
+    var alreadyOpen = false;
+    var nodes = document.querySelectorAll('[data-disclose]');
     for (var i = 0; i < nodes.length; i++) {
       var key = nodes[i].getAttribute('data-disclose');
       if (Object.prototype.hasOwnProperty.call(open, key)) {
-        nodes[i].open = open[key] === true;
+        var wanted = open[key] === true;
+        if (wanted && nodes[i].hasAttribute('data-instrpanel')) {
+          if (alreadyOpen) { wanted = false; }
+          alreadyOpen = alreadyOpen || wanted;
+        }
+        show(nodes[i], wanted);
         // Pruning to what this document has is what bounds the store: a
         // disclosure belonging to a stage that is no longer on screen is
         // dropped rather than kept for ever.
-        kept[key] = open[key];
+        kept[key] = wanted;
       }
     }
     var scrolled = state().scroll;
@@ -1853,15 +2062,47 @@ const DISCLOSURE_SCRIPT = `
     next[STORE] = kept;
     remember(next);
   }
+  function record(node, isOpen) {
+    var next = state();
+    var open = next[STORE] && typeof next[STORE] === 'object' ? next[STORE] : {};
+    open[node.getAttribute('data-disclose')] = isOpen === true;
+    next[STORE] = open;
+    remember(next);
+  }
   document.addEventListener('toggle', function (event) {
     var node = event.target;
     if (!node || !node.getAttribute || !node.hasAttribute('data-disclose')) { return; }
-    var next = state();
-    var open = next[STORE] && typeof next[STORE] === 'object' ? next[STORE] : {};
-    open[node.getAttribute('data-disclose')] = node.open === true;
-    next[STORE] = open;
-    remember(next);
+    record(node, node.open === true);
   }, true);
+  // The instructions toggle. The panel it opens is laid out after both actor
+  // cards, so opening one actor's instructions leaves the other actor's card
+  // exactly where it was; the button and the panel are tied by aria-controls
+  // and nothing else.
+  //
+  // A tab strip, so at most one panel is open: opening one closes the other,
+  // and pressing the open one's own toggle closes it and leaves none open.
+  // Both changes are recorded, or the closed one would come back on the next
+  // rerender and there would be two again.
+  function closeOthers(panel) {
+    var panels = document.querySelectorAll('[data-instrpanel]');
+    for (var i = 0; i < panels.length; i++) {
+      if (panels[i] !== panel && !panels[i].hidden) {
+        show(panels[i], false);
+        if (panels[i].hasAttribute('data-disclose')) { record(panels[i], false); }
+      }
+    }
+  }
+  document.addEventListener('click', function (event) {
+    var element = event.target instanceof Element ? event.target : null;
+    var toggle = element ? element.closest('button[data-instr]') : null;
+    if (!toggle) { return; }
+    var panel = document.getElementById(toggle.getAttribute('aria-controls'));
+    if (!panel) { return; }
+    var isOpen = panel.hidden;
+    if (isOpen) { closeOthers(panel); }
+    show(panel, isOpen);
+    if (panel.hasAttribute('data-disclose')) { record(panel, isOpen); }
+  });
   // Where the person had scrolled to, kept cheaply: the value is read back
   // only when a fresh document is built, so a throttle of a frame is
   // plenty and a scroll never costs a write per event.
@@ -1937,10 +2178,10 @@ const SCRIPT = `
     }
     agentConfigChanged(event.target);
   });
-  // The inline agent controls. An effort dropdown reports on change; a model
-  // field reports on blur and on Enter, never per keystroke -- each report
-  // runs an engine command, and one per character would be a queue of writes
-  // nobody asked for.
+  // The inline agent controls, which are dropdowns and nothing else: they
+  // report on change. The model is read-only text on the card and is changed
+  // in project.toml, so there is no text field here to save on blur or on
+  // Enter, and no keystroke path that could queue a write per character.
   //
   // Every message carries the scope the control was rendered with, so the
   // host can refuse one that belongs to a repository no longer on screen.
@@ -1949,15 +2190,12 @@ const SCRIPT = `
   // write over the first; the host's reply re-renders the page from the
   // engine's actual answer and the control comes back with that value in it.
   function agentConfigChanged(node) {
-    var isSelect = node instanceof HTMLSelectElement;
-    var isInput = node instanceof HTMLInputElement && node.type === 'text';
-    if ((!isSelect && !isInput) || !node.hasAttribute('data-role') || !node.hasAttribute('data-field')) { return; }
+    if (!(node instanceof HTMLSelectElement)) { return; }
+    if (!node.hasAttribute('data-role') || !node.hasAttribute('data-field')) { return; }
     if (node.disabled) { return; }
-    // A text field is trimmed, so emptying it -- including to a space -- is
-    // the clear it plainly means rather than a model name the engine would
-    // then have to refuse.
-    var raw = isInput ? node.value.trim() : node.value;
-    var sent = raw === '' ? null : raw;
+    // The empty option is the sentinel for "no override", which the host
+    // sends as null and the engine turns into its --*-default flag.
+    var sent = node.value === '' ? null : node.value;
     var stamp = sent === null ? '-' : '=' + sent;
     if (node.getAttribute('data-sent') === stamp) { return; }
     node.setAttribute('data-sent', stamp);
@@ -1970,13 +2208,6 @@ const SCRIPT = `
       scope: node.getAttribute('data-scope'),
     });
   }
-  document.addEventListener('keydown', function (event) {
-    if (event.key !== 'Enter') { return; }
-    var node = event.target;
-    if (!(node instanceof HTMLInputElement) || !node.hasAttribute('data-role')) { return; }
-    event.preventDefault();
-    agentConfigChanged(node);
-  });
   // Every text field is saved as it is typed (debounced) and on blur, so a
   // re-render of the page never loses what was typed; the extension stores it
   // as a draft. A check note carries the check's key; the freeform findings

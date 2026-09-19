@@ -215,17 +215,17 @@ export interface AgentFieldControl {
   label: string;
   /** The engine's current effective value, or `""` for the provider's default. */
   value: string;
-  /** Present for a dropdown; absent for a free-form text control. */
+  /** Present for a dropdown; absent when the field is read-only text. */
   options?: ControlOption[];
-  /** Shown when the field is empty, for a free-form control. */
-  placeholder?: string;
   /** Tooltip: what this value is and where it came from. */
   detail: string;
   /**
    * Set when the field cannot be edited, and is the text to show instead of
    * a control. Used for the provider when the engine reports exactly one for
-   * the role: there is nothing to choose, and a dropdown of one is a control
-   * that lies about being a control.
+   * the role — there is nothing to choose, and a dropdown of one is a
+   * control that lies about being a control — and always for the model,
+   * which no provider enumerates and which is therefore read here and
+   * changed in project.toml.
    */
   fixedText?: string;
 }
@@ -249,6 +249,23 @@ export interface AgentRoleControls {
    * merely unavailable, which is a different and untrue thing.
    */
   effort?: AgentFieldControl;
+}
+
+/**
+ * The provider's human name for one role's controls.
+ *
+ * Taken from whatever the engine put in the control — the fixed text when
+ * the role has exactly one provider, the matching option's label when it has
+ * several — and falling back to the canonical id. There is no table of
+ * vendor names here, and there must not be: a provider the engine gains is
+ * named by the engine.
+ */
+export function providerLabel(controls: AgentRoleControls): string {
+  if (controls.provider.fixedText) {
+    return controls.provider.fixedText;
+  }
+  const chosen = controls.provider.options?.find((option) => option.value === controls.provider.value);
+  return chosen?.label ?? controls.provider.value;
 }
 
 /** What the Overview shows for the effective configuration, if anything. */
@@ -350,14 +367,20 @@ function roleControls(role: EngineRoleConfig): AgentRoleControls | undefined {
           }
         : { fixedText: provider }),
     },
+    // Shown, never chosen. There is no catalogue of models behind this
+    // field -- both installed CLIs take free-form names and neither reports
+    // what it accepts -- so a control here could only be a box that takes
+    // any string and finds out it was wrong on the next turn. The model is
+    // reported as the engine resolved it, and changed in the project.toml
+    // the Settings button opens.
     model: {
       field: "model",
       label: "Model",
       value: role.model ?? PROVIDER_DEFAULT_VALUE,
-      placeholder: PROVIDER_DEFAULT_LABEL,
+      fixedText: role.model ?? PROVIDER_DEFAULT_LABEL,
       detail: role.model
-        ? `Model ${role.model} from ${sourcePhrase(role.model_source)}. Clear the field to use ${provider}'s own default.`
-        : `No model configured, so ${provider} chooses its own. Type a model name to pin one.`,
+        ? `Model ${role.model} from ${sourcePhrase(role.model_source)}. Change it in this project's project.toml.`
+        : `No model configured, so ${provider} chooses its own. Pin one in this project's project.toml.`,
     },
   };
   const levels = role.effort_levels ?? [];

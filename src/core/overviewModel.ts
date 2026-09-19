@@ -19,7 +19,7 @@
  */
 
 import { describeRepositoryContext, emptyStateLines, emptyStateTitle, type RepositoryContextView } from "./activeRepository";
-import { agentConfigView, type AgentConfigView, type EffectiveConfig } from "./effectiveConfig";
+import { agentConfigView, providerLabel, type AgentConfigView, type ConfigRole, type EffectiveConfig } from "./effectiveConfig";
 import { parseBriefGoal, parseBriefOpening } from "./brief";
 import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
@@ -90,14 +90,28 @@ export interface TimelineItem {
 export type ActorActivity = "Working" | "Sparring" | "Waiting" | "Idle";
 
 export interface ActorCard {
+  /**
+   * What this actor *is* in the workflow. It is the card's primary heading:
+   * the role is the concept a person reasons about, and the provider
+   * currently filling it is secondary to it.
+   */
   role: "Stage agent" | "Sparrer";
+  /** The same role in the engine's configuration vocabulary, which the controls are keyed by. */
+  configRole: ConfigRole;
   provider: string;
-  activity: ActorActivity;
+  /**
+   * Absent on the no-run screen, where the card is a configuration surface
+   * for a role that is not doing anything: there is no stage, so there is no
+   * activity to report and "Idle" would be a claim about a run that does not
+   * exist.
+   */
+  activity?: ActorActivity;
   /** `Xm Ys` since the latest turn start/resume, while active. */
   duration?: string;
   /** Persisted session/thread id, shortened for display. */
   sessionLabel?: string;
-  sessionKind: "session" | "thread";
+  /** Absent together with {@link activity}: with no run there is no session to name. */
+  sessionKind?: "session" | "thread";
   /** Set when a busy claim has had no meaningful activity for a long time (formatted age). */
   quietFor?: string;
   /** True when the Working/Sparring claim rests on telemetry alone: no runner process has been observed alive. */
@@ -603,8 +617,14 @@ export interface PushAuthorization {
 }
 
 /**
- * The effective provider/model/effort for both roles, the inline controls
- * that change it, and the Settings action.
+ * The effective provider/model/effort for both roles, the controls that
+ * change it, and the Settings action.
+ *
+ * The controls are drawn inside the actor card of the role they configure
+ * (see overviewHtml's renderActors), so this is a description of the
+ * configuration rather than of a panel: there is no second Agents section,
+ * and there must not be one, because two places describing the same two
+ * agents is one place too many to keep true.
  *
  * Every value is the engine's answer verbatim. The controls are a
  * convenience surface, not a replacement for the file: Settings still opens
@@ -819,6 +839,30 @@ function agentConfigSection(
   };
 }
 
+/**
+ * The same two cards, for a repository with no run yet.
+ *
+ * The cards are where model and effort are set, so they have to exist before
+ * there is anything to run — that is exactly when someone configures a
+ * project. They carry role, provider and nothing else: no activity word and
+ * no session line, because there is no stage and inventing either would be
+ * the cockpit describing a run that does not exist.
+ */
+function configOnlyActor(
+  role: ConfigRole,
+  section: AgentConfigSection | undefined,
+): ActorCard | undefined {
+  const controls = section?.controls.find((entry) => entry.role === role);
+  if (!controls) {
+    return undefined;
+  }
+  return {
+    role: role === "stage" ? "Stage agent" : "Sparrer",
+    configRole: role,
+    provider: providerLabel(controls),
+  };
+}
+
 const NO_ARTIFACTS: OverviewArtifacts = { handoff: false, sparring: false, brief: false, plan: false };
 
 export function buildOverviewModel(
@@ -838,14 +882,18 @@ export function buildOverviewModel(
         repositoryContext,
       };
     }
+    // A repository with no run yet is exactly where someone sets this up,
+    // so the two role cards — and Settings — are reachable before the first
+    // stage exists.
+    const config = agentConfigSection(artifacts.agentConfig);
     return {
       kind: "empty",
       title: emptyStateTitle(selection),
       emptyLines: emptyStateLines(selection),
       repositoryContext,
-      // A repository with no run yet is exactly where someone sets this up,
-      // so Settings is reachable before the first stage exists.
-      agentConfig: agentConfigSection(artifacts.agentConfig),
+      stageAgent: configOnlyActor("stage", config),
+      sparrer: configOnlyActor("sparring", config),
+      agentConfig: config,
     };
   }
   const run = selection.selected;
@@ -1709,6 +1757,7 @@ function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveSt
   }
   return {
     role: role === "stage" ? "Stage agent" : "Sparrer",
+    configRole: role === "stage" ? "stage" : "sparring",
     provider: providerDisplayName(actor?.provider ?? (role === "stage" ? "claude-cli" : "codex-cli"), role),
     activity,
     duration,
