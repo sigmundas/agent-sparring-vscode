@@ -369,7 +369,7 @@ describe("the exact text, all the way to the engine", () => {
     const handler = /private async recordHumanFeedback[\s\S]*?\n {2}}\n/.exec(panel)?.[0] ?? "";
     assert.ok(handler, "recordHumanFeedback exists");
     assert.match(handler, /setHumanFeedback\(stageScopeOf\(run\), message\.text\)/, "stored against the run and the stage it is current at, so it cannot resurface under the next stage");
-    assert.match(handler, /this\.lastHtmlKey = JSON\.stringify\(await this\.buildModel\(\)\)/, "the comparison key advances, so the stored text alone rebuilds nothing");
+    assert.doesNotMatch(handler, /lastHtmlKey|buildModel/, "a draft save must not cache an unrendered model; the behavioral render-key checks live in evidenceHandoffRecovery.test.ts");
     assert.ok(!/launch|buildRun|Terminal|sendFeedback/.test(handler), "and nothing on this path runs the engine");
   });
 

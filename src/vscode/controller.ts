@@ -1131,6 +1131,16 @@ export class SparringController implements vscode.Disposable {
    *    neither marked delivered nor marked failed to make buttons work.
    */
   async confirmRunnerInactive(runId: string, executionId: string | undefined, operationId?: string): Promise<{ confirmed: boolean; reason?: "not-found" | "already-ended"; overrode: boolean; submission: boolean }> {
+    // Validate the run and exact operation together before changing either
+    // liveness or admission. In particular, a guard-only confirmation from
+    // an old page must not claim success after a newer operation took its key.
+    if (operationId !== undefined && this.submissions.inFlightFor(runnerKey(runId))?.id !== operationId) {
+      this.render();
+      return { confirmed: false, reason: "not-found", overrode: false, submission: false };
+    }
+    if (executionId === undefined && operationId === undefined) {
+      return { confirmed: false, reason: "not-found", overrode: false, submission: false };
+    }
     // No execution at all: the run is being held by a duplicate guard and
     // nothing else, so there is no liveness to end and the confirmation is
     // about that guard alone. Passing an execution id that does not exist

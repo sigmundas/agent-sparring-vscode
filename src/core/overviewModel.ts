@@ -997,7 +997,7 @@ export function buildOverviewModel(
       liveness.stop === "requested"
         ? { label: "Stop requested…", detail: `${STOP_REQUESTED_DETAIL} ${liveness.detail}`, state: "running" }
         : { label: "Working", detail: liveness.detail, state: "running" };
-  } else if (!halted && loopEligible && (liveness.turnActive || guarded)) {
+  } else if (guarded || (!halted && loopEligible && liveness.turnActive)) {
     // Recorded as active, and neither alive nor ended can be established.
     // Two ways in, and they are said differently: the person asked for this
     // to stop and the answer never came, or nothing was asked and the run

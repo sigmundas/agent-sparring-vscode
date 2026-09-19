@@ -902,7 +902,8 @@ async function confirmRunnerInactiveCommand(controller: SparringController, over
         liveness.detail,
         "",
         "Confirming records that as your statement. It releases this run's actions and lets you send any evidence you drafted again; it claims nothing about whether the engine recorded anything.",
-        "If that runner is in fact still working, starting another one would do the same engine operation twice.",
+        "A command already handed to a shell may still be queued. Only confirm after checking that the exact command cannot run later; finding no running process alone does not establish that.",
+        "If that runner is still working or its command can still start, starting another one could do the same engine operation twice.",
       ].join("\n"),
     },
     "Yes — it is no longer active",
@@ -922,7 +923,7 @@ async function confirmRunnerInactiveCommand(controller: SparringController, over
     return;
   }
   void vscode.window.showInformationMessage(
-    `Agent Sparring: recorded that you checked and the runner is no longer active.${result.submission ? " Your evidence is still here and can be sent again; whether the engine recorded it is unknown." : ""}`,
+    `Agent Sparring: recorded that you checked and the runner is no longer active. Your drafts are preserved. Nothing has been resubmitted; use the submission action in Overview to retry. Whether the engine recorded the earlier evidence is unknown.`,
   );
 }
 
@@ -1718,7 +1719,7 @@ async function explainUnconfirmed(controller: SparringController, error: string,
       : "the person confirmed, having checked the terminal, that this command cannot still run; this is an override, not an observation",
   );
   if (result.overridden) {
-    void vscode.window.showInformationMessage(`Agent Sparring: ${submission.label} may be run again. Its earlier submission was cleared by you, not by evidence.`);
+    void vscode.window.showInformationMessage(`Agent Sparring: ${submission.label} may be run again. Its earlier submission was cleared by you, not by evidence. Your drafts are preserved. Nothing has been resubmitted; use the original action in Overview to retry.`);
     return;
   }
   void vscode.window.showInformationMessage(
