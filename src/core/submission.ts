@@ -39,6 +39,8 @@
  * No dependency on the vscode API.
  */
 
+import { stageScopeKey } from "./stageScope";
+
 /** Which of the two channels was submitted; each owns its own drafts. */
 export type SubmissionChannel = "checks" | "feedback";
 
@@ -62,8 +64,15 @@ export interface SubmissionRecord {
   entry: string;
   /** How many structured check results the entry carried (0 for a feedback-only submission). */
   results: number;
-  /** The stage the evidence belongs to, for the log and for a report. */
-  stageId?: string;
+  /**
+   * The stage the evidence belongs to.
+   *
+   * Required, and half of this record's storage key: a managed plan run keeps
+   * one run id across every stage, so without it a Stage 1 failure was still
+   * the run's "latest submission" while Stage 2 was being worked on, and the
+   * panel said so. See core/stageScope.ts.
+   */
+  stageId: string;
   /** Set once the execution ended without succeeding; absent while pending. */
   failure?: SubmissionFailure;
   /**
@@ -80,7 +89,13 @@ export interface SubmissionRecord {
   unresolved?: { atMs: number; note: string };
 }
 
-/** workspaceState entry: run id → its latest submission. */
+/**
+ * workspaceState entry: stage scope key (run id + the stage the evidence was
+ * entered for) → that stage's latest submission.
+ *
+ * Scoped rather than keyed by run, because a run outlives its stages: see
+ * core/stageScope.ts.
+ */
 export type Submissions = Record<string, SubmissionRecord>;
 
 export const SUBMISSIONS_KEY = "agentSparring.submissions";
@@ -120,12 +135,12 @@ export const SUBMISSION_UNRESOLVED =
  * entry, the results count and everything else are kept exactly as they
  * were; only the statement is added.
  */
-export function withSubmissionUnresolved(submissions: Submissions | undefined, runId: string, unresolved: { atMs: number; note: string }): Submissions {
-  const record = submissionFor(submissions, runId);
+export function withSubmissionUnresolved(submissions: Submissions | undefined, key: string, unresolved: { atMs: number; note: string }): Submissions {
+  const record = submissionFor(submissions, key);
   if (!record) {
     return { ...(submissions ?? {}) };
   }
-  return { ...submissions, [runId]: { ...record, unresolved } };
+  return { ...submissions, [key]: { ...record, unresolved } };
 }
 
 /** Exit codes that mean a person or a signal stopped it, not that the engine judged anything. */
@@ -149,28 +164,66 @@ export function submissionFailureReason(exitCode: number | undefined): string {
 /** The sentence a failed submission leads with. The reassurance comes first: it is the answer to what the person is about to fear. */
 export const SUBMISSION_PRESERVED = "Submission failed — your check results and feedback were preserved.";
 
-export function submissionFor(submissions: Submissions | undefined, runId: string): SubmissionRecord | undefined {
-  const record = submissions?.[runId];
+/**
+ * The submission stored under one stage scope key, or undefined.
+ *
+ * A record that does not name the scope it was found under is rejected
+ * rather than shown: a key and a record disagreeing about which run or stage
+ * this is means the store was written by something other than
+ * {@link withSubmission}, and the one thing this must never do is attribute
+ * somebody's evidence to the wrong stage.
+ */
+export function submissionFor(submissions: Submissions | undefined, key: string): SubmissionRecord | undefined {
+  const record = submissions?.[key];
   if (!record || typeof record !== "object" || typeof record.entry !== "string" || (record.channel !== "checks" && record.channel !== "feedback")) {
+    return undefined;
+  }
+  if (typeof record.stageId !== "string" || !record.stageId || typeof record.runId !== "string" || submissionKeyOf(record) !== key) {
     return undefined;
   }
   return record;
 }
 
-export function withSubmission(submissions: Submissions | undefined, record: SubmissionRecord): Submissions {
-  return { ...(submissions ?? {}), [record.runId]: record };
+/** The stage scope key a record belongs under; the only place a submission's key is made. */
+export function submissionKeyOf(record: SubmissionRecord): string {
+  return stageScopeKey({ runId: record.runId, stageId: record.stageId });
 }
 
-export function withSubmissionFailure(submissions: Submissions | undefined, runId: string, failure: SubmissionFailure): Submissions {
-  const record = submissionFor(submissions, runId);
+export function withSubmission(submissions: Submissions | undefined, record: SubmissionRecord): Submissions {
+  return { ...(submissions ?? {}), [submissionKeyOf(record)]: record };
+}
+
+export function withSubmissionFailure(submissions: Submissions | undefined, key: string, failure: SubmissionFailure): Submissions {
+  const record = submissionFor(submissions, key);
   if (!record) {
     return { ...(submissions ?? {}) };
   }
-  return { ...submissions, [runId]: { ...record, failure } };
+  return { ...submissions, [key]: { ...record, failure } };
 }
 
-export function withoutSubmission(submissions: Submissions | undefined, runId: string): Submissions {
+export function withoutSubmission(submissions: Submissions | undefined, key: string): Submissions {
   const next: Submissions = { ...(submissions ?? {}) };
-  delete next[runId];
+  delete next[key];
   return next;
+}
+
+/**
+ * The submission handed to one exact execution, wherever it is stored.
+ *
+ * This is how a confirmation dialog finds the submission it is about. The
+ * execution id comes from the surface the person was looking at, and it is
+ * the strongest identity in the store — stronger than "the current stage's
+ * submission", which by the time a click arrives may be a different stage's
+ * entirely. The run is required as well, so a confirmation about a runner of
+ * one run can never reach another run's record even if the two windows ever
+ * produced the same execution id.
+ */
+export function submissionByExecution(submissions: Submissions | undefined, executionId: string, runId: string): { key: string; record: SubmissionRecord } | undefined {
+  for (const key of Object.keys(submissions ?? {})) {
+    const record = submissionFor(submissions, key);
+    if (record?.executionId === executionId && record.runId === runId) {
+      return { key, record };
+    }
+  }
+  return undefined;
 }

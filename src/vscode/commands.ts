@@ -41,6 +41,7 @@ import {
   type StageSnapshot,
   type StandaloneStageSnapshot,
 } from "../core/discovery";
+import { stageScopeOf } from "../core/stageScope";
 import { FOLLOW_ACTIVE_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
 import { parseHandoffBranch, parsePlanStages, type PlanRunSource } from "../core/engineFormats";
@@ -288,16 +289,16 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
       if (!run) {
         return undefined;
       }
-      await controller.setHumanCheck(run.id, key, { outcome, note });
-      return controller.humanChecks(run.id)[key];
+      await controller.setHumanCheck(stageScopeOf(run), key, { outcome, note });
+      return controller.humanChecks(stageScopeOf(run))[key];
     }),
     vscode.commands.registerCommand("agentSparring._test.recordHumanFeedback", async (text: string) => {
       const run = controller.currentSelection.selected;
       if (!run) {
         return undefined;
       }
-      await controller.setHumanFeedback(run.id, text);
-      return controller.humanFeedback(run.id);
+      await controller.setHumanFeedback(stageScopeOf(run), text);
+      return controller.humanFeedback(stageScopeOf(run));
     }),
     vscode.commands.registerCommand("agentSparring._test.manifestDirectory", () => controller.manifestDirectoryPath),
     vscode.commands.registerCommand("agentSparring._test.lastEngineFailure", () => lastEngineFailure),
@@ -629,7 +630,7 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       if (run) {
         // Only the report goes. The drafts it was reporting about are the
         // user's work and are never touched from here.
-        await controller.dismissSubmission(run.id);
+        await controller.dismissSubmission(stageScopeOf(run));
         await overview.update();
       }
       return;

@@ -10,6 +10,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, type PlanRunSnapshot, type RunSnapshot } from "../../core/discovery";
+import { stageScopeOf } from "../../core/stageScope";
 import { parseStageState, type StageStatus } from "../../core/engineFormats";
 import { planRunDisplayName } from "../../core/planMembership";
 import {
@@ -159,7 +160,7 @@ export class OverviewPanelManager implements vscode.Disposable {
     // keystroke has no outcome. The absent half stays `undefined`, which
     // withHumanCheck reads as "not part of this change" — it must never be
     // filled in with a value, or one control would overwrite the other's.
-    await this.controller.setHumanCheck(run.id, message.key, { outcome: message.outcome, note: message.note }, !noteOnly);
+    await this.controller.setHumanCheck(stageScopeOf(run), message.key, { outcome: message.outcome, note: message.note }, !noteOnly);
     if (noteOnly) {
       this.lastHtmlKey = JSON.stringify(await this.buildModel());
     }
@@ -180,7 +181,7 @@ export class OverviewPanelManager implements vscode.Disposable {
     if (!run) {
       return;
     }
-    await this.controller.setHumanFeedback(run.id, message.text);
+    await this.controller.setHumanFeedback(stageScopeOf(run), message.text);
     this.lastHtmlKey = JSON.stringify(await this.buildModel());
   }
 
@@ -349,6 +350,7 @@ export class OverviewPanelManager implements vscode.Disposable {
       const run = selection.selected;
       repository = run.location.folderName;
       const stage = currentStageOf(run);
+      const scope = stageScopeOf(run);
       const association = run.kind === "stage" ? this.controller.planAssociation(run.id) : undefined;
       const guard = this.controller.guardFor(run.id);
       const [handoffText, sparring, briefText, notesText, planText, associatedText] = await Promise.all([
@@ -371,9 +373,12 @@ export class OverviewPanelManager implements vscode.Disposable {
         git: await gitContext(run.location.repoRoot),
         associatedPlan: association ? { path: association.path, exists: associatedText !== undefined, text: associatedText, manualMatch: association.match } : undefined,
         accepting: this.controller.isAccepting(run.id),
-        humanChecks: this.controller.humanChecks(run.id),
-        humanFeedback: this.controller.humanFeedback(run.id),
-        submission: this.controller.submissionFor(run.id),
+        // Everything a person entered, and the record of what was sent, read
+        // under the run *and* the stage it is current at — never the run
+        // alone, which a managed plan keeps across every stage of its life.
+        humanChecks: this.controller.humanChecks(scope),
+        humanFeedback: this.controller.humanFeedback(scope),
+        submission: this.controller.submissionFor(scope),
         notesText,
         capturedPrompts: await this.capturedPrompts(stage.dir),
         continuation: planContinuation(),

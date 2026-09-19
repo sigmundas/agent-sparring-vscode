@@ -114,7 +114,7 @@ describe("clicking Pass on a structured gate", () => {
 
     const before = view(drafts);
     assert.equal(before.model.actionRequired?.required[0].key, CHECK_ID, "the reviewer's stable id is the draft key");
-    assert.equal(before.model.actionRequired?.progress, "0 / 1 verified");
+    assert.equal(before.model.actionRequired?.progress, "0 / 1 verified · 1 remaining");
     assert.equal(before.model.actionRequired?.submit.enabled, false);
 
     // 1. the button the renderer emitted, clicked through the shipped script
@@ -196,7 +196,7 @@ describe("clicking Pass on a structured gate", () => {
     const panel = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "overview", "overviewPanel.ts"), "utf8");
     const handler = /private async recordHumanCheck[\s\S]*?\n {2}}\n/.exec(panel)?.[0] ?? "";
     assert.ok(handler, "recordHumanCheck exists");
-    assert.match(handler, /this\.controller\.setHumanCheck\(run\.id, message\.key/);
+    assert.match(handler, /this\.controller\.setHumanCheck\(stageScopeOf\(run\), message\.key/);
     assert.ok(!/launch|buildRun|Terminal|submitForReview/.test(handler), "no engine invocation on a draft");
   });
 });
@@ -265,7 +265,7 @@ describe("a note and an outcome are recorded independently", () => {
       ],
       "check 1 still says Can't test, with its note; check 2 says Pass",
     );
-    assert.equal(panel.progress, "1 / 2 verified · 1 blocked");
+    assert.equal(panel.progress, "1 / 2 verified · 1 couldn't test");
     assert.equal(panel.submit.enabled, true, "both checks have a result, so the evidence can go back");
     assert.match(after.html, new RegExp(`class="choice blocked on" data-check="${CHECK_ID}" data-outcome="blocked" aria-pressed="true"`), "and the selection is still visible");
     assert.match(after.html, />No pre-activation device available this week\.<\/textarea>/);

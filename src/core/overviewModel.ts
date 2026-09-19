@@ -28,6 +28,7 @@ import type { DeclaredRepository } from "./stageRepositories";
 import { deriveVerification, HUMAN_FEEDBACK_HEADING, parseHumanEvidence, parseHumanFeedback, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
 import { checkNameList } from "./humanTask";
 import { SUBMISSION_PRESERVED, SUBMISSION_UNRESOLVED, type SubmissionRecord } from "./submission";
+import { sameStageScope, stageScopeOf } from "./stageScope";
 import { formatTime } from "./logFormat";
 import { deriveLiveness, type ExecutionRecord, type LivenessState, type RunnerLiveness } from "./liveness";
 import { proposeNextStage, type NextStageProposal } from "./nextStage";
@@ -1314,7 +1315,14 @@ function actionRequired(
   // reviewer to rule on the same thing twice — and when it comes back without
   // having recorded anything, the panel says so above the reviewer's own
   // checks, with every drafted result still where the user left it.
-  const submission = artifacts.submission?.runId === run.id ? artifacts.submission : undefined;
+  // Belongs to this run *and* to the stage it is current at. A managed plan
+  // run keeps one id from its first stage to its last, so a run check alone
+  // let Stage 1's "Submission failed" sit on top of a healthy Stage 2 —
+  // including one that arrived late, after the run had already advanced.
+  // Both identities are the engine's own; nothing here compares titles,
+  // positions or panel instances. See core/stageScope.ts.
+  const submissionScope = stageScopeOf(run);
+  const submission = sameStageScope(artifacts.submission && { runId: artifacts.submission.runId, stageId: artifacts.submission.stageId }, submissionScope) ? artifacts.submission : undefined;
   // A submission a person has settled as unresolved is not in flight: the
   // engine is not holding it, nobody knows what it did, and the whole point
   // of that statement is that the evidence may be sent again.

@@ -55,6 +55,7 @@ import {
   SUBMISSIONS_KEY,
   submissionFailureReason,
   withSubmissionUnresolved,
+  submissionByExecution,
   submissionFor,
   submissionState,
   withSubmission,
@@ -84,6 +85,7 @@ import {
   type StageMode,
   type StageModes,
 } from "../core/stageModes";
+import { migrateToStageScope, stageScopeKey, type StageScope } from "../core/stageScope";
 import { deriveStatus } from "../core/status";
 import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
 import { TerminalPool } from "./terminalPool";
@@ -421,6 +423,7 @@ export class SparringController implements vscode.Disposable {
     await this.relocate();
     this.discovery = await discoverRuns(this.locations);
     await this.migrateDeclarationScopes();
+    await this.migrateStageScopedState();
     const sticky = this.attachedRunId ?? this.context.workspaceState.get<string>(STICKY_RUN_KEY);
     // Ownership first: whether a plan run has taken over from a pinned stage
     // is a question about recorded membership, and answering it any other way
@@ -802,6 +805,47 @@ export class SparringController implements vscode.Disposable {
     }
   }
 
+  /**
+   * Move drafts and submission records written before this window scoped
+   * them to a stage.
+   *
+   * They were keyed by the run id alone, which a managed plan run keeps for
+   * its whole life — the reason a Stage 1 failure banner outlived Stage 1.
+   * A submission record says which stage it was for, so it moves to that
+   * one; a draft does not, so it moves to the stage its run is current at,
+   * which is where the person who typed it was. An entry whose run this
+   * window cannot see is left untouched rather than guessed at: it is
+   * somebody's work.
+   */
+  private async migrateStageScopedState(): Promise<void> {
+    const currentStageFor = (runId: string): string | undefined => {
+      const run = this.discovery.runs.find((candidate) => candidate.id === runId);
+      return run ? currentStageOf(run).stageId : undefined;
+    };
+    const moves: { key: string; migration: { next: Record<string, unknown>; moved: { runId: string; stageId: string }[] } | undefined }[] = [
+      { key: HUMAN_CHECKS_KEY, migration: migrateToStageScope(this.context.workspaceState.get<HumanCheckDrafts>(HUMAN_CHECKS_KEY), currentStageFor) },
+      { key: HUMAN_FEEDBACK_KEY, migration: migrateToStageScope(this.context.workspaceState.get<HumanFeedbackDrafts>(HUMAN_FEEDBACK_KEY), currentStageFor) },
+      {
+        key: SUBMISSIONS_KEY,
+        migration: migrateToStageScope(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), currentStageFor, (record) => (typeof record?.stageId === "string" && record.stageId ? record.stageId : undefined)),
+      },
+    ];
+    let moved = false;
+    for (const { key, migration } of moves) {
+      if (!migration) {
+        continue;
+      }
+      await this.context.workspaceState.update(key, migration.next);
+      for (const entry of migration.moved) {
+        this.log(`${key} kept for ${entry.runId.split("|").pop() ?? entry.runId} was recorded before this window told stages apart; it now belongs to stage ${entry.stageId}, where it was entered.`);
+      }
+      moved = true;
+    }
+    if (moved) {
+      this.render();
+    }
+  }
+
   /** Store what could be attributed, and say once what could not. */
   private async applyMigration<V>(what: string, key: string, migration: DeclarationMigration<V>): Promise<boolean> {
     for (const entry of migration.ambiguous) {
@@ -830,22 +874,30 @@ export class SparringController implements vscode.Disposable {
 
   // ---------------------------------------------------------------- manual check drafts (UI state until submitted)
 
-  /** Outcomes / notes the user recorded for the plan's manual checks of a run; drafts in workspace state until Submit evidence writes them to notes.md. */
-  humanChecks(runId: string | undefined): Record<string, CheckRecord> {
-    return runId === undefined ? {} : humanChecksFor(this.context.workspaceState.get<HumanCheckDrafts>(HUMAN_CHECKS_KEY), runId);
+  /**
+   * Outcomes / notes the user recorded for the manual checks of one stage of
+   * a run; drafts in workspace state until Submit evidence writes them to
+   * notes.md.
+   *
+   * Keyed by run *and* stage, so the results entered for Stage 1 are not
+   * offered back as Stage 2's answers when the run advances. See
+   * core/stageScope.ts.
+   */
+  humanChecks(scope: StageScope | undefined): Record<string, CheckRecord> {
+    return scope === undefined ? {} : humanChecksFor(this.context.workspaceState.get<HumanCheckDrafts>(HUMAN_CHECKS_KEY), stageScopeKey(scope));
   }
 
   /** Merge one check's outcome and/or note. `notify` false keeps the Overview from re-rendering (a note being typed). */
-  async setHumanCheck(runId: string, key: string, change: CheckRecord, notify = true): Promise<void> {
-    const next = withHumanCheck(this.context.workspaceState.get<HumanCheckDrafts>(HUMAN_CHECKS_KEY), runId, key, change);
+  async setHumanCheck(scope: StageScope, key: string, change: CheckRecord, notify = true): Promise<void> {
+    const next = withHumanCheck(this.context.workspaceState.get<HumanCheckDrafts>(HUMAN_CHECKS_KEY), stageScopeKey(scope), key, change);
     await this.context.workspaceState.update(HUMAN_CHECKS_KEY, next);
     if (notify) {
       this.render();
     }
   }
 
-  async clearHumanChecks(runId: string): Promise<void> {
-    await this.context.workspaceState.update(HUMAN_CHECKS_KEY, withoutHumanChecks(this.context.workspaceState.get<HumanCheckDrafts>(HUMAN_CHECKS_KEY), runId));
+  async clearHumanChecks(scopeKey: string): Promise<void> {
+    await this.context.workspaceState.update(HUMAN_CHECKS_KEY, withoutHumanChecks(this.context.workspaceState.get<HumanCheckDrafts>(HUMAN_CHECKS_KEY), scopeKey));
     this.render();
   }
 
@@ -857,22 +909,22 @@ export class SparringController implements vscode.Disposable {
    * someone just wrote out — but stored apart from them, because it is not a
    * result for any check and nothing may ever read it as one.
    */
-  humanFeedback(runId: string | undefined): string | undefined {
-    return runId === undefined ? undefined : humanFeedbackFor(this.context.workspaceState.get<HumanFeedbackDrafts>(HUMAN_FEEDBACK_KEY), runId);
+  humanFeedback(scope: StageScope | undefined): string | undefined {
+    return scope === undefined ? undefined : humanFeedbackFor(this.context.workspaceState.get<HumanFeedbackDrafts>(HUMAN_FEEDBACK_KEY), stageScopeKey(scope));
   }
 
   /** Replace the draft with what the field now holds. `notify` false keeps the Overview from re-rendering mid-keystroke. */
-  async setHumanFeedback(runId: string, text: string, notify = false): Promise<void> {
-    const next = withHumanFeedback(this.context.workspaceState.get<HumanFeedbackDrafts>(HUMAN_FEEDBACK_KEY), runId, text);
+  async setHumanFeedback(scope: StageScope, text: string, notify = false): Promise<void> {
+    const next = withHumanFeedback(this.context.workspaceState.get<HumanFeedbackDrafts>(HUMAN_FEEDBACK_KEY), stageScopeKey(scope), text);
     await this.context.workspaceState.update(HUMAN_FEEDBACK_KEY, next);
     if (notify) {
       this.render();
     }
   }
 
-  /** Only a submission the engine actually recorded clears it; see {@link resolveSubmission}. */
-  async clearHumanFeedback(runId: string): Promise<void> {
-    await this.context.workspaceState.update(HUMAN_FEEDBACK_KEY, withoutHumanFeedback(this.context.workspaceState.get<HumanFeedbackDrafts>(HUMAN_FEEDBACK_KEY), runId));
+  /** Only a submission the engine actually recorded clears it; see {@link resolveSubmissions}. */
+  async clearHumanFeedback(scopeKey: string): Promise<void> {
+    await this.context.workspaceState.update(HUMAN_FEEDBACK_KEY, withoutHumanFeedback(this.context.workspaceState.get<HumanFeedbackDrafts>(HUMAN_FEEDBACK_KEY), scopeKey));
     this.render();
   }
 
@@ -905,9 +957,14 @@ export class SparringController implements vscode.Disposable {
 
   // ---------------------------------------------------------------- submissions (drafts survive until the engine records them)
 
-  /** The submission in flight or last failed for a run; undefined once the engine has recorded one. */
-  submissionFor(runId: string | undefined): SubmissionRecord | undefined {
-    return runId === undefined ? undefined : submissionFor(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), runId);
+  /**
+   * The submission in flight or last failed for one stage of a run;
+   * undefined once the engine has recorded one — and undefined for a stage
+   * that never had one, which is what keeps a previous stage's failure off
+   * the current stage's panel.
+   */
+  submissionFor(scope: StageScope | undefined): SubmissionRecord | undefined {
+    return scope === undefined ? undefined : submissionFor(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), stageScopeKey(scope));
   }
 
   /**
@@ -931,8 +988,8 @@ export class SparringController implements vscode.Disposable {
    */
   async resolveSubmissions(): Promise<void> {
     const submissions = this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY);
-    for (const runId of Object.keys(submissions ?? {})) {
-      const record = submissionFor(submissions, runId);
+    for (const key of Object.keys(submissions ?? {})) {
+      const record = submissionFor(submissions, key);
       if (!record || record.failure || record.unresolved) {
         continue; // already reported; the drafts are kept and the panel says so
       }
@@ -941,26 +998,31 @@ export class SparringController implements vscode.Disposable {
       if (state === "pending") {
         continue;
       }
+      // Everything below acts on `key` — the scope the evidence was entered
+      // under — and never on whatever stage happens to be current now. A
+      // Stage 1 execution that ends after the run has moved to Stage 2
+      // therefore clears Stage 1's drafts, or reports Stage 1's failure
+      // under Stage 1, and touches nothing a person is working on.
       if (state === "recorded") {
-        await this.context.workspaceState.update(SUBMISSIONS_KEY, withoutSubmission(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), runId));
+        await this.context.workspaceState.update(SUBMISSIONS_KEY, withoutSubmission(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), key));
         if (record.channel === "checks") {
-          await this.clearHumanChecks(runId);
+          await this.clearHumanChecks(key);
         } else {
-          await this.clearHumanFeedback(runId);
+          await this.clearHumanFeedback(key);
         }
-        this.log(`Submission: the engine exited 0 for ${record.stageId ?? runId}; the evidence is recorded and the drafts are cleared`);
+        this.log(`Submission: the engine exited 0 for ${record.stageId}; the evidence is recorded and the drafts are cleared`);
         continue;
       }
       const failure = { atMs: Date.now(), exitCode: execution?.exitCode, output: await this.tracker.outputOf(record.executionId), reason: submissionFailureReason(execution?.exitCode) };
-      await this.context.workspaceState.update(SUBMISSIONS_KEY, withSubmissionFailure(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), runId, failure));
-      this.log(`Submission: ${failure.reason} Every drafted result and note for ${record.stageId ?? runId} is kept exactly as it was.`);
+      await this.context.workspaceState.update(SUBMISSIONS_KEY, withSubmissionFailure(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), key, failure));
+      this.log(`Submission: ${failure.reason} Every drafted result and note for ${record.stageId} is kept exactly as it was.`);
       this.render();
     }
   }
 
   /** Dismiss a failed submission's report. The drafts are untouched: they are the user's, not the report's. */
-  async dismissSubmission(runId: string): Promise<void> {
-    await this.context.workspaceState.update(SUBMISSIONS_KEY, withoutSubmission(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), runId));
+  async dismissSubmission(scope: StageScope): Promise<void> {
+    await this.context.workspaceState.update(SUBMISSIONS_KEY, withoutSubmission(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), stageScopeKey(scope)));
     this.render();
   }
 
@@ -1091,12 +1153,17 @@ export class SparringController implements vscode.Disposable {
       return { ...ended, overrode: false, submission: false };
     }
     const overrode = released.overrode;
-    const record = this.submissionFor(runId);
+    // Found by the execution the panel was rendered from, never by "this
+    // run's current submission": by the time a person clicks, the run may
+    // have advanced and that lookup would answer with another stage's
+    // evidence entirely.
+    const found = executionId === undefined ? undefined : submissionByExecution(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), executionId, runId);
+    const record = found?.record;
     let submission = false;
-    if (executionId !== undefined && record && record.executionId === executionId && !record.failure && !record.unresolved) {
+    if (found && record && !record.failure && !record.unresolved) {
       await this.context.workspaceState.update(
         SUBMISSIONS_KEY,
-        withSubmissionUnresolved(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), runId, {
+        withSubmissionUnresolved(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), found.key, {
           atMs: Date.now(),
           note: "You confirmed that the runner this evidence was handed to is no longer active. Whether the engine recorded it is unknown, so nothing is claimed either way.",
         }),

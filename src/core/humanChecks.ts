@@ -346,10 +346,28 @@ export function matchReviewerRequest(checks: { text: string }[], request: string
 
 // ---------------------------------------------------------------- recorded outcomes (drafts)
 
+/**
+ * The three things a person can say about a requested check, and the three
+ * only.
+ *
+ *  - `pass` — they performed the check and it met its criteria;
+ *  - `fail` — they performed the check and it did not;
+ *  - `blocked` — they could not perform it, so there is **no result**.
+ *
+ * `blocked` is the engine's own value, written into notes.md as `Blocked`
+ * and parsed back by {@link parseHumanEvidence}, so it is what goes on the
+ * wire and nothing here translates it. What it *means* is the third case
+ * above, and this UI says so: "Can't test" on the button, "couldn't test" in
+ * the summary. It is neither a pass nor a failure, and counting it as either
+ * would tell the reviewer — and the person reading the panel — something
+ * nobody established. A check with no recorded outcome at all is a fourth,
+ * separate thing: still outstanding, and counted as remaining.
+ */
 export type CheckOutcome = "pass" | "fail" | "blocked";
 
 export const CHECK_OUTCOMES: readonly CheckOutcome[] = ["pass", "fail", "blocked"];
 
+/** The words written into notes.md. The engine's vocabulary, not the panel's. */
 export const OUTCOME_WORDS: Record<CheckOutcome, string> = { pass: "Pass", fail: "Fail", blocked: "Blocked" };
 
 export interface CheckRecord {
@@ -358,13 +376,20 @@ export interface CheckRecord {
   note?: string;
 }
 
-/** workspaceState entry: run id → check key → record. Drafts until submitted. */
+/**
+ * workspaceState entry: stage scope key → check key → record. Drafts until
+ * submitted.
+ *
+ * Scoped to the *stage* the results were entered for, not just the run: a
+ * managed plan run keeps one id across all its stages, so run-keyed drafts
+ * reappeared under the next stage's checks. See core/stageScope.ts.
+ */
 export type HumanCheckDrafts = Record<string, Record<string, CheckRecord>>;
 
 export const HUMAN_CHECKS_KEY = "agentSparring.humanChecks";
 
-export function humanChecksFor(drafts: HumanCheckDrafts | undefined, runId: string): Record<string, CheckRecord> {
-  const value = drafts?.[runId];
+export function humanChecksFor(drafts: HumanCheckDrafts | undefined, scope: string): Record<string, CheckRecord> {
+  const value = drafts?.[scope];
   if (!value || typeof value !== "object") {
     return {};
   }
@@ -399,9 +424,9 @@ export function humanChecksFor(drafts: HumanCheckDrafts | undefined, runId: stri
  * emptying the textarea sends), and an outcome is replaced by recording
  * another; nothing here clears a field by omission.
  */
-export function withHumanCheck(drafts: HumanCheckDrafts | undefined, runId: string, key: string, change: CheckRecord): HumanCheckDrafts {
+export function withHumanCheck(drafts: HumanCheckDrafts | undefined, scope: string, key: string, change: CheckRecord): HumanCheckDrafts {
   const next: HumanCheckDrafts = { ...(drafts ?? {}) };
-  const forRun = { ...humanChecksFor(drafts, runId) };
+  const forRun = { ...humanChecksFor(drafts, scope) };
   const merged: CheckRecord = { ...forRun[key] };
   if (change.outcome !== undefined) {
     merged.outcome = change.outcome;
@@ -418,16 +443,16 @@ export function withHumanCheck(drafts: HumanCheckDrafts | undefined, runId: stri
     delete forRun[key];
   }
   if (Object.keys(forRun).length > 0) {
-    next[runId] = forRun;
+    next[scope] = forRun;
   } else {
-    delete next[runId];
+    delete next[scope];
   }
   return next;
 }
 
-export function withoutHumanChecks(drafts: HumanCheckDrafts | undefined, runId: string): HumanCheckDrafts {
+export function withoutHumanChecks(drafts: HumanCheckDrafts | undefined, scope: string): HumanCheckDrafts {
   const next: HumanCheckDrafts = { ...(drafts ?? {}) };
-  delete next[runId];
+  delete next[scope];
   return next;
 }
 
@@ -452,7 +477,8 @@ export function withoutHumanChecks(drafts: HumanCheckDrafts | undefined, runId: 
  * revised checks, or (only if its own acceptance rules already allow it)
  * READY. It is not an instruction to the implementing agent.
  *
- * One draft per run, because it is one text box; it lives in workspace state
+ * One draft per stage of a run, because it is one text box and it belongs to
+ * the stage it was written about; it lives in workspace state
  * beside the check drafts so it survives a rerender, a details disclosure and
  * a window reload, and it is cleared only by a submission that actually
  * launched.
@@ -461,26 +487,26 @@ export type HumanFeedbackDrafts = Record<string, string>;
 
 export const HUMAN_FEEDBACK_KEY = "agentSparring.humanFeedback";
 
-/** The unsubmitted feedback for a run; undefined when there is none (whitespace is none). */
-export function humanFeedbackFor(drafts: HumanFeedbackDrafts | undefined, runId: string): string | undefined {
-  const value = drafts?.[runId];
+/** The unsubmitted feedback for one stage scope; undefined when there is none (whitespace is none). */
+export function humanFeedbackFor(drafts: HumanFeedbackDrafts | undefined, scope: string): string | undefined {
+  const value = drafts?.[scope];
   return typeof value === "string" && value.trim() ? value : undefined;
 }
 
 /** Store the text as typed (trailing spaces and blank lines included); empty text removes the draft. */
-export function withHumanFeedback(drafts: HumanFeedbackDrafts | undefined, runId: string, text: string): HumanFeedbackDrafts {
+export function withHumanFeedback(drafts: HumanFeedbackDrafts | undefined, scope: string, text: string): HumanFeedbackDrafts {
   const next: HumanFeedbackDrafts = { ...(drafts ?? {}) };
   if (text.trim()) {
-    next[runId] = text;
+    next[scope] = text;
   } else {
-    delete next[runId];
+    delete next[scope];
   }
   return next;
 }
 
-export function withoutHumanFeedback(drafts: HumanFeedbackDrafts | undefined, runId: string): HumanFeedbackDrafts {
+export function withoutHumanFeedback(drafts: HumanFeedbackDrafts | undefined, scope: string): HumanFeedbackDrafts {
   const next: HumanFeedbackDrafts = { ...(drafts ?? {}) };
-  delete next[runId];
+  delete next[scope];
   return next;
 }
 
@@ -832,18 +858,45 @@ function derivedItems(plan: PlanChecks, outcome: SparringOutcome | undefined): C
   return items;
 }
 
-/** `2 / 3 verified`: recorded evidence that is not a Fail/Blocked line, plus Pass drafts, over all checks; failed / blocked counts when any. */
+/**
+ * The one-line tally beside the checks heading: `2 / 5 verified · 1 failed ·
+ * 1 couldn't test · 1 remaining`.
+ *
+ * Every outcome is counted as itself. An earlier version reported the
+ * engine's word for the third one, and five checks a person could not run
+ * came out as "0 / 5 verified · 5 blocked" — which reads as five things
+ * standing in the way of the stage, when what actually happened is that no
+ * verification result could be obtained for any of them. A check nobody has
+ * answered yet is counted separately again, as `remaining`: unanswered and
+ * "couldn't test" are different statements and must not share a bucket.
+ *
+ * The verified count keeps its `n / total` shape, because that is the one
+ * number a person is tracking towards; the rest are omitted when zero, so a
+ * clean run says `5 / 5 verified` and nothing else.
+ */
 export function progressText(items: { record?: CheckRecord; evidence?: RecordedEvidence }[]): string | undefined {
   if (items.length === 0) {
     return undefined;
   }
   const outcomeOf = (item: { record?: CheckRecord; evidence?: RecordedEvidence }): CheckOutcome | undefined => (item.evidence ? (item.evidence.outcome ?? "pass") : item.record?.outcome);
-  const passed = items.filter((item) => outcomeOf(item) === "pass").length;
-  const failed = items.filter((item) => outcomeOf(item) === "fail").length;
-  const blocked = items.filter((item) => outcomeOf(item) === "blocked").length;
-  const extra = [failed ? `${failed} failed` : "", blocked ? `${blocked} blocked` : ""].filter(Boolean).join(" · ");
-  return `${passed} / ${items.length} verified${extra ? ` · ${extra}` : ""}`;
+  const outcomes = items.map(outcomeOf);
+  const count = (wanted: CheckOutcome | undefined): number => outcomes.filter((outcome) => outcome === wanted).length;
+  const extra = [
+    count("fail") ? `${count("fail")} failed` : "",
+    count("blocked") ? `${count("blocked")} ${PROGRESS_UNTESTED_WORD}` : "",
+    count(undefined) ? `${count(undefined)} remaining` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return `${count("pass")} / ${items.length} verified${extra ? ` · ${extra}` : ""}`;
 }
+
+/**
+ * How the summary names a check nobody could perform. One word list, so the
+ * button ("Can't test"), the recorded label and this tally cannot drift
+ * apart — and so a test can assert that "blocked" is not among them.
+ */
+export const PROGRESS_UNTESTED_WORD = "couldn't test";
 
 // ---------------------------------------------------------------- evidence rendering
 

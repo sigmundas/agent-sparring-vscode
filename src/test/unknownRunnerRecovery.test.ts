@@ -39,6 +39,7 @@ import {
   type SubmissionRecord,
   type Submissions,
 } from "../core/submission";
+import { stageScopeKey } from "../core/stageScope";
 import { Workspace } from "./fixtures";
 import { FakeTerminal, install, reset, until } from "./vscodeStub";
 
@@ -204,12 +205,13 @@ async function gate() {
   await ws.writeStage(STAGE, { status: "working", implementation_session_id: "impl", sparring_session_id: "spar" }, { "sparring.md": sparringReport() });
   const selection = selectRun((await discoverRuns([ws.location])).runs);
   const runId = selection.selected!.id;
+  const scope = stageScopeKey({ runId, stageId: STAGE });
   let drafts = {};
   for (const check of CHECKS) {
-    drafts = withHumanCheck(drafts, runId, check.id, { outcome: "pass" });
-    drafts = withHumanCheck(drafts, runId, check.id, { note: NOTES[check.id] });
+    drafts = withHumanCheck(drafts, scope, check.id, { outcome: "pass" });
+    drafts = withHumanCheck(drafts, scope, check.id, { note: NOTES[check.id] });
   }
-  const entered = { checks: humanChecksFor(drafts, runId) as Record<string, CheckRecord>, feedback: humanFeedbackFor(withHumanFeedback({}, runId, FEEDBACK), runId) as string };
+  const entered = { checks: humanChecksFor(drafts, scope) as Record<string, CheckRecord>, feedback: humanFeedbackFor(withHumanFeedback({}, scope, FEEDBACK), scope) as string };
 
   /** Exactly what the panel does on every update, from persisted state only. */
   const view = (state: { submissions?: Submissions; execution?: ExecutionRecord }): { model: OverviewModel; html: string } => {
@@ -220,12 +222,12 @@ async function gate() {
       plan: false,
       humanChecks: entered.checks,
       humanFeedback: entered.feedback,
-      submission: submissionFor(state.submissions, runId),
+      submission: submissionFor(state.submissions, scope),
     };
     const model = buildOverviewModel(selection, undefined, artifacts, NOW, state.execution);
     return { model, html: renderOverviewHtml(model, "n", "c") };
   };
-  return { runId, view, entered };
+  return { runId, scope, view, entered };
 }
 
 /** The runner this evidence was handed to, whose fate nothing could establish. */
@@ -241,7 +243,7 @@ const unknownRunner = (runId: string): ExecutionRecord => ({
 
 describe("a submission stranded behind an unknown runner can be recovered by the person", () => {
   it("10. the drafts survive, the confirmation makes it retryable, and no success or failure is invented", async () => {
-    const { runId, view } = await gate();
+    const { runId, scope, view } = await gate();
     const submitted: SubmissionRecord = {
       runId,
       channel: "checks",
@@ -277,8 +279,8 @@ describe("a submission stranded behind an unknown runner can be recovered by the
     // The person checks, and says so. That is an assertion about the runner,
     // and it is all it is: the submission becomes unresolved, not recorded
     // and not failed.
-    submissions = withSubmissionUnresolved(submissions, runId, { atMs: NOW, note: "You confirmed that the runner this evidence was handed to is no longer active. Whether the engine recorded it is unknown, so nothing is claimed either way." });
-    const confirmed = submissionFor(submissions, runId);
+    submissions = withSubmissionUnresolved(submissions, scope, { atMs: NOW, note: "You confirmed that the runner this evidence was handed to is no longer active. Whether the engine recorded it is unknown, so nothing is claimed either way." });
+    const confirmed = submissionFor(submissions, scope);
     assert.ok(confirmed?.unresolved, "the statement is recorded on the submission");
     assert.equal(confirmed.entry, submitted.entry, "with what was submitted kept verbatim");
     assert.equal(confirmed.failure, undefined, "it was not marked failed to make the buttons work");
