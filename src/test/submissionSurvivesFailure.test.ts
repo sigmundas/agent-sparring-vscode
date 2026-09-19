@@ -48,6 +48,7 @@ import {
   SUBMISSION_PRESERVED,
   submissionFailureReason,
   submissionFor,
+  submissionKeyOf,
   submissionState,
   withSubmission,
   withSubmissionFailure,
@@ -55,6 +56,7 @@ import {
   type SubmissionRecord,
   type Submissions,
 } from "../core/submission";
+import { stageScopeKey } from "../core/stageScope";
 import { Workspace } from "./fixtures";
 
 const NOW = Date.parse("2026-09-15T11:13:00.000Z");
@@ -105,14 +107,14 @@ const MANIFEST: ManifestStageView[] = [
 ];
 
 /** The five drafted results with their notes, and the freeform draft, in the shape workspace state holds them. */
-function enteredByHand(runId: string): { checks: Record<string, CheckRecord>; feedback: string } {
+function enteredByHand(scope: string): { checks: Record<string, CheckRecord>; feedback: string } {
   let drafts = {};
   for (const check of CHECKS) {
     // Recorded the way a person records them: the result, then the note.
-    drafts = withHumanCheck(drafts, runId, check.id, { outcome: "pass" });
-    drafts = withHumanCheck(drafts, runId, check.id, { note: NOTES[check.id] });
+    drafts = withHumanCheck(drafts, scope, check.id, { outcome: "pass" });
+    drafts = withHumanCheck(drafts, scope, check.id, { note: NOTES[check.id] });
   }
-  return { checks: humanChecksFor(drafts, runId), feedback: humanFeedbackFor(withHumanFeedback({}, runId, FEEDBACK), runId) as string };
+  return { checks: humanChecksFor(drafts, scope), feedback: humanFeedbackFor(withHumanFeedback({}, scope, FEEDBACK), scope) as string };
 }
 
 async function stage4() {
@@ -125,6 +127,7 @@ async function stage4() {
   await ws.writeStage(STAGE_4, { status: "working", implementation_session_id: "impl", sparring_session_id: "spar" }, { "sparring.md": sparring() });
   const selection = selectRun((await discoverRuns([ws.location])).runs);
   const runId = selection.selected!.id;
+  const scope = stageScopeKey({ runId, stageId: STAGE_4 });
 
   /** Exactly what the panel does on every update, from persisted state only. */
   const view = (state: { checks?: Record<string, CheckRecord>; feedback?: string; submissions?: Submissions; notes?: string }): { model: OverviewModel; html: string } => {
@@ -137,20 +140,20 @@ async function stage4() {
       git: { branch: "feature/reported-statistics-contract" },
       humanChecks: state.checks ?? {},
       humanFeedback: state.feedback,
-      submission: submissionFor(state.submissions, runId),
+      submission: submissionFor(state.submissions, scope),
       notesText: state.notes,
       manifestStages: MANIFEST,
     };
     const model = buildOverviewModel(selection, undefined, artifacts, NOW);
     return { model, html: renderOverviewHtml(model, "n", "c") };
   };
-  return { runId, view };
+  return { runId, scope, view };
 }
 
 describe("a submission the engine refused keeps everything that was entered", () => {
   it("five Pass results with notes and freeform feedback survive exit 1, byte for byte, and rerender after a reload", async () => {
-    const { runId, view } = await stage4();
-    const entered = enteredByHand(runId);
+    const { runId, scope, view } = await stage4();
+    const entered = enteredByHand(scope);
 
     // Before submitting: five results, five notes, the feedback, Submit ready.
     const before = view({ checks: entered.checks, feedback: entered.feedback });
@@ -170,7 +173,7 @@ describe("a submission the engine refused keeps everything that was entered", ()
 
     // The engine exits 1 with the plan-digest refusal.
     assert.equal(submissionState({ state: "ended", exitCode: 1 }), "failed");
-    submissions = withSubmissionFailure(submissions, runId, { atMs: NOW + 1815, exitCode: 1, output: PLAN_CHANGED_ERROR, reason: submissionFailureReason(1) });
+    submissions = withSubmissionFailure(submissions, scope, { atMs: NOW + 1815, exitCode: 1, output: PLAN_CHANGED_ERROR, reason: submissionFailureReason(1) });
 
     const after = view({ checks: entered.checks, feedback: entered.feedback, submissions });
     const panel = after.model.actionRequired!;
@@ -209,11 +212,11 @@ describe("a submission the engine refused keeps everything that was entered", ()
   it("a long plan run that recorded the evidence and failed later is not reported as a lost submission", async () => {
     // resume-plan --evidence records the evidence first, then continues the
     // plan; a stage failing an hour later says nothing about this submission.
-    const { runId, view } = await stage4();
-    const entered = enteredByHand(runId);
+    const { runId, scope, view } = await stage4();
+    const entered = enteredByHand(scope);
     const entry = "2026-09-15 — manual verification recorded in VS Code:\n\n- Pass — Inspect both editors · check `ui-wording-and-layout`";
     const record: SubmissionRecord = { runId, channel: "checks", executionId: "e9", startedAtMs: NOW, entry, results: 5, stageId: STAGE_4 };
-    const submissions = withSubmissionFailure(withSubmission({}, record), runId, { atMs: NOW + 3_600_000, exitCode: 1, output: "could not run stage 5: provider exited 1", reason: submissionFailureReason(1) });
+    const submissions = withSubmissionFailure(withSubmission({}, record), scope, { atMs: NOW + 3_600_000, exitCode: 1, output: "could not run stage 5: provider exited 1", reason: submissionFailureReason(1) });
 
     const landed = view({ checks: entered.checks, feedback: entered.feedback, submissions, notes: `# Notes\n\n## Human evidence\n\n${entry}\n` });
     assert.equal(landed.model.actionRequired?.submissionFailure, undefined, "the evidence is in notes.md, so nothing claims it was lost");
@@ -250,7 +253,13 @@ describe("a submission the engine refused keeps everything that was entered", ()
     assert.ok(resolve, "resolveSubmissions exists");
     assert.match(resolve, /const state = submissionState\(execution\);/, "the execution's own state decides");
     assert.match(resolve, /if \(state === "pending"\) \{\n\s*continue;/, "nothing happens while it is pending");
-    assert.match(resolve, /if \(state === "recorded"\)[\s\S]*?clearHumanChecks\(runId\)[\s\S]*?clearHumanFeedback\(runId\)/, "and clearing lives inside the recorded branch only");
+    assert.match(resolve, /if \(state === "recorded"\)[\s\S]*?clearHumanChecks\(key\)[\s\S]*?clearHumanFeedback\(key\)/, "and clearing lives inside the recorded branch only");
+    // `key` is the stage scope the evidence was entered under, taken from the
+    // store's own iteration — never the run's current stage. A Stage 1
+    // execution that exits 0 after the run advanced to Stage 2 therefore
+    // clears Stage 1's drafts and leaves Stage 2's alone.
+    assert.match(resolve, /for \(const key of Object\.keys\(submissions \?\? \{\}\)\)/, "each record is resolved under the scope it was stored at");
+    assert.doesNotMatch(resolve, /clearHuman(Checks|Feedback)\(runId\)/, "never against whichever stage happens to be current now");
     assert.match(resolve, /withSubmissionFailure/, "a failure is recorded, not a clearing");
     // The drafts are cleared nowhere else in the host except the run-scoped
     // reset those two functions are, and the tracker's end event is what
@@ -394,17 +403,32 @@ describe("editing the plan's prose does not end the run", () => {
 describe("a submission that the engine did record", () => {
   it("is the one case that clears, and it leaves no report behind", () => {
     const runId = "run|a";
-    const record: SubmissionRecord = { runId, channel: "checks", executionId: "e1", startedAtMs: NOW, entry: "…", results: 5 };
+    const record: SubmissionRecord = { runId, channel: "checks", executionId: "e1", startedAtMs: NOW, entry: "…", results: 5, stageId: "stage-1" };
+    const key = submissionKeyOf(record);
     const submissions = withSubmission({}, record);
-    assert.equal(submissionFor(submissions, runId)?.results, 5);
+    assert.equal(submissionFor(submissions, key)?.results, 5);
     assert.equal(submissionState({ state: "ended", exitCode: 0 }), "recorded");
-    assert.deepEqual(withoutSubmission(submissions, runId), {}, "the record goes with the drafts");
-    assert.equal(submissionFor(withoutSubmission(submissions, runId), runId), undefined);
+    assert.deepEqual(withoutSubmission(submissions, key), {}, "the record goes with the drafts");
+    assert.equal(submissionFor(withoutSubmission(submissions, key), key), undefined);
   });
 
   it("ignores a stored record that is not one", () => {
-    for (const junk of [undefined, {}, { "run|a": "text" }, { "run|a": { channel: "checks" } }, { "run|a": { entry: "x", channel: "other" } }] as unknown as Submissions[]) {
-      assert.equal(submissionFor(junk, "run|a"), undefined);
+    const key = stageScopeKey({ runId: "run|a", stageId: "stage-1" });
+    for (const junk of [
+      undefined,
+      {},
+      { [key]: "text" },
+      { [key]: { channel: "checks" } },
+      { [key]: { entry: "x", channel: "other" } },
+      // A record filed under a key that does not describe it: the store was
+      // written by something other than withSubmission, and attributing
+      // somebody's evidence to the wrong stage is the one thing that must
+      // never happen quietly.
+      { [key]: { runId: "run|a", channel: "checks", entry: "x", results: 0, executionId: "e", startedAtMs: 0, stageId: "stage-2" } },
+      { [key]: { runId: "run|b", channel: "checks", entry: "x", results: 0, executionId: "e", startedAtMs: 0, stageId: "stage-1" } },
+      { [key]: { runId: "run|a", channel: "checks", entry: "x", results: 0, executionId: "e", startedAtMs: 0 } },
+    ] as unknown as Submissions[]) {
+      assert.equal(submissionFor(junk, key), undefined);
     }
   });
 });

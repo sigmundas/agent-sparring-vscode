@@ -9,6 +9,7 @@ import {
   matchReviewerRequest,
   parseHumanEvidence,
   planChecks,
+  PROGRESS_UNTESTED_WORD,
   progressText,
   recordedEvidenceFor,
   renderHumanEvidence,
@@ -247,7 +248,7 @@ describe("deriveVerification", () => {
       view.required.map((item) => [item.text, item.origin, item.record?.outcome]),
       [["Exercise live enhanced push, pull, CAS retry, cross-client reconciliation, and real PostgREST JSONB reads", "reviewer", "pass"]],
     );
-    assert.equal(view.progress, "2 / 3 verified · 1 blocked");
+    assert.equal(view.progress, "2 / 3 verified · 1 couldn't test", "the engine's Blocked is reported as what it means: no result was obtained");
     assert.deepEqual(
       submittableChecks(view).map((check) => [check.text.slice(0, 8), check.origin, check.record.outcome]),
       [["Exercise", "reviewer", "pass"]],
@@ -269,7 +270,7 @@ describe("deriveVerification", () => {
         ["reviewer", "Confirm real PostgREST JSONB reads render the details object"],
       ],
     );
-    assert.equal(view.progress, "0 / 4 verified");
+    assert.equal(view.progress, "0 / 4 verified · 4 remaining");
   });
 
   it("without explicit or reviewer checks, the parent requirement itself is the recordable unit", () => {
@@ -311,10 +312,39 @@ describe("recorded outcomes (drafts) and the ## Human evidence entry", () => {
     assert.deepEqual(humanChecksFor(drafts, "run|a"), {});
   });
 
-  it("progress counts recorded evidence and Pass drafts as verified; failed / blocked separately", () => {
+  it("progress counts every outcome as itself, and never as another", () => {
+    const pass = { record: { outcome: "pass" as const } };
+    const fail = { record: { outcome: "fail" as const } };
+    const cantTest = { record: { outcome: "blocked" as const } };
+    const unanswered = {};
+    const times = <T,>(count: number, item: T): T[] => Array.from({ length: count }, () => item);
+
     assert.equal(progressText([]), undefined);
-    assert.equal(progressText([{ record: { outcome: "pass" } }, { evidence: { excerpt: "x", how: "prose" } }, {}]), "2 / 3 verified");
-    assert.equal(progressText([{ record: { outcome: "pass" } }, { record: { outcome: "fail" } }, { evidence: { excerpt: "x", how: "exact", outcome: "blocked" } }]), "1 / 3 verified · 1 failed · 1 blocked");
+
+    // 1. all Pass. 2. all Fail. Nothing is added when a bucket is empty.
+    assert.equal(progressText(times(5, pass)), "5 / 5 verified");
+    assert.equal(progressText(times(5, fail)), "0 / 5 verified · 5 failed");
+
+    // 3. The reported case: five checks a person could not run. It is not
+    // five things blocking the stage and it is not five failures — it is
+    // five verifications that could not be obtained.
+    const allUntested = progressText(times(5, cantTest));
+    assert.equal(allUntested, "0 / 5 verified · 5 couldn't test");
+    assert.doesNotMatch(allUntested!, /blocked/i, "never the engine's own word, which reads as something standing in the way");
+    assert.doesNotMatch(allUntested!, /failed/, "and never as a failure, which nobody observed");
+    assert.equal(PROGRESS_UNTESTED_WORD, "couldn't test");
+
+    // 4. Mixed, all answered. 5. Mixed with unanswered checks, which are
+    // their own bucket: "I could not test it" and "I have not said" are
+    // different statements.
+    assert.equal(progressText([pass, pass, pass, fail, cantTest]), "3 / 5 verified · 1 failed · 1 couldn't test");
+    assert.equal(progressText([pass, pass, fail, cantTest, unanswered]), "2 / 5 verified · 1 failed · 1 couldn't test · 1 remaining");
+    assert.equal(progressText(times(3, unanswered)), "0 / 3 verified · 3 remaining");
+
+    // Evidence already in notes.md counts the same way as a draft, by its
+    // own recorded outcome; an entry with no outcome word is a pass.
+    assert.equal(progressText([pass, { evidence: { excerpt: "x", how: "prose" } }, unanswered]), "2 / 3 verified · 1 remaining");
+    assert.equal(progressText([pass, fail, { evidence: { excerpt: "x", how: "exact", outcome: "blocked" } }]), "1 / 3 verified · 1 failed · 1 couldn't test");
   });
 
   it("renders only checks with an outcome, quoting the check wording, marking reviewer checks, indenting the note", () => {

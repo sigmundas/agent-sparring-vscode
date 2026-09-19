@@ -18,6 +18,7 @@ import * as crypto from "node:crypto";
 import * as os from "node:os";
 import type { DiscoveryDiagnostic } from "../core/diagnose";
 import { discoverRuns, selectRun } from "../core/discovery";
+import { stageScopeKey, stageScopeOf } from "../core/stageScope";
 import { planKey } from "../core/sparringCommand";
 import { BINDING_VERSION, bindingFileName, manifestFileName, parseExecutionManifest, renderBindingRecord } from "../core/manifest";
 import { isActionMessage, isAutoPushMessage, isCopyPromptMessage, isHumanCheckMessage, isHumanFeedbackMessage, isOpenPromptSourceMessage, renderOverviewHtml } from "../core/overviewHtml";
@@ -80,6 +81,7 @@ export async function run(): Promise<void> {
     ["prompt", () => promptInspectorAssertions()],
     ["disclosure", () => disclosurePersistenceAssertions()],
     ["evidence", () => evidenceLaunchAssertions(reportedRepo, fixtureRoot)],
+    ["stagescope", () => stageScopeAssertions(reportedRepo)],
     ["advance", () => advancementAssertions(reportedRepo)],
     ["terminals", () => terminalReuseAssertions(report, reportedRepo)],
     ["closed", () => closedTerminalAssertions(report, reportedRepo)],
@@ -310,6 +312,15 @@ interface ModelReport {
   busyState?: { label: string; detail: string; state: string };
   /** The Stop control, present only when an exact operation can be interrupted. */
   runner?: { alive: boolean; label: string; executionId: string; detail: string };
+  /** The manual-verification panel, as far as the stage-scope scenario reads it. */
+  actionRequired?: {
+    progress?: string;
+    required: { key: string; record?: { outcome?: string; note?: string } }[];
+    submit: { enabled: boolean; detail: string };
+    feedback: { draft?: string };
+    submitting?: { label: string };
+    submissionFailure?: { preserved: string; reason: string; error?: string };
+  };
   status?: { label: string; tone: string };
   planAction?: { kind: string; label: string; primary: boolean };
   unknownRunner?: { label: string; executionId: string; operationId?: string };
@@ -614,14 +625,17 @@ async function gateClickAssertions(): Promise<void> {
   const selection = selectRun((await discoverRuns([location])).runs);
   const runId = selection.selected?.id;
   assert.ok(runId, "the managed plan run is discovered");
+  // Drafts are stored under the run *and* the stage it is current at, so
+  // this reads them the way the host does (core/stageScope.ts).
+  const scope = stageScopeKey(stageScopeOf(selection.selected!));
   const view = (drafts: HumanCheckDrafts, feedback?: string) => {
-    const artifacts: OverviewArtifacts = { handoff: false, sparring: true, brief: false, plan: false, git: { branch: "feature/x" }, humanChecks: drafts[runId] ?? {}, humanFeedback: feedback, manifestStages };
+    const artifacts: OverviewArtifacts = { handoff: false, sparring: true, brief: false, plan: false, git: { branch: "feature/x" }, humanChecks: drafts[scope] ?? {}, humanFeedback: feedback, manifestStages };
     return buildOverviewModel(selection, undefined, artifacts, Date.now());
   };
 
   const before = view({});
   assert.equal(before.actionRequired?.required[0]?.key, GATE_CHECK_ID, "the gate's own id is the control's key");
-  assert.equal(before.actionRequired?.progress, "0 / 1 verified");
+  assert.equal(before.actionRequired?.progress, "0 / 1 verified · 1 remaining");
   assert.equal(before.actionRequired?.submit.enabled, false);
 
   const nonce = crypto.randomBytes(16).toString("base64");
@@ -646,7 +660,7 @@ async function gateClickAssertions(): Promise<void> {
     assert.deepEqual(message, { type: "humanCheck", key: GATE_CHECK_ID, outcome: "pass" }, "the click posted the gate's id and the outcome");
     assert.ok(isHumanCheckMessage(message), "and the host accepts it — this is what silently failed");
 
-    const after = view(withHumanCheck({}, runId, message.key as string, { outcome: "pass" }));
+    const after = view(withHumanCheck({}, scope, message.key as string, { outcome: "pass" }));
     assert.equal(after.actionRequired?.required[0]?.record?.outcome, "pass");
     assert.equal(after.actionRequired?.progress, "1 / 1 verified");
     assert.equal(after.actionRequired?.submit.enabled, true);
@@ -682,7 +696,7 @@ async function gateClickAssertions(): Promise<void> {
     const withFeedback = view({}, feedbackMessage.text as string);
     assert.equal(withFeedback.actionRequired?.feedback.draft, feedback);
     assert.equal(withFeedback.actionRequired?.feedback.send.enabled, true);
-    assert.equal(withFeedback.actionRequired?.progress, "0 / 1 verified", "and it claims nothing about the check");
+    assert.equal(withFeedback.actionRequired?.progress, "0 / 1 verified · 1 remaining", "and it claims nothing about the check");
     assert.equal(withFeedback.actionRequired?.submit.enabled, false);
   } finally {
     panel.dispose();
@@ -2572,6 +2586,189 @@ async function closedTerminalAssertions(report: DiscoveryDiagnostic, reportedRep
     `the open turn is attributed to the runner the person confirmed rather than read as a newer one, so the next Run stage needs no second override; got ${JSON.stringify(settled)}`,
   );
   console.log("integration: closing the extension's terminal leaves liveness unknown and the guard intact, and the person's confirmation is the way out");
+}
+
+// ---------------------------------------------------------------- a previous stage's submission, and what "Can't test" means
+
+const SCOPE_STAGE_2 = "stage-4-live-cloud-behaviour";
+const SCOPE_CHECKS = [
+  { id: "live-push-pull", instruction: "Push from desktop A and pull on desktop B; the row is byte-identical." },
+  { id: "cas-retry", instruction: "Force a concurrent edit and confirm the CAS retry keeps the extension group intact." },
+  { id: "cross-client", instruction: "Reconcile two signed-in clients and confirm no field is lost." },
+  { id: "jsonb-read", instruction: "Read the row back through PostgREST and confirm the JSONB rendering." },
+  { id: "pre-migration-reject", instruction: "Confirm a deployed pre-migration server rejects the enhanced write." },
+];
+
+/** A five-check gate for the second stage, in the engine's own shape. */
+function fiveCheckSparring(): string {
+  const gate = {
+    category: "DEVICE_MANUAL_CHECK",
+    title: "Live cloud behaviour has to be seen by a person",
+    checks: SCOPE_CHECKS.map((check) => ({ id: check.id, instruction: check.instruction, pass_criteria: "It behaves as the plan describes.", source: null })),
+  };
+  return ["# Sparring: stage 4", "", "## Routing outcome", "", "- Action: `NEEDS_YOU`", "- Summary: Five manual checks are the acceptance blockers.", "- Needs-you reason: DEVICE/MANUAL CHECK -- live cloud behaviour.", "", "## NEEDS YOU", "", "<!-- human-gate:v1 -->", "", "```json", JSON.stringify(gate, null, 2), "```", ""].join("\n");
+}
+
+/**
+ * The reported workflow, in a real window: a managed plan run whose Stage 3D
+ * submission failed, which then advanced to Stage 4.
+ *
+ * Nothing here is simulated in the model. The evidence is recorded through
+ * the host command the webview's own click reaches, the engine is the
+ * fixture's fake launched through the integrated shell, its non-zero exit is
+ * what produces the failure record, and the run advances by its plan-run
+ * state file changing on disk exactly as the engine advances it. What is
+ * asserted is what the person saw: the red banner belongs to the stage it
+ * happened on, and Stage 4 renders clean.
+ *
+ * The second half is the other report: five checks a person could not run
+ * are five verifications that could not be obtained, not five things blocking
+ * the stage. Those five clicks are real DOM clicks on the shipped document in
+ * a real webview, and each result reaches the host over VS Code's own
+ * message channel.
+ */
+async function stageScopeAssertions(reportedRepo: string): Promise<void> {
+  const model = async () => (await vscode.commands.executeCommand("agentSparring._test.overviewModel")) as ModelReport;
+  const sparring = path.join(reportedRepo, ".sparring");
+  const planState = path.join(sparring, "plans", `${GATE_PLAN_KEY}.json`);
+  const stateOf = (stageId: string, index: number): string =>
+    JSON.stringify({ current_stage: stageId, current_stage_index: index, expected_branch: "feature/reported-statistics", plan: GATE_PLAN_LABEL, plan_digest: "0".repeat(64), source: "manifest", status: "paused" });
+
+  await fs.mkdir(path.join(sparring, "plans"), { recursive: true });
+  await fs.mkdir(path.join(sparring, "stages", GATE_STAGE), { recursive: true });
+  await fs.mkdir(path.join(sparring, "stages", SCOPE_STAGE_2), { recursive: true });
+  await fs.writeFile(path.join(sparring, "stages", GATE_STAGE, "state.json"), JSON.stringify({ status: "working", base_sha: null, candidate_sha: null, implementation_session_id: "impl", sparring_session_id: "spar" }));
+  await fs.writeFile(path.join(sparring, "stages", GATE_STAGE, "sparring.md"), gateSparring());
+  await fs.writeFile(path.join(sparring, "stages", SCOPE_STAGE_2, "state.json"), JSON.stringify({ status: "working", base_sha: null, candidate_sha: null, implementation_session_id: "impl2", sparring_session_id: "spar2" }));
+  await fs.writeFile(path.join(sparring, "stages", SCOPE_STAGE_2, "sparring.md"), fiveCheckSparring());
+  await fs.mkdir(path.join(reportedRepo, "plans"), { recursive: true });
+  await fs.writeFile(
+    path.join(reportedRepo, "plans", "reported-statistics.md"),
+    ["# Reported statistics", "", "## Stage 3D — Snapshot v2 and attachment/export/import transport", "", "The transport.", "", "## Stage 4 — Live cloud behaviour", "", "The cloud.", ""].join("\n"),
+  );
+  await fs.writeFile(planState, stateOf(GATE_STAGE, 0));
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  const report = (await vscode.commands.executeCommand("agentSparring.diagnoseDiscovery")) as DiscoveryDiagnostic;
+  const runId = report.runs.find((run) => run.id.startsWith(`${reportedRepo}|`) && run.id.includes("plan:"))?.id;
+  assert.ok(runId, "the managed plan run is discovered");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+
+  const advanceTo = async (stageId: string, index: number): Promise<void> => {
+    await fs.writeFile(planState, stateOf(stageId, index));
+    await vscode.commands.executeCommand("agentSparring.refresh");
+    await waitUntil(async () => ((await model()).stageId === stageId ? true : undefined), 15_000, `the Overview follows the run to ${stageId}`);
+  };
+
+  // ---- the stale banner, end to end -------------------------------------
+  if (await shellIntegrationAvailable(reportedRepo)) {
+    await vscode.commands.executeCommand("agentSparring._test.recordHumanCheck", GATE_CHECK_ID, "pass", "Ran the oldest supported build; the row kept its details.");
+    await fs.writeFile(path.join(sparring, "fake-runner.conf"), "resume_exit=1\nresume_output='sparring: resume-plan refused: the recorded digest does not match'\n");
+    const restore = stubDialogs("feature/reported-statistics", "Submit for review");
+    try {
+      await vscode.commands.executeCommand("agentSparring._test.overviewAction", "submitForReview");
+      const failed = await waitUntil(async () => (await model()).actionRequired?.submissionFailure, 25_000, "the engine's non-zero exit is reported as a failed submission on the stage it happened on");
+      assert.match(failed.preserved, /your check results and feedback were preserved/, "and it leads with what was preserved");
+      const onStage1 = await model();
+      assert.equal(onStage1.stageId, GATE_STAGE);
+      assert.equal(onStage1.actionRequired?.required[0]?.record?.outcome, "pass", "with the result the person recorded still drafted");
+    } finally {
+      restore();
+      await fs.writeFile(path.join(sparring, "fake-runner.conf"), "sleep_for=3\nexit_with=0\n");
+    }
+
+    // The run advances, exactly as the engine advances it. The failure
+    // record is untouched in workspace state; what changes is which stage
+    // the Overview is about.
+    await advanceTo(SCOPE_STAGE_2, 1);
+    const onStage2 = await model();
+    assert.equal(onStage2.actionRequired?.submissionFailure, undefined, "Stage 3D's failure is not Stage 4's; this is the banner that stayed on screen");
+    assert.equal(onStage2.actionRequired?.submitting, undefined, "nor does Stage 4 look like it is submitting");
+    assert.deepEqual(
+      onStage2.actionRequired?.required.map((item) => item.record?.outcome),
+      SCOPE_CHECKS.map(() => undefined),
+      "and none of Stage 3D's drafted results populate Stage 4's controls",
+    );
+    assert.equal(onStage2.actionRequired?.feedback.draft, undefined);
+
+    // Nothing was destroyed to get there: going back to the stage it
+    // happened on still has the record.
+    await advanceTo(GATE_STAGE, 0);
+    assert.ok((await model()).actionRequired?.submissionFailure, "the failure is still recorded against the stage it belongs to");
+    await advanceTo(SCOPE_STAGE_2, 1);
+  } else {
+    console.log("integration: shell integration unavailable in this host; the stale-banner half of the stage-scope scenario is skipped");
+    await advanceTo(SCOPE_STAGE_2, 1);
+  }
+
+  // ---- five Can't test, clicked in a real webview ------------------------
+  const nonce = crypto.randomBytes(16).toString("base64");
+  const panel = vscode.window.createWebviewPanel("agentSparring.stageScopeTest", "cant test", { viewColumn: vscode.ViewColumn.Active, preserveFocus: true }, { enableScripts: true, localResourceRoots: [] });
+  try {
+    const before = await model();
+    assert.equal(before.actionRequired?.progress, "0 / 5 verified · 5 remaining", "five checks nobody has answered are five remaining, not five of anything else");
+
+    const clicked: Record<string, unknown>[] = [];
+    const allFive = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`only ${clicked.length} of 5 Can't test clicks arrived within 20s`)), 20_000);
+      panel.webview.onDidReceiveMessage((message: Record<string, unknown>) => {
+        if (message?.["type"] === "humanCheck") {
+          clicked.push(message);
+          if (clicked.length === SCOPE_CHECKS.length) {
+            clearTimeout(timer);
+            resolve();
+          }
+        }
+      });
+    });
+    const clicker = `<script nonce="${nonce}">document.querySelectorAll('button[data-outcome="blocked"]').forEach((button) => button.click());</script>`;
+    panel.webview.html = overviewHtmlFor(before, nonce, panel.webview.cspSource).replace("</body>", `${clicker}</body>`);
+    await allFive;
+
+    assert.deepEqual(
+      clicked.map((message) => message["outcome"]),
+      SCOPE_CHECKS.map(() => "blocked"),
+      "each click posted the engine's own value, which is what the reviewer parses",
+    );
+    for (const message of clicked) {
+      assert.ok(isHumanCheckMessage(message), "and the host accepts every one of them");
+      await vscode.commands.executeCommand("agentSparring._test.recordHumanCheck", message["key"], message["outcome"]);
+    }
+
+    const after = await model();
+    const progress = after.actionRequired!.progress!;
+    assert.equal(progress, "0 / 5 verified · 5 couldn't test", "the reported summary said '5 blocked', which reads as five things standing in the way of the stage");
+    assert.doesNotMatch(progress, /blocked/i);
+    assert.doesNotMatch(progress, /failed/i, "nobody observed a failure");
+    assert.equal(after.actionRequired?.submit.enabled, true, "every check has an answer, so the evidence can go to the reviewer, who decides what unavailable evidence means");
+
+    // A note typed for the stage a person is on survives an ordinary
+    // refresh: scoping state to the stage must not cost the persistence
+    // that made it worth storing.
+    await vscode.commands.executeCommand("agentSparring._test.recordHumanCheck", SCOPE_CHECKS[0].id, "blocked", "The staging cluster is down; I cannot reach either desktop.");
+    await vscode.commands.executeCommand("agentSparring.refresh");
+    const refreshed = await model();
+    assert.equal(refreshed.actionRequired?.required[0]?.record?.note, "The staging cluster is down; I cannot reach either desktop.", "the note is still there after a refresh of the same stage");
+    assert.equal(refreshed.actionRequired?.progress, "0 / 5 verified · 5 couldn't test", "and it is still not a result anybody obtained");
+
+    const html = overviewHtmlFor(after, nonce, panel.webview.cspSource);
+    assert.ok(!/\b5 blocked\b/.test(html), "and the word appears as a count nowhere on the page");
+    assert.match(html, new RegExp(`class="choice blocked on" data-check="${SCOPE_CHECKS[0].id}"`), "each Can't test reads back as chosen");
+    assert.match(html, /button\.choice\.on\.blocked \{ background: var\(--vscode-descriptionForeground\)/, "styled as absence, not as the failure red or a warning");
+    console.log("integration: a previous stage's submission failure does not follow the run forward, and five Can't test results are reported as five verifications nobody could obtain");
+  } finally {
+    panel.dispose();
+  }
+}
+
+/**
+ * The document the Overview renders for the model the host just built.
+ *
+ * `_test.overviewModel` returns the real `OverviewModel`; `ModelReport` is
+ * only this suite's narrowed reading of it, so the cast is a view of the same
+ * object and not a shape invented here.
+ */
+function overviewHtmlFor(model: ModelReport, nonce: string, cspSource: string): string {
+  return renderOverviewHtml(model as unknown as Parameters<typeof renderOverviewHtml>[0], nonce, cspSource);
 }
 
 // ---------------------------------------------------------------- Submit result and continue: resume-plan --evidence reaches the engine

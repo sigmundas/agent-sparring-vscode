@@ -160,7 +160,7 @@ describe("a second channel, beside the reviewer's checks", () => {
     assert.match(panel.submit.detail, /^Record a result for all 5 remaining checks first\./);
     assert.equal(panel.ready, false);
     assert.equal(panel.headline, "5 manual checks required");
-    assert.equal(panel.progress, "0 / 5 verified");
+    assert.equal(panel.progress, "0 / 5 verified · 5 remaining");
 
     assert.match(html, /<button type="button" data-action="sendFeedbackForReview" title="[^"]*">Send feedback for review<\/button>/, "enabled: no disabled attribute");
     assert.match(html, /data-action="submitForReview" title="[^"]*" disabled>Submit result and continue</);
@@ -220,7 +220,7 @@ describe("sending feedback claims nothing about the checks", () => {
 
     assert.equal(panel.required.length, OUTSTANDING, "all five checks are still outstanding");
     assert.equal(panel.recorded.length, 0, "and none of them counts as recorded");
-    assert.equal(panel.progress, "0 / 5 verified");
+    assert.equal(panel.progress, "0 / 5 verified · 5 remaining");
     assert.equal(panel.ready, false);
     assert.equal(panel.submit.enabled, false);
     assert.deepEqual(submittableChecks(panel), [], "nothing would be written as a result");
@@ -243,7 +243,7 @@ describe("sending feedback claims nothing about the checks", () => {
     const panel = view({ notes }).model.actionRequired!;
     assert.equal(panel.recorded.length, 0);
     assert.equal(panel.required.length, OUTSTANDING);
-    assert.equal(panel.progress, "0 / 5 verified");
+    assert.equal(panel.progress, "0 / 5 verified · 5 remaining");
 
     // The same words as an ordinary ## Human evidence paragraph — no feedback
     // sub-heading — are still matched, so this is the sub-heading doing the
@@ -268,7 +268,7 @@ describe("sending feedback claims nothing about the checks", () => {
       "the check result is still matched by its stable id",
     );
     assert.equal(panel.required.length, OUTSTANDING - 1);
-    assert.equal(panel.progress, "1 / 5 verified", "the feedback does not add to or subtract from the count");
+    assert.equal(panel.progress, "1 / 5 verified · 4 remaining", "the feedback does not add to or subtract from the count");
     assert.deepEqual(parseHumanFeedback(notes), [renderHumanFeedback(CRASH, new Date(NOW))!.split("\n").slice(1).join("\n").trim()]);
   });
 
@@ -354,7 +354,7 @@ describe("the exact text, all the way to the engine", () => {
     const panel = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "overview", "overviewPanel.ts"), "utf8");
     const handler = /private async recordHumanFeedback[\s\S]*?\n {2}}\n/.exec(panel)?.[0] ?? "";
     assert.ok(handler, "recordHumanFeedback exists");
-    assert.match(handler, /setHumanFeedback\(run\.id, message\.text\)/);
+    assert.match(handler, /setHumanFeedback\(stageScopeOf\(run\), message\.text\)/, "stored against the run and the stage it is current at, so it cannot resurface under the next stage");
     assert.match(handler, /this\.lastHtmlKey = JSON\.stringify\(await this\.buildModel\(\)\)/, "the comparison key advances, so the stored text alone rebuilds nothing");
     assert.ok(!/launch|buildRun|Terminal|sendFeedback/.test(handler), "and nothing on this path runs the engine");
   });
@@ -427,7 +427,7 @@ describe("what the reviewer does with it", () => {
     const view = deriveVerification({ explicit: [], parents: [] }, { action: "NEEDS_YOU", summary: "s", humanGate: { category: "UI_MANUAL_CHECK", title: "t", checks: revised } }, [], drafts);
     assert.equal(view.required[2].key, "stage-4-reference-workflow-v2");
     assert.equal(view.required[2].record, undefined, "a materially changed check starts without a result");
-    assert.equal(view.progress, "0 / 5 verified");
+    assert.equal(view.progress, "0 / 5 verified · 5 remaining");
 
     // The checks the reviewer kept do keep their drafts, which is what the
     // stable id is for.
@@ -491,7 +491,7 @@ describe("the structured gate is unchanged by any of this", () => {
     const { view } = await stage4Gate();
     const { model, html } = view({ drafts: { [CHECKS[0].id]: { outcome: "fail", note: "The third column is empty." } }, feedback: CRASH });
     const panel = model.actionRequired!;
-    assert.equal(panel.progress, "0 / 5 verified · 1 failed");
+    assert.equal(panel.progress, "0 / 5 verified · 1 failed · 4 remaining");
     assert.equal(panel.gateTitle, "Confirm the editor renders and guards reported statistics correctly");
     assert.match(html, new RegExp(`class="choice fail on" data-check="${CHECKS[0].id}"`));
     assert.match(html, /<details class="tech"[^>]*><summary>Show technical details<\/summary>/);

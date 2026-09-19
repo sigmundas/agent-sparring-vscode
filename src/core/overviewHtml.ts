@@ -887,13 +887,18 @@ function renderRecordControls(item: CheckItem): string {
  * The words on the three buttons. `blocked` is the engine's own value and
  * the word written into notes.md; what it means to the person pressing it is
  * that they could not run the check, so that is what the button says.
+ *
+ * "Can't test" is not a failure and is never dressed as one. It is styled
+ * neutrally — grey, `⊘` — beside a red Fail, because the two say entirely
+ * different things about the stage and a person scanning the list has to be
+ * able to tell them apart at a glance.
  */
 export const OUTCOME_LABELS: Record<CheckOutcome, string> = { pass: "Pass", fail: "Fail", blocked: "Can't test" };
 
 const OUTCOME_TITLES: Record<CheckOutcome, string> = {
   pass: "The check was performed and met its criteria",
   fail: "The check was performed and did not meet its criteria",
-  blocked: "You could not perform the check (recorded as Blocked, the engine's own word for it)",
+  blocked: "You could not perform the check, so there is no result either way (recorded as Blocked, the engine's own word for it)",
 };
 
 function originTag(item: CheckItem): string {
@@ -1522,7 +1527,8 @@ h1 { font-size: 1.35em; font-weight: 600; margin: 0; }
 .check .mark { flex: none; width: 18px; text-align: center; font-weight: 700; color: var(--vscode-descriptionForeground); }
 .check.pass .mark { color: var(--good); }
 .check.fail .mark { color: var(--bad); }
-.check.blocked .mark { color: var(--warn); }
+/* Not a failure and not a warning: no result was obtained, so it reads as absence. */
+.check.blocked .mark { color: var(--vscode-descriptionForeground); }
 .checkbody { flex: 1 1 auto; min-width: 0; }
 .criterion { margin: 0 0 2px; white-space: pre-wrap; }
 .criterion.parent { padding: 4px 10px; border-left: 2px solid var(--info); background: var(--vscode-textBlockQuote-background); }
@@ -1530,7 +1536,7 @@ h1 { font-size: 1.35em; font-weight: 600; margin: 0; }
 .outcome { font-weight: 600; }
 .outcome.pass { color: var(--good); }
 .outcome.fail { color: var(--bad); }
-.outcome.blocked { color: var(--warn); }
+.outcome.blocked { color: var(--vscode-descriptionForeground); }
 .evidence { margin: 0; font-family: var(--vscode-editor-font-family); }
 .record { display: flex; gap: 8px; align-items: flex-start; margin: 6px 0 0 28px; flex-wrap: wrap; }
 .choices { display: inline-flex; gap: 0; flex: none; }
@@ -1539,7 +1545,7 @@ button.choice:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
 button.choice:last-child { border-radius: 0 6px 6px 0; }
 button.choice.on.pass { background: var(--good); color: var(--vscode-editor-background); border-color: var(--good); font-weight: 600; }
 button.choice.on.fail { background: var(--bad); color: var(--vscode-editor-background); border-color: var(--bad); font-weight: 600; }
-button.choice.on.blocked { background: var(--warn); color: var(--vscode-editor-background); border-color: var(--warn); font-weight: 600; }
+button.choice.on.blocked { background: var(--vscode-descriptionForeground); color: var(--vscode-editor-background); border-color: var(--vscode-descriptionForeground); font-weight: 600; }
 textarea.note { flex: 1 1 240px; min-height: 26px; padding: 4px 8px; font-family: inherit; font-size: 0.92em; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--line)); border-radius: 6px; resize: vertical; }
 textarea.note:focus { outline: 1px solid var(--vscode-focusBorder); }
 .action > .actions { margin-top: 12px; align-items: center; }

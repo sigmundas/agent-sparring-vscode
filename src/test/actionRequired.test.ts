@@ -130,7 +130,7 @@ describe("Action required — prose plan (Stage 3C shape)", () => {
         ["reviewer", OLDER],
       ],
     );
-    assert.equal(panel.progress, "0 / 3 verified");
+    assert.equal(panel.progress, "0 / 3 verified · 3 remaining");
     assert.equal(panel.ready, false);
     assert.equal(panel.headline, "Action required");
     assert.equal(panel.submit.label, "Submit for review");
@@ -156,7 +156,7 @@ describe("Action required — prose plan (Stage 3C shape)", () => {
       ],
       "the still-pending paragraph names these checks but denies them, so they stay required",
     );
-    assert.equal(panel.progress, "2 / 3 verified");
+    assert.equal(panel.progress, "2 / 3 verified · 1 remaining");
     assert.equal(panel.ready, false, "one requested check still has no outcome");
     assert.equal(panel.submit.enabled, false);
     assert.match(panel.submit.detail, /Record a result for the remaining check first/);
@@ -230,7 +230,7 @@ describe("Action required — explicit ### Manual verification checklist", () =>
       "the reviewer's live-behaviour and pre-Stage-3C clauses are the same checks as plan items and are dropped; deployment is new",
     );
     assert.equal(panel.reviewerCount, 1);
-    assert.equal(panel.progress, "1 / 4 verified");
+    assert.equal(panel.progress, "1 / 4 verified · 3 remaining");
     const html = renderOverviewHtml(model, "n", "c");
     assert.match(html, /<p class="criterion">CAS retry after a concurrent edit keeps the extension group intact\. <span class="tag plan" title="Plan line 19">Plan<\/span><\/p>/);
     // An explicit plan checklist speaks for itself: the checks are shown as

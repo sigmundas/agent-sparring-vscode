@@ -160,7 +160,7 @@ describe("the Stage 3D pattern: exactly one control", () => {
     assert.equal(check.text, INSTRUCTION);
     assert.equal(check.passCriteria, PASS_CRITERIA);
     assert.equal(check.source, SOURCE);
-    assert.equal(panel.progress, "0 / 1 verified");
+    assert.equal(panel.progress, "0 / 1 verified · 1 remaining");
 
     const html = renderOverviewHtml(model, "n", "c");
     assert.equal((html.match(/data-outcome="pass"/g) ?? []).length, 1, "one Pass control, for one check");
