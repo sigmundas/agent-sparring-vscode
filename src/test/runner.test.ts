@@ -258,7 +258,11 @@ describe("runner lifecycle presentation", () => {
     assert.ok(!html.includes('data-action="stopRunner"'));
     assert.match(html, /<span class="busy unknown" title="[^"]*"><svg[^>]*>.*?<\/svg>Run status unknown<\/span>/);
     assert.ok(!/>Running</.test(html), "the word Running never appears for telemetry-only liveness");
-    assert.match(html, /Working\? <span class="muted">\(turn observed 59s ago\)<\/span> <span class="muted">· runner status unknown<\/span>/);
+    // The same three claims the card has always made about a telemetry-only
+    // turn, in the corner-pill presentation: the state is qualified rather
+    // than asserted, and the caveats that qualify it read underneath it.
+    assert.match(html, /<span class="statepill working uncertain"><svg[^>]*>.*?<\/svg><span>Working\?<\/span><\/span>/);
+    assert.match(html, /<div class="statenote">turn observed 59s ago · runner status unknown<\/div>/);
 
     const liveness = deriveLiveness(live, undefined, T0 + 60_000);
     const status = deriveStatus(selection, liveness.live, T0 + 60_000, liveness);
