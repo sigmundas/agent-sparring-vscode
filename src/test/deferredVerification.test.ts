@@ -319,6 +319,13 @@ describe("the plan's verification checkpoint", () => {
     }
   });
 
+  it("explains a still-owed check as the person's own result, not as the reviewer asking again", async () => {
+    const { model, html } = await atCheckpoint({ results: [{ check_id: "resize-readability", outcome: "fail", note: "labels overlap" }] });
+    assert.equal(model.actionRequired!.required[0].owedUntilPassed, true);
+    assert.match(html, /a Pass is what settles a deferred check, so it is still owed/);
+    assert.ok(!html.includes("the reviewer has asked it again"), "the reviewer asked once and is still waiting");
+  });
+
   it("counts what is still owed, not what was ever deferred", async () => {
     const { model } = await atCheckpoint({ results: [{ check_id: "resize-readability", outcome: "pass" }] });
     assert.equal(model.actionRequired!.headline, "Manual verification required");

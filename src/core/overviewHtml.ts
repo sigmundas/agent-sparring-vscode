@@ -996,17 +996,29 @@ function renderEarlierAnswers(item: CheckItem): string {
     })
     .join("");
   const what = item.previous.length === 1 ? "Your previous answer" : `Your ${item.previous.length} previous answers`;
-  // Only say the reviewer asked again when the gate actually says so. A
-  // gate recorded before instances existed names no asking, so "asked it
-  // again" would be this panel inventing a fact about the reviewer; what is
-  // true in that case is narrower, and is what it says instead.
-  const why = item.askingIdentified ? "the reviewer has asked it again, so it needs an answer for this round" : "this gate does not record which round it is, so it needs an answer for this one";
-  const title = item.askingIdentified ? PREVIOUS_TITLE : PREVIOUS_TITLE_UNATTRIBUTED;
+  // Three different reasons a check has history and is still being asked,
+  // and only one of them is the reviewer's doing.
+  //
+  // At a deferred obligation the reviewer asked once and is still waiting:
+  // what is on record is the person's own Fail or Can't test, and neither
+  // settles the obligation. Saying the reviewer asked again would attribute
+  // their own result to somebody else. Elsewhere, a gate recorded before
+  // instances existed names no asking at all, so "asked it again" would be
+  // inventing a fact about the reviewer; what is true there is narrower.
+  const why = item.owedUntilPassed
+    ? "a Pass is what settles a deferred check, so it is still owed"
+    : item.askingIdentified
+      ? "the reviewer has asked it again, so it needs an answer for this round"
+      : "this gate does not record which round it is, so it needs an answer for this one";
+  const title = item.owedUntilPassed ? PREVIOUS_TITLE_STILL_OWED : item.askingIdentified ? PREVIOUS_TITLE : PREVIOUS_TITLE_UNATTRIBUTED;
   return `<div class="previous" title="${escapeHtml(title)}"><p class="lead muted small">${what} to this check — ${why}:</p><ul class="prevlist">${rows}</ul></div>`;
 }
 
 const PREVIOUS_TITLE =
   "Recorded in notes.md for an earlier asking of this same check. It is kept there and still goes to the reviewer; it is not counted as this round's answer, because the reviewer asked again.";
+
+const PREVIOUS_TITLE_STILL_OWED =
+  "Recorded by the engine against this same asking. The reviewer has not asked again — it deferred this check once and is still waiting, and a Fail or a Can't test settles nothing, so the plan stays open until it passes. The earlier answer is kept in the stage that raised the check.";
 
 const PREVIOUS_TITLE_UNATTRIBUTED =
   "Recorded in notes.md for this check, by a version of the engine that did not record which round a gate is. It is kept there and still goes to the reviewer; it is not counted as this round's answer, because nothing can show which round it answered.";

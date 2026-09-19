@@ -1383,7 +1383,7 @@ function deferredVerification(
   const outstandingStages = new Set(obligations.filter((obligation) => unansweredChecks(obligation).length > 0).map((obligation) => obligation.stageId));
   const stages = outstandingStages.size > 0 ? outstandingStages : new Set(obligations.map((obligation) => obligation.stageId));
   const total = view.required.length || view.recorded.length;
-  const failedChecks = obligations.filter(obligationFailed).flatMap((obligation) => obligation.results.filter((result) => result.outcome === "fail"));
+  const failedChecks = obligations.filter(obligationFailed).flatMap((obligation) => obligation.gate.checks.filter((check) => obligation.results.find((result) => result.checkId === check.id)?.outcome === "fail"));
 
   const submissionScope = stageScopeOf(run);
   const submission = sameStageScope(artifacts.submission && { runId: artifacts.submission.runId, stageId: artifacts.submission.stageId }, submissionScope) ? artifacts.submission : undefined;
@@ -1503,10 +1503,9 @@ function deferredNote(run: RunSnapshot, outcome: SparringOutcome | undefined): O
   // What is still owed, not what was ever deferred: two of three passed is
   // one check outstanding, and saying three would be counting work already
   // done.
+  // Always at least one: `owed` is the unresolved obligations, and an
+  // obligation is unresolved exactly when it has an unanswered check.
   const checks = owed.reduce((count, entry) => count + unansweredChecks(entry).length, 0);
-  if (checks === 0) {
-    return undefined;
-  }
   const raisedHere = outcome?.action === "READY" ? outcome.deferredHumanGate : undefined;
   return {
     label: `Review passed — ${checks} manual ${checks === 1 ? "check" : "checks"} deferred ${checkpointWord(owed)}`,
@@ -2426,6 +2425,12 @@ function currentLine(
         const owed = run.state.deferredHumanChecks
           .filter((entry) => run.state.awaiting?.kind === DEFERRED_VERIFICATION_REQUIRED && run.state.awaiting.instanceIds.includes(entry.gate.instanceId ?? ""))
           .reduce((count, entry) => count + unansweredChecks(entry).length, 0);
+        if (owed === 0) {
+          // Every named asking has in fact been answered; the engine will
+          // clear the pause on the next resume. Saying "0 deferred checks"
+          // in the meantime would be a warning about nothing.
+          return { stageLine: "Every stage is accepted, and every deferred check is answered. Resume the plan to finish it." };
+        }
         return {
           stageLine:
             run.state.awaiting.reason === "promoted"

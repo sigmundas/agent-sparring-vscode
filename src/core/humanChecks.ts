@@ -855,6 +855,18 @@ export interface CheckItem {
    */
   gateInstanceId?: string;
   /**
+   * This check belongs to a deferred obligation, where only a `pass`
+   * settles it.
+   *
+   * It changes what may be *said* about a previous answer. Everywhere else,
+   * a check with history is back because the reviewer asked it again; here
+   * the reviewer asked once and is still waiting, and the answer on record
+   * is the person's own Fail or Can't test, neither of which settles
+   * anything. Telling them the reviewer re-asked would attribute their own
+   * result to somebody else.
+   */
+  owedUntilPassed?: boolean;
+  /**
    * The stage whose review raised this check, for a deferred obligation.
    *
    * Absent for an immediate gate, where the check belongs to the stage in
@@ -1054,6 +1066,7 @@ export function deriveDeferredVerification(
     const rendered = gateItems(obligation.gate);
     rendered.forEach((item, index) => {
       item.originStageId = obligation.stageId;
+      item.owedUntilPassed = true;
       wireId.set(item.draftKey, obligation.gate.checks[index].id);
       const recorded = obligation.results.find((result) => result.checkId === obligation.gate.checks[index].id);
       if (recorded?.outcome === "pass") {
