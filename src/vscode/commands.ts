@@ -166,6 +166,9 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
       return controller.planAssociation(run?.id)?.match;
     }),
     vscode.commands.registerCommand("agentSparring._test.overviewModel", () => overview.buildModel()),
+    // One inline agent-config change, delivered exactly as the webview would
+    // post it and awaited to completion.
+    vscode.commands.registerCommand("agentSparring._test.agentConfig", (message: unknown) => overview.deliverAgentConfig(message)),
     vscode.commands.registerCommand("agentSparring._test.startNextStage", async () => {
       const run = controller.currentSelection.selected;
       return run?.kind === "stage" ? performStartNextStage(controller, overview, run, { confirm: false }) : undefined;

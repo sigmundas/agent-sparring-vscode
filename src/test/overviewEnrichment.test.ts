@@ -166,7 +166,11 @@ describe("recent events résumé", () => {
     assert.ok(html.indexOf('<section class="actors">') < html.indexOf('<section class="history">'));
     const quiet = renderOverviewHtml(buildOverviewModel(selection, undefined, ALL, T0), "n", "c");
     assert.ok(!quiet.includes('class="history"'));
-    assert.ok(!/model|effort|Elapsed|Pause between|Tests passed|Pushed/i.test(quiet), "no claims the telemetry cannot back");
+    // The rendered page, not the stylesheet or the event-handling script:
+    // those mention the agent controls by name whether or not this run has
+    // any, and the claim under test is about what a person is shown.
+    const shown = quiet.slice(quiet.indexOf("<main>"), quiet.indexOf("</main>"));
+    assert.ok(!/model|effort|Elapsed|Pause between|Tests passed|Pushed/i.test(shown), "no claims the telemetry cannot back");
   });
 });
 

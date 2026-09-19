@@ -563,14 +563,50 @@ export interface PushAuthorization {
 }
 
 /**
- * The effective provider/model/effort for both roles, plus the one action
- * that edits it. The values are the engine's answer verbatim; the Settings
- * button opens the project's own `project.toml`, which remains the edit
- * surface (there are deliberately no inline model or effort controls).
+ * The effective provider/model/effort for both roles, the inline controls
+ * that change it, and the Settings action.
+ *
+ * Every value is the engine's answer verbatim. The controls are a
+ * convenience surface, not a replacement for the file: Settings still opens
+ * the project's own `project.toml`, which remains where the whole
+ * configuration is visible, and a change made here goes through the engine's
+ * `set-config` rather than through anything in this extension that knows
+ * TOML — because nothing in this extension does.
  */
 export interface AgentConfigSection extends AgentConfigView {
   settings: { label: string; detail: string };
+  /**
+   * The project.toml a control was rendered from, absolute, as the engine
+   * reported it. It travels with every mutation the webview posts and is
+   * compared against the cockpit's current target before anything is
+   * written, so a control left open across a repository switch cannot apply
+   * itself to the repository that is now on screen.
+   */
+  scope?: string;
+  /**
+   * Said beside the controls while a managed run is executing. Configuration
+   * is read when a turn is launched, so a change reaches the next one and
+   * cannot reconfigure a provider process already running.
+   */
+  activeRunNote?: string;
 }
+
+/**
+ * What one attempted inline configuration change did.
+ *
+ * `refused` means the cockpit itself declined -- the change named a
+ * repository this window is no longer looking at. `error` is the engine's
+ * own diagnostic for a change it would not make. Either way nothing was
+ * written and the panel was re-rendered from the engine's actual state.
+ */
+export interface AgentConfigOutcome {
+  applied: boolean;
+  refused?: string;
+  error?: string;
+}
+
+export const APPLIES_NEXT_TURN =
+  "This run is active. A change here applies to the next agent turn; it does not affect a turn already running.";
 
 export interface OverviewModel {
   kind: "empty" | "ambiguous" | "run";
@@ -719,9 +755,24 @@ const SETTINGS_ACTION = {
  * the Settings action is offered even if the answer was an error or a
  * missing file — that is precisely when a person wants to open the file.
  */
-function agentConfigSection(config: EffectiveConfig | undefined): AgentConfigSection | undefined {
+function agentConfigSection(
+  config: EffectiveConfig | undefined,
+  active = false,
+): AgentConfigSection | undefined {
   const view = agentConfigView(config);
-  return view ? { ...view, settings: SETTINGS_ACTION } : undefined;
+  if (!view) {
+    return undefined;
+  }
+  return {
+    ...view,
+    settings: SETTINGS_ACTION,
+    scope: view.configPath,
+    // Only said when it is true, and worded as a fact about when the change
+    // lands rather than as a warning against making it. Nothing here blocks
+    // the edit: the engine has no restriction to enforce, and inventing one
+    // would be the cockpit deciding something it has no basis to decide.
+    activeRunNote: active ? APPLIES_NEXT_TURN : undefined,
+  };
 }
 
 const NO_ARTIFACTS: OverviewArtifacts = { handoff: false, sparring: false, brief: false, plan: false };
@@ -783,7 +834,10 @@ export function buildOverviewModel(
       matchStage: run.kind === "stage" && plan?.source === "associated" && plan.hasHeadings,
       diff: diffAction(stage),
     },
-    agentConfig: agentConfigSection(artifacts.agentConfig),
+    agentConfig: agentConfigSection(
+      artifacts.agentConfig,
+      !halted && (liveness.state === "running" || liveness.turnActive),
+    ),
     facts: facts(run, stage, artifacts.git, presentation, artifacts.associatedPlan, artifacts.siblingRepositories),
     goal: goal(artifacts, plan),
     activity: activityLine(live, halted, nowMs, uncertain),

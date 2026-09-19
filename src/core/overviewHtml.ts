@@ -14,6 +14,15 @@
  */
 
 import { ACTIVE_CONTEXT_HEADLINE, FOLLOW_ACTIVE_LABEL, SELECT_RUN_LABEL } from "./activeRepository";
+import {
+  CONFIG_FIELDS,
+  CONFIG_ROLES,
+  PROVIDER_DEFAULT_VALUE,
+  type AgentFieldControl,
+  type AgentRoleControls,
+  type ConfigField,
+  type ConfigRole,
+} from "./effectiveConfig";
 import { CHECK_OUTCOMES, isCheckKey, type CheckItem, type CheckOutcome } from "./humanChecks";
 import { checkName, humanTask, splitPassCriteria } from "./humanTask";
 import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type AgentConfigSection, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type PushAuthorization, type TimelineItem, type WhatsNext } from "./overviewModel";
@@ -194,6 +203,58 @@ export function isHumanCheckMessage(message: unknown): message is HumanCheckMess
 export function isHumanFeedbackMessage(message: unknown): message is HumanFeedbackMessage {
   const record = asRecord(message);
   return record !== undefined && record["type"] === "humanFeedback" && typeof record["text"] === "string" && (record["text"] as string).length <= NOTE_MAX_LENGTH;
+}
+
+/**
+ * One inline agent-configuration change: a model typed, or an effort chosen.
+ *
+ * It is its own message type, not an action, because it carries a value that
+ * becomes an argument to an engine command — and it carries `scope`, the
+ * project.toml the control was rendered from. The host refuses a message
+ * whose scope is not the repository it is now looking at, which is what
+ * stops a control left open across a repository switch from writing to the
+ * wrong project. `value` is `null` for "use the provider's default", which
+ * clears the override; it is never the words "provider default".
+ */
+export interface AgentConfigMessage {
+  type: "agentConfig";
+  role: ConfigRole;
+  field: ConfigField;
+  value: string | null;
+  scope: string;
+}
+
+/**
+ * A model name is free text, so it is bounded here the way a note is: long
+ * enough for any identifier a provider could plausibly have, short enough
+ * that the message cannot be a payload. The engine validates what it means.
+ */
+export const MODEL_MAX_LENGTH = 200;
+
+export function isAgentConfigMessage(message: unknown): message is AgentConfigMessage {
+  const record = asRecord(message);
+  if (!record || record["type"] !== "agentConfig") {
+    return false;
+  }
+  if (!(CONFIG_ROLES as readonly string[]).includes(String(record["role"]))) {
+    return false;
+  }
+  if (!(CONFIG_FIELDS as readonly string[]).includes(String(record["field"]))) {
+    return false;
+  }
+  if (typeof record["scope"] !== "string" || !record["scope"]) {
+    return false;
+  }
+  const value = record["value"];
+  if (value === null) {
+    // "Use the provider's default" is only meaningful for an override. A
+    // role always resolves to some provider, so there is nothing to clear.
+    return record["field"] !== "provider";
+  }
+  // Not trimmed or emptied here: a blank value means "clear", and turning it
+  // into one silently would make two different requests look the same on the
+  // wire. The webview sends null for a clear; anything else must be a value.
+  return typeof value === "string" && value.length > 0 && value.length <= MODEL_MAX_LENGTH;
 }
 
 /** A note is free text a person typed; long enough for evidence, bounded so a message cannot be a payload. */
@@ -1209,15 +1270,79 @@ function capitalize(word: string): string {
  * the edit surface.
  */
 function renderAgentConfig(section: AgentConfigSection): string {
-  const rows = section.lines
+  // With controls, the read-only lines would say the same thing twice; they
+  // remain the whole answer when the engine could not resolve a
+  // configuration and there is nothing to put in a control.
+  const body =
+    section.controls.length > 0 && section.scope
+      ? section.controls.map((role) => renderRoleControls(role, section.scope as string)).join("")
+      : section.lines
+          .map(
+            (line) =>
+              `<div class="agentconfig-role" title="${escapeHtml(line.detail)}"><span class="muted">${escapeHtml(line.role)}</span><span class="agentconfig-value">${escapeHtml(line.text)}</span></div>`,
+          )
+          .join("");
+  const note = section.note ? `<p class="muted note">${escapeHtml(section.note)}</p>` : "";
+  const active = section.activeRunNote
+    ? `<p class="muted note">${escapeHtml(section.activeRunNote)}</p>`
+    : "";
+  const settings = button("openSettings", section.settings.label, true, section.settings.detail, "quiet");
+  return `<section class="agentconfig"><div class="agentconfig-head"><h3>${icon("gear")}Agents</h3>${settings}</div>${body}${active}${note}</section>`;
+}
+
+/**
+ * One role's compact block: provider, model, effort.
+ *
+ * Every control carries the role, the field and the scope it was rendered
+ * with, so the message the webview posts is self-describing and the host
+ * never has to infer which repository a change was meant for from whatever
+ * happens to be selected when it arrives.
+ */
+function renderRoleControls(role: AgentRoleControls, scope: string): string {
+  const attrs = `data-role="${escapeHtml(role.role)}" data-scope="${escapeHtml(scope)}"`;
+  const items = [role.provider, role.model, ...(role.effort ? [role.effort] : [])];
+  const rows = items.map((item) => field(item.label, control(item, attrs))).join("");
+  return `<div class="agentconfig-block"><div class="agentconfig-rolename">${escapeHtml(role.label)}</div>${rows}</div>`;
+}
+
+function field(label: string, input: string): string {
+  return `<label class="agentconfig-field"><span class="muted">${escapeHtml(label)}</span>${input}</label>`;
+}
+
+/**
+ * The input for one field.
+ *
+ * A dropdown when the engine gave options — its entries are the engine's own
+ * levels, so nothing here enumerates what a provider accepts. A plain text
+ * input otherwise, because a model name is free-form on both installed CLIs
+ * and a closed list would reject a model that exists. An empty text input is
+ * the provider's default, spelled in the placeholder rather than written
+ * into the field as a value nobody chose.
+ */
+function control(item: AgentFieldControl, attrs: string): string {
+  // The value this control was rendered with, in the same spelling a message
+  // would carry it. The script compares against it before posting, so simply
+  // tabbing through a field -- or re-selecting what is already selected --
+  // runs no engine command at all.
+  const sent = ` data-sent="${escapeHtml(item.value === PROVIDER_DEFAULT_VALUE ? "null" : item.value)}"`;
+  const common = `${attrs} data-field="${escapeHtml(item.field)}" title="${escapeHtml(item.detail)}"${sent}`;
+  if (item.fixedText !== undefined) {
+    return `<span class="agentconfig-fixed" title="${escapeHtml(item.detail)}">${escapeHtml(item.fixedText)}</span>`;
+  }
+  if (item.options) {
+    return `<select ${common}>${options(item.options, item.value)}</select>`;
+  }
+  const placeholder = item.placeholder ? ` placeholder="${escapeHtml(item.placeholder)}"` : "";
+  return `<input type="text" ${common} value="${escapeHtml(item.value)}"${placeholder} maxlength="${MODEL_MAX_LENGTH}" spellcheck="false" autocomplete="off">`;
+}
+
+function options(items: readonly { value: string; label: string }[], selected: string): string {
+  return items
     .map(
-      (line) =>
-        `<div class="agentconfig-role" title="${escapeHtml(line.detail)}"><span class="muted">${escapeHtml(line.role)}</span><span class="agentconfig-value">${escapeHtml(line.text)}</span></div>`,
+      (item) =>
+        `<option value="${escapeHtml(item.value)}"${item.value === selected ? " selected" : ""}>${escapeHtml(item.label)}</option>`,
     )
     .join("");
-  const note = section.note ? `<p class="muted note">${escapeHtml(section.note)}</p>` : "";
-  const settings = button("openSettings", section.settings.label, true, section.settings.detail, "quiet");
-  return `<section class="agentconfig"><div class="agentconfig-head"><h3>${icon("gear")}Agents</h3>${settings}</div>${rows}${note}</section>`;
 }
 
 function button(action: OverviewAction, label: string, enabled = true, title?: string, cls = ""): string {
@@ -1370,6 +1495,20 @@ pre.engineerror { margin: 6px 0 0; padding: 6px 8px; max-height: 9em; overflow: 
 .agentconfig-role .muted { min-width: 8.5em; }
 .agentconfig-value { font-weight: 600; overflow-wrap: anywhere; }
 .agentconfig .note { margin: 6px 0 0; }
+.agentconfig-block { margin-top: 6px; }
+.agentconfig-block + .agentconfig-block { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line); }
+.agentconfig-rolename { font-weight: 600; font-size: 0.92em; margin-bottom: 3px; }
+.agentconfig-field { display: flex; align-items: center; gap: 8px; margin-top: 3px; font-size: 0.9em; }
+.agentconfig-field > .muted { min-width: 5.5em; }
+.agentconfig-field select,
+.agentconfig-field input[type="text"] {
+  flex: 1; min-width: 0; padding: 2px 4px; font: inherit; font-size: 0.95em;
+  color: var(--vscode-input-foreground); background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, var(--line)); border-radius: 3px;
+}
+.agentconfig-field select:disabled,
+.agentconfig-field input[type="text"]:disabled { opacity: 0.6; }
+.agentconfig-fixed { flex: 1; font-weight: 600; }
 
 /* The freeform channel: beside the checks, never inside one of them. */
 .feedback { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
@@ -1612,8 +1751,47 @@ const SCRIPT = `
   // what runs an engine command, and it reads this choice from the host.
   document.addEventListener('change', function (event) {
     var box = event.target;
-    if (!(box instanceof HTMLInputElement) || !box.hasAttribute('data-autopush')) { return; }
-    vscode.postMessage({ type: 'autoPush', enabled: box.checked });
+    if (box instanceof HTMLInputElement && box.hasAttribute('data-autopush')) {
+      vscode.postMessage({ type: 'autoPush', enabled: box.checked });
+      return;
+    }
+    agentConfigChanged(event.target);
+  });
+  // The inline agent controls. An effort dropdown reports on change; a model
+  // field reports on blur and on Enter, never per keystroke -- each report
+  // runs an engine command, and one per character would be a queue of writes
+  // nobody asked for.
+  //
+  // Every message carries the scope the control was rendered with, so the
+  // host can refuse one that belongs to a repository no longer on screen.
+  // The control is disabled while its own change is in flight, which is what
+  // stops a double click or a fast second selection from starting a second
+  // write over the first; the host's reply re-renders the page from the
+  // engine's actual answer and the control comes back with that value in it.
+  function agentConfigChanged(node) {
+    var isSelect = node instanceof HTMLSelectElement;
+    var isInput = node instanceof HTMLInputElement && node.type === 'text';
+    if ((!isSelect && !isInput) || !node.hasAttribute('data-role') || !node.hasAttribute('data-field')) { return; }
+    if (node.disabled) { return; }
+    var raw = node.value;
+    var sent = raw === '' ? null : raw;
+    if (node.getAttribute('data-sent') === String(sent)) { return; }
+    node.setAttribute('data-sent', String(sent));
+    node.disabled = true;
+    vscode.postMessage({
+      type: 'agentConfig',
+      role: node.getAttribute('data-role'),
+      field: node.getAttribute('data-field'),
+      value: sent,
+      scope: node.getAttribute('data-scope'),
+    });
+  }
+  document.addEventListener('keydown', function (event) {
+    if (event.key !== 'Enter') { return; }
+    var node = event.target;
+    if (!(node instanceof HTMLInputElement) || !node.hasAttribute('data-role')) { return; }
+    event.preventDefault();
+    agentConfigChanged(node);
   });
   // Every text field is saved as it is typed (debounced) and on blur, so a
   // re-render of the page never loses what was typed; the extension stores it
@@ -1642,7 +1820,10 @@ const SCRIPT = `
   });
   document.addEventListener('focusout', function (event) {
     var area = event.target;
-    if (!tracked(area)) { return; }
+    if (!tracked(area)) {
+      agentConfigChanged(event.target);
+      return;
+    }
     clearTimeout(timers[timerKey(area)]);
     save(area);
   });
