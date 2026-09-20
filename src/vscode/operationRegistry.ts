@@ -511,6 +511,13 @@ export interface OperationView {
   terminalPid?: number;
   /** Whether this window still holds the exact execution identity (lost by a reload). */
   identifiable: boolean;
+  /**
+   * Whether the shell reported this execution as started, which is what makes
+   * its end something this window will be told about. Holding an execution
+   * identity is not the same thing: that comes back from the hand-over,
+   * before the shell has reported anything.
+   */
+  shellReportedStart: boolean;
   restored: boolean;
   /** The child process running it, for a direct operation whose pid is known. */
   directPid?: number;
@@ -637,6 +644,17 @@ interface Operation extends OperationIdentity {
   terminalName?: string;
   terminalPid?: number;
   execution?: vscode.TerminalShellExecution;
+  /**
+   * Whether the shell has reported this execution as started.
+   *
+   * Not the same question as whether `execution` is set: that identity is
+   * handed back by `executeCommand` at the hand-over, before the shell has
+   * said anything at all. It is this flag, and not the presence of an
+   * execution, that says an end event is coming — a shell that never reported
+   * the start is not going to report the end either, and an operation in that
+   * position can only be settled from the process table.
+   */
+  shellReportedStart?: boolean;
   output?: Promise<string>;
   lease?: TerminalLease;
   announce?: (wait: StartWait) => void;
@@ -1178,7 +1196,11 @@ export class OperationRegistry implements vscode.Disposable {
 
   private onStarted(event: vscode.TerminalShellExecutionStartEvent): void {
     const operation = this.forExecution(event.execution, event.terminal);
-    if (operation) {
+    if (operation?.state === "running-shell") {
+      // Already running, already guarded, already established: the probe said
+      // so. All this adds is the exact identity it was missing.
+      this.attachExecution(operation, event.execution);
+    } else if (operation) {
       this.advanceToRunning(operation, event.terminal, event.execution, undefined);
     }
     // Another execution starting in a terminal that hosts one of ours changes
@@ -1293,9 +1315,45 @@ export class OperationRegistry implements vscode.Disposable {
    * executing now, which is the strongest possible reason to keep refusing a
    * second copy. The guard is released by this execution's own end.
    */
+  /**
+   * The shell reporting the execution for a command this window had already
+   * found running as a process. The same operation, told apart more exactly.
+   *
+   * It is deliberately not an advance. The record is already `running-shell`
+   * and already guarding this command; what changes is that this window now
+   * holds the execution identity, so the shell's own end event can release
+   * the guard and Stop can aim at something exact. Nothing is announced and
+   * no establishment is emitted: the caller was told when the wait expired,
+   * and a second establishment for one command would be a second lifecycle
+   * for it.
+   *
+   * The pid stays recorded. It cost real evidence to obtain, it is what
+   * follows this command through its shell dying, and it is what probing
+   * falls back to if observation is lost again.
+   */
+  private attachExecution(operation: Operation, execution: vscode.TerminalShellExecution): void {
+    operation.execution = execution;
+    // The shell is watching this execution now, so its end will be reported.
+    operation.shellReportedStart = true;
+    // The execution's own end will report this now; the process table no
+    // longer has to be asked. `outstanding` says the same thing.
+    clearInterval(operation.probeTimer);
+    operation.probeTimer = undefined;
+    this.log(
+      `${operation.label}: the shell in "${operation.terminalName ?? "its terminal"}" has now reported the execution for the command this window had already found running${
+        operation.enginePid === undefined ? "" : ` as pid ${operation.enginePid}`
+      }; it is the same operation, now holding that exact execution, and that execution's end releases the guard`,
+    );
+    this.persistQuietly();
+    this.changeEmitter.fire();
+  }
+
   private advanceToRunning(operation: Operation, terminal: vscode.Terminal, execution: vscode.TerminalShellExecution, ended: { exitCode: number | undefined } | undefined): void {
     const late = operation.waitExpired;
     operation.state = "running-shell";
+    // The shell itself said so, which is what makes its end an event this
+    // window will be told about rather than something it must go and look for.
+    operation.shellReportedStart = true;
     operation.terminal = terminal;
     operation.terminalName = terminal.name;
     operation.execution = execution;
@@ -1347,6 +1405,20 @@ export class OperationRegistry implements vscode.Disposable {
     }
     for (const operation of this.operations.values()) {
       if (operation.execution === undefined && (operation.state === "submitted-shell" || (operation.state === "armed" && operation.transport === "shell")) && !operation.restored && operation.terminal === terminal) {
+        return operation;
+      }
+    }
+    // The probe got there first. This operation is already `running-shell`,
+    // anchored to a pid, and the shell is only now reporting the start of the
+    // very execution it was handed. Claiming it strengthens the record that
+    // exists; it never starts a second one.
+    //
+    // It also has to be claimed. Left unmatched, the loop in `onStarted`
+    // reads this execution as a *foreign* command taking the foreground and
+    // retires the terminal — the terminal this operation is running in, and
+    // the one Stop has to reach to interrupt it.
+    for (const operation of this.operations.values()) {
+      if (operation.state === "running-shell" && !operation.shellReportedStart && !operation.restored && (operation.execution === execution || (operation.execution === undefined && operation.terminal === terminal))) {
         return operation;
       }
     }
@@ -2125,11 +2197,28 @@ export function outstanding(view: OperationView): boolean {
       return false;
     case "submitted-shell":
       return true;
+    case "running-shell":
+      // Normally this window watches such an operation through the execution
+      // the shell reported as started, and that same execution's end is what
+      // releases it. When the process probe established it first, the shell
+      // has reported nothing: it never announced a start, so it is not going
+      // to announce an end, and only the process table can settle it. That
+      // blind spot is exactly the one a reload or a lost terminal leaves, and
+      // it has to be probed for the same reason.
+      //
+      // Note that holding an execution identity does not answer this. That
+      // identity comes back from `executeCommand` at the hand-over, so a
+      // probe-established operation has one and is still unwatched — which is
+      // precisely how this was missed. Such an operation used to be guarded
+      // for the life of the window: its probe timer kept firing every few
+      // seconds and `probeOnce` refused every round here, so the engine could
+      // exit with nothing noticing.
+      return view.restored || view.observationLost === true || !view.shellReportedStart;
     default:
-      // `armed`, `running-shell`, `running-direct`, `running-dedicated`: this
-      // window's own are visible to it and to the caller that started them —
-      // unless observation of them has been lost, which is precisely when
-      // nobody here can account for them any more.
+      // `armed`, `running-direct`, `running-dedicated`: this window's own are
+      // visible to it and to the caller that started them — unless
+      // observation of them has been lost, which is precisely when nobody
+      // here can account for them any more.
       return view.restored || view.observationLost === true;
   }
 }
@@ -2152,6 +2241,7 @@ function view(operation: Operation): OperationView {
     terminalName: operation.terminalName,
     terminalPid: operation.terminalPid,
     identifiable: operation.execution !== undefined,
+    shellReportedStart: operation.shellReportedStart === true,
     restored: operation.restored,
     directPid: operation.directPid,
     observationLost: operation.observationLost,
