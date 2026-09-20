@@ -1007,7 +1007,14 @@ export class ExecutionTracker implements vscode.Disposable {
     this.log(`${describe(item)} ${how}${detail ? ` — ${detail}` : ""}`);
     void this.persist();
     this.changeEmitter.fire("ended");
-    if (item.record.source !== "launched" || !item.word) {
+    // Only a command *this window started* may be explained as an engine
+    // failure; a runner we merely observed or reattached to is not ours to
+    // account for. "Launched" used to mean the shell transport alone, because
+    // a dedicated terminal is tracked under source `terminal` — so a dedicated
+    // runner that exited non-zero raised nothing at all. That was tolerable
+    // while it was a rare fallback and is not now that every free-text
+    // submission takes it: a refused `resume-plan --evidence` has to say so.
+    if ((item.record.source !== "launched" && !item.dedicated) || !item.word) {
       return;
     }
     if (wasCommandNotFound(exitCode, process.platform, item.plan)) {

@@ -3137,17 +3137,24 @@ async function evidenceLaunchAssertions(reportedRepo: string, fixtureRoot: strin
     assert.match(evidence, /^\d{4}-\d{2}-\d{2} — manual verification recorded in VS Code/, "the whole entry, from its first character");
 
     // The fake exited 127 with its own complaint. That is an engine failure.
-    const failure = (await waitFor127()) as { runId: string; kind: string; exitCode: number; output: string } | undefined;
+    const failure = await waitForEngineFailure("resume-plan");
     assert.ok(failure, "a non-zero exit from a launched engine is reported");
     assert.equal(failure.kind, "resume-plan");
     assert.equal(failure.exitCode, 127);
-    assert.match(failure.output, /the recorded digest does not match/, `what the engine printed is what the user is shown, got: ${JSON.stringify(failure.output)}`);
+    // The engine's own complaint used to be quoted back into the panel,
+    // because a shell-integration execution exposes an output stream. A
+    // dedicated terminal does not, and VS Code offers no way to read one, so
+    // what the engine said is on screen in its terminal and in the Output
+    // Channel instead of in the failure record. The failure says so itself
+    // (core/submission.ts, `submissionFailureReason`) rather than presenting
+    // an exit code with nothing under it.
+    assert.equal(failure.output, "", "a dedicated runner has no readable output stream; this is stated, not quietly empty");
     assert.deepEqual(
       await vscode.commands.executeCommand("agentSparring._test.lastCommandNotFound"),
       beforeNotFound,
       "and nothing claims the shell could not find an executable it just ran",
     );
-    console.log("integration: resume-plan --evidence reached the configured executable as 8 arguments; its 127 was reported as an engine failure");
+    console.log("integration: resume-plan --evidence reached the configured executable as 8 arguments with no shell in between; its 127 was reported as an engine failure");
   } finally {
     restore();
     await fs.writeFile(path.join(sparring, "fake-runner.conf"), "sleep_for=3\nexit_with=0\n");
@@ -3226,12 +3233,23 @@ async function waitForFile(file: string, timeoutMs: number, what: string): Promi
   }
 }
 
-async function waitFor127(): Promise<unknown> {
-  const deadline = Date.now() + 20_000;
+/**
+ * The failure of *this* command, not whatever failure is still on the books.
+ *
+ * `lastEngineFailure` keeps the most recent one for the whole session, and an
+ * earlier section leaves a `run-loop` failure there. Waiting for "a failure"
+ * therefore returned that one as soon as it was asked, which passed only
+ * because a shell-bound execution happened to report its end before the first
+ * poll. A dedicated terminal's exit arrives with the pty host's close event
+ * instead, a little later — and the stale answer was suddenly the one that
+ * came back. The scenario always meant this.
+ */
+async function waitForEngineFailure(kind: string): Promise<{ runId: string; kind: string; exitCode: number; output: string } | undefined> {
+  const deadline = Date.now() + 30_000;
   for (;;) {
-    const failure = await vscode.commands.executeCommand("agentSparring._test.lastEngineFailure");
-    if (failure || Date.now() >= deadline) {
-      return failure;
+    const failure = (await vscode.commands.executeCommand("agentSparring._test.lastEngineFailure")) as { kind: string; exitCode: number } | undefined;
+    if (failure?.kind === kind || Date.now() >= deadline) {
+      return failure as { runId: string; kind: string; exitCode: number; output: string } | undefined;
     }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }

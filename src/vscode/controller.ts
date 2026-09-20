@@ -1013,7 +1013,15 @@ export class SparringController implements vscode.Disposable {
         this.log(`Submission: the engine exited 0 for ${record.stageId}; the evidence is recorded and the drafts are cleared`);
         continue;
       }
-      const failure = { atMs: Date.now(), exitCode: execution?.exitCode, output: await this.tracker.outputOf(record.executionId), reason: submissionFailureReason(execution?.exitCode) };
+      // A runner in a dedicated terminal has no readable output stream — VS
+      // Code exposes one only for a shell-integration execution — so the
+      // engine's last words cannot be quoted back into the panel the way a
+      // shell-bound failure's are. That is said plainly rather than left as a
+      // failure with nothing under it; the words themselves are on screen in
+      // the terminal that ran it and in the Output Channel, both of which this
+      // then points at.
+      const output = await this.tracker.outputOf(record.executionId);
+      const failure = { atMs: Date.now(), exitCode: execution?.exitCode, output, reason: submissionFailureReason(execution?.exitCode, output !== undefined) };
       await this.context.workspaceState.update(SUBMISSIONS_KEY, withSubmissionFailure(this.context.workspaceState.get<Submissions>(SUBMISSIONS_KEY), key, failure));
       this.log(`Submission: ${failure.reason} Every drafted result and note for ${record.stageId} is kept exactly as it was.`);
       this.render();

@@ -151,14 +151,15 @@ const INTERRUPTED_EXITS = new Set([130, 143]);
  * nothing here infers a cause from it, because the engine's own output is
  * carried alongside and says what actually happened.
  */
-export function submissionFailureReason(exitCode: number | undefined): string {
+export function submissionFailureReason(exitCode: number | undefined, quoted = true): string {
+  const where = quoted ? "" : " Its own words are in the Agent Sparring terminal it ran in, and in the Output Channel.";
   if (exitCode === undefined) {
-    return "The submission was interrupted before the engine finished (Ctrl-C, a signal, or the terminal was closed).";
+    return `The submission was interrupted before the engine finished (Ctrl-C, a signal, or the terminal was closed).${where}`;
   }
   if (INTERRUPTED_EXITS.has(exitCode)) {
-    return `The submission was interrupted (exit ${exitCode}) before the engine recorded the evidence.`;
+    return `The submission was interrupted (exit ${exitCode}) before the engine recorded the evidence.${where}`;
   }
-  return `The engine exited with code ${exitCode} without recording the evidence.`;
+  return `The engine exited with code ${exitCode} without recording the evidence.${where}`;
 }
 
 /** The sentence a failed submission leads with. The reassurance comes first: it is the answer to what the person is about to fear. */
