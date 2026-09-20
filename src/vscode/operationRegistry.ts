@@ -864,6 +864,18 @@ export class OperationRegistry implements vscode.Disposable {
    * relied on after a crash, so nothing is started at all and the caller is
    * told; that is the one ordering under which a crash can never leave a
    * started operation with no durable identity.
+   *
+   * `details.args` is persisted verbatim, which means a person's own evidence
+   * text goes into workspace state in the clear. That is deliberate and not a
+   * slip: re-attributing a process to this operation after a reload compares
+   * the recorded argument vector to what the process table reports
+   * (core/processInvocation.ts), and a redacted or hashed vector cannot do
+   * that — the alternative is a runner nobody can identify, which is the
+   * failure this whole registry exists to prevent. The same text is already
+   * kept beside it as the submission's own record (core/submission.ts), which
+   * is what makes a failed submission recoverable. Nothing here writes it to
+   * the log: the launchers state how many arguments there were, never what
+   * was in them.
    */
   async arm(claim: OperationClaim, transport: OperationTransport, details?: Pick<OperationIdentity, "word" | "plan"> & { args?: string[] }): Promise<ArmResult> {
     const operation = this.held(claim, "reserved");

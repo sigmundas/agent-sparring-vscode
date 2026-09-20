@@ -20,7 +20,7 @@ import type { DiscoveryDiagnostic } from "../core/diagnose";
 import { discoverRuns, selectRun } from "../core/discovery";
 import { stageScopeKey, stageScopeOf } from "../core/stageScope";
 import { buildResumePlanArgs } from "../core/cli";
-import { fourCheckEvidence } from "../test/fixtures/fourCheckEvidence";
+import { hostileEvidence } from "../test/fixtures/hostileEvidence";
 import { planKey } from "../core/sparringCommand";
 import { BINDING_VERSION, bindingFileName, manifestFileName, parseExecutionManifest, renderBindingRecord } from "../core/manifest";
 import { isActionMessage, isAgentConfigMessage, isAutoPushMessage, isCopyPromptMessage, isHumanCheckMessage, isHumanFeedbackMessage, isOpenPromptSourceMessage, renderOverviewHtml } from "../core/overviewHtml";
@@ -2607,6 +2607,14 @@ function trackerOver(lease: TerminalLease, logged: string[]): { tracker: Executi
   };
 }
 
+/** A tracker over a pool of the caller's choosing, with its own registry. */
+function trackerOverPool(pool: TerminalPool, logged: string[]): { tracker: ExecutionTracker; registry: OperationRegistry; dispose: () => void } {
+  const context = { workspaceState: memento() } as unknown as vscode.ExtensionContext;
+  const registry = new OperationRegistry(context, (message: string) => logged.push(message));
+  const tracker = new ExecutionTracker(context, (message) => logged.push(message), () => [], pool, registry);
+  return { tracker, registry, dispose: () => { tracker.dispose(); registry.dispose(); } };
+}
+
 /** A tracker over a given registry, for the reload and attribution scenarios. */
 function trackerWith(registry: OperationRegistry, stored: vscode.Memento, logged: string[]): ExecutionTracker {
   const context = { workspaceState: stored } as unknown as vscode.ExtensionContext;
@@ -3129,29 +3137,43 @@ async function evidenceLaunchAssertions(reportedRepo: string, fixtureRoot: strin
     assert.match(evidence, /^\d{4}-\d{2}-\d{2} — manual verification recorded in VS Code/, "the whole entry, from its first character");
 
     // The fake exited 127 with its own complaint. That is an engine failure.
-    const failure = (await waitFor127()) as { runId: string; kind: string; exitCode: number; output: string } | undefined;
+    const failure = await waitForEngineFailure("resume-plan");
     assert.ok(failure, "a non-zero exit from a launched engine is reported");
     assert.equal(failure.kind, "resume-plan");
     assert.equal(failure.exitCode, 127);
-    assert.match(failure.output, /the recorded digest does not match/, `what the engine printed is what the user is shown, got: ${JSON.stringify(failure.output)}`);
+    // The engine's own complaint used to be quoted back into the panel,
+    // because a shell-integration execution exposes an output stream. A
+    // dedicated terminal does not, and VS Code offers no way to read one, so
+    // what the engine said is on screen in its terminal and in the Output
+    // Channel instead of in the failure record. The failure says so itself
+    // (core/submission.ts, `submissionFailureReason`) rather than presenting
+    // an exit code with nothing under it.
+    assert.equal(failure.output, "", "a dedicated runner has no readable output stream; this is stated, not quietly empty");
     assert.deepEqual(
       await vscode.commands.executeCommand("agentSparring._test.lastCommandNotFound"),
       beforeNotFound,
       "and nothing claims the shell could not find an executable it just ran",
     );
-    console.log("integration: resume-plan --evidence reached the configured executable as 8 arguments; its 127 was reported as an engine failure");
+    console.log("integration: resume-plan --evidence reached the configured executable as 8 arguments with no shell in between; its 127 was reported as an engine failure");
   } finally {
     restore();
     await fs.writeFile(path.join(sparring, "fake-runner.conf"), "sleep_for=3\nexit_with=0\n");
   }
 }
 
-/** The incident's longer, four-check payload through a real interactive zsh. */
+/**
+ * The incident's payload, launched by the real launcher in a real extension
+ * host, against a real executable that records its own argv.
+ *
+ * This used to send the payload through an interactive zsh and assert that it
+ * arrived; it always passed, because the command line it produced was 1124
+ * bytes and the ceiling on a terminal's input is around 1968. The live
+ * submission was longer, and was cut off part-way through. So the payload here
+ * is now deliberately larger than any command line could carry, and the claim
+ * is the one that actually matters: whatever is in it, and however long it is,
+ * the engine's argv holds it exactly.
+ */
 async function fourChecksZshAssertions(fixtureRoot: string): Promise<void> {
-  if (process.platform === "win32") {
-    console.log("integration: zsh four-check scenario skipped on Windows");
-    return;
-  }
   const cwd = path.join(fixtureRoot, "four-check-evidence");
   await fs.mkdir(cwd, { recursive: true });
   const reporter = path.join(cwd, "sparring");
@@ -3160,24 +3182,28 @@ async function fourChecksZshAssertions(fixtureRoot: string): Promise<void> {
 for a in "$@"; do printf '<%s>\\n' "$a"; done > '${argvFile}'
 printf '[end]\\n' >> '${argvFile}'
 `, { mode: 0o755 });
-  const terminal = vscode.window.createTerminal({ name: "four-check evidence regression", cwd, shellPath: "/bin/zsh" });
-  const integration = await shellIntegrationFor(terminal, 8000);
-  assert.ok(integration, "the explicit zsh terminal must expose shell integration");
-  const { lease } = bypassLease(terminal);
   const logged: string[] = [];
-  const { tracker, dispose } = trackerOver(lease, logged);
+  // A pool that fails loudly: a free-text submission must not lease a shell
+  // terminal at all, let alone write into one.
+  const pool = { acquire: () => { throw new Error("a free-text submission must not lease a shell terminal"); } } as unknown as TerminalPool;
+  const { tracker, dispose } = trackerOverPool(pool, logged);
   try {
     const planPath = path.join(cwd, "reviewed-plans", "continuations", "2026-09-19-add-reference-dialog-redesign-continuation.md");
-    const args = buildResumePlanArgs({ source: "markdown", planPath, repoRoot: cwd, expectedBranch: "feature/add-reference-dialog-redesign", evidence: fourCheckEvidence() });
+    const evidence = hostileEvidence();
+    assert.ok(evidence.length > 4000, `the payload must exceed what any command line can carry, got ${evidence.length}`);
+    const args = buildResumePlanArgs({ source: "markdown", planPath, repoRoot: cwd, expectedBranch: "feature/add-reference-dialog-redesign", evidence });
     assert.equal(args.length, 8);
     const result = await tracker.launch({ configured: reporter, args, cwd, name: "four-check evidence", runId: "four-check-evidence", kind: "resume-plan", planPath, reveal: false });
-    assert.equal(result.ok, true, `the complete command must start, never remain at quote>: ${logged.join("\n")}`);
-    const output = await waitForFile(argvFile, 5000, "the four-check command records its arguments");
-    assert.deepEqual([...output.matchAll(/<([^]*?)>\n/g)].map(match => match[1]), args, "newlines, backticks, dashes and all four check/gate identities survive the real terminal");
-    console.log("integration: the real four-check multiline payload started in zsh and arrived as exactly eight intact arguments");
+    assert.equal(result.ok, true, `the complete submission must start: ${logged.join("\n")}`);
+    assert.equal(result.via, "terminal", "and it must start as its own process, with no shell in between");
+    const output = await waitForFile(argvFile, 10_000, "the submission records its arguments");
+    assert.deepEqual([...output.matchAll(/<([^]*?)>\n/g)].map(match => match[1]), args, "every argument arrives byte for byte, newlines, quotes, backticks, dollars, dashes and all");
+    console.log(`integration: a ${evidence.length}-byte evidence payload reached the engine as exactly eight intact arguments, with no shell involved`);
   } finally {
     dispose();
-    terminal.dispose();
+    for (const terminal of vscode.window.terminals.filter((item) => item.name.includes("four-check evidence"))) {
+      terminal.dispose();
+    }
   }
 }
 
@@ -3207,12 +3233,23 @@ async function waitForFile(file: string, timeoutMs: number, what: string): Promi
   }
 }
 
-async function waitFor127(): Promise<unknown> {
-  const deadline = Date.now() + 20_000;
+/**
+ * The failure of *this* command, not whatever failure is still on the books.
+ *
+ * `lastEngineFailure` keeps the most recent one for the whole session, and an
+ * earlier section leaves a `run-loop` failure there. Waiting for "a failure"
+ * therefore returned that one as soon as it was asked, which passed only
+ * because a shell-bound execution happened to report its end before the first
+ * poll. A dedicated terminal's exit arrives with the pty host's close event
+ * instead, a little later — and the stale answer was suddenly the one that
+ * came back. The scenario always meant this.
+ */
+async function waitForEngineFailure(kind: string): Promise<{ runId: string; kind: string; exitCode: number; output: string } | undefined> {
+  const deadline = Date.now() + 30_000;
   for (;;) {
-    const failure = await vscode.commands.executeCommand("agentSparring._test.lastEngineFailure");
-    if (failure || Date.now() >= deadline) {
-      return failure;
+    const failure = (await vscode.commands.executeCommand("agentSparring._test.lastEngineFailure")) as { kind: string; exitCode: number } | undefined;
+    if (failure?.kind === kind || Date.now() >= deadline) {
+      return failure as { runId: string; kind: string; exitCode: number; output: string } | undefined;
     }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }

@@ -41,11 +41,8 @@ import {
   buildRunLoopArgs,
   buildRunPlanArgs,
   buildRunSparringArgs,
-  needsOwnQuoting,
   planShellHandover,
-  posixQuote,
-  shellCommandLine,
-  shellFamily,
+  transportSafety,
   vscodeQuotingIsFaithful,
   wasCommandNotFound,
 } from "../core/cli";
@@ -105,8 +102,6 @@ async function throughShell(shell: string, line: string, cwd: string): Promise<{
   return { argv: [...result.stdout.matchAll(/<([^]*?)>\n/g)].map((match) => match[1]), exitCode: result.exitCode };
 }
 
-const SHELLS = ["/bin/bash", "/bin/zsh"];
-
 describe("handing a free-text argument to a shell", () => {
   it("VS Code's own escaping turns a gate check's evidence into shell syntax — the reported failure", async () => {
     const { dir, file } = await argvReporter();
@@ -125,37 +120,6 @@ describe("handing a free-text argument to a shell", () => {
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  for (const shell of SHELLS) {
-    it(`a command line built here survives ${shell} exactly`, async () => {
-      const { dir, file } = await argvReporter();
-      const args = buildResumePlanArgs({ source: "manifest", manifest: path.join(dir, "m.json"), repoRoot: dir, expectedBranch: "feature/x", evidence: realEvidence() });
-      const line = shellCommandLine(file, args, "posix-ansi");
-      assert.ok(line, "a POSIX shell is one this extension can quote for");
-      const seen = await throughShell(shell, line, dir);
-      assert.deepEqual(seen.argv, args, "every argument reaches the process byte for byte");
-      assert.equal(seen.exitCode, 0, "and the shell has nothing left over to run");
-      await fs.rm(dir, { recursive: true, force: true });
-    });
-  }
-
-  it("survives everything a person can type, not only the evidence that failed", async () => {
-    const { dir, file } = await argvReporter();
-    const nasty = [
-      "it's `date` $HOME \\ \"quoted\" & ; | > < (sub) {brace} [glob] * ? ~ #hash !bang",
-      "line one\nline two\n\n- PASS — em dash · middot",
-      "  leading and trailing  ",
-      "",
-      "\t\ttabs\t",
-      "$(rm -rf /) — must arrive as text",
-    ];
-    const line = shellCommandLine(file, nasty, "posix-ansi");
-    assert.ok(line);
-    for (const shell of SHELLS) {
-      assert.deepEqual((await throughShell(shell, line, dir)).argv, nasty, `${shell} passes it through unchanged`);
-    }
-    await fs.rm(dir, { recursive: true, force: true });
-  });
-
   it("leaves every existing invocation exactly as it was: VS Code's escaping is only bypassed when it would lie", () => {
     const loop = { stageId: "stage-reported-statistics-typed-parser", repoRoot: "/Users/me/Code/my repo", expectedBranch: "feature/reported-statistics" };
     for (const args of [
@@ -167,9 +131,13 @@ describe("handing a free-text argument to a shell", () => {
       buildAcceptCandidateArgs(loop),
       buildNewStageArgs({ stageId: loop.stageId, repoRoot: loop.repoRoot, briefFile: "/tmp/brief.md" }),
     ]) {
-      assert.equal(needsOwnQuoting(args), false, `unchanged: ${args[0]}`);
+      assert.equal(transportSafety("/Users/me/venv/bin/sparring", args), "shell", `unchanged: ${args[0]}`);
     }
-    assert.equal(needsOwnQuoting(buildResumePlanArgs({ source: "markdown", planPath: "p.md", repoRoot: "/r", expectedBranch: "b", evidence: realEvidence() })), true, "only the free-text one is taken over");
+    assert.equal(
+      transportSafety("/Users/me/venv/bin/sparring", buildResumePlanArgs({ source: "markdown", planPath: "p.md", repoRoot: "/r", expectedBranch: "b", evidence: realEvidence() })),
+      "no-shell",
+      "only the free-text one is taken off the shell",
+    );
   });
 
   it("knows exactly which arguments VS Code's escaping can carry", () => {
@@ -184,33 +152,20 @@ describe("handing a free-text argument to a shell", () => {
   it("the launcher's decision, for the exact invocation that failed", async () => {
     const { dir, file } = await argvReporter();
     const args = buildResumePlanArgs({ source: "manifest", manifest: path.join(dir, "m.json"), repoRoot: dir, expectedBranch: "feature/x", evidence: realEvidence() });
-    const handover = planShellHandover(file, args, "posix-ansi");
-    assert.equal(handover.via, "command-line", "the evidence launch is quoted here, not by VS Code");
-    assert.deepEqual((await throughShell("/bin/zsh", (handover as { commandLine: string }).commandLine, dir)).argv, args);
+    assert.deepEqual(planShellHandover(file, args), { via: "no-shell" }, "the evidence launch never goes near a shell");
 
     const plain = buildRunLoopArgs({ stageId: "stage-a", repoRoot: dir, expectedBranch: "feature/x" });
-    assert.deepEqual(planShellHandover(file, plain, "posix"), { via: "arguments" }, "everything else keeps VS Code's own escaping");
-    assert.deepEqual(planShellHandover(file, args, "cmd"), { via: "no-shell" }, "a shell whose quoting is not written here is bypassed entirely");
+    assert.deepEqual(planShellHandover(file, plain), { via: "arguments" }, "everything else keeps VS Code's own escaping");
     await fs.rm(dir, { recursive: true, force: true });
   });
 
-  it("quotes for the POSIX shells and refuses to guess for the rest", () => {
-    assert.equal(posixQuote("it's"), "'it'\\''s'");
-    assert.equal(shellFamily("/bin/zsh", "darwin"), "posix-ansi");
-    assert.equal(shellFamily("/usr/local/bin/fish", "linux"), "posix");
-    assert.equal(shellFamily("C:\\Program Files\\PowerShell\\7\\pwsh.exe", "win32"), "cmd");
-    assert.equal(shellFamily("C:\\Windows\\System32\\cmd.exe", "win32"), "cmd");
-    assert.equal(shellFamily("C:\\Program Files\\Git\\bin\\bash.exe", "win32"), "posix-ansi", "Git Bash on Windows is still a POSIX shell");
-    assert.equal(shellFamily(undefined, "darwin"), "posix");
-    for (const shell of ["/bin/sh", "/bin/dash", "/bin/ash", "/bin/fish", undefined]) {
-      assert.deepEqual(planShellHandover("sparring", ["--evidence", "first\nsecond"], shellFamily(shell, "linux")), { via: "no-shell" }, "unknown ANSI-C support takes the existing direct route before any handoff");
-    }
-    assert.deepEqual(planShellHandover("sparring", ["--evidence", "text\0tail"], "posix-ansi"), { via: "no-shell" }, "NUL must never be silently truncated");
-    assert.equal(
-      shellCommandLine("sparring", ["resume-plan", "--evidence", "it's"], "cmd"),
-      undefined,
-      "no command line is invented for a shell whose quoting is not written here; the caller runs the process without a shell instead",
-    );
+  it("the answer does not depend on which shell the person happens to use", () => {
+    // It used to: a bash/zsh/ksh user got an ANSI-C quoted command line and
+    // everyone else was sent off the shell. The command line is what failed,
+    // so there is now one answer for everybody.
+    const args = buildResumePlanArgs({ source: "markdown", planPath: "p.md", repoRoot: "/r", expectedBranch: "b", evidence: realEvidence() });
+    assert.deepEqual(planShellHandover("sparring", args), { via: "no-shell" });
+    assert.deepEqual(planShellHandover("sparring", ["--evidence", "text\0tail"]), { via: "no-shell" }, "NUL must never be silently truncated either");
   });
 });
 
@@ -287,7 +242,7 @@ describe("one launcher for every engine action", () => {
       assert.ok(!/integration\.executeCommand\(/.test(source), `${file} does not call executeCommand itself`);
     }
     const shared = await read("vscode/shellIntegration.ts");
-    assert.match(shared, /planShellHandover\(word, args, shellFamily\(/, "and it decides by the one rule in core, not by a second copy of it");
+    assert.match(shared, /planShellHandover\(word, args\)/, "and it decides by the one rule in core, not by a second copy of it");
     // The one place the final check and the hand-over meet, and they meet
     // with no `await` between them.
     const handover = await read("vscode/shellHandover.ts");

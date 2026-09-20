@@ -6,7 +6,7 @@
  */
 
 import * as vscode from "vscode";
-import { planShellHandover, shellFamily, type ShellHandover } from "../core/cli";
+import { planShellHandover, type ShellHandover } from "../core/cli";
 
 export type { ShellHandover };
 
@@ -69,10 +69,8 @@ export function awaitExecutionEnd(execution: vscode.TerminalShellExecution, term
 /** What was handed to the shell, for the log and for the tests. */
 export interface ShellRequest {
   execution: vscode.TerminalShellExecution;
-  /** The line the shell will read, however it was built. */
+  /** The line the shell will read, as the host reports it. */
   commandLine: string;
-  /** Whether this extension quoted it, rather than VS Code's own escaping. */
-  quotedHere: boolean;
   /**
    * Reading back what the host said it handed over failed, *after* the shell
    * had already been given the command. The command line above is then this
@@ -107,19 +105,20 @@ export type HandoverAttempt =
  * *before* anything irreversible happens.
  *
  * VS Code's `executeCommand(executable, args)` escaping is exact for flags
- * and paths but mangles anything a person wrote (see
- * `vscodeQuotingIsFaithful`), so when an argument would not survive it, the
- * command line is built here instead and passed as one already-quoted
- * string. `no-shell` means this shell's quoting is not reproduced in
- * `shellCommandLine` — the caller must then reach the process without a
- * shell rather than send it something it cannot express.
+ * and paths, so those are handed over as `arguments` and nothing changes.
+ * Everything else — above all anything carrying text a person wrote — is
+ * `no-shell`: the caller must reach the process with an exact argument array
+ * and no shell anywhere in between. The rule itself lives in core
+ * (`transportSafety`); this is only the VS Code-facing name for it, and it
+ * takes no shell or platform, because the answer does not depend on which
+ * shell the person uses. No shell gets to see such a command.
  *
  * Deciding this first is what lets a caller record its durable intent to run
  * the operation only when it really is about to: an operation that can never
- * be handed to this shell must not be armed for one.
+ * be handed to a shell must not be armed for one.
  */
-export function shellHandoverFor(word: string, args: string[], shell = vscode.env.shell, platform: NodeJS.Platform = process.platform): ShellHandover {
-  return planShellHandover(word, args, shellFamily(shell, platform));
+export function shellHandoverFor(word: string, args: string[]): ShellHandover {
+  return planShellHandover(word, args);
 }
 
 /**
@@ -144,23 +143,21 @@ export function performShellHandover(integration: vscode.TerminalShellIntegratio
   if (handover.via === "no-shell") {
     return { handedOver: false, error: new Error("performShellHandover was called for a command this shell cannot be given") };
   }
-  const quotedHere = handover.via === "command-line";
-  // 2. the irreversible boundary: nothing but this call is in the try
+  // 2. the irreversible boundary: nothing but this call is in the try.
+  //    Always the (word, args) form — this extension never builds a physical
+  //    command line for a shell to re-read.
   let execution: vscode.TerminalShellExecution;
   try {
-    execution = quotedHere ? integration.executeCommand(handover.commandLine) : integration.executeCommand(word, args);
+    execution = integration.executeCommand(word, args);
   } catch (error) {
     return { handedOver: false, error: error as Error };
   }
   // 3. observation. The shell has the command; from here on nothing may
   //    downgrade that to "it was never handed over".
-  if (quotedHere) {
-    return { handedOver: true, request: { execution, commandLine: handover.commandLine, quotedHere: true } };
-  }
   try {
-    return { handedOver: true, request: { execution, commandLine: execution.commandLine.value, quotedHere: false } };
+    return { handedOver: true, request: { execution, commandLine: execution.commandLine.value } };
   } catch (error) {
-    return { handedOver: true, request: { execution, commandLine: [word, ...args].join(" "), quotedHere: false, metadataError: error as Error } };
+    return { handedOver: true, request: { execution, commandLine: [word, ...args].join(" "), metadataError: error as Error } };
   }
 }
 
