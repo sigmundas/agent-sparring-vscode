@@ -157,6 +157,7 @@ convenience surface, not a replacement for seeing the real configuration.
 | Nothing configured, terminal shell integration available (the normal case) | Your integrated shell receives `sparring` plus the argument array through the shell-integration API; the shell's own `PATH`, venv activation and profile apply. Nothing is pre-checked from the extension host. | Only here can an exit code mean a missing CLI: if the shell reports the bare word as not found (exit 127, or 9009 on cmd.exe), the extension says so and offers **Open Settings** / **Choose executable…**. |
 | `agentSparring.executable` set | Exactly that path (relative paths resolve against the project). It is validated before anything is launched. | `agentSparring.executable points at …, which does not exist or is not executable.` |
 | Nothing configured, no shell integration within 5 s | A best-effort `PATH` search in the extension host, then a dedicated terminal whose process is `sparring`. | `Agent Sparring could not resolve the CLI from this VS Code environment. Set agentSparring.executable to the full path.` (never a suggestion to reinstall the engine). |
+| Nothing configured, submitting free text (`--evidence`, `--deferred-result`) | The same host `PATH` search, because no shell is involved to do the resolving (see "Free-text arguments never go through a shell"). | Same message. If your shell finds `sparring` but VS Code's environment does not — a venv activated only by your shell profile, for instance — set `agentSparring.executable` to the full path and every route works. |
 
 Short commands (Accept stage) use the same rule: your shell through shell
 integration when available (the output is read back for translation and
@@ -168,19 +169,28 @@ bad exit code from *that* is the command's own: the extension reports
 sends you to the executable setting for an executable it just ran. The full
 output is in the Output Channel.
 
-### Free-text arguments
+### Free-text arguments never go through a shell
 
-`resume-plan --evidence` carries a whole `## Human evidence` entry — a
-gate check's backticked id, the note you typed, several lines. VS Code's
-`executeCommand(executable, args)` double-quotes an argument only when it
-holds whitespace and none of `"`, `'` or a backtick, and appends everything
-else raw, so such an entry would reach the shell as syntax rather than as
-text. When an argument would not survive that escaping, the extension quotes
-the command line itself (POSIX single quotes) and hands it over as one
-string; on a shell whose quoting is not written here (cmd.exe, PowerShell)
-it bypasses the shell and runs the process with an argument array instead.
-Every other invocation — flags, stage ids, paths — is unaffected and still
-goes through VS Code's own escaping.
+`resume-plan --evidence` carries a whole `## Human evidence` entry — a gate
+check's backticked id, the note you typed, several lines — and
+`--deferred-result` carries your answer to a manual check. Those do not need
+shell semantics and are never given any.
+
+Such a command is classified `no-shell` before anything else happens
+(`core/cli.ts`, `transportSafety`) and runs as the process of its own
+**Agent Sparring** terminal: the `sparring` executable *is* that terminal's
+process and the argument array is passed straight to it, so your text reaches
+the engine as one argument, byte for byte, with no interactive line editor, no
+`shell -c` and no quoting of any kind in between. The terminal still shows the
+engine's output. Every other invocation — flags, stage ids, paths — is
+unaffected and still goes to your own shell through VS Code's escaping.
+
+This is not a preference. Two earlier versions did encode the entry into a
+single command line — first POSIX `'…'`, then ANSI-C `$'…'` — and both failed
+in use, because an interactive shell on a pty stops accepting a command line
+after roughly 1968 bytes and a real four-check entry is larger than that. The
+line was cut off part-way through and no engine process appeared. No encoding
+survives that, since the limit is on the line and not on its syntax.
 
 ## What the words mean
 
@@ -593,7 +603,7 @@ a runner is alive.
 | its terminal was closed | the pty and the shell reading it are gone, so a queued line can never be read |
 | `ps` no longer lists the shell process that took it | the same conclusion, for a submission this window can no longer identify |
 | `ps` lists *this exact command* (same subcommand, stage / plan / manifest) | it started |
-| the command line was never handed over (this shell's quoting could not be written) | there is no submitted line at all |
+| the command line was never handed over (no terminal of this project had an idle, observable shell) | there is no submitted line at all |
 
 **What never resolves one:** a timer of any kind, the terminal-reconnect grace
 period after a reload, and *any other* runner turning up in the project's
@@ -792,8 +802,8 @@ Liveness sources, most exact first:
 
 | Source | How it is observed | Ends when |
 | --- | --- | --- |
-| Launched from the extension | This project's integrated terminal (your normal shell, cwd = project — only when its shell is idle) runs `sparring` through the terminal shell-integration API with an argument array (see "Free-text arguments" for the one case that is quoted here instead). Recorded as a runner only once the shell reports that exact execution started; a submission the shell has not started is kept apart from the launches and is never a runner (see "Submitting a command is not running it"). | The shell-execution end event fires (normal exit, non-zero exit, Ctrl-C), another command starts in that terminal, or the terminal closes. |
-| Dedicated terminal (fallback) | Only if shell integration does not activate within 5 s: a terminal whose process *is* `sparring` (argument array, no shell). | That terminal closes, which VS Code does as soon as the process exits. |
+| Launched from the extension | This project's integrated terminal (your normal shell, cwd = project — only when its shell is idle) runs `sparring` through the terminal shell-integration API with an argument array (see "Free-text arguments never go through a shell" for the commands that bypass the shell entirely). Recorded as a runner only once the shell reports that exact execution started; a submission the shell has not started is kept apart from the launches and is never a runner (see "Submitting a command is not running it"). | The shell-execution end event fires (normal exit, non-zero exit, Ctrl-C), another command starts in that terminal, or the terminal closes. |
+| Dedicated terminal | A terminal whose process *is* `sparring` (argument array, no shell). Used for every command carrying free text, and whenever shell integration does not activate within 5 s. | That terminal closes, which VS Code does as soon as the process exits. |
 | Typed in an integrated terminal | Shell integration reports the command line and cwd; `sparring run-loop <stage>`, `run-plan` and `resume-plan` are recognised and tied to the project by `--repo-root` / `--sparring-dir` / cwd (nested projects match their own root). | Same as a launched command. |
 | Re-found after a window reload | Launches are recorded in `workspaceState`; after a reload the hosting terminal is re-found by process id and, on macOS/Linux, a `ps` probe checks that the runner still runs under it. | The probe no longer finds it, or a shell execution starts/ends in that terminal. On Windows the state stays `unknown`. |
 | Outside VS Code / before activation | Nothing observes the process. | Never known; telemetry describes activity and liveness is labelled unknown. |

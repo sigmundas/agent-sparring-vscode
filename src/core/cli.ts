@@ -364,7 +364,7 @@ export function commandNotFoundMessage(word: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// handing a command to a shell
+// choosing a transport
 // ---------------------------------------------------------------------------
 
 /**
@@ -380,8 +380,7 @@ export function commandNotFoundMessage(word: string): string {
  * That is exact for subcommands, flags and ordinary paths, and wrong for
  * anything a person wrote: a backtick becomes command substitution, an
  * apostrophe opens a quote, a newline starts a second command, `$` expands,
- * and an empty argument disappears entirely. `resume-plan --evidence` is
- * exactly that kind of text.
+ * and an empty argument disappears entirely.
  *
  * This says whether the shell will parse VS Code's line back into the
  * argument it was given. It is deliberately strict: an argument qualifies
@@ -396,8 +395,7 @@ export function vscodeQuotingIsFaithful(arg: string): boolean {
   }
   if (TERMINAL_CONTROL.test(arg)) {
     // Terminal control bytes act on the interactive reader before the shell
-    // parses quoting. Encode them instead of sending literal line breaks,
-    // tabs or editing keys.
+    // parses quoting at all.
     return false;
   }
   if (/\s/.test(arg)) {
@@ -410,103 +408,80 @@ export function vscodeQuotingIsFaithful(arg: string): boolean {
 /** Anything outside this set can mean something to a shell when unquoted. */
 const SHELL_ACTIVE = /[^\p{L}\p{N}_@%+=:,./-]/u;
 
-/** Whether the extension must build the command line itself for these arguments. */
-export function needsOwnQuoting(args: readonly string[]): boolean {
-  return args.some((arg) => !vscodeQuotingIsFaithful(arg));
-}
-
-/**
- * The shells the extension knows how to quote for. `cmd` stands for every
- * shell whose quoting is not reproduced here — cmd.exe (which cannot carry a
- * newline in an argument at all) and PowerShell (whose native-command
- * argument passing differs between 5.1 and 7.3+). For those the caller must
- * bypass the shell and pass an argument array to the process directly.
- * `posix-ansi` additionally supports $'…' escapes, so free text containing
- * terminal control bytes can be delivered as one physical command line.
- */
-export type ShellFamily = "posix" | "posix-ansi" | "cmd";
-
-const ANSI_QUOTING_SHELLS: ReadonlySet<string> = new Set(["bash", "zsh", "ksh"]);
-
-const POSIX_SHELLS: ReadonlySet<string> = new Set(["sh", "bash", "zsh", "dash", "ksh", "ash", "fish"]);
-
-/** The family of `shell` (a shell path, e.g. VS Code's `env.shell`). */
-export function shellFamily(shell: string | undefined, platform: NodeJS.Platform): ShellFamily {
-  const name = (shell ?? "").replace(/\\/g, "/").split("/").pop()?.toLowerCase().replace(/\.exe$/, "") ?? "";
-  if (ANSI_QUOTING_SHELLS.has(name)) {
-    return "posix-ansi";
-  }
-  if (POSIX_SHELLS.has(name)) {
-    return "posix";
-  }
-  return platform === "win32" ? "cmd" : "posix";
-}
-
-/**
- * A command line that `family` parses back into exactly `[word, ...args]`,
- * or undefined when this family's quoting is not reproduced here. Arguments
- * a shell would not touch are left bare so the terminal still shows a
- * readable command.
- */
-export function shellCommandLine(word: string, args: readonly string[], family: ShellFamily): string | undefined {
-  if (family === "cmd") {
-    return undefined;
-  }
-  const parts = [word, ...args];
-  if (parts.some(part => part.includes("\0"))) {
-    return undefined; // no process argv can carry NUL; never silently truncate it
-  }
-  // executeCommand sends terminal input, not a script to `shell -c`. Literal
-  // newlines enter zsh's quote> reader one line at a time, and control bytes
-  // can act on the line editor. Keep all of them out of the physical line.
-  // Unknown/POSIX-only shells use the existing no-shell transport instead
-  // of guessing whether they understand ANSI-C quoting.
-  if (family !== "posix-ansi" && parts.some(part => TERMINAL_CONTROL.test(part))) {
-    return undefined;
-  }
-  return parts.map(part => TERMINAL_CONTROL.test(part) ? ansiQuote(part) : SHELL_ACTIVE.test(part) || part === "" ? posixQuote(part) : part).join(" ");
-}
-
 // eslint-disable-next-line no-control-regex
 const TERMINAL_CONTROL = /[\x00-\x1f\x7f]/;
 
-/** zsh/bash/ksh decode the escapes only after accepting the complete line. */
-function ansiQuote(value: string): string {
-  // Escape backslashes before control bytes so literal `\n` stays literal.
-  // Apostrophes must be escaped inside $'…'; backticks and dollars stay inert.
-  const escaped = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'")
-    // eslint-disable-next-line no-control-regex
-    .replace(/[\x00-\x1f\x7f]/g, byte => `\\${byte.charCodeAt(0).toString(8).padStart(3, "0")}`);
-  return `$'${escaped}'`;
+/**
+ * The flags whose **value** is text a person or a model wrote, rather than an
+ * identifier this extension constructed.
+ *
+ * This set is the one place that distinction is made. No launch site asks
+ * about a flag by name; they ask `transportSafety`, which is the only
+ * authority on whether a shell may be shown a command at all.
+ *
+ * Adding a free-text flag to the engine means adding it here. The character
+ * rule below means forgetting to is usually caught anyway — real human text
+ * nearly always contains something `vscodeQuotingIsFaithful` rejects — but it
+ * is not a substitute for the list. "All four checks passed" is free text that
+ * happens to look like an identifier, and it must not be treated as one.
+ */
+export const FREE_TEXT_FLAGS: ReadonlySet<string> = new Set(["--evidence", "--deferred-result"]);
+
+/** Whether any argument is the value of a free-text flag. */
+export function carriesFreeText(args: readonly string[]): boolean {
+  return args.some((_value, at) => at > 0 && FREE_TEXT_FLAGS.has(args[at - 1]));
 }
 
 /**
- * Single quotes are the one POSIX construct that is literal throughout: no
- * expansion, no history, no line continuation. A single quote inside is
- * closed, escaped and reopened — the `'\''` idiom, which sh, bash, zsh and
- * fish all read the same way.
+ * Whether a command may be given to an interactive shell at all.
+ *
+ * `no-shell` is a hard requirement, not a preference: the caller must reach
+ * the engine with an exact argument array and nothing in between that reads
+ * syntax — no interactive line editor, no `shell -c`, no environment
+ * variable, no temporary file. It is returned when either
+ *
+ *  - an argument is the value of a free-text flag (`FREE_TEXT_FLAGS`), whatever
+ *    that value happens to contain; or
+ *  - VS Code's own escaping would not survive a round trip through the shell
+ *    for the executable word or any argument.
+ *
+ * The first condition is what makes the guarantee unconditional. A person's
+ * evidence is not a command line and is never made into one: this extension
+ * spent two releases inventing progressively cleverer quoting for it — POSIX
+ * `'...'`, then ANSI-C `$'...'` — and each time the text still had to cross an
+ * interactive terminal that reads bytes before any shell parses them. A
+ * command line long enough is corrupted in transit regardless of how
+ * faithfully it was encoded, and the engine then receives something that is
+ * not what the person wrote, or nothing at all. The only encoding a terminal
+ * cannot damage is the one that never goes near it.
  */
-export function posixQuote(value: string): string {
-  return `'${value.split("'").join("'\\''")}'`;
+export type TransportSafety = "shell" | "no-shell";
+
+export function transportSafety(word: string, args: readonly string[]): TransportSafety {
+  if (carriesFreeText(args)) {
+    return "no-shell";
+  }
+  return vscodeQuotingIsFaithful(word) && args.every(vscodeQuotingIsFaithful) ? "shell" : "no-shell";
 }
 
 /**
  * How a command should be handed to a shell:
  *  - `arguments`: VS Code's own escaping is exact for these, so nothing
  *    changes — this is every flag-and-path invocation the extension makes;
- *  - `command-line`: an argument would not survive that escaping, so the
- *    line is quoted here and passed as one string;
- *  - `no-shell`: this shell's quoting is not written here, so the caller
- *    must reach the process with an argument array and no shell at all.
+ *  - `no-shell`: the caller must reach the process with an argument array and
+ *    no shell at all (`transportSafety`).
+ *
+ * There is deliberately no third answer. A `command-line` variant used to
+ * exist, in which this file built the physical line itself and passed it as
+ * one already-quoted string; it is gone, and with it `shellCommandLine`,
+ * `ansiQuote` and `posixQuote`. Under this policy "shell-bound" and "VS Code's
+ * escaping is already faithful" are the same set, so an encoder of our own had
+ * no reachable caller left — only tests proving it correct to itself.
  */
-export type ShellHandover = { via: "arguments" } | { via: "command-line"; commandLine: string } | { via: "no-shell" };
+export type ShellHandover = { via: "arguments" } | { via: "no-shell" };
 
-export function planShellHandover(word: string, args: readonly string[], family: ShellFamily): ShellHandover {
-  if (vscodeQuotingIsFaithful(word) && !needsOwnQuoting(args)) {
-    return { via: "arguments" };
-  }
-  const commandLine = shellCommandLine(word, args, family);
-  return commandLine === undefined ? { via: "no-shell" } : { via: "command-line", commandLine };
+export function planShellHandover(word: string, args: readonly string[]): ShellHandover {
+  return transportSafety(word, args) === "shell" ? { via: "arguments" } : { via: "no-shell" };
 }
 
 function withExtensions(candidate: string, isWindows: boolean, pathext: string | undefined): string[] {

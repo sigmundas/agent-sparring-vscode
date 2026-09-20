@@ -121,16 +121,18 @@ export class SparringCommandRunner {
       this.operations.release(claim, "the executable could not be resolved, so nothing was ever submitted");
       return { ok: false, error: configured.error, problem: configured.problem };
     }
+    // Whether a shell may be shown this command at all is decided first, before
+    // a terminal is opened and before anything durable is written: an operation
+    // that must not be parsed by a shell is never armed for one, and never
+    // leases a terminal it will not use (core/cli.ts, `transportSafety`).
+    const word = executableWord(configured.plan);
+    const shellBound = shellHandoverFor(word, options.args).via !== "no-shell";
     // The project's own terminal, for as long as this command runs — and only
     // when its shell is idle, never one the user is working in.
-    const lease = this.terminals.acquire(options.cwd);
-    const integration = await awaitShellIntegration(lease.terminal);
-    const word = executableWord(configured.plan);
-    // Whether this shell *can* be given the command is decided before
-    // anything durable is written: an operation that must take the
-    // shell-less route is never armed for a shell.
+    const lease = shellBound ? this.terminals.acquire(options.cwd) : undefined;
+    const integration = lease ? await awaitShellIntegration(lease.terminal) : undefined;
     const handover = integration ? shellHandoverFor(word, options.args) : undefined;
-    if (integration && handover && handover.via !== "no-shell") {
+    if (lease && integration && handover && handover.via !== "no-shell") {
       // The exact invocation goes on the durable record here, before the
       // hand-over. A short command carries no `--repo-root` and cannot be
       // parsed for a target, so this argument array is the only thing a later
@@ -190,18 +192,16 @@ export class SparringCommandRunner {
       const text = await output;
       leased.release();
       this.log(
-        `ran ${options.name} via shell integration (${word}, ${options.args.length} args${request.quotedHere ? ", command line quoted here" : ""}, cwd ${options.cwd}); exit ${exitCode === undefined ? "unknown" : exitCode}${settled.ended ? " (the shell reported the end before the start was observed)" : ""}`,
+        `ran ${options.name} via shell integration (${word}, ${options.args.length} args, cwd ${options.cwd}); exit ${exitCode === undefined ? "unknown" : exitCode}${settled.ended ? " (the shell reported the end before the start was observed)" : ""}`,
       );
       return { ok: true, outcome: { exitCode, output: text, resolvedBy: configured.plan.kind === "shell" ? "shell" : "path" }, via: "shell", plan: configured.plan };
     }
-    if (integration) {
-      // The shell is fine, it just cannot carry this command line; keep it.
-      lease.release();
-    } else {
-      lease.discard();
-    }
-    // No shell to resolve a bare name (or none whose quoting can be written
-    // here): fall back to this process's view and an argument array.
+    // A shell that never reported integration cannot be watched — nothing
+    // would say when the command ended — so it is of no further use. When the
+    // command was never shell-bound, no terminal was leased in the first place.
+    lease?.discard();
+    // No shell to resolve a bare name (or a command no shell may be shown):
+    // fall back to this process's view and an argument array.
     const direct = await planExecutable(options.configured, hostEnv(options.cwd), false);
     if (!direct.ok) {
       this.operations.release(claim, "no executable could be resolved without a shell either, so nothing was started");

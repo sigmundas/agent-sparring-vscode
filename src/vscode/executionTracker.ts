@@ -635,16 +635,21 @@ export class ExecutionTracker implements vscode.Disposable {
    * user's normal shell, cwd = project) through shell integration, handing
    * the shell a bare `sparring` (or the configured path) as executable plus
    * an argument array, so the shell's own PATH and environment resolve it;
-   * the extension host's PATH is never consulted for that. Arguments that
-   * VS Code's own escaping would hand the shell as syntax rather than as
-   * text — free-text `--evidence`, above all — are quoted here instead
-   * (`executeThroughShell`).
+   * the extension host's PATH is never consulted for that.
    *
-   * Falls back to a dedicated terminal whose process *is* the runner, with
-   * the argument array passed to the process and no shell in between, when
-   * shell integration does not appear in time or when this shell's quoting
-   * is not one the extension can write. Then a bare name must be resolvable
-   * from this process, or the launch fails with a configuration message.
+   * That is only for commands a shell may safely be shown at all: flags,
+   * paths and identifiers whose round trip through VS Code's own escaping is
+   * exact. Anything carrying text a person or a model wrote — `--evidence`
+   * and `--deferred-result` above all — is `no-shell` (core/cli.ts,
+   * `transportSafety`) and takes the second route below unconditionally.
+   *
+   * That route is a dedicated terminal whose process *is* the runner: the
+   * executable is the terminal's own process and the argument array is passed
+   * to it by the pty host, so argv reaches the engine exactly as built, with
+   * no interactive line editor, no shell and no line-length limit between the
+   * two. It is also used when shell integration does not appear in time. Then
+   * a bare name must be resolvable from this process, or the launch fails with
+   * a configuration message.
    */
   async launch(options: LaunchOptions): Promise<LaunchResult> {
     // Before anything else — before the executable is resolved, before a
@@ -684,21 +689,25 @@ export class ExecutionTracker implements vscode.Disposable {
       this.operations.release(claim, "the executable could not be resolved, so nothing was ever submitted");
       return { ok: false, error: configured.error, problem: configured.problem };
     }
+    // Whether a shell may be shown this command at all is decided first —
+    // before a terminal is opened, before shell integration is awaited and
+    // before anything durable is written. A command that must not be parsed by
+    // a shell is never armed for one, and no longer leases somebody's terminal
+    // and waits five seconds for integration on it only to hand it back
+    // unused: an evidence submission goes straight to its own process.
+    const word = executableWord(configured.plan);
+    const shellBound = shellHandoverFor(word, options.args).via !== "no-shell";
     // This project's terminal, reused only when its shell is genuinely idle:
     // a plan run is a long series of commands and each one used to leave a
     // dead tab behind, but a terminal someone else is using is never written
     // to (terminalPool.ts).
-    const lease = this.terminals.acquire(options.cwd);
-    if (options.reveal) {
+    const lease = shellBound ? this.terminals.acquire(options.cwd) : undefined;
+    if (lease && options.reveal) {
       lease.terminal.show(true);
     }
-    const integration = await awaitShellIntegration(lease.terminal);
-    const word = executableWord(configured.plan);
-    // Whether this shell can be given the command at all is decided before
-    // anything durable is written, so an operation that must take the
-    // shell-less route is never armed for a shell.
+    const integration = lease ? await awaitShellIntegration(lease.terminal) : undefined;
     const handover = integration ? shellHandoverFor(word, options.args) : undefined;
-    if (integration && handover && handover.via !== "no-shell") {
+    if (lease && integration && handover && handover.via !== "no-shell") {
       // The durable execution intent, on disk before the hand-over. A crash
       // between the two then leaves a record that blocks conservatively
       // rather than nothing at all; a failed write means nothing is handed
@@ -737,7 +746,7 @@ export class ExecutionTracker implements vscode.Disposable {
       // The output must be read immediately after the hand-over or it is lost.
       this.operations.submittedToShell(armed.armed, leased, request.execution, collectOutput(request.execution));
       this.log(
-        `submitted ${options.name} to the shell in "${leased.terminal.name}" (${configured.plan.kind === "shell" ? `'${word}' resolved by the shell` : word}, ${options.args.length} args${request.quotedHere ? ", command line quoted here" : ""}, cwd ${options.cwd}); waiting for the shell to report it started`,
+        `submitted ${options.name} to the shell in "${leased.terminal.name}" (${configured.plan.kind === "shell" ? `'${word}' resolved by the shell` : word}, ${options.args.length} args, cwd ${options.cwd}); waiting for the shell to report it started`,
       );
       const settled = await this.operations.waitForStart(armed.armed, EXECUTION_START_TIMEOUT_MS);
       if (settled.established) {
@@ -750,11 +759,9 @@ export class ExecutionTracker implements vscode.Disposable {
       const view = this.operations.pendingShellFor(key) ?? this.operations.inFlightFor(key);
       return { ok: false, error: view ? operationRefusal(view) : "The command could not be confirmed as started.", problem: "unconfirmed", submission: view && outstanding(view) ? view : undefined };
     }
-    if (integration) {
-      // The shell is fine, it just cannot carry this command line; keep it.
-      this.log(`${options.name}: this shell's quoting cannot be written safely, so the engine is run without a shell`);
-      lease.release();
-    } else {
+    if (!shellBound) {
+      this.log(`${options.name}: this command must not be parsed by a shell, so the engine is run directly as a dedicated terminal's own process`);
+    } else if (lease) {
       // A shell that never reported integration cannot be watched: nothing
       // would tell us when the command ended. It is of no further use.
       lease.discard();
