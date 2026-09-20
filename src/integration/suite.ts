@@ -1773,7 +1773,11 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
     return;
   }
   const executable = vscode.workspace.getConfiguration("agentSparring").get<string>("executable", "");
-  const argvLog = path.join(fixtureRoot, "fake-argv.log");
+  // Each half asserts about its own subcommand's log. They are separate files
+  // because the fake engine records one per subcommand: whether *this* command
+  // ran cannot be answered by some other call the extension made meanwhile.
+  const runPlanLog = path.join(fixtureRoot, "fake-argv-run-plan.log");
+  const runLoopLog = path.join(fixtureRoot, "fake-argv-run-loop.log");
 
   // ---- A. the command line is eaten by whatever holds the shell ----------
   {
@@ -1786,7 +1790,7 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
     }
     const typed = path.join(fixtureRoot, "typed-into-the-bypassed-terminal.txt");
     await fs.rm(typed, { force: true });
-    await fs.rm(argvLog, { force: true });
+    await fs.rm(runPlanLog, { force: true });
     occupy(terminal, typed);
     await new Promise((resolve) => setTimeout(resolve, 2000)); // let the occupant take the foreground
 
@@ -1814,7 +1818,7 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
       assert.deepEqual(tracker.persisted(), [], "and a window reload would find no live runner either");
       assert.equal(retired(), true, "the terminal is quarantined: never written to again");
       assert.equal(terminal.exitStatus, undefined, "while the user's command is left alone, not interrupted");
-      assert.ok(!(await fs.stat(argvLog).then(() => true, () => false)), "the engine never ran: the fake sparring recorded no argv");
+      assert.ok(!(await fs.stat(runPlanLog).then(() => true, () => false)), "the engine never ran: the fake sparring recorded no argv");
 
       // The submission itself is kept: nothing here can prove that command
       // will never run, so a second one is refused rather than submitted.
@@ -1877,7 +1881,7 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
       return;
     }
     await fs.writeFile(path.join(reportedRepo, ".sparring", "fake-runner.conf"), "sleep_for=1\nexit_with=0\n");
-    await fs.rm(argvLog, { force: true });
+    await fs.rm(runLoopLog, { force: true });
     const { lease, retired } = bypassLease(terminal);
     const logged: string[] = [];
     const { tracker, registry, dispose } = trackerOver(lease, logged);
@@ -1924,7 +1928,7 @@ async function falseRunnerAssertions(reportedRepo: string, fixtureRoot: string):
         "a reload would now find exactly this one live runner",
       );
       assert.ok(logged.some((line) => /started it .*long after the wait had expired/.test(line)), `the log says it started late, got ${JSON.stringify(logged)}`);
-      assert.ok(await fs.stat(argvLog).then(() => true, () => false), "and the engine really did run");
+      assert.ok(await fs.stat(runLoopLog).then(() => true, () => false), "and the engine really did run");
 
       const ended = await waitUntil(() => {
         const record = tracker.executionFor(runId);
@@ -3081,7 +3085,7 @@ async function evidenceLaunchAssertions(reportedRepo: string, fixtureRoot: strin
     return;
   }
   const sparring = path.join(reportedRepo, ".sparring");
-  const argvLog = path.join(fixtureRoot, "fake-resume-argv.log");
+  const argvLog = path.join(fixtureRoot, "fake-argv-resume-plan.log");
   await fs.mkdir(path.join(sparring, "stages", GATE_STAGE), { recursive: true });
   await fs.writeFile(path.join(sparring, "stages", GATE_STAGE, "state.json"), JSON.stringify({ status: "working", base_sha: null, candidate_sha: null, implementation_session_id: "impl", sparring_session_id: "spar" }));
   await fs.writeFile(path.join(sparring, "stages", GATE_STAGE, "sparring.md"), gateSparring());
