@@ -1,8 +1,16 @@
 """Send one command as VS Code does: CR-separated input, without bracketed paste.
 
 Only a disposable test shell is touched. Stdout is JSON; no user startup files
-or environment values are loaded. The caller's fake executable records argv.
+or environment values are loaded.
+
+The master side is non-blocking and the bytes the terminal actually accepted
+are counted, because that is the measurement this fixture exists for: an
+interactive shell on a pty stops accepting a single logical command line after
+a bounded number of bytes, and the rest is simply never delivered. A blocking
+write would hang there instead of reporting it.
 """
+import errno
+import fcntl
 import json
 import os
 import pty
@@ -44,10 +52,27 @@ try:
     if "SPARRING_PRIMARY> " not in ready:
         raise RuntimeError("test zsh did not reach its initial prompt")
     wire = (request["line"].replace("\r\n", "\n").replace("\n", "\r") + "\r").encode("utf-8")
-    while wire:
-        wire = wire[os.write(master, wire):]
+    fcntl.fcntl(master, fcntl.F_SETFL, os.O_NONBLOCK)
+    written = 0
+    stalled_at = time.monotonic() + 3
+    while written < len(wire) and time.monotonic() < stalled_at:
+        try:
+            sent = os.write(master, wire[written:])
+        except OSError as error:
+            if error.errno != errno.EAGAIN:
+                raise
+            time.sleep(0.05)
+            continue
+        if sent:
+            written += sent
+            stalled_at = time.monotonic() + 3
     output = read_until_primary(5)
-    print(json.dumps({"output": output, "returnedToPrompt": "SPARRING_PRIMARY> " in output}))
+    print(json.dumps({
+        "output": output,
+        "returnedToPrompt": "SPARRING_PRIMARY> " in output,
+        "sent": len(wire),
+        "accepted": written,
+    }))
 finally:
     # This is only the exact PID created by this test, never a name/group match.
     os.kill(pid, signal.SIGKILL)

@@ -52,7 +52,14 @@ it("a paused plan preserves four Passes through an ambiguous handoff, exact over
   };
   const confirmation = (id: string, targetRun = runId) => Controller.prototype.confirmRunnerInactive.call({ context, tracker, submissions: registry, log: () => {}, render: () => {} } as never, targetRun, undefined, id);
   const entry = renderHumanEvidence(submittableChecks(model().actionRequired!), new Date("2026-09-20"), "Comparison")!;
-  const args = buildResumePlanArgs({ source: "markdown", planPath, repoRoot: ws.root, expectedBranch: "feature/x", evidence: entry });
+  // The ambiguity this test is about belongs to the *shell* transport, so the
+  // command that becomes ambiguous is a shell-bound one: Continue plan, which
+  // carries no free text and is handed to the user's own shell exactly as
+  // before. The evidence submission no longer takes that route at all
+  // (core/cli.ts, `transportSafety`), but it shares this run's admission
+  // guard, so a Continue plan nobody can account for still has to leave four
+  // Passes untouched and recoverable — which is the whole point.
+  const args = buildResumePlanArgs({ source: "markdown", planPath, repoRoot: ws.root, expectedBranch: "feature/x" });
   const options = { configured: process.execPath, args, cwd: ws.root, name: "resume-plan", runId, kind: "resume-plan" as const, planPath, reveal: false };
   try {
     assert.equal(model().actionRequired?.submit.enabled, true);
@@ -99,6 +106,18 @@ it("a paused plan preserves four Passes through an ambiguous handoff, exact over
     stub.window.startEmitter.fire({ terminal, shellIntegration: terminal.shellIntegration!, execution: terminal.executions[0] });
     assert.equal((await retry).ok, true);
     stub.window.endEmitter.fire({ terminal, shellIntegration: terminal.shellIntegration!, execution: terminal.executions[0], exitCode: 0 });
+
+    // And the submission those four Passes were waiting for, once the run is
+    // free again: the same drafts, now carried to the engine as exact argv in
+    // a process of its own. It leases no terminal from the pool, because a
+    // command no shell may be shown never asks for one.
+    const before = terminals.length;
+    const evidenceArgs = buildResumePlanArgs({ source: "markdown", planPath, repoRoot: ws.root, expectedBranch: "feature/x", evidence: entry });
+    const submitted = await tracker.launch({ ...options, args: evidenceArgs });
+    assert.equal(submitted.ok, true, "the evidence submission starts");
+    assert.equal(submitted.via, "terminal", "as its own process, not as a line in anybody's shell");
+    assert.equal(terminals.length, before, "and without leasing a shell terminal it would never write to");
+    assert.deepEqual(stub.window.created.at(-1)?.shellArgs, evidenceArgs, "the argument array reaches the pty host untouched");
   } finally { tracker.dispose(); registry.dispose(); }
 });
 

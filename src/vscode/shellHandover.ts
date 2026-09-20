@@ -99,10 +99,13 @@ export async function handOverToIdleShell(request: HandoverRequest): Promise<Han
         return { ok: false, reason: "threw", error: attempt.error };
       }
       if (handover.via === "no-shell") {
-        // This shell's quoting cannot be written here. That is a fact about
-        // the shell, not about the terminal, so trying another one of the
-        // same shell would fail identically.
-        return { ok: false, reason: "no-idle-terminal", detail: "this shell's quoting cannot be written safely, so nothing was handed to it" };
+        // Unreachable in practice: both callers ask `shellHandoverFor` the
+        // same question before arming, and the answer depends only on the
+        // word and the arguments, so it cannot change here. Kept because the
+        // answer is a fact about the command rather than about the terminal —
+        // another terminal would give it too — and because a caller that
+        // reached this point must never be told a shell was written to.
+        return { ok: false, reason: "no-idle-terminal", detail: "this command must not be given to any shell, so nothing was handed to one" };
       }
       request.log(
         `"${lease.terminal.name}" is no longer idle — something was started in it while Agent Sparring was recording what it was about to run. Nothing is written into it and nothing in it is interrupted; it is retired from reuse and another terminal is used.`,
