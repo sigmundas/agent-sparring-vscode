@@ -43,7 +43,7 @@ export interface PlanRunState {
    * the engine had it, and absent whenever the run is not stopped on such a
    * reason.
    */
-  awaiting?: PushAuthorizationRequired;
+  awaiting?: PushAuthorizationRequired | DeferredVerificationRequired;
   /**
    * What a person has allowed this run to push, and for exactly what
    * (push_gate.py: `PushAuthorization`). Absent — including for every run
@@ -51,6 +51,80 @@ export interface PlanRunState {
    * all, which is the engine's default and is never inferred otherwise.
    */
   pushAuthorization?: PushAuthorizationState;
+  /**
+   * Human verification the reviewers deferred rather than stopped for
+   * (`plan.py`: `PlanRunState.deferred_human_checks`, `deferred_gate.py`).
+   *
+   * This is the engine's durable ledger, and it is the only place these
+   * live: a stage's `sparring.md` is rewritten by every SEND_BACK cycle, and
+   * an obligation deliberately outlives the stage that raised it. Empty for
+   * every run recorded before deferral existed — which is also the right
+   * reading of "this run owes nothing".
+   */
+  deferredHumanChecks: DeferredObligation[];
+}
+
+/** `deferred_gate.py`: the one outcome vocabulary, shared with human gates. */
+export type DeferredCheckOutcome = "pass" | "fail" | "blocked";
+
+/** One person's recorded answer to one deferred check (`deferred_gate.py`: `CheckResult`). */
+export interface DeferredCheckResult {
+  checkId: string;
+  outcome: DeferredCheckOutcome;
+  note?: string;
+}
+
+/**
+ * One obligation in the run's ledger: what a reviewer deferred, why, and
+ * where it came from (`deferred_gate.py`: `DeferredObligation`).
+ *
+ * `stageId` and the gate's `instanceId` are the provenance. An obligation
+ * raised by stage 2 and answered after stage 7 is still stage 2's, and the
+ * asking it belongs to is still the one the reviewer minted it under — which
+ * is what keeps an answer to an earlier asking from satisfying a later one.
+ */
+export interface DeferredObligation {
+  /** The stage whose review raised it. */
+  stageId: string;
+  gate: HumanGate;
+  /** Why the reviewer judged continuing first to be low risk. Required by the engine. */
+  rationale: string;
+  /** `before_plan_completion` today; a stored value, so a later checkpoint is a value and not a format. */
+  checkpoint: string;
+  /** A later reviewer decided this can wait no longer. Same asking, due sooner. */
+  promoted: boolean;
+  results: DeferredCheckResult[];
+}
+
+/** The engine's own derivation (`DeferredObligation.status`), repeated here rather than stored. */
+export function obligationResolved(obligation: DeferredObligation): boolean {
+  return obligation.gate.checks.every(
+    (check) => obligation.results.find((result) => result.checkId === check.id)?.outcome === "pass",
+  );
+}
+
+/** Did somebody record a Fail against this obligation? Then the plan cannot finish on it. */
+export function obligationFailed(obligation: DeferredObligation): boolean {
+  return obligation.results.some((result) => result.outcome === "fail");
+}
+
+/** `deferred_gate.py`: the typed reason a run stops for verification already owed. */
+export const DEFERRED_VERIFICATION_REQUIRED = "deferred_verification_required";
+
+/**
+ * A run stopped because a person owes it verification an earlier reviewer
+ * deferred (`deferred_gate.py`: `DeferredVerificationRequired`).
+ *
+ * It names only the askings; the obligations themselves are in
+ * {@link PlanRunState.deferredHumanChecks}, which is the one authority for
+ * their content. `reason` says which checkpoint stopped the run —
+ * `plan_completion` for the ordinary end-of-plan checkpoint,
+ * `promoted` for an obligation a later reviewer said could not wait.
+ */
+export interface DeferredVerificationRequired {
+  kind: typeof DEFERRED_VERIFICATION_REQUIRED;
+  reason: "plan_completion" | "promoted";
+  instanceIds: string[];
 }
 
 export type PlanRunSource = "markdown" | "manifest";
@@ -122,7 +196,65 @@ export function parsePlanRunState(text: string): PlanRunState {
     source,
     awaiting: parseAwaiting(payload["awaiting"]),
     pushAuthorization: parsePushAuthorization(payload["push_authorization"]),
+    deferredHumanChecks: parseDeferredObligations(payload["deferred_human_checks"]),
   };
+}
+
+/**
+ * The obligation ledger, or an empty one.
+ *
+ * An entry that cannot be read as a whole obligation is dropped rather than
+ * half-shown, exactly as a malformed candidate repository is: the panel may
+ * only state what the engine actually recorded, and half an obligation would
+ * ask a person to answer a question nobody can see. Absence of the field is
+ * not an error — it is every run written before deferral existed.
+ */
+function parseDeferredObligations(raw: unknown): DeferredObligation[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: DeferredObligation[] = [];
+  for (const value of raw) {
+    if (!isRecord(value)) {
+      continue;
+    }
+    const stageId = text(value, "stage_id");
+    const gate = parseGateObject(value["gate"]);
+    const rationale = text(value, "rationale");
+    // An obligation with no engine-minted asking cannot be answered, and an
+    // obligation with no rationale is not one the engine would have written.
+    if (!stageId || !gate || !gate.instanceId || !rationale) {
+      continue;
+    }
+    out.push({
+      stageId,
+      gate,
+      rationale,
+      checkpoint: text(value, "checkpoint") ?? "before_plan_completion",
+      promoted: value["promoted"] === true,
+      results: parseDeferredResults(value["results"]),
+    });
+  }
+  return out;
+}
+
+function parseDeferredResults(raw: unknown): DeferredCheckResult[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+  const out: DeferredCheckResult[] = [];
+  for (const value of raw) {
+    if (!isRecord(value)) {
+      continue;
+    }
+    const checkId = text(value, "check_id");
+    const outcome = value["outcome"];
+    if (!checkId || (outcome !== "pass" && outcome !== "fail" && outcome !== "blocked")) {
+      continue;
+    }
+    out.push({ checkId, outcome, note: text(value, "note") });
+  }
+  return out;
 }
 
 /**
@@ -135,8 +267,19 @@ export function parsePlanRunState(text: string): PlanRunState {
  * not what. An unknown kind is a newer engine, and the honest answer to it
  * is to fall back to the ordinary presentation rather than to guess.
  */
-function parseAwaiting(raw: unknown): PushAuthorizationRequired | undefined {
-  if (!isRecord(raw) || raw["kind"] !== PUSH_AUTHORIZATION_REQUIRED) {
+function parseAwaiting(raw: unknown): PushAuthorizationRequired | DeferredVerificationRequired | undefined {
+  if (!isRecord(raw)) {
+    return undefined;
+  }
+  if (raw["kind"] === DEFERRED_VERIFICATION_REQUIRED) {
+    const ids = Array.isArray(raw["instance_ids"]) ? raw["instance_ids"].filter((value): value is string => typeof value === "string" && value.trim().length > 0) : [];
+    if (ids.length === 0) {
+      return undefined; // a checkpoint that names no asking is not one
+    }
+    const reason = raw["reason"] === "promoted" ? "promoted" : "plan_completion";
+    return { kind: DEFERRED_VERIFICATION_REQUIRED, reason, instanceIds: ids };
+  }
+  if (raw["kind"] !== PUSH_AUTHORIZATION_REQUIRED) {
     return undefined;
   }
   const stageId = text(raw, "stage_id");
@@ -482,6 +625,26 @@ export interface HumanGate {
  */
 export const HUMAN_GATE_MARKER = "<!-- human-gate:v1 -->";
 
+/**
+ * The marker before a *deferred* gate's canonical JSON
+ * (`deferred_gate.py`: `DEFERRED_GATE_MARKER`). A different marker, not a
+ * flag inside the same block, so a consumer can never read one for the
+ * other: the whole point of the distinction is that a deferred gate does
+ * *not* stop the stage.
+ */
+export const DEFERRED_GATE_MARKER = "<!-- deferred-human-gate:v1 -->";
+
+/**
+ * A gate a READY verdict deferred: the same checks, plus why continuing
+ * first is low risk and by when the answer is owed.
+ */
+export interface DeferredHumanGate {
+  gate: HumanGate;
+  rationale: string;
+  /** `before_plan_completion` today. */
+  checkpoint: string;
+}
+
 export interface SparringOutcome {
   action: RoutingAction;
   summary: string;
@@ -504,6 +667,16 @@ export interface SparringOutcome {
    * structured gates.
    */
   humanGate?: HumanGate;
+  /**
+   * The verification this READY verdict deferred, when it deferred any.
+   *
+   * Its presence is the difference between "the reviewer accepted this
+   * stage" and "the reviewer accepted this stage and a person still owes it
+   * a check" — and the panel must say the second one without ever saying
+   * the stage is waiting, because it is not. The durable record is the
+   * plan-run state's ledger; this is what the stage's own review said.
+   */
+  deferredHumanGate?: DeferredHumanGate;
 }
 
 /**
@@ -514,21 +687,55 @@ export interface SparringOutcome {
  * unstructured rather than inventing checks.
  */
 export function parseHumanGate(markdown: string): HumanGate | undefined {
-  const at = markdown.indexOf(HUMAN_GATE_MARKER);
+  return parseGateObject(markedJson(markdown, HUMAN_GATE_MARKER));
+}
+
+/**
+ * The deferred gate a READY verdict recorded, from the block that follows
+ * {@link DEFERRED_GATE_MARKER} (`deferred_gate.py`, rendered by
+ * `sparring_exchange.py`).
+ *
+ * The same two-layer shape as the immediate gate, plus the reviewer's
+ * rationale and the checkpoint. A gate without a rationale is not read at
+ * all: the engine refuses to mint one, so a block missing it is not
+ * something this version should present as a reviewer's decision.
+ */
+export function parseDeferredHumanGate(markdown: string): DeferredHumanGate | undefined {
+  const raw = markedJson(markdown, DEFERRED_GATE_MARKER);
+  const gate = parseGateObject(raw);
+  const rationale = isRecord(raw) && typeof raw["rationale"] === "string" ? raw["rationale"].trim() : "";
+  if (!gate || !rationale) {
+    return undefined;
+  }
+  const checkpoint = isRecord(raw) && typeof raw["checkpoint"] === "string" && raw["checkpoint"].trim() ? raw["checkpoint"].trim() : "before_plan_completion";
+  return { gate, rationale, checkpoint };
+}
+
+/** The first ```` ```json ```` block after `marker`, parsed; undefined for anything else. */
+function markedJson(markdown: string, marker: string): unknown {
+  const at = markdown.indexOf(marker);
   if (at < 0) {
     return undefined;
   }
-  const after = markdown.slice(at + HUMAN_GATE_MARKER.length);
+  const after = markdown.slice(at + marker.length);
   const fence = /^[^\S\n]*```[^\n]*\n([\s\S]*?)\n[^\S\n]*```/m.exec(after);
   if (!fence) {
     return undefined;
   }
-  let raw: unknown;
   try {
-    raw = JSON.parse(fence[1]);
+    return JSON.parse(fence[1]);
   } catch {
     return undefined;
   }
+}
+
+/**
+ * A gate's own fields, from an already-parsed object. Shared by the
+ * immediate gate in sparring.md, the deferred gate beside it, and the
+ * obligations in the plan-run state, so all three read the same shape the
+ * same way and cannot drift apart.
+ */
+function parseGateObject(raw: unknown): HumanGate | undefined {
   if (!isRecord(raw)) {
     return undefined;
   }
@@ -609,6 +816,7 @@ export function parseSparringOutcome(markdown: string): SparringOutcome | undefi
     deferred: sectionBody(lines, "## Deferred"),
     findings: sectionBody(lines, SPARRING_FINDINGS_HEADING),
     humanGate: action === "NEEDS_YOU" ? parseHumanGate(markdown) : undefined,
+    deferredHumanGate: action === "READY" ? parseDeferredHumanGate(markdown) : undefined,
   };
 }
 

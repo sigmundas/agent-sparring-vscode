@@ -96,6 +96,7 @@ async function buildFixture(): Promise<{ root: string; workspaceFile: string }> 
       "# shifted away, next to the fixture root: the launch tests assert on the",
       "# exact executable and the exact arguments the process was given.",
       'argv_log="$(dirname "$0")/../fake-argv.log"',
+      '[ "$1" != resume-plan ] || argv_log="$(dirname "$0")/../fake-resume-argv.log"',
       'printf \'[%s]\\n\' "$0" > "$argv_log"',
       'for a in "$@"; do printf \'<%s>\\n\' "$a" >> "$argv_log"; done',
       '# A reader can only trust the log once this last line is there.',

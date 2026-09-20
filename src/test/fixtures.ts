@@ -119,6 +119,8 @@ export class Workspace {
       awaiting?: Record<string, unknown> | null;
       /** The recorded push permission (push_gate.py: `PushAuthorization`), verbatim. */
       push_authorization?: Record<string, unknown> | null;
+      /** The deferred-obligation ledger (deferred_gate.py: `DeferredObligation`), verbatim. */
+      deferred_human_checks?: Record<string, unknown>[];
     },
   ): Promise<string> {
     const dir = path.join(this.sparringDir, "plans");
@@ -137,6 +139,9 @@ export class Workspace {
       // all, and that case has to be reproducible here.
       ...(state.awaiting !== undefined ? { awaiting: state.awaiting } : {}),
       ...(state.push_authorization !== undefined ? { push_authorization: state.push_authorization } : {}),
+      // Same rule as the two above: omitted unless the caller asks for it, so
+      // a run recorded before deferred verification existed is reproducible.
+      ...(state.deferred_human_checks !== undefined ? { deferred_human_checks: state.deferred_human_checks } : {}),
     };
     await fs.writeFile(file, JSON.stringify(payload, null, 2) + "\n");
     return file;

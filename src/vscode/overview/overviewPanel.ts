@@ -147,8 +147,9 @@ export class OverviewPanelManager implements vscode.Disposable {
   /**
    * A Pass / Fail / Blocked click re-renders (the choice lights up); a note
    * keystroke is stored without re-rendering, or the textarea being typed
-   * in would be replaced under the user's cursor. The key the next update
-   * compares against is advanced so the stored note alone triggers nothing.
+   * in would be replaced under the user's cursor. Draft text is excluded from
+   * the render key so the stored note alone triggers nothing; a concurrent
+   * operation change still re-renders.
    */
   private async recordHumanCheck(message: HumanCheckMessage): Promise<void> {
     const run = this.controller.currentSelection.selected;
@@ -161,17 +162,13 @@ export class OverviewPanelManager implements vscode.Disposable {
     // withHumanCheck reads as "not part of this change" — it must never be
     // filled in with a value, or one control would overwrite the other's.
     await this.controller.setHumanCheck(stageScopeOf(run), message.key, { outcome: message.outcome, note: message.note }, !noteOnly);
-    if (noteOnly) {
-      this.lastHtmlKey = JSON.stringify(await this.buildModel());
-    }
   }
 
   /**
    * The freeform findings field, stored as a draft without re-rendering —
    * the textarea being typed in must not be replaced under the user's
-   * cursor. The comparison key is advanced for the same reason it is for a
-   * note: so the stored text alone does not make the next update rebuild the
-   * document.
+   * cursor. Draft text is excluded from the render key, so typing alone does not
+   * rebuild the document. Only update() may remember a rendered model.
    *
    * Nothing is launched here. Sending the feedback is a separate, deliberate
    * click, and it is the only thing on this path that runs the engine.
@@ -182,7 +179,6 @@ export class OverviewPanelManager implements vscode.Disposable {
       return;
     }
     await this.controller.setHumanFeedback(stageScopeOf(run), message.text);
-    this.lastHtmlKey = JSON.stringify(await this.buildModel());
   }
 
   /**
@@ -315,7 +311,7 @@ export class OverviewPanelManager implements vscode.Disposable {
       return;
     }
     const model = await this.buildModel();
-    const key = JSON.stringify(model);
+    const key = overviewRenderKey(model);
     if (key === this.lastHtmlKey) {
       return; // nothing visible changed; leave the document alone
     }
@@ -734,4 +730,24 @@ async function sameFile(a: string, b: string): Promise<boolean> {
       return false;
     }
   }
+}
+
+/** Ignore only editable text already present in the DOM, never operation/action state.
+ * A draft save must not mark an unrendered model as rendered: an override can
+ * resolve while the save awaits persistence, and that recovery still needs painting.
+ */
+export function overviewRenderKey(model: OverviewModel): string {
+  const panel = model.actionRequired;
+  if (!panel) {
+    return JSON.stringify(model);
+  }
+  return JSON.stringify({
+    ...model,
+    actionRequired: {
+      ...panel,
+      feedback: { ...panel.feedback, draft: undefined },
+      required: panel.required.map(item => ({ ...item, record: item.record?.outcome ? { outcome: item.record.outcome } : undefined })),
+      submittable: panel.submittable.map(item => ({ ...item, record: { outcome: item.record.outcome } })),
+    },
+  });
 }

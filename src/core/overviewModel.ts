@@ -23,10 +23,10 @@ import { agentConfigView, providerLabel, type AgentConfigView, type ConfigRole, 
 import { parseBriefGoal, parseBriefOpening } from "./brief";
 import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
-import { PUSH_AUTHORIZATION_REQUIRED, parseHandoffBranch, type PlanRunState, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
+import { DEFERRED_VERIFICATION_REQUIRED, PUSH_AUTHORIZATION_REQUIRED, obligationFailed, obligationResolved, parseHandoffBranch, type DeferredObligation, type PlanRunState, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
 import type { DeclaredRepository } from "./stageRepositories";
-import { deriveVerification, HUMAN_FEEDBACK_HEADING, parseHumanEvidence, parseHumanFeedback, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
-import { checkNameList } from "./humanTask";
+import { deriveDeferredVerification, deriveVerification, draftKeyFor, HUMAN_FEEDBACK_HEADING, parseHumanEvidence, parseHumanFeedback, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
+import { categoryWord, checkNameList } from "./humanTask";
 import { SUBMISSION_PRESERVED, SUBMISSION_UNRESOLVED, type SubmissionRecord } from "./submission";
 import { sameStageScope, stageScopeOf } from "./stageScope";
 import { formatTime } from "./logFormat";
@@ -476,8 +476,48 @@ export interface TechnicalDetail {
   value: string;
 }
 
+/**
+ * One deferred obligation as the checkpoint presents it: what a reviewer
+ * asked for, which stage's review asked, and why it was judged safe to
+ * carry.
+ *
+ * The rationale is shown, not hidden in a details layer. It is the answer to
+ * the question a person arriving at this checkpoint actually has — "why am I
+ * being asked about stage 2 now?" — and it is the record that lets them
+ * disagree with the reviewer's judgement.
+ */
+export interface DeferredGroup {
+  /** The engine-minted asking; every answer is addressed to it. */
+  instanceId: string;
+  /** The stage whose review raised it. */
+  stageId: string;
+  /** `Device manual check`, `Ui visual check`, … made readable. */
+  category: string;
+  title: string;
+  rationale: string;
+  /** A later reviewer decided this one could not wait; it is why the run stopped early. */
+  promoted: boolean;
+  /** The draft keys of this obligation's checks, in the reviewer's order. */
+  checkKeys: string[];
+}
+
 export interface ActionRequired extends VerificationView {
-  kind: "needs_you" | "escalate";
+  /**
+   * `deferred_verification` is not a stage handed back to the human: every
+   * stage is accepted and the run is at the plan's own verification
+   * checkpoint, holding the checks earlier reviewers deferred. It shares
+   * this panel because the thing a person does is identical — Pass, Fail,
+   * Can't test, with a note — and a second evidence surface would mean a
+   * second set of rules about which recorded answer counts.
+   */
+  kind: "needs_you" | "escalate" | "deferred_verification";
+  /**
+   * `deferred_verification` only: the obligations this checkpoint gathered,
+   * each with the stage that raised it and the reviewer's own reason for
+   * deferring. The checks themselves are in the shared lists; this is what
+   * groups and explains them.
+   */
+  deferredGroups?: DeferredGroup[];
   /** `Needs you` / `Escalated`. */
   word: string;
   /**
@@ -690,6 +730,20 @@ export interface OverviewModel {
   autoPushEnabled?: { label: string; detail: string };
   /** Reviewer hand-back to the human; present only for NEEDS_YOU / ESCALATE with no turn in progress. */
   actionRequired?: ActionRequired;
+  /**
+   * This run owes manual verification a reviewer deferred, and is not at the
+   * checkpoint for it yet.
+   *
+   * Said quietly and said always, because a stage accepted with a deferral
+   * is accepted *and* still owes a check, and a panel that shows only the
+   * first half claims the second. It is not an action: nothing is waiting on
+   * the person here, and the journey continues.
+   */
+  deferredNote?: {
+    label: string;
+    detail: string;
+    entries: { stageId: string; title: string; rationale: string }[];
+  };
   title: string;
   /** `Plan run`, `Historical stage` or `Standalone stage`; see RUN_KIND. */
   runKind?: string;
@@ -997,7 +1051,7 @@ export function buildOverviewModel(
       liveness.stop === "requested"
         ? { label: "Stop requested…", detail: `${STOP_REQUESTED_DETAIL} ${liveness.detail}`, state: "running" }
         : { label: "Working", detail: liveness.detail, state: "running" };
-  } else if (!halted && loopEligible && (liveness.turnActive || guarded)) {
+  } else if (guarded || (!halted && loopEligible && liveness.turnActive)) {
     // Recorded as active, and neither alive nor ended can be established.
     // Two ways in, and they are said differently: the person asked for this
     // to stop and the answer never came, or nothing was asked and the run
@@ -1084,6 +1138,10 @@ export function buildOverviewModel(
     delete model.continueAutomatically;
   }
   model.autoPushEnabled = autoPushEnabled(run);
+  // Before the push gate's early return: what this run still owes is true
+  // whatever else it happens to be stopped on, and a note that disappears
+  // when another panel opens is a note that cannot be relied on.
+  model.deferredNote = deferredNote(run, outcome);
   model.pushAuthorization = pushAuthorization(run, artifacts, model, branchGuard, liveness);
   if (model.pushAuthorization) {
     // The run is stopped on a permission, not on a review. Nothing that would
@@ -1095,9 +1153,17 @@ export function buildOverviewModel(
     delete model.banner;
     return model;
   }
-  model.actionRequired = actionRequired(run, presentation, outcome, plan, artifacts, model, branchGuard, liveness);
+  model.actionRequired =
+    deferredVerification(run, artifacts, model, branchGuard, liveness) ??
+    actionRequired(run, presentation, outcome, plan, artifacts, model, branchGuard, liveness);
   if (model.actionRequired) {
-    if (model.continueAutomatically?.kind === "adopt") {
+    if (model.actionRequired.kind === "deferred_verification") {
+      // The plan is at its own checkpoint. Resuming it is exactly what
+      // submitting does, and a second route to it would resume into the same
+      // pause with nothing answered.
+      delete model.continueAutomatically;
+      delete model.planAction;
+    } else if (model.continueAutomatically?.kind === "adopt") {
       // Adopting is not answering the gate, and it does not touch it: the
       // engine reads the recorded NEEDS_YOU, keeps the pause exactly as it
       // stands and stops there. So it stays offered — this is the one place
@@ -1112,7 +1178,7 @@ export function buildOverviewModel(
     }
     // The panel names and explains the action; no banner repeats it.
     delete model.banner;
-    if (model.actionRequired.ready && model.actionRequired.kind === "needs_you") {
+    if (model.actionRequired.ready && model.actionRequired.kind !== "escalate") {
       // The recorded routing action is still NEEDS_YOU; what changed is that
       // every check it asked for now has an outcome. The pill says that, and
       // the panel's own headline is the only other place it is said.
@@ -1253,6 +1319,200 @@ function autoPushEnabled(run: RunSnapshot): OverviewModel["autoPushEnabled"] {
   return {
     label: "Auto-push is on for this run",
     detail: `Candidates this run verifies are pushed to ${authorization.remote}/${authorization.remoteBranch} without asking. Recorded by the engine for this run; it covers no other plan and no other branch.`,
+  };
+}
+
+// ---------------------------------------------------------------- deferred verification checkpoint
+
+/**
+ * The plan's verification checkpoint: every stage accepted, and the manual
+ * checks earlier reviewers deferred now due.
+ *
+ * Built **only** from the engine's own records — `awaiting` says the run is
+ * stopped on this, and the ledger in the plan-run state says what is owed —
+ * so nothing here is inferred from prose and nothing is derived from the
+ * current stage's `sparring.md`, which by now belongs to a stage that
+ * finished and was accepted.
+ *
+ * It is deliberately not phrased as a stage waiting for the human. No stage
+ * is waiting; the plan is, and it is waiting on work the reviewers said
+ * could be done at the end. The one interruption covers everything that
+ * accumulated, with each check still naming the stage that raised it.
+ */
+function deferredVerification(
+  run: RunSnapshot,
+  artifacts: OverviewArtifacts,
+  model: OverviewModel,
+  branchGuard: BranchGuard | undefined,
+  liveness: RunnerLiveness,
+): ActionRequired | undefined {
+  if (run.kind !== "plan" || run.state.status !== "paused") {
+    return undefined;
+  }
+  const awaiting = run.state.awaiting;
+  if (!awaiting || awaiting.kind !== DEFERRED_VERIFICATION_REQUIRED) {
+    return undefined;
+  }
+  if (model.accepting || liveness.state === "running") {
+    return undefined;
+  }
+  // Only the askings this pause named, in the engine's order, and only the
+  // ones still in the ledger. A pause that names an asking the ledger no
+  // longer holds is a state file this version cannot present honestly, so
+  // that entry is skipped rather than invented.
+  const obligations = awaiting.instanceIds
+    .map((id) => run.state.deferredHumanChecks.find((entry) => entry.gate.instanceId === id))
+    .filter((entry): entry is DeferredObligation => entry !== undefined);
+  if (obligations.length === 0) {
+    return undefined;
+  }
+  const view = deriveDeferredVerification(obligations, artifacts.humanChecks ?? {});
+  const groups: DeferredGroup[] = obligations.map((obligation) => ({
+    instanceId: obligation.gate.instanceId as string,
+    stageId: obligation.stageId,
+    category: categoryWord(obligation.gate.category),
+    title: obligation.gate.title,
+    rationale: obligation.rationale,
+    promoted: obligation.promoted,
+    checkKeys: obligation.gate.checks.map((check) => draftKeyFor(check.id, obligation.gate.instanceId)),
+  }));
+  // What is still owed, not what was ever deferred. A check answered at an
+  // earlier visit to this checkpoint is done, and counting it here would ask
+  // a person to account for work they have already accounted for; it stays
+  // visible under "Previous evidence".
+  const outstandingStages = new Set(obligations.filter((obligation) => unansweredChecks(obligation).length > 0).map((obligation) => obligation.stageId));
+  const stages = outstandingStages.size > 0 ? outstandingStages : new Set(obligations.map((obligation) => obligation.stageId));
+  const total = view.required.length || view.recorded.length;
+  const failedChecks = obligations.filter(obligationFailed).flatMap((obligation) => obligation.gate.checks.filter((check) => obligation.results.find((result) => result.checkId === check.id)?.outcome === "fail"));
+
+  const submissionScope = stageScopeOf(run);
+  const submission = sameStageScope(artifacts.submission && { runId: artifacts.submission.runId, stageId: artifacts.submission.stageId }, submissionScope) ? artifacts.submission : undefined;
+  const inFlight = submission && !submission.failure && !submission.unresolved ? submission : undefined;
+  const submitting = inFlight
+    ? { label: "Submitting…", detail: "Your results are with the engine. Nothing is cleared until it finishes; if it fails, everything you entered is still here." }
+    : undefined;
+
+  const outstanding = view.required.filter((item) => !item.record?.outcome);
+  let submitEnabled = false;
+  let submitDetail: string;
+  if (branchGuard) {
+    submitDetail = `Switch to ${branchGuard.expected} first; the engine refuses to continue this run from another branch.`;
+  } else if (view.required.length === 0) {
+    submitDetail = "Every deferred check already has a recorded result in the engine's own ledger. There is nothing further to send.";
+  } else if (!view.ready) {
+    const names = checkNameList(outstanding);
+    const which = names ? `the remaining ${outstanding.length === 1 ? "check" : "checks"} (${names})` : outstanding.length === 1 ? "the remaining check" : `all ${outstanding.length} remaining checks`;
+    submitDetail = `Record a result for ${which} first. The plan finishes when every deferred check has been answered, so the results go together.`;
+  } else if (submitting) {
+    submitDetail = submitting.detail;
+  } else if (blocked(model)) {
+    submitDetail = blockedDetail(model);
+  } else {
+    submitEnabled = true;
+    submitDetail =
+      "Records each result against the asking it answers (sparring resume-plan --deferred-result) and lets the engine finish the plan. A Pass resolves its check; a Fail keeps the plan open and is written into the stage that raised it; Can't test records that no result could be obtained, which resolves nothing.";
+  }
+
+  const headline = total === 1 ? "Manual verification required" : `Manual verification required — ${total} deferred checks`;
+  const subtitle =
+    awaiting.reason === "promoted"
+      ? `A later review decided ${stages.size === 1 ? "this check" : "these checks"} can wait no longer. The run stopped before the next stage.`
+      : `${total} deferred ${total === 1 ? "check" : "checks"} from ${stages.size} earlier ${stages.size === 1 ? "stage" : "stages"}, owed ${checkpointWord(obligations)}. Every stage is accepted; this is the verification the reviewers judged safe to leave until now.`;
+
+  return {
+    ...view,
+    kind: "deferred_verification",
+    word: "Verification owed",
+    deferredGroups: groups,
+    headline,
+    subtitle,
+    summary: failedChecks.length > 0
+      ? `${failedChecks.length} deferred ${failedChecks.length === 1 ? "check has" : "checks have"} been recorded as failed. The plan will not complete until the behaviour is corrected and the check is answered again.`
+      : subtitle,
+    technical: [
+      { label: "Engine state", value: `awaiting.kind = ${awaiting.kind}, reason = ${awaiting.reason}` },
+      ...groups.map((group) => ({ label: `Gate instance (${group.stageId})`, value: group.instanceId })),
+      { label: "What submitting does", value: "sparring resume-plan … --deferred-result '<gate instance>:<check id>=<pass|fail|blocked>[=note]'. The engine records it in its own ledger and in the originating stage's notes.md; the plan completes only once every obligation passes." },
+    ],
+    submit: { label: "Submit verification and finish", enabled: submitEnabled, detail: submitDetail },
+    feedback: {
+      draft: artifacts.humanFeedback?.trim() ? artifacts.humanFeedback : undefined,
+      submitted: parseHumanFeedback(artifacts.notesText),
+      send: {
+        label: "Send feedback for review",
+        enabled: false,
+        detail: "Feedback goes to a reviewer about a candidate under review. There is no stage under review here: every stage is accepted and the plan is waiting on these results. Record a Fail with a note instead — it reaches the stage that raised the check.",
+      },
+    },
+    submitting,
+    planSection: false,
+    review: artifacts.sparring,
+  };
+}
+
+/**
+ * The quiet counterpart, for a stage that was accepted *with* a deferral:
+ * the review passed and a person still owes a check.
+ *
+ * Both halves are said, because "accepted" on its own would read as
+ * "verified" and the whole point of a deferral is that it is not a waiver.
+ * It is never a "waiting for you" state — nothing is waiting, and the plan
+ * is already on the next stage.
+ */
+/**
+ * The checks of one obligation that are still owed.
+ *
+ * The engine's own rule (`deferred_gate.py`: `DeferredObligation.unanswered`),
+ * repeated rather than stored: only a `pass` settles a check. A `fail` leaves
+ * the obligation failed and a `blocked` records that no result could be
+ * obtained, and in both cases the run stays stopped on it — so both are still
+ * owed, and counting them as done would tell a person the opposite of what
+ * the engine is about to do.
+ */
+function unansweredChecks(obligation: DeferredObligation): { id: string }[] {
+  return obligation.gate.checks.filter((check) => obligation.results.find((result) => result.checkId === check.id)?.outcome !== "pass");
+}
+
+/**
+ * By when the answers are owed, from the obligations' own recorded
+ * checkpoint rather than from a sentence hardcoded here — so a checkpoint
+ * this version does not know is named rather than silently mislabelled as
+ * the one it does.
+ */
+function checkpointWord(obligations: DeferredObligation[]): string {
+  const kinds = new Set(obligations.map((entry) => entry.checkpoint));
+  if (kinds.size === 1 && kinds.has("before_plan_completion")) {
+    return "until plan completion";
+  }
+  return kinds.size === 1 ? `until ${[...kinds][0]}` : "until their recorded checkpoints";
+}
+
+function deferredNote(run: RunSnapshot, outcome: SparringOutcome | undefined): OverviewModel["deferredNote"] {
+  if (run.kind !== "plan") {
+    return undefined;
+  }
+  const owed = run.state.deferredHumanChecks.filter((entry) => !obligationResolved(entry));
+  if (owed.length === 0) {
+    return undefined;
+  }
+  // Already at the checkpoint: the panel above states all of this, and
+  // saying it twice would read as two separate things to do.
+  if (run.state.awaiting?.kind === DEFERRED_VERIFICATION_REQUIRED) {
+    return undefined;
+  }
+  // What is still owed, not what was ever deferred: two of three passed is
+  // one check outstanding, and saying three would be counting work already
+  // done.
+  // Always at least one: `owed` is the unresolved obligations, and an
+  // obligation is unresolved exactly when it has an unanswered check.
+  const checks = owed.reduce((count, entry) => count + unansweredChecks(entry).length, 0);
+  const raisedHere = outcome?.action === "READY" ? outcome.deferredHumanGate : undefined;
+  return {
+    label: `Review passed — ${checks} manual ${checks === 1 ? "check" : "checks"} deferred ${checkpointWord(owed)}`,
+    detail: raisedHere
+      ? `This stage's reviewer deferred "${raisedHere.gate.title}": ${raisedHere.rationale}`
+      : `Raised by ${[...new Set(owed.map((entry) => entry.stageId))].join(", ")}. The engine will not report this plan complete until they are answered.`,
+    entries: owed.map((entry) => ({ stageId: entry.stageId, title: entry.gate.title, rationale: entry.rationale })),
   };
 }
 
@@ -2155,6 +2415,30 @@ function currentLine(
       return { stageLine: "All stages accepted.", banner: { kind: "done", text: `Plan complete${total ? ` — ${total} stage${total === 1 ? "" : "s"} accepted` : ""}` } };
     }
     if (run.state.status === "paused") {
+      if (run.state.awaiting?.kind === DEFERRED_VERIFICATION_REQUIRED) {
+        // Not "waiting for you" about a stage, because no stage is waiting:
+        // every stage the plan could run is accepted, and what is left is
+        // the verification earlier reviewers deliberately deferred.
+        // Checks, not askings: one obligation can carry three of them, and a
+        // banner saying "1 deferred check" beside a panel headed "3 deferred
+        // checks" is two different answers to the same question.
+        const owed = run.state.deferredHumanChecks
+          .filter((entry) => run.state.awaiting?.kind === DEFERRED_VERIFICATION_REQUIRED && run.state.awaiting.instanceIds.includes(entry.gate.instanceId ?? ""))
+          .reduce((count, entry) => count + unansweredChecks(entry).length, 0);
+        if (owed === 0) {
+          // Every named asking has in fact been answered; the engine will
+          // clear the pause on the next resume. Saying "0 deferred checks"
+          // in the meantime would be a warning about nothing.
+          return { stageLine: "Every stage is accepted, and every deferred check is answered. Resume the plan to finish it." };
+        }
+        return {
+          stageLine:
+            run.state.awaiting.reason === "promoted"
+              ? "A later review decided a deferred check can wait no longer. Record the result and the plan continues."
+              : "Every stage is accepted. The plan finishes once the deferred manual checks are answered.",
+          banner: { kind: "warn", text: `Verification owed — ${owed} deferred ${owed === 1 ? "check" : "checks"}` },
+        };
+      }
       if (outcome?.action === "NEEDS_YOU" || outcome?.action === "ESCALATE") {
         const detail = outcome.summary ? ` — ${outcome.summary}` : "";
         return {

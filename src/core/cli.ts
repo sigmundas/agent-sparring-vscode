@@ -86,6 +86,31 @@ export interface ResumePlanInvocation extends PlanInvocation {
   evidence?: string;
   /** Present only when the person has just allowed a push; see `PushAuthorizationRequest`. */
   allowPush?: PushAuthorizationRequest;
+  /**
+   * Answers to the deferred manual checks the run is stopped on, one per
+   * `--deferred-result`.
+   *
+   * Always addressed as `<gate instance>:<check id>`, never as the bare id:
+   * two askings at one checkpoint can own the same check id, and the engine
+   * refuses an ambiguous reference rather than guessing. Sending the
+   * qualified form always means the answer lands on the asking that was on
+   * screen, and on no other. A gate instance never contains a colon
+   * (`human_gate.py`: `_INSTANCE_ID_RE`), so the left half is unambiguous; a
+   * reviewer's check id may, and the engine reads the reference both ways to
+   * cover that.
+   */
+  deferredResults?: DeferredResultAnswer[];
+}
+
+/** One answer to one deferred check, as the engine's `--deferred-result` takes it. */
+export interface DeferredResultAnswer {
+  /** The engine-minted asking this answers. */
+  gateInstanceId: string;
+  /** The reviewer's own check id. */
+  checkId: string;
+  outcome: "pass" | "fail" | "blocked";
+  /** Optional; recorded with the result in the originating stage's notes.md. */
+  note?: string;
 }
 
 export function buildResumePlanArgs(invocation: ResumePlanInvocation): string[] {
@@ -93,6 +118,14 @@ export function buildResumePlanArgs(invocation: ResumePlanInvocation): string[] 
   const args = [...globalArgs(invocation), "resume-plan", ...planInput(invocation), ...loopArgs(invocation)];
   if (invocation.evidence && invocation.evidence.trim()) {
     args.push("--evidence", invocation.evidence.trim());
+  }
+  for (const answer of invocation.deferredResults ?? []) {
+    // `<ref>=<outcome>[=<note>]`, and the engine splits at most twice, so a
+    // note may contain `=` freely. Newlines are collapsed: the value is one
+    // shell argument, and a note is a sentence, not a document.
+    const note = answer.note?.trim().replace(/\s+/g, " ");
+    const ref = `${answer.gateInstanceId}:${answer.checkId}`;
+    args.push("--deferred-result", note ? `${ref}=${answer.outcome}=${note}` : `${ref}=${answer.outcome}`);
   }
   if (invocation.allowPush) {
     args.push("--allow-push-candidate", invocation.allowPush.candidateSha);
@@ -361,10 +394,10 @@ export function vscodeQuotingIsFaithful(arg: string): boolean {
   if (/["'`]/.test(arg)) {
     return false; // never quoted, so every metacharacter in it is live
   }
-  if (/[\n\r]/.test(arg)) {
-    // Whether or not it is quoted, a newline makes this a multi-line command
-    // line; the extension writes those itself rather than rely on how a
-    // shell and shell integration reconcile them.
+  if (TERMINAL_CONTROL.test(arg)) {
+    // Terminal control bytes act on the interactive reader before the shell
+    // parses quoting. Encode them instead of sending literal line breaks,
+    // tabs or editing keys.
     return false;
   }
   if (/\s/.test(arg)) {
@@ -388,14 +421,21 @@ export function needsOwnQuoting(args: readonly string[]): boolean {
  * newline in an argument at all) and PowerShell (whose native-command
  * argument passing differs between 5.1 and 7.3+). For those the caller must
  * bypass the shell and pass an argument array to the process directly.
+ * `posix-ansi` additionally supports $'…' escapes, so free text containing
+ * terminal control bytes can be delivered as one physical command line.
  */
-export type ShellFamily = "posix" | "cmd";
+export type ShellFamily = "posix" | "posix-ansi" | "cmd";
+
+const ANSI_QUOTING_SHELLS: ReadonlySet<string> = new Set(["bash", "zsh", "ksh"]);
 
 const POSIX_SHELLS: ReadonlySet<string> = new Set(["sh", "bash", "zsh", "dash", "ksh", "ash", "fish"]);
 
 /** The family of `shell` (a shell path, e.g. VS Code's `env.shell`). */
 export function shellFamily(shell: string | undefined, platform: NodeJS.Platform): ShellFamily {
   const name = (shell ?? "").replace(/\\/g, "/").split("/").pop()?.toLowerCase().replace(/\.exe$/, "") ?? "";
+  if (ANSI_QUOTING_SHELLS.has(name)) {
+    return "posix-ansi";
+  }
   if (POSIX_SHELLS.has(name)) {
     return "posix";
   }
@@ -409,10 +449,35 @@ export function shellFamily(shell: string | undefined, platform: NodeJS.Platform
  * readable command.
  */
 export function shellCommandLine(word: string, args: readonly string[], family: ShellFamily): string | undefined {
-  if (family !== "posix") {
+  if (family === "cmd") {
     return undefined;
   }
-  return [word, ...args].map((part) => (SHELL_ACTIVE.test(part) || part === "" ? posixQuote(part) : part)).join(" ");
+  const parts = [word, ...args];
+  if (parts.some(part => part.includes("\0"))) {
+    return undefined; // no process argv can carry NUL; never silently truncate it
+  }
+  // executeCommand sends terminal input, not a script to `shell -c`. Literal
+  // newlines enter zsh's quote> reader one line at a time, and control bytes
+  // can act on the line editor. Keep all of them out of the physical line.
+  // Unknown/POSIX-only shells use the existing no-shell transport instead
+  // of guessing whether they understand ANSI-C quoting.
+  if (family !== "posix-ansi" && parts.some(part => TERMINAL_CONTROL.test(part))) {
+    return undefined;
+  }
+  return parts.map(part => TERMINAL_CONTROL.test(part) ? ansiQuote(part) : SHELL_ACTIVE.test(part) || part === "" ? posixQuote(part) : part).join(" ");
+}
+
+// eslint-disable-next-line no-control-regex
+const TERMINAL_CONTROL = /[\x00-\x1f\x7f]/;
+
+/** zsh/bash/ksh decode the escapes only after accepting the complete line. */
+function ansiQuote(value: string): string {
+  // Escape backslashes before control bytes so literal `\n` stays literal.
+  // Apostrophes must be escaped inside $'…'; backticks and dollars stay inert.
+  const escaped = value.replace(/\\/g, "\\\\").replace(/'/g, "\\'")
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\x00-\x1f\x7f]/g, byte => `\\${byte.charCodeAt(0).toString(8).padStart(3, "0")}`);
+  return `$'${escaped}'`;
 }
 
 /**
@@ -437,7 +502,7 @@ export function posixQuote(value: string): string {
 export type ShellHandover = { via: "arguments" } | { via: "command-line"; commandLine: string } | { via: "no-shell" };
 
 export function planShellHandover(word: string, args: readonly string[], family: ShellFamily): ShellHandover {
-  if (!needsOwnQuoting(args)) {
+  if (vscodeQuotingIsFaithful(word) && !needsOwnQuoting(args)) {
     return { via: "arguments" };
   }
   const commandLine = shellCommandLine(word, args, family);
