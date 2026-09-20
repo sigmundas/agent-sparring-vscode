@@ -938,9 +938,12 @@ describe("whichever observer establishes a start first, the operation still sett
       assert.equal(joined?.identifiable, true, "this window holds that exact execution");
       assert.equal(joined?.enginePid, ENGINE_PID, "without losing the pid that cost real evidence to obtain");
       assert.ok(registry.inFlightFor(key()), "the same single record still holds the key: a stronger observation is not a second lifecycle");
-      assert.deepEqual(registry.unresolved(), [], "and it no longer needs the process table: this window is watching it again");
+      // And it stops being an operation nobody here can account for. That
+      // answer is what offers a person the "confirm it cannot run" override,
+      // which must not be on offer against a command the shell is reporting.
+      assert.deepEqual(registry.unresolved(), [], "it no longer needs the process table: the shell is watching it again");
       assert.deepEqual(resolutions(logged), [], "and nothing has been resolved: the command is executing");
-      assert.deepEqual(terminals.retired, [], "the terminal it is running in was not retired: Stop has to be able to reach it");
+      assert.deepEqual(terminals.retired, [], "and the terminal it is running in was not retired");
 
       const second = await runner.run(options());
       assert.equal(second.ok, false, "a second copy is still refused while it executes");
@@ -1020,6 +1023,38 @@ describe("whichever observer establishes a start first, the operation still sett
       assert.equal(registry.inFlightFor(key()), undefined, "its own execution's end is what settles it");
       assert.equal(resolutions(logged).length, 1, "exactly once");
       assert.match(resolutions(logged)[0], /shell-execution-ended/);
+    } finally {
+      registry.dispose();
+    }
+  });
+
+  it("a foreign command starting in the same terminal is never adopted as this operation's start", async () => {
+    const logged: string[] = [];
+    let processes = tableWithEngine();
+    const { registry, terminals, integration } = await probeWinsFirst(logged, () => processes);
+    try {
+      assert.equal(registry.inFlightFor(key())?.enginePid, ENGINE_PID, "the probe established it");
+
+      // Something else runs in that terminal — the person typing, or a
+      // backgrounded engine leaving the foreground. The new matching pass
+      // must not treat this as the report of *this* operation's start: that
+      // would attach a stranger's identity and let a stranger's end release
+      // this guard.
+      const foreign = { commandLine: { value: "git status", isTrusted: true } } as never;
+      stub.window.startEmitter.fire({ terminal: terminals.acquired[0], shellIntegration: integration, execution: foreign });
+
+      const after = registry.inFlightFor(key());
+      assert.ok(after, "the operation is still guarded");
+      assert.equal(after?.shellReportedStart, false, "no stranger's execution was adopted as its start");
+      assert.equal(after?.observationLost, true, "what changed is that the foreground is someone else's now");
+      assert.deepEqual(resolutions(logged), [], "and nothing was resolved by another command starting");
+
+      // Its own pid still settles it, and the stranger's fate never does.
+      processes = tableWithoutEngine();
+      await registry.probeAll();
+      assert.equal(registry.inFlightFor(key()), undefined, "its own engine process being gone is what ends it");
+      assert.equal(resolutions(logged).length, 1, "exactly once");
+      assert.match(resolutions(logged)[0], /engine-process-gone/);
     } finally {
       registry.dispose();
     }

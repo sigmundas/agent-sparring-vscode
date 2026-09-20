@@ -1320,12 +1320,15 @@ export class OperationRegistry implements vscode.Disposable {
    * found running as a process. The same operation, told apart more exactly.
    *
    * It is deliberately not an advance. The record is already `running-shell`
-   * and already guarding this command; what changes is that this window now
-   * holds the execution identity, so the shell's own end event can release
-   * the guard and Stop can aim at something exact. Nothing is announced and
-   * no establishment is emitted: the caller was told when the wait expired,
-   * and a second establishment for one command would be a second lifecycle
-   * for it.
+   * and already guarding this command; what changes is that the shell is now
+   * known to be watching that execution, so its end will be reported as an
+   * event and this window no longer has to ask the process table. Nothing is
+   * announced and no establishment is emitted: the caller was told when the
+   * wait expired, and a second establishment for one command would be a
+   * second lifecycle for it.
+   *
+   * Stop is unaffected either way — it sends Ctrl-C to the terminal, which
+   * this record has held since the hand-over.
    *
    * The pid stays recorded. It cost real evidence to obtain, it is what
    * follows this command through its shell dying, and it is what probing
@@ -1413,10 +1416,14 @@ export class OperationRegistry implements vscode.Disposable {
     // very execution it was handed. Claiming it strengthens the record that
     // exists; it never starts a second one.
     //
-    // It also has to be claimed. Left unmatched, the loop in `onStarted`
-    // reads this execution as a *foreign* command taking the foreground and
-    // retires the terminal — the terminal this operation is running in, and
-    // the one Stop has to reach to interrupt it.
+    // Left unmatched, the record would never learn that the shell is watching
+    // it: `shellReportedStart` would stay false for the rest of its life, so
+    // `outstanding` would keep answering "nobody here can account for this"
+    // about a command the shell is actively reporting on. That answer is what
+    // offers a person the manual override — "confirm it cannot run" — and
+    // what `override` itself requires, so the cost of missing this report is
+    // that the one way to falsely release a guard stays open against a
+    // command that is demonstrably running.
     for (const operation of this.operations.values()) {
       if (operation.state === "running-shell" && !operation.shellReportedStart && !operation.restored && (operation.execution === execution || (operation.execution === undefined && operation.terminal === terminal))) {
         return operation;
