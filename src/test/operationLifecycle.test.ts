@@ -844,3 +844,251 @@ describe("the durable execution intent is on disk before anything can execute", 
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// 8. two observers race to establish the same start
+// ---------------------------------------------------------------------------
+
+/**
+ * A shell-run command can be established as started in two ways: the shell
+ * reports the execution, or the process probe finds the engine running under
+ * that shell. Both are real evidence, they race, and either can arrive first.
+ *
+ * The probe winning used to be a trap. It moved the record to `running-shell`
+ * with a pid but no execution, and `outstanding` answered "no" for
+ * `running-shell` — on the reasoning that such an operation is one this
+ * window is watching through its execution. This one has no execution to
+ * watch, so nothing would ever report its end, and `probeOnce` refused every
+ * round for the one operation that had only the process table left. The
+ * engine could exit and the guard stayed for as long as the window lived; a
+ * real integration run sat there for fifteen minutes.
+ *
+ * The rule these tests hold to: whichever observation arrives first, the
+ * operation has exactly one lifecycle, a later stronger observation joins
+ * that record rather than starting another, and the command's real end
+ * settles it exactly once.
+ */
+describe("whichever observer establishes a start first, the operation still settles exactly once", () => {
+  beforeEach(() => reset());
+
+  const stage = "stage-9-probe-race";
+  const cwd = path.join(os.tmpdir(), "agent-sparring-probe-race");
+  const args = ["freeze-candidate", stage, "--repo-root", cwd];
+  const options = () => ({
+    configured: process.execPath,
+    args,
+    cwd,
+    name: "freeze-candidate",
+    operation: { subcommand: "freeze-candidate", target: stage },
+  });
+  const key = () => commandKey(cwd, "freeze-candidate", stage);
+
+  /** The shell that took the line, and the engine running under it. */
+  const SHELL_PID = 7100;
+  const ENGINE_PID = 9001;
+  const engineLine = `${process.execPath} ${args.join(" ")}`;
+  const tableWithEngine = (): ProcessInfo[] => [
+    { pid: 1, ppid: 0, command: "/sbin/launchd" },
+    { pid: SHELL_PID, ppid: 1, command: "/bin/zsh -il" },
+    { pid: ENGINE_PID, ppid: SHELL_PID, command: engineLine, started: new Date().toISOString() },
+  ];
+  const tableWithoutEngine = (): ProcessInfo[] => [
+    { pid: 1, ppid: 0, command: "/sbin/launchd" },
+    { pid: SHELL_PID, ppid: 1, command: "/bin/zsh -il" },
+  ];
+
+  /**
+   * Hand the command to a shell and let the *probe* establish it, without the
+   * shell ever having reported the execution. The returned execution is the
+   * one the shell is still holding, to be reported later or not at all.
+   */
+  async function probeWinsFirst(logged: string[], processes: () => ProcessInfo[]) {
+    const kept = store();
+    const registry: Registry = new OperationRegistry({ workspaceState: kept } as never, (message: string) => logged.push(message), () => true, async () => processes());
+    const terminals = pool();
+    const runner: Runner = new SparringCommandRunner((message) => logged.push(message), terminals as never, registry);
+    const started = runner.run(options());
+    await waitingForIntegration();
+    const integration: FakeShellIntegration = terminals.acquired[0].integrate();
+    const execution = await until(() => terminals.acquired[0].executions[0], "the command to be handed to the shell");
+    // The shell has the line and has reported nothing about it. The probe is
+    // the only observer with anything to say.
+    await until(() => (registry.inFlightFor(key())?.terminalPid === SHELL_PID ? true : undefined), "the shell's pid to be recorded");
+    await registry.probeAll();
+    return { registry, terminals, runner, integration, execution, started, kept };
+  }
+
+  it("the probe establishes it, the shell's later report joins the same record, and that execution's end settles it", async () => {
+    const logged: string[] = [];
+    const processes = tableWithEngine();
+    const { registry, terminals, runner, integration, execution } = await probeWinsFirst(logged, () => processes);
+    try {
+      const probed = registry.inFlightFor(key());
+      assert.equal(probed?.state, "running-shell", "the probe established it as running");
+      assert.equal(probed?.observation, "probed", "and says so: this was the process table, not the shell");
+      assert.equal(probed?.enginePid, ENGINE_PID, "anchored to the exact engine process it found");
+      assert.equal(probed?.shellReportedStart, false, "and the shell has reported nothing, so nothing will announce its end");
+
+      // The shell finally reports the execution for the command already
+      // known to be running. One record, told apart more exactly.
+      stub.window.startEmitter.fire({ terminal: terminals.acquired[0], shellIntegration: integration, execution });
+      const joined = registry.inFlightFor(key());
+      assert.equal(joined?.state, "running-shell", "the same state: it was already running and still is");
+      assert.equal(joined?.shellReportedStart, true, "and the shell is now watching that execution, so its end will be reported");
+      assert.equal(joined?.identifiable, true, "this window holds that exact execution");
+      assert.equal(joined?.enginePid, ENGINE_PID, "without losing the pid that cost real evidence to obtain");
+      assert.ok(registry.inFlightFor(key()), "the same single record still holds the key: a stronger observation is not a second lifecycle");
+      // And it stops being an operation nobody here can account for. That
+      // answer is what offers a person the "confirm it cannot run" override,
+      // which must not be on offer against a command the shell is reporting.
+      assert.deepEqual(registry.unresolved(), [], "it no longer needs the process table: the shell is watching it again");
+      assert.deepEqual(resolutions(logged), [], "and nothing has been resolved: the command is executing");
+      assert.deepEqual(terminals.retired, [], "and the terminal it is running in was not retired");
+
+      const second = await runner.run(options());
+      assert.equal(second.ok, false, "a second copy is still refused while it executes");
+      assert.equal(terminals.acquired.length, 1, "and no second terminal was acquired");
+
+      // Its own end, through the identity it gained.
+      stub.window.endEmitter.fire({ terminal: terminals.acquired[0], shellIntegration: integration, execution, exitCode: 0 });
+      assert.equal(registry.inFlightFor(key()), undefined, "the execution's end releases the guard");
+      assert.equal(resolutions(logged).length, 1, "exactly once");
+      assert.match(resolutions(logged)[0], /shell-execution-ended/, "by the strongest evidence it had");
+
+      const third = await runner.run(options());
+      assert.equal(third.ok, true, "and the next command is admitted");
+    } finally {
+      registry.dispose();
+    }
+  });
+
+  it("the probe establishes it, the shell never reports anything, and the engine exiting settles it", async () => {
+    const logged: string[] = [];
+    let processes = tableWithEngine();
+    const { registry, runner } = await probeWinsFirst(logged, () => processes);
+    try {
+      assert.equal(registry.inFlightFor(key())?.enginePid, ENGINE_PID, "the probe established it");
+
+      // Still running: absence of a shell report is not absence of a process.
+      await registry.probeAll();
+      assert.equal(registry.inFlightFor(key())?.state, "running-shell", "a live engine is not declared gone");
+      assert.deepEqual(resolutions(logged), [], "and nothing is resolved while it runs");
+
+      // The engine exits. Nothing else will ever say so: this window holds no
+      // execution for it, and the shell is not going to report one. This is
+      // the round that used to be refused, leaving the guard forever.
+      processes = tableWithoutEngine();
+      await registry.probeAll();
+      assert.equal(registry.inFlightFor(key()), undefined, "the engine process being gone is what ends it");
+      assert.equal(resolutions(logged).length, 1, "settled exactly once");
+      assert.match(resolutions(logged)[0], /engine-process-gone/, "on the evidence it actually had: that exact pid");
+
+      const next = await runner.run(options());
+      assert.equal(next.ok, true, "and the next command is admitted, rather than blocked for the life of the window");
+    } finally {
+      registry.dispose();
+    }
+  });
+
+  it("the shell reports first, and the process table is then not allowed to settle it", async () => {
+    const logged: string[] = [];
+    // A table in which the engine cannot be found at all. For an operation
+    // this window is watching through its execution, that must decide
+    // nothing: `ps` not showing a process is not that execution ending, and
+    // reading it as such would be a false completion.
+    const processes = tableWithoutEngine();
+    const kept = store();
+    const registry: Registry = new OperationRegistry({ workspaceState: kept } as never, (message: string) => logged.push(message), () => true, async () => processes);
+    const terminals = pool();
+    const runner: Runner = new SparringCommandRunner((message) => logged.push(message), terminals as never, registry);
+    try {
+      void runner.run(options());
+      await waitingForIntegration();
+      const integration: FakeShellIntegration = terminals.acquired[0].integrate();
+      const execution = await until(() => terminals.acquired[0].executions[0], "the command to be handed to the shell");
+
+      stub.window.startEmitter.fire({ terminal: terminals.acquired[0], shellIntegration: integration, execution });
+      const running = registry.inFlightFor(key());
+      assert.equal(running?.state, "running-shell", "the shell established it");
+      assert.equal(running?.observation, "launched", "by reporting the execution, not by a process lookup");
+      assert.equal(running?.shellReportedStart, true, "so its end is an event this window will be told about");
+      assert.equal(running?.enginePid, undefined, "and no pid was bound: knowing an execution started never says which process it is");
+
+      await registry.probeAll();
+      await registry.probeAll();
+      assert.equal(registry.inFlightFor(key())?.state, "running-shell", "the process table settles nothing here");
+      assert.deepEqual(resolutions(logged), [], "a command this window is watching is not completed by a probe");
+
+      stub.window.endEmitter.fire({ terminal: terminals.acquired[0], shellIntegration: integration, execution, exitCode: 0 });
+      assert.equal(registry.inFlightFor(key()), undefined, "its own execution's end is what settles it");
+      assert.equal(resolutions(logged).length, 1, "exactly once");
+      assert.match(resolutions(logged)[0], /shell-execution-ended/);
+    } finally {
+      registry.dispose();
+    }
+  });
+
+  it("a foreign command starting in the same terminal is never adopted as this operation's start", async () => {
+    const logged: string[] = [];
+    let processes = tableWithEngine();
+    const { registry, terminals, integration } = await probeWinsFirst(logged, () => processes);
+    try {
+      assert.equal(registry.inFlightFor(key())?.enginePid, ENGINE_PID, "the probe established it");
+
+      // Something else runs in that terminal — the person typing, or a
+      // backgrounded engine leaving the foreground. The new matching pass
+      // must not treat this as the report of *this* operation's start: that
+      // would attach a stranger's identity and let a stranger's end release
+      // this guard.
+      const foreign = { commandLine: { value: "git status", isTrusted: true } } as never;
+      stub.window.startEmitter.fire({ terminal: terminals.acquired[0], shellIntegration: integration, execution: foreign });
+
+      const after = registry.inFlightFor(key());
+      assert.ok(after, "the operation is still guarded");
+      assert.equal(after?.shellReportedStart, false, "no stranger's execution was adopted as its start");
+      assert.equal(after?.observationLost, true, "what changed is that the foreground is someone else's now");
+      assert.deepEqual(resolutions(logged), [], "and nothing was resolved by another command starting");
+
+      // Its own pid still settles it, and the stranger's fate never does.
+      processes = tableWithoutEngine();
+      await registry.probeAll();
+      assert.equal(registry.inFlightFor(key()), undefined, "its own engine process being gone is what ends it");
+      assert.equal(resolutions(logged).length, 1, "exactly once");
+      assert.match(resolutions(logged)[0], /engine-process-gone/);
+    } finally {
+      registry.dispose();
+    }
+  });
+
+  it("a probe-established operation keeps its pid identity across a reload, and settles there", async () => {
+    const logged: string[] = [];
+    let processes = tableWithEngine();
+    const { registry, kept } = await probeWinsFirst(logged, () => processes);
+    let reloaded: Registry | undefined;
+    try {
+      assert.equal(registry.inFlightFor(key())?.enginePid, ENGINE_PID);
+      const persisted = kept.get<{ state: string; enginePid?: number; generation?: string }[]>(OPERATIONS_KEY, []);
+      assert.equal(persisted.length, 1, "it is written down: a reload must not duplicate it");
+      assert.equal(persisted[0].state, "running-shell");
+      assert.equal(persisted[0].enginePid, ENGINE_PID, "with the identity that became authoritative");
+      assert.ok(persisted[0].generation, "and the birth time that tells it from a reused pid");
+
+      // The window reloads. The execution identity cannot survive that; the
+      // pid one does, and is what settles it.
+      registry.dispose();
+      const after: string[] = [];
+      reloaded = new OperationRegistry({ workspaceState: kept } as never, (message: string) => after.push(message), () => true, async () => processes);
+      reloaded.restore();
+      await reloaded.probeAll();
+      assert.equal(reloaded.unresolved()[0]?.state, "running-shell", "a live engine still blocks a duplicate after the reload");
+
+      processes = tableWithoutEngine();
+      await reloaded.probeAll();
+      assert.equal(reloaded.inFlightFor(key()), undefined, "and its exact process being gone settles it");
+      assert.equal(resolutions(after).length, 1, "exactly once");
+      assert.match(resolutions(after)[0], /engine-process-gone/);
+    } finally {
+      reloaded?.dispose();
+    }
+  });
+});
