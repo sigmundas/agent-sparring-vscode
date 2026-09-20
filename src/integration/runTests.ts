@@ -17,7 +17,27 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
+/**
+ * Variables a VS Code integrated terminal exports into everything started from
+ * it. The child launched below *is* VS Code, and it inherits this environment:
+ * `ELECTRON_RUN_AS_NODE=1` makes it run as plain Node, which then reads the
+ * `.code-workspace` argument as a script and fails with a bare
+ * `SyntaxError: Unexpected token ':'` that says nothing about the cause. The
+ * others describe the parent window's own session and must not be adopted by a
+ * second one. Clearing them here means `npm run test:integration` works from
+ * any terminal, rather than only from one outside VS Code.
+ */
+function forgetTheParentWindow(): void {
+  delete process.env.ELECTRON_RUN_AS_NODE;
+  for (const name of Object.keys(process.env)) {
+    if (name.startsWith("VSCODE_")) {
+      delete process.env[name];
+    }
+  }
+}
+
 async function main(): Promise<void> {
+  forgetTheParentWindow();
   const extensionDevelopmentPath = path.resolve(__dirname, "..", "..");
   const extensionTestsPath = path.resolve(__dirname, "suite");
   const fixture = await buildFixture();
@@ -95,8 +115,27 @@ async function buildFixture(): Promise<{ root: string; workspaceFile: string }> 
       "# Every call records its own argv, unambiguously and before anything is",
       "# shifted away, next to the fixture root: the launch tests assert on the",
       "# exact executable and the exact arguments the process was given.",
-      'argv_log="$(dirname "$0")/../fake-argv.log"',
-      '[ "$1" != resume-plan ] || argv_log="$(dirname "$0")/../fake-resume-argv.log"',
+      "#",
+      "# One log per subcommand, because the record is truncated on every call",
+      "# and the extension probes the engine in the background. A shared log let",
+      "# a `show-config --json` probe overwrite the launch a test was asserting",
+      "# on, and let \"the engine never ran\" / \"the engine really did run\" be",
+      "# answered by some other subcommand's call. Each reader names the",
+      "# subcommand it means, so no other call can answer for it.",
+      "#",
+      "# The name is the subcommand, not $1: --sparring-dir is a global option",
+      "# and comes before it.",
+      "argv_skip=0",
+      "argv_sub=none",
+      'for a in "$@"; do',
+      '  if [ "$argv_skip" = 1 ]; then argv_skip=0; continue; fi',
+      '  case "$a" in',
+      "    --sparring-dir) argv_skip=1 ;;",
+      "    -*) ;;",
+      '    *) argv_sub="$a"; break ;;',
+      "  esac",
+      "done",
+      'argv_log="$(dirname "$0")/../fake-argv-$argv_sub.log"',
       'printf \'[%s]\\n\' "$0" > "$argv_log"',
       'for a in "$@"; do printf \'<%s>\\n\' "$a" >> "$argv_log"; done',
       '# A reader can only trust the log once this last line is there.',
