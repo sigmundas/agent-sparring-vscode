@@ -70,3 +70,30 @@ Run from this repository root:
 Report what changed, validation and limitations concisely. Do not rerun passed
 broad suites without new changes/evidence. Managed stages use their assigned
 role-specific response format and stop at their scope boundary.
+
+## Git policy
+
+Agents may create branches, commit, push, merge, and delete branches as needed
+to complete the task.
+
+Use normal Git workflows and keep history understandable.
+
+Do not:
+
+- force-push unless the user explicitly asks for it;
+- rewrite published history unnecessarily;
+- push secrets or credentials;
+- merge obviously unrelated work;
+- publish an extension/release or modify production systems unless the task
+  explicitly includes that.
+
+For staged/agent-sparring work:
+
+- commit and push completed stage work;
+- merge when the stage or plan calls for it;
+- leave a clear handoff describing what changed, what was tested, and any
+  unresolved issues.
+
+This is about ordinary Git workflow, and does not loosen the rule above in
+`Boundaries to preserve`: pushing or publishing must never happen merely as
+incidental validation of a change.
