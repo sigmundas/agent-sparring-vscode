@@ -645,11 +645,20 @@ export class ExecutionTracker implements vscode.Disposable {
    *
    * That route is a dedicated terminal whose process *is* the runner: the
    * executable is the terminal's own process and the argument array is passed
-   * to it by the pty host, so argv reaches the engine exactly as built, with
-   * no interactive line editor, no shell and no line-length limit between the
+   * to it by the pty host, so argv reaches the engine as built, with no
+   * interactive line editor, no shell and no line-length limit between the
    * two. It is also used when shell integration does not appear in time. Then
    * a bare name must be resolvable from this process, or the launch fails with
    * a configuration message.
+   *
+   * On macOS and Linux that is literal: the pty host reaches `execvp` with
+   * this argument vector and nothing transforms it. On Windows it is a belief
+   * rather than a demonstrated fact — node-pty has no argv to hand ConPTY, so
+   * it reassembles `shellArgs` into one command line under the MSVCRT quoting
+   * rules and the engine's runtime parses it back. That transform is meant to
+   * be invertible and almost certainly is for Python's argv, but nothing here
+   * tests it on win32, and the exact-argv guarantee should be read as unproven
+   * there rather than as established.
    */
   async launch(options: LaunchOptions): Promise<LaunchResult> {
     // Before anything else — before the executable is resolved, before a

@@ -185,6 +185,13 @@ the engine as one argument, byte for byte, with no interactive line editor, no
 engine's output. Every other invocation — flags, stage ids, paths — is
 unaffected and still goes to your own shell through VS Code's escaping.
 
+On macOS and Linux that is exact: the argument vector is what the process is
+started with. On Windows it is one step less certain — there is no argv to
+pass through ConPTY, so the arguments are reassembled into a command line and
+parsed back by the engine's own runtime. That transform is meant to be
+invertible and in practice is, but it is not tested here, so treat the
+byte-for-byte guarantee as proven on POSIX and expected on Windows.
+
 This is not a preference. Two earlier versions did encode the entry into a
 single command line — first POSIX `'…'`, then ANSI-C `$'…'` — and both failed
 in use, because an interactive shell on a pty stops accepting a command line

@@ -454,6 +454,14 @@ export function carriesFreeText(args: readonly string[]): boolean {
  * faithfully it was encoded, and the engine then receives something that is
  * not what the person wrote, or nothing at all. The only encoding a terminal
  * cannot damage is the one that never goes near it.
+ *
+ * What `no-shell` then guarantees is exact on POSIX, where the transport
+ * reaches `execvp` with the argument vector itself. On Windows there is no
+ * argv to pass — node-pty rebuilds a command line under the MSVCRT rules for
+ * ConPTY and the engine's runtime parses it back — so the guarantee there
+ * rests on that transform being invertible, which is untested in this
+ * repository. It is still strictly better than an interactive shell, which
+ * has the line-length ceiling as well.
  */
 export type TransportSafety = "shell" | "no-shell";
 
