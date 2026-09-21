@@ -9,8 +9,24 @@ import type { RunSnapshot, StageSnapshot } from "./discovery";
 import type { RoutingAction, SparringOutcome, StageStatus } from "./engineFormats";
 import type { LiveState } from "./liveState";
 
-const PLAN_KEY_PREFIX_RE = /^(?:[a-z0-9-]*-)?[0-9a-f]{8}-stage-\d+-/;
+/**
+ * The `<slug>-<8 hex>-` namespace a managed run's stage id carries (plan.py:
+ * `plan_key`), matched only when a `stage-<label>-` follows it so an
+ * ordinary id that merely happens to end in hex is left alone. The label may
+ * be lettered (`3b`), which is what the extension's own plan labels look
+ * like.
+ */
+const PLAN_KEY_PREFIX_RE = /^(?:[a-z0-9-]*-)?[0-9a-f]{8}-(?=stage-\d+[a-z]?-)/;
 const STAGE_PREFIX_RE = /^stage-(?:\d+-)?/;
+
+/**
+ * A stage id with its plan-key namespace removed, or unchanged when it has
+ * none. Shared with plan matching, which must see the `stage-<label>-<slug>`
+ * shape underneath whether or not the stage belongs to a managed run.
+ */
+export function stripPlanKeyPrefix(stageId: string): string {
+  return stageId.replace(PLAN_KEY_PREFIX_RE, "");
+}
 
 /**
  * Turn a machine stage id into a restrained label:
@@ -18,8 +34,7 @@ const STAGE_PREFIX_RE = /^stage-(?:\d+-)?/;
  * `foo-1cd13d24-stage-2-schema-api` → `Schema api`.
  */
 export function humanizeStageId(stageId: string): string {
-  let rest = stageId.replace(PLAN_KEY_PREFIX_RE, "");
-  rest = rest.replace(STAGE_PREFIX_RE, "");
+  const rest = stripPlanKeyPrefix(stageId).replace(STAGE_PREFIX_RE, "");
   const words = rest
     .split(/[-_.]+/)
     .map((word) => word.trim())

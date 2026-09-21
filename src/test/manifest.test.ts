@@ -78,6 +78,19 @@ const PLAN = [
   "",
 ].join("\n");
 
+/** plan.py: plan_key over PLAN_LABEL — the namespace this plan's fresh stage ids carry. */
+const PLAN_KEY = "reported-statistics-bbd2e9fe";
+
+/**
+ * The id `buildManifest` gives a stage of *this* plan that does not exist
+ * yet. Namespaced by the plan key, so a different plan document in the same
+ * worktree — even one numbering its sections Stage 1 again — never proposes
+ * the same directory.
+ */
+function proposed(label: string, slug: string): string {
+  return `${PLAN_KEY}-stage-${label}-${slug}`;
+}
+
 function build(known: KnownStage[] = []) {
   return buildManifest({ markdown: PLAN, planLabel: PLAN_LABEL, planName: PLAN_NAME, known });
 }
@@ -131,7 +144,7 @@ describe("building an execution manifest from a human plan", () => {
     assert.equal(
       stage.brief,
       [
-        "# Stage brief: stage-3c-cloud-schema-rpc-and-sync-transport",
+        `# Stage brief: ${proposed("3c", "cloud-schema-rpc-and-sync-transport")}`,
         "",
         `Stage 3C from plan \`${PLAN_NAME}\`. Implement only this section; the other stages are separate.`,
         "",
@@ -160,10 +173,34 @@ describe("building an execution manifest from a human plan", () => {
         "stage-reported-statistics-contract",
         "stage-3c-cloud-schema-rpc-and-sync-transport",
         "stage-3d-snapshot-v2-and-attachment-export-import-transport",
-        // Not yet started: the id Start next stage would have proposed.
-        "stage-4-editor-and-ui-inspection",
+        // Not yet started, so it gets a fresh id in this plan's own
+        // namespace. The three above keep the unprefixed ids they were
+        // actually created under, which is the whole point of `known`: a
+        // sequence that already ran does not get renamed.
+        proposed("4", "editor-and-ui-inspection"),
       ],
     );
+  });
+
+  it("gives two plans that define the same stage headings different stage ids", () => {
+    // The follow-up-plan collision, at its source. Plan A is finished; plan
+    // B is a different document in the same worktree whose sections happen
+    // to be worded the same. Nothing about B may resolve to A's directories,
+    // because A's accepted work is not B's Stage 1.
+    const a = buildManifest({ markdown: PLAN, planLabel: "docs/plans/a.md", planName: "a.md" });
+    const b = buildManifest({ markdown: PLAN, planLabel: "docs/plans/b.md", planName: "b.md" });
+    assert.ok(a.ok && b.ok);
+
+    const ids = (built: typeof a & { ok: true }) => built.manifest.stages.map((stage) => stage.stage_id);
+    assert.deepEqual(
+      ids(a).filter((id) => ids(b).includes(id)),
+      [],
+      "not one shared stage id, though every heading is identical",
+    );
+    // And each is namespaced by its own plan, not by a random discriminator:
+    // the same plan document always rebuilds to the same ids, which is what
+    // lets the engine refuse a manifest that changed.
+    assert.deepEqual(ids(a), ids(buildManifest({ markdown: PLAN, planLabel: "docs/plans/a.md", planName: "a.md" }) as typeof a & { ok: true }));
   });
 
   it("briefs an already-executed stage from its own brief.md, and a future stage from the plan", () => {
@@ -305,7 +342,8 @@ describe("building an execution manifest from a human plan", () => {
     // that label. Adopting that would re-implement accepted work.
     const built = build([{ label: "3D", stageId: "stage-3d-snapshot-v2" }]);
     assert.ok(built.ok);
-    const existing = new Set(["stage-3c-cloud-schema-rpc-and-sync-transport", "stage-3d-snapshot-v2"]);
+    const idOf = (label: string) => built.manifest.stages.find((stage) => stage.label === label)!.stage_id;
+    const existing = new Set([idOf("Stage 3C"), "stage-3d-snapshot-v2"]);
 
     assert.deepEqual(
       adoptionGaps(built.manifest, existing).map((stage) => stage.label),
@@ -318,7 +356,7 @@ describe("building an execution manifest from a human plan", () => {
   it("stages after the last existing one are the future, not a gap", () => {
     const built = build();
     assert.ok(built.ok);
-    assert.deepEqual(adoptionGaps(built.manifest, new Set(["stage-1-contract-and-compatibility-fixtures"])), []);
+    assert.deepEqual(adoptionGaps(built.manifest, new Set([proposed("1", "contract-and-compatibility-fixtures")])), []);
     assert.deepEqual(adoptionGaps(built.manifest, new Set()), [], "a plan that has never run is all future");
     assert.deepEqual(adoptionGaps(built.manifest, new Set(built.manifest.stages.map((stage) => stage.stage_id))), [], "a fully existing sequence has no hole");
   });

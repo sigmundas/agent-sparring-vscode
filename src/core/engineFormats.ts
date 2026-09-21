@@ -349,6 +349,15 @@ export interface StageState {
   candidateSha: string | null;
   /** Declared sibling repositories; empty for the ordinary single-repository stage. */
   repositories: StateRepository[];
+  /**
+   * The plan key of the managed plan run that owns this stage instance
+   * (stage.py: `StageState.plan`), or null when no run has claimed it — a
+   * hand-driven standalone stage, or one written before the engine recorded
+   * ownership. This is the authoritative answer to "whose stage is this",
+   * and the only thing that may decide it: two plans in one worktree can
+   * generate the same stage id, so the name never settles it.
+   */
+  plan: string | null;
 }
 
 const STAGE_STATUSES: ReadonlySet<string> = new Set(["working", "frozen", "accepted"]);
@@ -366,6 +375,7 @@ export function parseStageState(text: string): StageState {
     baseSha: optionalString(payload, "base_sha"),
     candidateSha: optionalString(payload, "candidate_sha"),
     repositories: stateRepositories(payload["repositories"]),
+    plan: optionalString(payload, "plan"),
   };
 }
 

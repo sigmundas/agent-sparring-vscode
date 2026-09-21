@@ -29,7 +29,7 @@
 
 import { parseBriefStageMarkers } from "./brief";
 import { slugify } from "./engineFormats";
-import { humanizeStageId } from "./presentation";
+import { humanizeStageId, stripPlanKeyPrefix } from "./presentation";
 
 // ---------------------------------------------------------------- storage
 
@@ -373,8 +373,9 @@ export function findHeading(headings: PlanHeading[], ref: HeadingRef): number {
  * Which heading describes the stage. Layers, first decisive one wins:
  *
  *  1. the user's manual match (still present in the document);
- *  2. the stage id: the heading's title slug equals the id's slug once the
- *     `stage-` / `stage-<n>-` prefix is removed, or the humanized id;
+ *  2. the stage id: the heading's title slug equals the id's slug once any
+ *     plan-key namespace and the `stage-` / `stage-<n>-` prefix are
+ *     removed, or the humanized id;
  *  3. a stage label carried by the id (`stage-3b-…`) or by the brief's own
  *     title/first lines (`# Stage 3B — …`), when the plan has that stage;
  *  4. the display title, when it slugifies to exactly one heading title.
@@ -390,8 +391,14 @@ export function locateStage(headings: PlanHeading[], identity: string | StageIde
       return position(headings, index, at, "manual");
     }
   }
+  // A managed run's stage id is namespaced by its plan key
+  // (`follow-up-7c1e42a9-stage-1-foundation`). Both id layers below are
+  // about the `stage-<label>-<slug>` shape underneath, so the namespace is
+  // stripped first — otherwise a managed stage would fall through to the
+  // weaker title/brief layers purely for being namespaced.
+  const bareId = stripPlanKeyPrefix(who.stageId);
   const idSlug = slugify(humanizeStageId(who.stageId));
-  const bare = slugify(who.stageId.replace(/^stage-(?:\d+[a-z]?-)?/i, ""));
+  const bare = slugify(bareId.replace(/^stage-(?:\d+[a-z]?-)?/i, ""));
   const byId = unique(headings, (heading) => {
     const slug = slugify(heading.title);
     return slug.length > 0 && (slug === idSlug || slug === bare);
@@ -399,7 +406,7 @@ export function locateStage(headings: PlanHeading[], identity: string | StageIde
   if (byId !== undefined) {
     return position(headings, index, byId, "id");
   }
-  const idLabel = /^stage-(\d+[a-z]?)-/i.exec(who.stageId)?.[1];
+  const idLabel = /^stage-(\d+[a-z]?)-/i.exec(bareId)?.[1];
   const byIdLabel = stageEntryFor(index, idLabel);
   if (byIdLabel) {
     return position(headings, index, headings.indexOf(byIdLabel.canonical ?? byIdLabel.occurrences[0]), "label");

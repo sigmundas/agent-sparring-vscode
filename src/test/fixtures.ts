@@ -153,18 +153,34 @@ export class Workspace {
 
   async writeStage(
     stageId: string,
-    state: Partial<{ status: "working" | "frozen" | "accepted"; implementation_session_id: string | null; sparring_session_id: string | null; base_sha: string | null; candidate_sha: string | null }> = {},
+    state: Partial<{
+      status: "working" | "frozen" | "accepted";
+      implementation_session_id: string | null;
+      sparring_session_id: string | null;
+      base_sha: string | null;
+      candidate_sha: string | null;
+      /**
+       * The plan key of the managed run that owns this stage (stage.py:
+       * `StageState.plan`). Written only when given, including as an
+       * explicit null: a hand-driven stage, and every stage written before
+       * ownership existed, omits the key entirely, and that case has to be
+       * reproducible here.
+       */
+      plan: string | null;
+    }> = {},
     files: Partial<Record<"brief.md" | "notes.md" | "handoff.md" | "sparring.md", string>> = {},
   ): Promise<string> {
     const dir = this.stageDir(stageId);
     await fs.mkdir(dir, { recursive: true });
+    const { plan, ...rest } = state;
     const payload = {
       base_sha: null,
       candidate_sha: null,
       implementation_session_id: null,
       sparring_session_id: null,
       status: "working",
-      ...state,
+      ...rest,
+      ...(plan !== undefined ? { plan } : {}),
     };
     await fs.writeFile(path.join(dir, "state.json"), JSON.stringify(payload, null, 2) + "\n");
     for (const [name, content] of Object.entries(files)) {

@@ -51,6 +51,7 @@ import type { OverviewAction } from "../core/overviewHtml";
 import { UNKNOWN_RUNNER_EXPLANATION, type ActionRequired, type PlanContinuation } from "../core/overviewModel";
 import { createStage, proposeNextStage, renderNextStageBrief, type NewStageResult } from "../core/nextStage";
 import { buildStageIndex, locateStage, parsePlanHeadings, sectionSummary, type HeadingRef, type PlanHeading, type StageEntry } from "../core/planAssociation";
+import { stageBelongsToPlan, type PlanScope, type StageOrigin } from "../core/planMembership";
 import { stageMatchRows, type StageMatchRow, type StageToMatch } from "../core/stageMatches";
 import { buildRunPickGroups, describeRun } from "../core/runPick";
 import { stageDisplayName } from "../core/presentation";
@@ -1954,7 +1955,11 @@ async function runPlanCommand(controller: SparringController, overview: Overview
       return;
     }
     const label = planLabel(planPath, location.repoRoot);
-    await startManagedRun(controller, overview, { location, planPath, markdown, label, runId, expectedBranch, confirm: true });
+    // A newly chosen plan document starts a new managed run, full stop. Old
+    // stage directories in `.sparring` are history, not work to inherit —
+    // even when this plan's sections are numbered Stage 1..3 again and even
+    // on the branch the previous plan was finished on.
+    await startManagedRun(controller, overview, { location, planPath, markdown, label, runId, expectedBranch, confirm: true, adopt: false });
     return;
   }
   const args = buildRunPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir });
@@ -2336,7 +2341,11 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
     markdown,
     planLabel: run.state.plan,
     planName: path.basename(run.planPath),
-    known: await knownStageIds(controller, run.location.projectDir, markdown),
+    // A resume rebuilds the manifest of a run that already exists, so its
+    // own stages are known by the run they are in — and only its own. No
+    // adoption: whatever this run adopted at start is already its, and a
+    // resume is not a new occasion to take over anything.
+    known: await knownStageIds(controller, run.location.projectDir, markdown, { planKey: run.planKey, planRunId: run.id, adopt: false }),
     ...declarationsFor(controller, run.planKey, run.location),
   });
   if (!built.ok) {
@@ -2460,7 +2469,16 @@ async function performContinueAutomatically(controller: SparringController, over
     );
     return { ok: false, reason: "branch" };
   }
-  return startManagedRun(controller, overview, { location, planPath, markdown, label, runId, expectedBranch, stage: currentStageOf(run), confirm: options.confirm });
+  // This is the adoption entry point, and the only one: the person is
+  // looking at a standalone stage — hand-driven work belonging to no
+  // managed run — and asked for the plan to be continued automatically from
+  // there. Adopting that sequence is precisely what they asked for.
+  //
+  // Arriving here with a managed plan run selected means its stages are
+  // already this run's; arriving with nothing selected is an ordinary fresh
+  // start. Neither adopts.
+  const adopt = run.kind === "stage";
+  return startManagedRun(controller, overview, { location, planPath, markdown, label, runId, expectedBranch, stage: currentStageOf(run), confirm: options.confirm, adopt });
 }
 
 /** What a fresh managed run needs to know before it is started. */
@@ -2479,6 +2497,20 @@ interface ManagedStart {
    */
   stage?: StageSnapshot;
   confirm: boolean;
+  /**
+   * The person asked for an existing, hand-driven sequence to be adopted
+   * into this managed run. It is a *request*, made at one entry point
+   * (Continue plan automatically, from the standalone stage the person is
+   * looking at), and it is the only thing that produces `--adopt`.
+   *
+   * It is deliberately not derived from what is on disk. It used to be —
+   * `adopt = onDisk.size > 0` — and that is what turned "run this new plan"
+   * into "adopt whatever has this generated name": a follow-up plan on the
+   * same branch found the previous plan's three ACCEPTED stages, asked the
+   * engine to adopt them, and completed as a no-op. Existing stage state is
+   * evidence about the repository, never an instruction about intent.
+   */
+  adopt: boolean;
 }
 
 /**
@@ -2499,13 +2531,14 @@ interface ManagedStart {
  * first candidate: whether this run may push the candidates it verifies.
  */
 async function startManagedRun(controller: SparringController, overview: OverviewPanelManager, start: ManagedStart): Promise<ContinueAutomaticallyOutcome> {
-  const { location, planPath, markdown, label, runId, expectedBranch } = start;
+  const { location, planPath, markdown, label, runId, expectedBranch, adopt } = start;
+  const key = planKey(label);
   const built = buildManifest({
     markdown,
     planLabel: label,
     planName: path.basename(planPath),
-    known: await knownStageIds(controller, location.projectDir, markdown),
-    ...declarationsFor(controller, planKey(label), location),
+    known: await knownStageIds(controller, location.projectDir, markdown, { planKey: key, planRunId: runId, adopt }),
+    ...declarationsFor(controller, key, location),
   });
   if (!built.ok) {
     const detail = built.problems.map((problem) => `• ${problem.reason}`).join("\n");
@@ -2521,11 +2554,11 @@ async function startManagedRun(controller: SparringController, overview: Overvie
     return { ok: false, reason: "manifest", message: built.problems[0]?.reason };
   }
 
-  // Only a fresh run needs --adopt, and only when the plan's stages already
-  // exist on disk from stage-by-stage work. The engine still checks each one
-  // and reports what it inherits; nothing is taken over silently.
+  // What is on disk, for the preflight to describe and check against. It
+  // does *not* decide `adopt`: that came in as the person's own request
+  // (see ManagedStart.adopt). An ordinary Run Plan whose stage ids happen to
+  // exist is a collision to be reported, not an adoption to be performed.
   const onDisk = await existingStages(controller, location, built.manifest);
-  const adopt = onDisk.size > 0;
 
   if (await refusedByPreflight(controller, overview, start.stage, { manifest: built.manifest, location, adopt, onDisk, expectedBranch })) {
     return { ok: false, reason: "preflight", message: "preflight" };
@@ -2690,14 +2723,35 @@ async function refusedByPreflight(
 }
 
 /**
- * Which stage ids this project already uses for which plan labels — and, for
- * the ones that have really run, the brief they ran against.
+ * Which stage ids **this plan** already uses for which plan labels — and,
+ * for the ones that have really run, the brief they ran against.
  *
  * The ids keep an existing sequence's history instead of re-creating it
- * under new ones. Each stage of the same project is located in the plan the
- * same way the Overview locates it — the user's manual match first, then the
- * brief's own `Stage 3B` markers, then the id — and only an unambiguous
- * match counts.
+ * under new ones. Each candidate stage is located in the plan the same way
+ * the Overview locates it — the user's manual match first, then the brief's
+ * own `Stage 3B` markers, then the id — and only an unambiguous match
+ * counts.
+ *
+ * ### Which stages are candidates at all
+ *
+ * This used to be every stage of the project, and that was the bug. One
+ * plan was finished on a feature branch; a follow-up plan was started on the
+ * same branch with its sections numbered Stage 1..3 again; its Stage 1
+ * located the first plan's `stage-1-…` unambiguously, so the manifest was
+ * built around that id *and that stage's brief*, the extension saw the
+ * stages already existed and added `--adopt`, and the engine — asked
+ * outright to adopt three ACCEPTED stages — advanced past all of them. The
+ * follow-up plan completed without running anything.
+ *
+ * So membership now has to be shown, not matched. A stage is this plan's
+ * when its id carries this plan's key, or when it is a stage of this plan's
+ * own managed run. Nothing else is, however alike the names are.
+ *
+ * `adopt` is the one deliberate exception, and only because it is a
+ * deliberate request: adopting a hand-driven sequence means taking over
+ * stages that were created outside any managed run, so unowned stages of
+ * the project become candidates too. A stage another managed run owns is
+ * still not one — the engine refuses that outright, whatever this returns.
  *
  * The brief is carried only for a stage with real execution history: it is
  * accepted, or it holds a session or a candidate commit. For such a stage
@@ -2710,16 +2764,24 @@ async function refusedByPreflight(
  * there is no history to protect, and the current section is the better
  * text.
  */
-async function knownStageIds(controller: SparringController, projectDir: string, markdown: string): Promise<KnownStage[]> {
+async function knownStageIds(
+  controller: SparringController,
+  projectDir: string,
+  markdown: string,
+  scope: PlanScope,
+): Promise<KnownStage[]> {
   const headings = parsePlanHeadings(markdown);
   const known: KnownStage[] = [];
   for (const candidate of stagesOfProject(controller, projectDir)) {
+    if (!stageBelongsToPlan(originOf(candidate), scope)) {
+      continue;
+    }
     const briefText = await readOptional(path.join(candidate.stage.dir, BRIEF_FILENAME));
     const position = locateStage(headings, {
       stageId: candidate.stage.stageId,
       title: candidate.stage.title,
       briefText,
-      manual: candidate.runId ? controller.planAssociation(candidate.runId)?.match : undefined,
+      manual: candidate.standalone ? controller.planAssociation(candidate.runId)?.match : undefined,
     });
     const label = position?.stage?.label;
     if (!label || known.some((entry) => entry.label === label)) {
@@ -2739,8 +2801,16 @@ async function knownStageIds(controller: SparringController, projectDir: string,
  * the manifest around a different id and brief on the next resume, and the
  * engine would then refuse the digest.
  */
-function stagesOfProject(controller: SparringController, projectDir: string): { stage: StageSnapshot; runId?: string }[] {
-  const out: { stage: StageSnapshot; runId?: string }[] = [];
+interface DiscoveredStage {
+  stage: StageSnapshot;
+  /** The discovered run this stage was found in, whichever kind it is. */
+  runId: string;
+  /** It was found as a standalone stage run, not inside a managed plan run. */
+  standalone: boolean;
+}
+
+function stagesOfProject(controller: SparringController, projectDir: string): DiscoveredStage[] {
+  const out: DiscoveredStage[] = [];
   const seen = new Set<string>();
   for (const candidate of controller.currentDiscovery.runs) {
     if (candidate.location.projectDir !== projectDir) {
@@ -2752,10 +2822,15 @@ function stagesOfProject(controller: SparringController, projectDir: string): { 
         continue;
       }
       seen.add(stage.stageId);
-      out.push({ stage, runId: candidate.kind === "stage" ? candidate.id : undefined });
+      out.push({ stage, runId: candidate.id, standalone: candidate.kind === "stage" });
     }
   }
   return out;
+}
+
+/** This discovered stage as `stageBelongsToPlan` (planMembership.ts) needs to see it. */
+function originOf(candidate: DiscoveredStage): StageOrigin {
+  return { stageId: candidate.stage.stageId, owner: candidate.stage.state?.plan, runId: candidate.runId };
 }
 
 /** Has this stage actually run? Acceptance, a recorded session or a candidate commit all say yes. */
@@ -2822,6 +2897,22 @@ async function preflight(stage: StageSnapshot | undefined, context: PreflightCon
         action: "review-matches",
       });
     }
+  }
+
+  // 1b. Not adopting, yet stages of this plan already exist. The engine
+  //     refuses that — rightly: a fresh run means fresh stages, and an old
+  //     session id or ACCEPTED status is never inherited by accident — and
+  //     it should be said here rather than in a terminal after the
+  //     confirmation. This is deliberately *not* answered by quietly adding
+  //     `--adopt`: inferring adoption from existing state is what let a
+  //     follow-up plan complete as a no-op over the previous plan's accepted
+  //     stages.
+  if (manifest && !context.adopt && context.onDisk.size > 0) {
+    const listed = [...context.onDisk].sort().join(", ");
+    problems.push({
+      title: `${context.onDisk.size} stage director${context.onDisk.size === 1 ? "y" : "ies"} this plan would use already exist (${listed}).`,
+      fix: "A fresh run makes fresh stages, so the engine will not reuse them. Remove them deliberately if they are yours to remove, or continue the run that made them.",
+    });
   }
 
   // 2. A declared sibling repository that is not where, or not as, it was

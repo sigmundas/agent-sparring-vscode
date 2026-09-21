@@ -55,6 +55,7 @@ import { buildStageIndex, parsePlanHeadings, type PlanHeading, type StageEntry }
 import { slugify } from "./engineFormats";
 import { humanizeStageId } from "./presentation";
 import { STAGE_ID_RE } from "./nextStage";
+import { planKey } from "./sparringCommand";
 import type { StageMode } from "./stageModes";
 
 export const MANIFEST_VERSION = 1;
@@ -112,7 +113,13 @@ export interface ManifestInput {
   planLabel: string;
   /** Display name used inside each brief's header line (the plan's file name). */
   planName: string;
-  /** Stage ids already in use for particular plan labels, so history stays visible. */
+  /**
+   * Stage ids **this plan** already uses for particular plan labels, so its
+   * own history stays visible. Only stages that provably belong to this
+   * plan may appear here; another plan's stages are not this plan's
+   * history, and supplying them is how a follow-up plan ends up adopting
+   * work it never did.
+   */
   known?: KnownStage[];
   /** Sibling repositories a given plan label's stage reviews alongside the primary one. */
   repositories?: Record<string, ManifestRepository[]>;
@@ -143,11 +150,18 @@ export type ManifestBuild = { ok: true; manifest: ExecutionManifest; skipped: Ma
  * section and is skipped, because there is no definition to brief from; it
  * stays visible in the document and in `skipped`, and is never executed.
  *
- * Which id each stage gets: the id that project *already* uses for that
- * label, when one is known, so an existing sequence keeps its history and
- * its recorded sessions; otherwise the same `stage-<label>-<slug>` id
- * "Start next stage" would have proposed, so manual and automatic mode
- * agree.
+ * Which id each stage gets: the id this plan *already* uses for that label,
+ * when one is known, so an existing sequence keeps its history and its
+ * recorded sessions; otherwise a fresh `<plan-key>-stage-<label>-<slug>`
+ * id, namespaced to this plan.
+ *
+ * That namespace is load-bearing, not cosmetic. Finishing one plan and
+ * starting a follow-up one on the same branch — whose sections may well be
+ * numbered Stage 1..3 again — is an ordinary workflow, and the follow-up's
+ * stages must be new work rather than the first plan's accepted history
+ * under a colliding name. `known` is scoped to this plan for the same
+ * reason: see `knownStageIds` in commands.ts, which decides what "already
+ * uses" is allowed to mean.
  *
  * A stage the plan defines ambiguously (several plausible definitions), or
  * whose section has a heading but no content, or whose id would be unusable,
@@ -174,6 +188,11 @@ export type ManifestBuild = { ok: true; manifest: ExecutionManifest; skipped: Ma
  * it — dropping it would silently shorten the sequence instead.
  */
 export function buildManifest(input: ManifestInput): ManifestBuild {
+  // Derived here rather than taken as an input: the stage ids this manifest
+  // proposes have to be namespaced by the *same* key the engine files the
+  // run state under, and one derivation from `plan_label` is the only way
+  // those cannot drift apart.
+  const key = planKey(input.planLabel);
   const headings = parsePlanHeadings(input.markdown);
   const index = buildStageIndex(headings);
   const known = new Map((input.known ?? []).map((entry) => [entry.label.toUpperCase(), entry]));
@@ -194,7 +213,7 @@ export function buildManifest(input: ManifestInput): ManifestBuild {
       skipped.push({ label: entry.label, reason: describeSkip(entry) });
       continue;
     }
-    const stageId = existing?.stageId ?? proposeStageId(entry);
+    const stageId = existing?.stageId ?? proposeStageId(entry, key);
     if (!stageId) {
       problems.push({ label: entry.label, reason: `No usable stage id could be formed for ${entry.display}.` });
       continue;
@@ -257,10 +276,28 @@ function describeSkip(entry: StageEntry): string {
     : `Stage ${entry.label} appears only as a record of what happened (${where}), not as a section defining the work.`;
 }
 
-/** The `stage-<label>-<slug>` id "Start next stage" would propose, so both modes agree on identity. */
-function proposeStageId(entry: StageEntry): string | undefined {
+/**
+ * The id a stage of *this plan* gets: `<plan-key>-stage-<label>-<slug>`.
+ *
+ * The plan key is the namespace that makes execution-stage identity
+ * `(run, stage)` rather than a project-global directory name, and it is the
+ * engine's own convention for a managed run's stages (plan.py:
+ * `_stage_id_for`, which prefixes exactly this way for a Markdown plan
+ * run). Without it, two plans in one worktree that both define "Stage 1 —
+ * Foundation" generate the same id, and the second plan's Stage 1 lands on
+ * the first plan's accepted directory — which is the bug this prefix
+ * closes, before the engine's ownership refusal ever has to.
+ *
+ * Deliberately *not* the unprefixed `stage-<label>-<slug>` that
+ * `proposeNextStage` still uses. That is the id of a hand-driven standalone
+ * stage, which belongs to no plan run and is exactly what adoption takes
+ * over; a managed run's stage is a different thing and now says so. An
+ * existing run keeps whichever ids it already uses, prefixed or not, via
+ * `KnownStage`.
+ */
+function proposeStageId(entry: StageEntry, planKey: string): string | undefined {
   const slug = slugify(entry.title ?? "");
-  const stageId = `stage-${entry.label.toLowerCase()}${slug ? `-${slug}` : ""}`.slice(0, 128).replace(/-+$/, "");
+  const stageId = `${planKey}-stage-${entry.label.toLowerCase()}${slug ? `-${slug}` : ""}`.slice(0, 128).replace(/-+$/, "");
   return STAGE_ID_RE.test(stageId) ? stageId : undefined;
 }
 

@@ -189,3 +189,68 @@ export async function resolveMemberships(
 export function stageOwnership(memberships: ReadonlyMap<string, PlanMembership>): StageOwnership {
   return new Map([...memberships].map(([runId, membership]) => [runId, membership.planRunId]));
 }
+
+// ---------------------------------------------------------------- whose stage is this, when a manifest is built
+
+/** One discovered stage, reduced to what deciding its plan needs. */
+export interface StageOrigin {
+  stageId: string;
+  /** `state.json`'s `plan`: the plan key of the managed run that owns this stage instance. */
+  owner?: string | null;
+  /** The discovered run this stage was found in, whichever kind it is. */
+  runId: string;
+}
+
+/** The plan a manifest is being built for. */
+export interface PlanScope {
+  planKey: string;
+  /** The run id that plan's managed run has (or will have). */
+  planRunId: string;
+  /**
+   * The person asked for an existing hand-driven sequence to be adopted
+   * into this run. A request, never inferred from what is on disk.
+   */
+  adopt: boolean;
+}
+
+/**
+ * May a manifest for `plan` be built around this stage — its id, and the
+ * brief it actually ran against?
+ *
+ * This is the question that produced the reported bug, and it was being
+ * answered by plan matching alone: one plan was finished on a feature
+ * branch, a follow-up plan was started on the same branch with its sections
+ * numbered Stage 1..3 again, each of its stages located the *previous*
+ * plan's `stage-1-…`/`stage-2-…`/`stage-3-…` unambiguously, and so the new
+ * plan's manifest was built around three already-ACCEPTED stages. The run
+ * then completed without executing anything. Locating a stage in a document
+ * says the words line up; it does not say the work is this plan's.
+ *
+ * So membership is shown, in this order:
+ *
+ *  1. the engine's own record. `state.json`'s `plan` is written when a
+ *     managed run creates or deliberately adopts a stage, and it is the only
+ *     thing that can settle which of two same-named stages this is. Present
+ *     means decided — for this plan, or against it.
+ *  2. this plan's own managed run. A run started before ownership was
+ *     recorded has stages that read back unowned, but the run state itself
+ *     establishes that they are its.
+ *  3. this plan's id namespace, for a stage an older engine created without
+ *     recording an owner. Only this plan generates ids under its own key
+ *     (`plan_key` is a digest of the plan's label), so this claims nothing
+ *     about another plan's stages — unlike the prefix rule this module
+ *     dropped for *display* membership, which claimed a plan run had
+ *     executed stages it never had.
+ *  4. only under an explicit `adopt` request: any stage no run owns. That is
+ *     what adoption is — hand-driven work, belonging to no managed run,
+ *     deliberately taken into one.
+ *
+ * A stage another managed run owns is never this plan's: no branch returns
+ * true for one, and the engine refuses it outright as well.
+ */
+export function stageBelongsToPlan(stage: StageOrigin, plan: PlanScope): boolean {
+  if (stage.owner) {
+    return stage.owner === plan.planKey;
+  }
+  return stage.runId === plan.planRunId || stage.stageId.startsWith(`${plan.planKey}-`) || plan.adopt;
+}
