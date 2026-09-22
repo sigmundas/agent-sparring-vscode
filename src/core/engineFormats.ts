@@ -13,16 +13,26 @@ export class EngineFormatError extends Error {}
 // .sparring/plans/<plan key>.json  (plan.py: PlanRunState)
 // ---------------------------------------------------------------------------
 
+import * as crypto from "node:crypto";
+import * as path from "node:path";
+
 export type PlanRunStatus = "running" | "paused" | "complete";
 
 export interface PlanRunState {
   /** Plan label: repo-relative POSIX path, or an absolute path (plan.py: plan_label). */
   plan: string;
+  /**
+   * This run instance's own key (plan.py: `PlanRunState.run`) — which
+   * *execution* of `plan` this is. Null for a run recorded before run
+   * instances existed; `runKeyOf` reads that as the plan's key, which is the
+   * key such a run's stages already record.
+   */
+  run: string | null;
   planDigest: string;
   expectedBranch: string;
   /** 0-based index into the plan's parsed stages. */
   currentStageIndex: number;
-  /** Stage id of the current stage (`<plan key>-stage-<n>-<slug>`). */
+  /** Stage id of the current stage (`<run key>-stage-<n>-<slug>`). */
   currentStage: string;
   status: PlanRunStatus;
   /**
@@ -188,6 +198,7 @@ export function parsePlanRunState(text: string): PlanRunState {
   const source: PlanRunSource = rawSource === "manifest" ? "manifest" : "markdown";
   return {
     plan,
+    run: optionalString(payload, "run"),
     planDigest,
     expectedBranch,
     currentStageIndex,
@@ -350,14 +361,19 @@ export interface StageState {
   /** Declared sibling repositories; empty for the ordinary single-repository stage. */
   repositories: StateRepository[];
   /**
-   * The plan key of the managed plan run that owns this stage instance
-   * (stage.py: `StageState.plan`), or null when no run has claimed it — a
+   * The key of the managed **run instance** that owns this stage instance
+   * (stage.py: `StageState.run`), or null when no run has claimed it — a
    * hand-driven standalone stage, or one written before the engine recorded
    * ownership. This is the authoritative answer to "whose stage is this",
-   * and the only thing that may decide it: two plans in one worktree can
+   * and the only thing that may decide it: two runs in one worktree can
    * generate the same stage id, so the name never settles it.
+   *
+   * A run instance, not a plan document: the same document can be executed
+   * twice, and the second run's stages are its own. A file carrying the
+   * older `plan` spelling held a plan key, which named that document's only
+   * execution, and is read here as that legacy run.
    */
-  plan: string | null;
+  run: string | null;
 }
 
 const STAGE_STATUSES: ReadonlySet<string> = new Set(["working", "frozen", "accepted"]);
@@ -375,7 +391,10 @@ export function parseStageState(text: string): StageState {
     baseSha: optionalString(payload, "base_sha"),
     candidateSha: optionalString(payload, "candidate_sha"),
     repositories: stateRepositories(payload["repositories"]),
-    plan: optionalString(payload, "plan"),
+    // Either spelling: `run` is the owner, and a file written under the
+    // older `plan` key recorded a plan key, which named that document's one
+    // execution. Reading it as the owning run is what it meant.
+    run: optionalString(payload, "run") ?? optionalString(payload, "plan"),
   };
 }
 
@@ -493,6 +512,27 @@ export interface PlanStageHeading {
   stageId: string;
 }
 
+/**
+ * plan.py `plan_key`: the plan *document*'s identity — slugged stem (<=32
+ * chars) plus the first 8 hex digits of SHA-256(label).
+ *
+ * A document's identity, not a run's. It groups what belongs to the plan
+ * across executions (the declarations a person made about its stages, its
+ * runs in the cockpit's history), while one execution is identified by a run
+ * key — see plan.py `new_run_key` and `PlanRunSnapshot.runKey`.
+ */
+export function planKey(label: string): string {
+  const digest = crypto.createHash("sha256").update(label, "utf8").digest("hex").slice(0, 8);
+  const stem = path.posix.basename(label).replace(/\.[^.]*$/, "");
+  const slug = stem
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32)
+    .replace(/-+$/g, "");
+  return slug ? `${slug}-${digest}` : digest;
+}
+
 const STAGE_PREFIX_RE = /^##\s+stage\b/i;
 const STAGE_HEADING_RE = /^##\s+stage\s+(\d+)\s*[—–:-]\s*(\S.*?)\s*$/i;
 const FENCE_RE = /^\s*(```|~~~)/;
@@ -504,11 +544,16 @@ export function slugify(title: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
-/** Mirrors plan.py `_stage_id_for`: `<plan key>-stage-<n>-<slug>`, clamped to 128 chars. */
-export function stageIdFor(planKey: string | undefined, number: number, title: string): string {
+/**
+ * Mirrors plan.py `_stage_id_for`: `<run key>-stage-<n>-<slug>`, clamped to
+ * 128 chars. The namespace is the owning *run instance*'s key, since one plan
+ * document may have been executed more than once and each execution has its
+ * own stages.
+ */
+export function stageIdFor(runKey: string | undefined, number: number, title: string): string {
   let base = `stage-${number}`;
-  if (planKey) {
-    base = `${planKey}-${base}`;
+  if (runKey) {
+    base = `${runKey}-${base}`;
   }
   const slug = slugify(title);
   if (!slug) {
@@ -525,7 +570,7 @@ export function stageIdFor(planKey: string | undefined, number: number, title: s
  * stage headings returns an empty array rather than throwing, so a caller
  * can use this both for validation and for "is this a plan document?".
  */
-export function parsePlanStages(markdown: string, planKey?: string): PlanStageHeading[] {
+export function parsePlanStages(markdown: string, runKey?: string): PlanStageHeading[] {
   const stages: PlanStageHeading[] = [];
   let inFence = false;
   const lines = markdown.split(/\r?\n/);
@@ -552,7 +597,7 @@ export function parsePlanStages(markdown: string, planKey?: string): PlanStageHe
         `stage numbering must be 1..N in document order; found 'Stage ${number}' where 'Stage ${expected}' was expected`,
       );
     }
-    stages.push({ number, title, stageId: stageIdFor(planKey, number, title) });
+    stages.push({ number, title, stageId: stageIdFor(runKey, number, title) });
   }
   return stages;
 }

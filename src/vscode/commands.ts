@@ -54,9 +54,9 @@ import { buildStageIndex, locateStage, parsePlanHeadings, sectionSummary, type H
 import { stageBelongsToPlan, type PlanScope, type StageOrigin } from "../core/planMembership";
 import { stageMatchRows, type StageMatchRow, type StageToMatch } from "../core/stageMatches";
 import { buildRunPickGroups, describeRun } from "../core/runPick";
-import { stageDisplayName } from "../core/presentation";
+import { humanizeStageId, stageDisplayName } from "../core/presentation";
 import { stageActions, stageRunAction } from "../core/runner";
-import { planKey, planLabel, planRunId, type SparringSubcommand } from "../core/sparringCommand";
+import { newRunKey, planKey, planLabel, planRunId, type SparringSubcommand } from "../core/sparringCommand";
 import { chooseLaunchRepository, launchTargets } from "../core/launchRepositories";
 import { STAGE_REPOSITORIES_KEY, manifestRepositories, relativeRepositoryPath, repositoriesForPlan, type DeclaredRepository, type StageRepositories } from "../core/stageRepositories";
 import type { ManifestRepository } from "../core/manifest";
@@ -221,7 +221,10 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
       }
       const location: SparringLocation = { sparringDir: path.join(projectDir, ".sparring"), projectDir, repoRoot: projectDir, workspaceFolder: projectDir, folderName: path.basename(projectDir) };
       const label = planLabel(planPath, projectDir);
-      const built = buildManifest({ markdown, planLabel: label, planName: path.basename(planPath), ...declarationsFor(controller, planKey(label), location) });
+      // A fixed run key, so what two worktrees would execute can be
+      // compared: a minted one differs per call and would swamp the
+      // declarations this is actually about.
+      const built = buildManifest({ markdown, planLabel: label, planName: path.basename(planPath), runKey: planKey(label), ...declarationsFor(controller, planKey(label), location) });
       if (!built.ok) {
         return { ok: false, reason: built.problems[0]?.reason };
       }
@@ -249,6 +252,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
           markdown,
           planLabel: label,
           planName: path.basename(planPath),
+          runKey: key, // fixed, for the same reason as `_test.manifestFor`
           repositories: manifestRepositories(repositoriesForPlan(stored.repositories, key, projectDir), projectDir),
           modes: modesForPlan(stored.modes, key, projectDir),
         });
@@ -1052,7 +1056,7 @@ async function submitDeferredVerification(
   }
   const args = buildResumePlanArgs({ ...input, repoRoot: run.location.repoRoot, expectedBranch, sparringDir: run.location.sparringDir, deferredResults: answers });
   controller.log(`Submit deferred verification: ${answers.length} result(s) passed to resume-plan --deferred-result`);
-  const result = await launch(controller, run.location, args, "resume-plan", run.planPath, "manifest" in input ? input.manifest : undefined);
+  const result = await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, "manifest" in input ? input.manifest : undefined);
   if (result.ok) {
     await controller.beginSubmission({
       runId: run.id,
@@ -1174,7 +1178,7 @@ async function askReviewerAgain(controller: SparringController, run: RunSnapshot
     }
     const args = buildResumePlanArgs({ ...input, repoRoot: run.location.repoRoot, expectedBranch, sparringDir: run.location.sparringDir, evidence: entry });
     controller.log(`${logPrefix} passed to resume-plan --evidence for ${run.currentStage.stageId}`);
-    const result = await launch(controller, run.location, args, "resume-plan", run.planPath, "manifest" in input ? input.manifest : undefined);
+    const result = await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, "manifest" in input ? input.manifest : undefined);
     return result.ok ? { launched: true, executionId: result.record.id } : { launched: false };
   }
   const expectedBranch = await currentBranch(run.location.repoRoot);
@@ -1290,7 +1294,7 @@ async function allowPushCommand(controller: SparringController, overview: Overvi
   controller.log(
     `Allow push: authorizing ${panel.candidateSha} for ${panel.target}${forRun ? ", and this run's later verified candidates" : ""}; the engine performs the push and then its own acceptance gate`,
   );
-  const result = await launch(controller, run.location, args, "resume-plan", run.planPath, "manifest" in input ? input.manifest : undefined);
+  const result = await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, "manifest" in input ? input.manifest : undefined);
   if (!result.ok) {
     await overview.update();
     return { ok: false, reason: "launch", message: result.error };
@@ -1897,14 +1901,16 @@ async function chooseExecutableCommand(): Promise<void> {
 }
 
 /** Returns the launch result, for callers that must not discard a draft the engine never received. */
-async function launch(controller: SparringController, location: SparringLocation, args: string[], kind: SparringSubcommand, planPath: string, manifest?: string): Promise<LaunchResult> {
+async function launch(controller: SparringController, location: SparringLocation, args: string[], kind: SparringSubcommand, planPath: string, runId: string, manifest?: string): Promise<LaunchResult> {
   // The command runs inside the user's normal integrated terminal through
   // shell integration, so the user sees the engine's own output and the
   // terminal follows VS Code's normal persistence; the run id is the one the
   // engine will write state under. Every engine action in this file takes
   // this same route (controller.launch / controller.runCommand): nothing
   // here builds a command line or starts a process of its own.
-  const result = await controller.launch({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: kind, runId: planRunId(location, planPath), kind, planPath, manifest, reveal: true });
+  // `runId` is passed in rather than derived from the plan path: a plan run
+  // is identified by its run *instance*, and a document may have several.
+  const result = await controller.launch({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: kind, runId, kind, planPath, manifest, reveal: true });
   await explainLaunch(controller, result);
   return result;
 }
@@ -1931,39 +1937,64 @@ async function runPlanCommand(controller: SparringController, overview: Overview
   if (!planPath) {
     return;
   }
-  const runId = planRunId(location, planPath);
-  if (controller.livenessFor(runId).state === "running") {
-    await sayRunnerAlive(controller, overview, "a runner for this plan is alive in a terminal of this window.", runId);
-    return;
-  }
-  const existing = controller.currentDiscovery.runs.find((candidate) => candidate.id === runId);
-  if (existing?.kind === "plan") {
-    // The engine refuses a fresh run of a plan it already has a run for, and
-    // that run's input kind is its own. Continue it instead of starting a
-    // second one on different terms.
-    await resumePlanCommand(controller, existing);
+  const label = planLabel(planPath, location.repoRoot);
+  // Run Plan starts a *new* run of the selected plan, always. It used to
+  // redirect to Resume when a run of this document was already recorded,
+  // which made "run this plan" mean "continue whatever ran it last" — and
+  // after a completed run there was nothing left to continue.
+  //
+  // A run still in flight is the one case that cannot simply be joined: two
+  // live managed runs of one document in one worktree would compete for the
+  // same candidate, and the engine refuses it. So the person is asked, and
+  // Resume is offered as the other answer rather than silently chosen.
+  const open = controller.currentDiscovery.runs.find(
+    (candidate): candidate is PlanRunSnapshot =>
+      candidate.kind === "plan" && candidate.location.projectDir === location.projectDir && candidate.state.plan === label && candidate.state.status !== "complete",
+  );
+  if (open) {
+    if (controller.livenessFor(open.id).state === "running") {
+      await sayRunnerAlive(controller, overview, `a runner for ${path.basename(planPath)} is alive in a terminal of this window.`, open.id);
+      return;
+    }
+    const choice = await vscode.window.showWarningMessage(
+      `A run of ${path.basename(planPath)} is still ${open.state.status}.`,
+      {
+        modal: true,
+        detail: `${describeRun(open)}\n\nTwo live runs of one plan in the same worktree would compete for the same candidate, so this one has to be finished or abandoned before another starts. Continuing it picks up at ${humanizeStageId(open.state.currentStage)}.`,
+      },
+      "Continue that run",
+    );
+    if (choice === "Continue that run") {
+      await resumePlanCommand(controller, open);
+    }
     return;
   }
   const expectedBranch = await resolveExpectedBranch(location);
   if (!expectedBranch) {
     return;
   }
+  // Minted here, before anything is written: this run's identity, which its
+  // stage ids, its manifest file and the terminal tracking all derive from.
+  const runKey = newRunKey(label);
+  const runId = planRunId(location, runKey);
   if (planContinuationMode() === "automatic") {
     const markdown = await readOptional(planPath);
     if (markdown === undefined) {
       void vscode.window.showWarningMessage(`Agent Sparring: the plan document ${path.basename(planPath)} could not be read.`);
       return;
     }
-    const label = planLabel(planPath, location.repoRoot);
-    // A newly chosen plan document starts a new managed run, full stop. Old
-    // stage directories in `.sparring` are history, not work to inherit —
-    // even when this plan's sections are numbered Stage 1..3 again and even
-    // on the branch the previous plan was finished on.
-    await startManagedRun(controller, overview, { location, planPath, markdown, label, runId, expectedBranch, confirm: true, adopt: false });
+    // A new run, full stop. Old stage directories in `.sparring` are
+    // history, not work to inherit — even when this plan's sections are
+    // numbered Stage 1..3 again, even on the branch the previous run
+    // finished on, and even when it is the very same plan document.
+    await startManagedRun(controller, overview, { location, planPath, markdown, label, runKey, runId, expectedBranch, confirm: true, adopt: false });
     return;
   }
-  const args = buildRunPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir });
-  await launch(controller, location, args, "run-plan", planPath);
+  const args = buildRunPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir, runKey });
+  const result = await launch(controller, location, args, "run-plan", planPath, runId);
+  if (result.ok) {
+    await controller.releasePinForStartedRun(runId);
+  }
 }
 
 /**
@@ -2048,7 +2079,7 @@ async function resumePlanCommand(controller: SparringController, preselected?: P
     sparringDir: run.location.sparringDir,
     evidence,
   });
-  await launch(controller, run.location, args, "resume-plan", run.planPath, "manifest" in input ? input.manifest : undefined);
+  await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, "manifest" in input ? input.manifest : undefined);
 }
 
 function describeEntry(entry: StageEntry): string {
@@ -2230,7 +2261,7 @@ async function writeManifestFile(controller: SparringController, owner: Manifest
   const directory = controller.manifestDirectoryPath;
   const file = manifestPathFor(directory, owner);
   let previous = await readOptional(file);
-  for (const name of previousManifestFileNames(owner.planKey, owner.location.projectDir)) {
+  for (const name of previousManifestFileNames(owner.runKey, owner.location.projectDir)) {
     if (previous !== undefined) {
       break;
     }
@@ -2345,7 +2376,8 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
     // own stages are known by the run they are in — and only its own. No
     // adoption: whatever this run adopted at start is already its, and a
     // resume is not a new occasion to take over anything.
-    known: await knownStageIds(controller, run.location.projectDir, markdown, { planKey: run.planKey, planRunId: run.id, adopt: false }),
+    runKey: run.runKey,
+    known: await knownStageIds(controller, run.location.projectDir, markdown, { runKey: run.runKey, planRunId: run.id, adopt: false }),
     ...declarationsFor(controller, run.planKey, run.location),
   });
   if (!built.ok) {
@@ -2438,15 +2470,24 @@ async function performContinueAutomatically(controller: SparringController, over
   }
 
   const label = run.kind === "plan" ? run.state.plan : planLabel(planPath, location.repoRoot);
-  const runId = runIdFor(location, "plan", planKey(label));
-  const existing = controller.currentDiscovery.runs.find((candidate) => candidate.id === runId);
-  const managed = existing?.kind === "plan" ? existing : undefined;
-  if (managed?.state.status === "complete") {
-    void vscode.window.showInformationMessage(`Agent Sparring: the managed run of ${label} is complete; every stage was accepted.`);
-    return { ok: false, reason: "complete" };
-  }
-  if (controller.livenessFor(runId).state === "running") {
-    await sayRunnerAlive(controller, overview, `a runner for ${label} is already alive in a terminal of this window.`, runId);
+  // "Continue" means continue *a run*, so which run is answered by the one
+  // the person is looking at when that is a plan run, and otherwise by the
+  // open run of this document — a document may have several recorded runs,
+  // and only an open one can be continued. A complete run is history here,
+  // not something to continue and not something to block on: Run Plan
+  // starts a new run of the same document.
+  const managed =
+    run.kind === "plan"
+      ? run
+      : controller.currentDiscovery.runs.find(
+          (candidate): candidate is PlanRunSnapshot =>
+            candidate.kind === "plan" &&
+            candidate.location.projectDir === location.projectDir &&
+            candidate.state.plan === label &&
+            candidate.state.status !== "complete",
+        );
+  if (managed && controller.livenessFor(managed.id).state === "running") {
+    await sayRunnerAlive(controller, overview, `a runner for ${label} is already alive in a terminal of this window.`, managed.id);
     return { ok: false, reason: "running" };
   }
 
@@ -2478,7 +2519,19 @@ async function performContinueAutomatically(controller: SparringController, over
   // already this run's; arriving with nothing selected is an ordinary fresh
   // start. Neither adopts.
   const adopt = run.kind === "stage";
-  return startManagedRun(controller, overview, { location, planPath, markdown, label, runId, expectedBranch, stage: currentStageOf(run), confirm: options.confirm, adopt });
+  const runKey = newRunKey(label);
+  return startManagedRun(controller, overview, {
+    location,
+    planPath,
+    markdown,
+    label,
+    runKey,
+    runId: planRunId(location, runKey),
+    expectedBranch,
+    stage: currentStageOf(run),
+    confirm: options.confirm,
+    adopt,
+  });
 }
 
 /** What a fresh managed run needs to know before it is started. */
@@ -2486,8 +2539,16 @@ interface ManagedStart {
   location: SparringLocation;
   planPath: string;
   markdown: string;
-  /** The plan label the run will be keyed by (plan.py: plan_label). */
+  /** The plan document this run executes (plan.py: plan_label). */
   label: string;
+  /**
+   * The run instance's key, minted for this start (plan.py: `new_run_key`).
+   * The extension mints it rather than letting the engine, because it has to
+   * name the run before the run exists: the stage ids it writes into the
+   * manifest are namespaced by it, the manifest file is named by it, and the
+   * terminal it launches is tracked under the run id derived from it.
+   */
+  runKey: string;
   runId: string;
   expectedBranch: string;
   /**
@@ -2531,13 +2592,19 @@ interface ManagedStart {
  * first candidate: whether this run may push the candidates it verifies.
  */
 async function startManagedRun(controller: SparringController, overview: OverviewPanelManager, start: ManagedStart): Promise<ContinueAutomaticallyOutcome> {
-  const { location, planPath, markdown, label, runId, expectedBranch, adopt } = start;
+  const { location, planPath, markdown, label, runKey, runId, expectedBranch, adopt } = start;
+  // Two identities, and they are not interchangeable. `runKey` is *this
+  // execution*: the stage ids and the manifest file are named by it, and
+  // membership is decided against it. `planKey` is the *document*, and it is
+  // what the person's declarations about the plan's stages are filed under —
+  // those are about the plan, so a second run of it inherits them.
   const key = planKey(label);
   const built = buildManifest({
     markdown,
     planLabel: label,
     planName: path.basename(planPath),
-    known: await knownStageIds(controller, location.projectDir, markdown, { planKey: key, planRunId: runId, adopt }),
+    runKey,
+    known: await knownStageIds(controller, location.projectDir, markdown, { runKey, planRunId: runId, adopt }),
     ...declarationsFor(controller, key, location),
   });
   if (!built.ok) {
@@ -2582,7 +2649,7 @@ async function startManagedRun(controller: SparringController, overview: Overvie
   let manifestPath: string;
   try {
     await controller.manifestDirectory();
-    manifestPath = await writeManifestFile(controller, { planKey: planKey(label), location }, built.manifest);
+    manifestPath = await writeManifestFile(controller, { runKey, planKey: key, location }, built.manifest);
   } catch (error) {
     void vscode.window.showErrorMessage(`Agent Sparring: could not write the execution manifest: ${(error as Error).message}. Nothing was started.`);
     return { ok: false, reason: "write", message: (error as Error).message };
@@ -2592,10 +2659,10 @@ async function startManagedRun(controller: SparringController, overview: Overvie
     controller.log(`Continue automatically: not executable, left in the plan — ${problem.reason}`);
   }
   controller.log(
-    `Continue automatically: run-plan${adopt ? " --adopt" : ""}${autoPush ? " --allow-push-for-run" : ""} --manifest ${manifestPath} (${built.manifest.stages.length} stage(s): ${built.manifest.stages.map((stage) => stage.stage_id).join(", ")})`,
+    `Continue automatically: run-plan --run-key ${runKey}${adopt ? " --adopt" : ""}${autoPush ? " --allow-push-for-run" : ""} --manifest ${manifestPath} (${built.manifest.stages.length} stage(s): ${built.manifest.stages.map((stage) => stage.stage_id).join(", ")})`,
   );
 
-  const args = buildRunPlanArgs({ manifest: manifestPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir, adopt, allowPushForRun: autoPush });
+  const args = buildRunPlanArgs({ manifest: manifestPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir, runKey, adopt, allowPushForRun: autoPush });
   const result = await controller.launch({
     configured: configuredExecutable(),
     args,
@@ -2608,6 +2675,12 @@ async function startManagedRun(controller: SparringController, overview: Overvie
     reveal: true,
   });
   await explainLaunch(controller, result);
+  if (result.ok) {
+    // The screen follows the work that was just started, rather than staying
+    // where a pin left it — typically on the finished run this new one comes
+    // after.
+    await controller.releasePinForStartedRun(runId);
+  }
   await overview.update();
   if (!result.ok) {
     return { ok: false, reason: "write", message: result.error };
@@ -2670,7 +2743,7 @@ async function continueManagedRun(
 
   controller.log(`Continue automatically: resume-plan ${manifest ? `--manifest ${manifest}` : run.planPath} (the run is recorded as a ${input.source} plan input)`);
   const args = buildResumePlanArgs({ ...input, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir });
-  const result = await launch(controller, location, args, "resume-plan", run.planPath, manifest);
+  const result = await launch(controller, location, args, "resume-plan", run.planPath, run.id, manifest);
   await overview.update();
   if (!result.ok) {
     return { ok: false, reason: "write", message: result.error };
@@ -2830,7 +2903,7 @@ function stagesOfProject(controller: SparringController, projectDir: string): Di
 
 /** This discovered stage as `stageBelongsToPlan` (planMembership.ts) needs to see it. */
 function originOf(candidate: DiscoveredStage): StageOrigin {
-  return { stageId: candidate.stage.stageId, owner: candidate.stage.state?.plan, runId: candidate.runId };
+  return { stageId: candidate.stage.stageId, owner: candidate.stage.state?.run, runId: candidate.runId };
 }
 
 /** Has this stage actually run? Acceptance, a recorded session or a candidate commit all say yes. */

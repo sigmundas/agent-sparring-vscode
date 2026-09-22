@@ -37,11 +37,27 @@ export interface PlanInvocation {
   expectedBranch: string;
   /** Passed as the global `--sparring-dir` when it is not `<repoRoot>/.sparring`. */
   sparringDir?: string;
+  /**
+   * `--run-key`: which *execution* of the plan document this is.
+   *
+   * On a fresh `run-plan` it is required in practice, because everything the
+   * extension tracks about the run — the stage ids in its manifest, the
+   * manifest's file name, the run id its terminal is filed under — is derived
+   * from it, and letting the engine mint one instead would leave the
+   * extension unable to name the run it just started.
+   *
+   * On a `resume-plan` it says which recorded run to continue. Omitted, the
+   * engine continues the plan's one open run, which is right for a run
+   * recorded before run instances existed.
+   */
+  runKey?: string;
 }
 
 /**
  * `sparring run-plan (<plan> | --manifest <file>) --repo-root … --expected-branch …`
- * (cli.py: run_plan). `adopt` adds `--adopt`, which lets the run take over
+ * (cli.py: run_plan). Every call starts a *new* run — `--run-key` is what
+ * makes it identifiable — so the same plan document may be run again without
+ * disturbing an earlier run. `adopt` adds `--adopt`, which lets the run take over
  * stages that already exist instead of refusing them — each one checked and
  * reported by the engine, never silently inherited. `allowPushForRun` adds
  * `--allow-push-for-run`, recording as part of creating the run that it may
@@ -233,8 +249,12 @@ function globalArgs(invocation: { repoRoot: string; sparringDir?: string }): str
   return ["--sparring-dir", invocation.sparringDir];
 }
 
-function loopArgs(invocation: { repoRoot: string; expectedBranch: string }): string[] {
-  return ["--repo-root", invocation.repoRoot, "--expected-branch", invocation.expectedBranch];
+function loopArgs(invocation: { repoRoot: string; expectedBranch: string; runKey?: string }): string[] {
+  const args = ["--repo-root", invocation.repoRoot, "--expected-branch", invocation.expectedBranch];
+  if (invocation.runKey) {
+    args.push("--run-key", invocation.runKey);
+  }
+  return args;
 }
 
 // ---------------------------------------------------------------------------

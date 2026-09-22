@@ -531,9 +531,14 @@ ${renderActors(model, discloseScope(model))}
  *    appear even when they are the same, so the policy reads the same way
  *    every time and a pin never hides where the window actually is.
  *
- * Agent Sparring's own chooser sits here too. Switching context must not
- * depend on a VS Code gesture this extension cannot observe, so the way to do
- * it is where the person already is rather than only in the Command Palette.
+ * Agent Sparring's own controls sit here too, and they are two rather than
+ * one. Switching context must not depend on a VS Code gesture this extension
+ * cannot observe, so the way to do it is where the person already is rather
+ * than only in the Command Palette — and **Run Plan** is here for the same
+ * reason. The ordinary workflow is *repository -> plan -> run*, Run Plan asks
+ * for both in that order, and it must not be reachable only by way of a list
+ * of old runs: reading finished history is not how work is started, and one
+ * control named "Select repository / run…" made it look as though it were.
  */
 function renderRepositoryContext(model: OverviewModel): string {
   const context = model.repositoryContext;
@@ -546,7 +551,8 @@ function renderRepositoryContext(model: OverviewModel): string {
     lines.push(contextLine(ACTIVE_CONTEXT_HEADLINE, context.activeRepository, false));
   }
   const controls = [
-    button("selectRun", SELECT_RUN_LABEL, true, "Pin an Agent Sparring repository or run explicitly", "quiet"),
+    button("runPlan", "Run Plan", true, "Choose a repository and a plan document, and start a new run of it"),
+    button("selectRun", SELECT_RUN_LABEL, true, "Pin a recorded run — including a finished one — to inspect it", "quiet"),
     pinned ? button("followActiveRepository", FOLLOW_ACTIVE_LABEL, true, context.explanation) : "",
   ].join("");
   return `<section class="repocontext${pinned ? " pinned" : ""}${context.away ? " away" : ""}" title="${escapeHtml(context.explanation)}">

@@ -1324,6 +1324,30 @@ export class SparringController implements vscode.Disposable {
    * picker, because a pin is otherwise indistinguishable from the cockpit
    * simply disagreeing with the Source Control view.
    */
+  /**
+   * A new plan run has just been started, so stop holding the screen
+   * somewhere else.
+   *
+   * Only a pin is released, and only one that names a different run. Nothing
+   * is pinned in its place: the run that was just started is the only *open*
+   * plan run of its repository, so ordinary automatic selection shows it as
+   * soon as the engine records it, and a second selection mechanism is not
+   * needed for that.
+   *
+   * This is what stops the cockpit from staying on a finished run while new
+   * work is running. Starting a plan is a clear statement about what the
+   * person is looking at now, and a pin taken earlier — to read that
+   * finished run's history — is not.
+   */
+  async releasePinForStartedRun(runId: string): Promise<void> {
+    const pinned = this.context.workspaceState.get<string>(SELECTED_RUN_KEY);
+    if (!pinned || pinned === runId) {
+      return;
+    }
+    this.log(`a new plan run was started, so the pin on ${pinned} is released; the cockpit follows the run you just started. ${FOLLOW_ACTIVE_LABEL} is how it goes back to following this window.`);
+    await this.chooseRun(undefined);
+  }
+
   async followActiveRepository(): Promise<void> {
     const root = this.activeRepository.activeRepoRoot;
     this.log(root ? `following the active repository again: ${path.basename(root)}` : "following the active repository again; this window is in no repository the Git extension has opened");

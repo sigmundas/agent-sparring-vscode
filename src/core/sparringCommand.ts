@@ -14,9 +14,10 @@
  * No dependency on the vscode API.
  */
 
-import * as crypto from "node:crypto";
 import * as path from "node:path";
+import * as crypto from "node:crypto";
 import { runIdFor, type RunSnapshot, type SparringLocation } from "./discovery";
+import { planKey } from "./engineFormats";
 
 export type SparringSubcommand = "run-loop" | "run-sparring" | "run-plan" | "resume-plan";
 
@@ -28,6 +29,14 @@ export interface ParsedSparringCommand {
   planPath?: string;
   /** Execution manifest as typed (`--manifest`), in place of a plan path. */
   manifest?: string;
+  /**
+   * `--run-key`: which *execution* of the plan document this is. A plan
+   * document can be run more than once, so this — not the plan path — is
+   * what a plan run is identified by. Absent when a hand-typed command lets
+   * the engine mint one, in which case the extension cannot know the run id
+   * the engine will file it under.
+   */
+  runKey?: string;
   repoRoot?: string;
   sparringDir?: string;
   expectedBranch?: string;
@@ -151,6 +160,9 @@ export function parseSparringCommand(commandLine: string): ParsedSparringCommand
         case "--manifest":
           parsed.manifest = value;
           break;
+        case "--run-key":
+          parsed.runKey = value;
+          break;
         default:
           break;
       }
@@ -239,17 +251,28 @@ export function planLabel(planPath: string, repoRoot: string): string {
   return resolved.split(path.sep).join("/");
 }
 
-/** plan.py: plan_key — slugged stem (≤32 chars) plus the first 8 hex digits of SHA-256(label). */
-export function planKey(label: string): string {
-  const digest = crypto.createHash("sha256").update(label, "utf8").digest("hex").slice(0, 8);
-  const stem = path.posix.basename(label).replace(/\.[^.]*$/, "");
-  const slug = stem
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 32)
-    .replace(/-+$/g, "");
-  return slug ? `${slug}-${digest}` : digest;
+// Lives in engineFormats.ts, which discovery.ts can import without a cycle,
+// and is re-exported here because this is where callers have always found it.
+export { planKey };
+
+/**
+ * plan.py `new_run_key`: an identity for one *execution* of a plan document.
+ *
+ * The document's key, so a run is recognisable and a document's runs sort
+ * together, plus eight hex digits that are this execution. The extension
+ * mints it rather than leaving it to the engine because it needs the run's
+ * identity before the run exists — the stage ids it writes into a manifest
+ * are namespaced by it, and the terminal it launches is tracked under the
+ * run id derived from it — and passes it to `run-plan --run-key` so the
+ * engine files the run under the same key.
+ *
+ * Random rather than counted, for the reason the engine gives: the only
+ * thing a counter could be derived from is the directory a person may prune,
+ * so it would restart, and a restarted run key would hand run B the stage
+ * directories of run A.
+ */
+export function newRunKey(label: string): string {
+  return `${planKey(label)}-${crypto.randomBytes(4).toString("hex")}`;
 }
 
 export interface MatchedExecution {
@@ -295,21 +318,38 @@ export function matchSparringCommand(parsed: ParsedSparringCommand, cwd: string 
     return { location, runId: runIdFor(location, "stage", parsed.stageId), kind: parsed.subcommand, stageId: parsed.stageId };
   }
   const planPath = resolve(parsed.planPath);
+  if (parsed.runKey) {
+    // The run key *is* the run's identity, and it is the only thing on the
+    // command line that names one execution rather than a document. A
+    // `--manifest` command with one is therefore attributable even though
+    // its plan lives inside the manifest file.
+    return { location, runId: runIdFor(location, "plan", parsed.runKey), kind: parsed.subcommand, planPath };
+  }
   if (!planPath) {
-    // A `--manifest` invocation names the plan inside the manifest file, so
-    // its run id cannot be derived from the command line alone. The
-    // extension's own launches pass their run id explicitly; a manifest run
-    // typed by hand in a terminal is simply not tied to a discovered run,
-    // rather than tied to the wrong one.
+    // A `--manifest` invocation with no run key names the plan inside the
+    // manifest file, so its run id cannot be derived from the command line
+    // alone. The extension's own launches pass their run id explicitly; a
+    // manifest run typed by hand in a terminal is simply not tied to a
+    // discovered run, rather than tied to the wrong one.
     return undefined;
   }
+  // A plan path and no run key: this is `resume-plan <plan>`, which the
+  // engine resolves to that document's one open run. The plan key is the
+  // run key of a run recorded before run instances existed, which is the
+  // only run this can be addressing unambiguously; a newer run's key cannot
+  // be derived from a document path, and inventing one would attribute the
+  // terminal to a run that does not exist.
   const key = planKey(planLabel(planPath, location.repoRoot));
   return { location, runId: runIdFor(location, "plan", key), kind: parsed.subcommand, planPath };
 }
 
-/** The run id a run-plan / resume-plan launched by the extension itself will write to. */
-export function planRunId(location: SparringLocation, planPath: string): string {
-  return runIdFor(location, "plan", planKey(planLabel(planPath, location.repoRoot)));
+/**
+ * The run id a run-plan / resume-plan launched by the extension itself will
+ * write to: the run *instance*'s id, since one plan document may have
+ * several runs and each is its own row in the cockpit.
+ */
+export function planRunId(location: SparringLocation, runKey: string): string {
+  return runIdFor(location, "plan", runKey);
 }
 
 function same(a: string, b: string): boolean {

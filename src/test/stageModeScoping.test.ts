@@ -21,6 +21,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { planKey } from "../core/sparringCommand";
 import { buildManifest, manifestDigest, renderManifest } from "../core/manifest";
 import { migrateStageModes, modeForStage, modesForPlan, stageModeScope, withStageMode, type StageModes } from "../core/stageModes";
 
@@ -47,6 +48,7 @@ function manifestFor(state: StageModes | undefined, projectDir: string): string 
   const built = buildManifest({
     markdown: PLAN,
     planLabel: PLAN_LABEL,
+    runKey: planKey(PLAN_LABEL),
     planName: "reported-statistics.md",
     modes: modesForPlan(state, PLAN_KEY, projectDir),
   });
@@ -58,6 +60,7 @@ function digestFor(state: StageModes | undefined, projectDir: string): string | 
   const built = buildManifest({
     markdown: PLAN,
     planLabel: PLAN_LABEL,
+    runKey: planKey(PLAN_LABEL),
     planName: "reported-statistics.md",
     modes: modesForPlan(state, PLAN_KEY, projectDir),
   });

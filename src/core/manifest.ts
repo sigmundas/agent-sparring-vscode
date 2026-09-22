@@ -55,7 +55,6 @@ import { buildStageIndex, parsePlanHeadings, type PlanHeading, type StageEntry }
 import { slugify } from "./engineFormats";
 import { humanizeStageId } from "./presentation";
 import { STAGE_ID_RE } from "./nextStage";
-import { planKey } from "./sparringCommand";
 import type { StageMode } from "./stageModes";
 
 export const MANIFEST_VERSION = 1;
@@ -114,11 +113,22 @@ export interface ManifestInput {
   /** Display name used inside each brief's header line (the plan's file name). */
   planName: string;
   /**
-   * Stage ids **this plan** already uses for particular plan labels, so its
-   * own history stays visible. Only stages that provably belong to this
-   * plan may appear here; another plan's stages are not this plan's
-   * history, and supplying them is how a follow-up plan ends up adopting
-   * work it never did.
+   * The key of the run instance this manifest is for, which fresh stage ids
+   * are namespaced by (`<run key>-stage-<label>-<slug>`).
+   *
+   * An input rather than something derived here, because it *cannot* be
+   * derived: a run key identifies one execution of the plan, and the same
+   * document may be executed again tomorrow. Whoever starts the run mints
+   * it, writes it into these stage ids, and passes it to `run-plan
+   * --run-key` so the engine files the run under the same key.
+   */
+  runKey: string;
+  /**
+   * Stage ids **this run** already uses for particular plan labels, so its
+   * own history stays visible. Only stages that provably belong to this run
+   * may appear here; another run's stages are not this run's history —
+   * whether that run executed a different document or the same one — and
+   * supplying them is how a new run ends up adopting work it never did.
    */
   known?: KnownStage[];
   /** Sibling repositories a given plan label's stage reviews alongside the primary one. */
@@ -150,18 +160,19 @@ export type ManifestBuild = { ok: true; manifest: ExecutionManifest; skipped: Ma
  * section and is skipped, because there is no definition to brief from; it
  * stays visible in the document and in `skipped`, and is never executed.
  *
- * Which id each stage gets: the id this plan *already* uses for that label,
- * when one is known, so an existing sequence keeps its history and its
- * recorded sessions; otherwise a fresh `<plan-key>-stage-<label>-<slug>`
- * id, namespaced to this plan.
+ * Which id each stage gets: the id this *run* already uses for that label,
+ * when one is known, so a run being continued keeps its history and its
+ * recorded sessions; otherwise a fresh `<run-key>-stage-<label>-<slug>` id,
+ * namespaced to this run.
  *
- * That namespace is load-bearing, not cosmetic. Finishing one plan and
- * starting a follow-up one on the same branch — whose sections may well be
- * numbered Stage 1..3 again — is an ordinary workflow, and the follow-up's
- * stages must be new work rather than the first plan's accepted history
- * under a colliding name. `known` is scoped to this plan for the same
- * reason: see `knownStageIds` in commands.ts, which decides what "already
- * uses" is allowed to mean.
+ * That namespace is load-bearing, not cosmetic. Two ordinary workflows
+ * depend on it: finishing one plan and starting a follow-up one on the same
+ * branch, whose sections may well be numbered Stage 1..3 again; and running
+ * the *same* plan document a second time. In both, the new run's stages must
+ * be new work rather than an earlier run's accepted history under a
+ * colliding name. `known` is scoped to this run for the same reason: see
+ * `knownStageIds` in commands.ts, which decides what "already uses" is
+ * allowed to mean.
  *
  * A stage the plan defines ambiguously (several plausible definitions), or
  * whose section has a heading but no content, or whose id would be unusable,
@@ -188,11 +199,7 @@ export type ManifestBuild = { ok: true; manifest: ExecutionManifest; skipped: Ma
  * it — dropping it would silently shorten the sequence instead.
  */
 export function buildManifest(input: ManifestInput): ManifestBuild {
-  // Derived here rather than taken as an input: the stage ids this manifest
-  // proposes have to be namespaced by the *same* key the engine files the
-  // run state under, and one derivation from `plan_label` is the only way
-  // those cannot drift apart.
-  const key = planKey(input.planLabel);
+  const key = input.runKey;
   const headings = parsePlanHeadings(input.markdown);
   const index = buildStageIndex(headings);
   const known = new Map((input.known ?? []).map((entry) => [entry.label.toUpperCase(), entry]));
@@ -277,16 +284,20 @@ function describeSkip(entry: StageEntry): string {
 }
 
 /**
- * The id a stage of *this plan* gets: `<plan-key>-stage-<label>-<slug>`.
+ * The id a stage of *this run* gets: `<run-key>-stage-<label>-<slug>`.
  *
- * The plan key is the namespace that makes execution-stage identity
- * `(run, stage)` rather than a project-global directory name, and it is the
- * engine's own convention for a managed run's stages (plan.py:
+ * The run key is the namespace that makes execution-stage identity
+ * `(run instance, stage)` rather than a project-global directory name, and
+ * it is the engine's own convention for a managed run's stages (plan.py:
  * `_stage_id_for`, which prefixes exactly this way for a Markdown plan
- * run). Without it, two plans in one worktree that both define "Stage 1 —
- * Foundation" generate the same id, and the second plan's Stage 1 lands on
- * the first plan's accepted directory — which is the bug this prefix
- * closes, before the engine's ownership refusal ever has to.
+ * run). Without it, two runs in one worktree that both define "Stage 1 —
+ * Foundation" generate the same id and the second run's Stage 1 lands on the
+ * first run's accepted directory — which is the bug this prefix closes,
+ * before the engine's ownership refusal ever has to.
+ *
+ * Note that it is the *run* key and not the plan key. Namespacing by the
+ * document would keep two different plans apart but not two runs of one
+ * plan, and re-running a plan document is ordinary work.
  *
  * Deliberately *not* the unprefixed `stage-<label>-<slug>` that
  * `proposeNextStage` still uses. That is the id of a hand-driven standalone
@@ -295,9 +306,9 @@ function describeSkip(entry: StageEntry): string {
  * existing run keeps whichever ids it already uses, prefixed or not, via
  * `KnownStage`.
  */
-function proposeStageId(entry: StageEntry, planKey: string): string | undefined {
+function proposeStageId(entry: StageEntry, runKey: string): string | undefined {
   const slug = slugify(entry.title ?? "");
-  const stageId = `${planKey}-stage-${entry.label.toLowerCase()}${slug ? `-${slug}` : ""}`.slice(0, 128).replace(/-+$/, "");
+  const stageId = `${runKey}-stage-${entry.label.toLowerCase()}${slug ? `-${slug}` : ""}`.slice(0, 128).replace(/-+$/, "");
   return STAGE_ID_RE.test(stageId) ? stageId : undefined;
 }
 
@@ -1082,16 +1093,27 @@ function short(digest: string): string {
  * writer, the reader and the tests cannot drift into different files.
  */
 export function manifestPathFor(directory: string, run: ManifestOwner): string {
-  return path.join(directory, manifestFileName(run.planKey, run.location.projectDir));
+  return path.join(directory, manifestFileName(run.runKey, run.location.projectDir));
 }
 
 /** Where its binding record lives: beside the manifest, under the same identity. */
 export function bindingPathFor(directory: string, run: ManifestOwner): string {
-  return path.join(directory, bindingFileName(run.planKey, run.location.projectDir));
+  return path.join(directory, bindingFileName(run.runKey, run.location.projectDir));
 }
 
 /** The parts of a run that decide where its manifest is kept. */
 export interface ManifestOwner {
+  /**
+   * The run *instance*'s key, which is what the file is named by. It used to
+   * be the plan key, and then two runs of one plan document overwrote each
+   * other's manifest — the second run's rebuild would have been read as the
+   * first run's stage list.
+   *
+   * A run recorded before run instances existed has the plan key as its run
+   * key, so its file keeps exactly the name it already has.
+   */
+  runKey: string;
+  /** The plan document's key, recorded in the binding record. */
   planKey: string;
   location: { projectDir: string };
 }
@@ -1103,19 +1125,20 @@ export function manifestExpectationFor(run: ManifestOwner & { state: { plan: str
     currentStageId: run.state.currentStage,
     planDigest: run.state.planDigest,
     projectDir: run.location.projectDir,
-    manifestFile: manifestFileName(run.planKey, run.location.projectDir),
+    manifestFile: manifestFileName(run.runKey, run.location.projectDir),
   };
 }
 
 /**
  * A stable file name for one plan run's manifest, so regenerating it
- * overwrites in place.
+ * overwrites in place — and a *different* name for a different run of the
+ * same plan document, which is why this is keyed by run and not by plan.
  *
- * Scoped to the project directory as well as the plan, because a plan key is
- * a hash of the plan's **repo-relative** path: two worktrees of the same
- * repository — the ordinary way to run two stages of the same plan side by
- * side — produce the same key for `docs/plans/foo.md`, and used to share one
- * file in global storage.
+ * Scoped to the project directory as well, because a run key contains a hash
+ * of the plan's **repo-relative** path: two worktrees of the same repository —
+ * the ordinary way to run two stages of the same plan side by side — can
+ * produce the same key for `docs/plans/foo.md`, and used to share one file in
+ * global storage.
  *
  * The scope is the *full* SHA-256 of the resolved project directory. It was
  * eight hex digits, which is 32 bits and collides in practice: a reviewer
@@ -1125,13 +1148,13 @@ export function manifestExpectationFor(run: ManifestOwner & { state: { plan: str
  * namespace that collides is not even a useful *index*, and there is no reason
  * to spend only 32 bits on it.
  */
-export function manifestFileName(planKey: string, projectDir: string): string {
-  return `${planKey}-${projectDigest(projectDir)}.manifest.json`;
+export function manifestFileName(runKey: string, projectDir: string): string {
+  return `${runKey}-${projectDigest(projectDir)}.manifest.json`;
 }
 
-/** The binding record beside it, under the same plan-and-project identity. */
-export function bindingFileName(planKey: string, projectDir: string): string {
-  return `${planKey}-${projectDigest(projectDir)}.binding.json`;
+/** The binding record beside it, under the same run-and-project identity. */
+export function bindingFileName(runKey: string, projectDir: string): string {
+  return `${runKey}-${projectDigest(projectDir)}.binding.json`;
 }
 
 /**
@@ -1151,13 +1174,13 @@ export function bindingFileName(planKey: string, projectDir: string): string {
  * reads, so its stage membership degrades honestly to "not recorded here"
  * rather than being taken from a file whose worktree nothing vouches for.
  */
-export function previousManifestFileNames(planKey: string, projectDir: string): string[] {
-  return [`${planKey}-${shortProjectDigest(projectDir)}.manifest.json`, legacyManifestFileName(planKey)];
+export function previousManifestFileNames(runKey: string, projectDir: string): string[] {
+  return [`${runKey}-${shortProjectDigest(projectDir)}.manifest.json`, legacyManifestFileName(runKey)];
 }
 
 /** The name manifests had before they were scoped to a project at all. */
-export function legacyManifestFileName(planKey: string): string {
-  return `${planKey}.manifest.json`;
+export function legacyManifestFileName(runKey: string): string {
+  return `${runKey}.manifest.json`;
 }
 
 /** SHA-256 of the resolved project directory, in full: an index, never an authority. */

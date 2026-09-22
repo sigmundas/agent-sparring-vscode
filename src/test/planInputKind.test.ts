@@ -126,8 +126,13 @@ describe("every path that resumes a managed run goes through the one decision", 
     // different terms. In automatic mode Run plan starts the same managed,
     // manifest-driven run Continue automatically starts.
     const body = fn(await commandsSource(), "runPlanCommand");
-    assert.match(body, /if \(existing\?\.kind === "plan"\) \{/, "an existing run is continued, not restarted");
-    assert.match(body, /await resumePlanCommand\(controller, existing\)/);
+    // An *open* run is the one thing Run plan does not restart over, because
+    // two live runs of one plan would compete for the same candidate. It is
+    // offered for continuation rather than silently continued: a completed
+    // run is history, and Run plan starting a new run of the same document
+    // is the point.
+    assert.match(body, /state\.status !== "complete"/, "only an open run stands in the way");
+    assert.match(body, /await resumePlanCommand\(controller, open\)/, "and continuing it is the same one decision");
     assert.match(body, /if \(planContinuationMode\(\) === "automatic"\)/);
     assert.match(body, /await startManagedRun\(/, "the same managed start as Continue automatically");
     assert.match(body, /buildRunPlanArgs\(\{ planPath,/, "and the Markdown route is what manual mode is for");

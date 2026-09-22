@@ -364,7 +364,14 @@ export function repositoryOfPath(git: GitSource, fsPath: string): string | undef
 /** The one name for going back to automatic selection, wherever it is offered. */
 export const FOLLOW_ACTIVE_LABEL = "Follow active repository";
 /** The one name for Agent Sparring's own repository/run chooser. */
-export const SELECT_RUN_LABEL = "Select repository / run…";
+/**
+ * The history picker's name. It used to be "Select repository / run…", which
+ * was the only control in the cockpit's repository line and so was also the
+ * way people started work — and reading a list of finished runs is not how
+ * you start work. Starting a plan is its own button now (Run Plan), and this
+ * is what it says it is: the runs, including the finished ones, to look at.
+ */
+export const SELECT_RUN_LABEL = "History / Runs…";
 
 /** The headline above the repository name, one per mode. */
 export const CONTEXT_HEADLINE = {
@@ -409,8 +416,8 @@ export interface RepositoryContextView {
 }
 
 const FOLLOWING_EXPLANATION =
-  "Agent Sparring follows the repository of the active editor or the Source Control view's focus. VS Code's own repository selector in the status bar is not readable by extensions, so it is not what this follows; use Select repository / run to choose explicitly.";
-const PINNED_EXPLANATION = `This run was pinned through Select repository / run, and a pin is kept even when the window moves to another repository so that history stays open while you work elsewhere. ${FOLLOW_ACTIVE_LABEL} releases it.`;
+  "Agent Sparring follows the repository of the active editor or the Source Control view's focus. VS Code's own repository selector in the status bar is not readable by extensions, so it is not what this follows; Run Plan asks which repository, and History / Runs pins one explicitly.";
+const PINNED_EXPLANATION = `This run was pinned through ${SELECT_RUN_LABEL}, and a pin is kept even when the window moves to another repository so that history stays open while you work elsewhere. ${FOLLOW_ACTIVE_LABEL} releases it, and starting a new plan run releases it too.`;
 const UNSCOPED_EXPLANATION =
   "No repository could be resolved: the built-in Git extension has opened none, or has not answered yet. Nothing is scoped away, so every discovered run is a candidate.";
 
@@ -500,7 +507,7 @@ export function describeElsewhere(runs: readonly RunSnapshot[]): string | undefi
   if (runs.length === 0) {
     return undefined;
   }
-  return `Agent Sparring has also discovered ${countByRepository(runs)}. Select repository / run pins one of those to inspect it.`;
+  return `Agent Sparring has also discovered ${countByRepository(runs)}. ${SELECT_RUN_LABEL} pins one of those to inspect it.`;
 }
 
 /**
@@ -515,7 +522,7 @@ export function describeUnattributed(runs: readonly RunSnapshot[]): string | und
   if (runs.length === 0) {
     return undefined;
   }
-  return `Agent Sparring has also discovered ${countByRepository(runs)} that could not be attributed to any repository the Git extension has opened; nothing is selected from those automatically. Select repository / run reaches them.`;
+  return `Agent Sparring has also discovered ${countByRepository(runs)} that could not be attributed to any repository the Git extension has opened; nothing is selected from those automatically. ${SELECT_RUN_LABEL} reaches them.`;
 }
 
 function countByRepository(runs: readonly RunSnapshot[]): string {

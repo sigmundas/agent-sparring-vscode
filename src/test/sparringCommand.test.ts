@@ -111,18 +111,43 @@ describe("matching a typed command to a discovered run", () => {
     assert.ok(runs.some((run) => run.id === byCwd!.runId), "the matched id is a discovered run id");
   });
 
-  it("run-plan matches the run id the engine will write, whether the plan path is relative or absolute", async () => {
+  it("a plan command matches the run id the engine will write, whether the plan path is relative or absolute", async () => {
+    // A run recorded before run instances existed: its key is its plan key,
+    // which is the only run key a plan *path* can imply, so a hand-typed
+    // command naming the document still resolves to it.
     const ws = await Workspace.create({ withSpaces: true });
     const planFile = await ws.writePlan();
     await ws.writePlanRun(FOO_PLAN_KEY, { plan: FOO_PLAN_LABEL, status: "running", current_stage_index: 0, current_stage: "foo-1cd13d24-stage-1-contract" });
     const run = selectRun((await discoverRuns([ws.location])).runs).selected as PlanRunSnapshot;
     assert.equal(run.kind, "plan");
+    assert.equal(run.runKey, FOO_PLAN_KEY);
     const relative = matchSparringCommand(parseSparringCommand("sparring run-plan docs/plans/foo.md --expected-branch main")!, ws.root, [ws.location]);
     assert.equal(relative?.runId, run.id);
     const absolute = matchSparringCommand(parseSparringCommand(`sparring resume-plan "${planFile}" --repo-root "${ws.root}" --expected-branch main`)!, "/somewhere/else", [ws.location]);
     assert.equal(absolute?.runId, run.id);
     assert.equal(absolute?.kind, "resume-plan");
-    assert.equal(planRunId(ws.location, planFile), run.id, "extension launches compute the same id");
+    assert.equal(planRunId(ws.location, run.runKey), run.id, "extension launches compute the same id");
+  });
+
+  it("--run-key is what identifies a run, and it is enough on its own", async () => {
+    // Every run the extension starts names itself, because a plan document
+    // can have several runs and a document path cannot say which. It is also
+    // what makes a `--manifest` command attributable at all: its plan lives
+    // inside the manifest file.
+    const ws = await Workspace.create();
+    const second = `${FOO_PLAN_KEY}-2222bbbb`;
+    await ws.writePlanRun(second, { plan: FOO_PLAN_LABEL, run: second, status: "running", current_stage_index: 0, current_stage: `${second}-stage-1-contract` });
+    const run = selectRun((await discoverRuns([ws.location])).runs).selected as PlanRunSnapshot;
+    assert.equal(run.runKey, second);
+
+    const named = parseSparringCommand(`sparring run-plan --manifest /tmp/m.json --run-key ${second} --repo-root "${ws.root}" --expected-branch main`)!;
+    assert.equal(named.runKey, second);
+    assert.equal(matchSparringCommand(named, ws.root, [ws.location])?.runId, run.id);
+    assert.equal(planRunId(ws.location, second), run.id);
+
+    // Without one, a manifest command names no run rather than the wrong one.
+    const anonymous = parseSparringCommand(`sparring run-plan --manifest /tmp/m.json --repo-root "${ws.root}" --expected-branch main`)!;
+    assert.equal(matchSparringCommand(anonymous, ws.root, [ws.location]), undefined);
   });
 
   it("--sparring-dir selects the project when the repository root lives elsewhere", async () => {

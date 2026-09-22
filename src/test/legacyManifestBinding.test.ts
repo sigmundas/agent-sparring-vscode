@@ -75,7 +75,7 @@ async function completedLegacyRun(options: { name?: "unscoped" | "short-scoped";
 
   const store = await ManifestStore.create();
   const text = manifestText(options.planLabel);
-  const name = options.name === "short-scoped" ? path.basename(manifestPathFor(store.dir, { planKey: PLAN_KEY, location: { projectDir: ws.root } })) : legacyManifestFileName(PLAN_KEY);
+  const name = options.name === "short-scoped" ? path.basename(manifestPathFor(store.dir, { runKey: PLAN_KEY, planKey: PLAN_KEY, location: { projectDir: ws.root } })) : legacyManifestFileName(PLAN_KEY);
   // The legacy file, written at the legacy name. No sidecar: that is the
   // whole point — the run finished before sidecars existed.
   await fs.writeFile(path.join(store.dir, name), text);

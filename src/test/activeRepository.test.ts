@@ -419,7 +419,7 @@ describe("a run is only B's when it can be shown to be B's", () => {
       `the empty state names them: ${lines.join(" | ")}`,
     );
     assert.ok(
-      lines.some((line) => line.includes("Select repository / run")),
+      lines.some((line) => line.includes(SELECT_RUN_LABEL)),
       "and says how to reach them",
     );
   });

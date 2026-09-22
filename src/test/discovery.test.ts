@@ -149,7 +149,7 @@ describe("selection rule", () => {
     await ws.writePlanRun(FOO_PLAN_KEY, { plan: FOO_PLAN_LABEL, status: "complete", current_stage_index: 2, current_stage: FOO_STAGE_IDS[2] });
     await ws.writePlanRun("bar-00000000", { plan: "docs/plans/bar.md", status: "running", current_stage_index: 0, current_stage: "bar-00000000-stage-1-only" });
     const selection = selectRun((await discover(ws)).runs);
-    assert.equal((selection.selected as PlanRunSnapshot).planKey, "bar-00000000");
+    assert.equal((selection.selected as PlanRunSnapshot).runKey, "bar-00000000");
   });
 
   it("falls back to a standalone stage when no plan run exists, and excludes planned stage dirs", async () => {

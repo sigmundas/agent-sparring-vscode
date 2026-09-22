@@ -13,6 +13,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import {
+  planKey as planKeyOf,
   parsePlanRunState,
   parsePlanStages,
   parseSparringOutcome,
@@ -84,6 +85,18 @@ export interface PlanRunSnapshot {
   /** Stable identity across reloads: `plan:<state file path>`. */
   id: string;
   location: SparringLocation;
+  /**
+   * This run *instance*'s key: which execution of {@link planKey}'s document
+   * it is, and the namespace its stage ids carry. Read from the state file's
+   * `run` field, falling back to its name — which is what a run recorded
+   * before run instances existed is keyed by, and what its stages record as
+   * their owner.
+   *
+   * This is the run's identity. {@link planKey} is the document's, and two
+   * snapshots can share it.
+   */
+  runKey: string;
+  /** The plan *document*'s key: what declarations and history are grouped by. */
   planKey: string;
   statePath: string;
   stateMtimeMs: number;
@@ -330,7 +343,13 @@ async function discoverPlanRuns(location: SparringLocation, problems: Discovery[
 async function snapshotPlanRun(location: SparringLocation, statePath: string): Promise<PlanRunSnapshot> {
   const [text, stat] = await Promise.all([fs.readFile(statePath, "utf8"), fs.stat(statePath)]);
   const state = parsePlanRunState(text);
-  const planKey = path.basename(statePath, ".json");
+  // The file name is the run key for every run ever written: new runs are
+  // filed under theirs, and a run recorded before run instances existed is
+  // filed under its plan key, which *is* its run key. `state.run` is
+  // preferred anyway, so a copied or renamed file cannot make a run answer
+  // for another run's stages.
+  const runKey = state.run ?? path.basename(statePath, ".json");
+  const planKey = planKeyOf(state.plan);
   const planPath = resolvePlanPath(state.plan, location.repoRoot);
 
   let planStages: PlanStageHeading[] | undefined;
@@ -346,7 +365,7 @@ async function snapshotPlanRun(location: SparringLocation, statePath: string): P
     // makes of the rest of it: a plan that carries handoff records is refused
     // as a stage list and still has a name a person recognises.
     try {
-      planStages = parsePlanStages(planText, planKey);
+      planStages = parsePlanStages(planText, runKey);
       if (planStages.length === 0) {
         planStages = undefined;
         planError = "plan declares no stages";
@@ -376,8 +395,9 @@ async function snapshotPlanRun(location: SparringLocation, statePath: string): P
 
   return {
     kind: "plan",
-    id: runIdFor(location, "plan", planKey),
+    id: runIdFor(location, "plan", runKey),
     location,
+    runKey,
     planKey,
     statePath,
     stateMtimeMs: stat.mtimeMs,
@@ -426,7 +446,10 @@ async function discoverStandaloneStages(location: SparringLocation, planRuns: Pl
   const claimed = new Set<string>();
   const prefixes: string[] = [];
   for (const run of planRuns) {
-    prefixes.push(`${run.planKey}-stage-`);
+    // By run key, not plan key: a managed run's stages are namespaced by the
+    // run that owns them, and a stage of run B must not be claimed by run A
+    // merely for executing the same document.
+    prefixes.push(`${run.runKey}-stage-`);
     for (const stage of run.stages) {
       claimed.add(stage.stageId);
     }

@@ -201,10 +201,16 @@ export interface StageOrigin {
   runId: string;
 }
 
-/** The plan a manifest is being built for. */
+/** The run a manifest is being built for. */
 export interface PlanScope {
-  planKey: string;
-  /** The run id that plan's managed run has (or will have). */
+  /**
+   * The key of the run instance the manifest is for. Deliberately the run's
+   * and not the plan document's: a document can be executed more than once,
+   * and run B's manifest must not be built around run A's stages even when
+   * both run the same file.
+   */
+  runKey: string;
+  /** The run id that run has (or will have). */
   planRunId: string;
   /**
    * The person asked for an existing hand-driven sequence to be adopted
@@ -214,7 +220,7 @@ export interface PlanScope {
 }
 
 /**
- * May a manifest for `plan` be built around this stage — its id, and the
+ * May a manifest for this *run* be built around this stage — its id, and the
  * brief it actually ran against?
  *
  * This is the question that produced the reported bug, and it was being
@@ -224,33 +230,34 @@ export interface PlanScope {
  * plan's `stage-1-…`/`stage-2-…`/`stage-3-…` unambiguously, and so the new
  * plan's manifest was built around three already-ACCEPTED stages. The run
  * then completed without executing anything. Locating a stage in a document
- * says the words line up; it does not say the work is this plan's.
+ * says the words line up; it does not say the work is this run's.
  *
  * So membership is shown, in this order:
  *
- *  1. the engine's own record. `state.json`'s `plan` is written when a
+ *  1. the engine's own record. `state.json`'s `run` is written when a
  *     managed run creates or deliberately adopts a stage, and it is the only
  *     thing that can settle which of two same-named stages this is. Present
- *     means decided — for this plan, or against it.
- *  2. this plan's own managed run. A run started before ownership was
- *     recorded has stages that read back unowned, but the run state itself
- *     establishes that they are its.
- *  3. this plan's id namespace, for a stage an older engine created without
- *     recording an owner. Only this plan generates ids under its own key
- *     (`plan_key` is a digest of the plan's label), so this claims nothing
- *     about another plan's stages — unlike the prefix rule this module
- *     dropped for *display* membership, which claimed a plan run had
- *     executed stages it never had.
+ *     means decided — for this run, or against it.
+ *  2. this run itself. A run started before ownership was recorded has
+ *     stages that read back unowned, but the run state itself establishes
+ *     that they are its.
+ *  3. this run's id namespace, for a stage an older engine created without
+ *     recording an owner. Only this run generates ids under its own key, so
+ *     this claims nothing about another run's stages — unlike the prefix
+ *     rule this module dropped for *display* membership, which claimed a
+ *     plan run had executed stages it never had.
  *  4. only under an explicit `adopt` request: any stage no run owns. That is
  *     what adoption is — hand-driven work, belonging to no managed run,
- *     deliberately taken into one.
+ *     deliberately taken into one. An ordinary Run Plan never asks for it.
  *
- * A stage another managed run owns is never this plan's: no branch returns
- * true for one, and the engine refuses it outright as well.
+ * A stage another managed run owns is never this run's — including a run of
+ * the same plan document, which is the reason every comparison here is
+ * against a run key and not a plan key. No branch returns true for one, and
+ * the engine refuses it outright as well.
  */
 export function stageBelongsToPlan(stage: StageOrigin, plan: PlanScope): boolean {
   if (stage.owner) {
-    return stage.owner === plan.planKey;
+    return stage.owner === plan.runKey;
   }
-  return stage.runId === plan.planRunId || stage.stageId.startsWith(`${plan.planKey}-`) || plan.adopt;
+  return stage.runId === plan.planRunId || stage.stageId.startsWith(`${plan.runKey}-`) || plan.adopt;
 }

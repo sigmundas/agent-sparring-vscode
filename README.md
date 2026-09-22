@@ -343,8 +343,10 @@ finds as a stop rather than as work to do, and completes the stage over the
 commit it reviewed instead of manufacturing one. Nothing is merged.
 
 Both kinds of declaration are scoped to the **worktree** they were made in, as
-well as to the plan and the stage. A plan key is a hash of the plan's
-repo-relative path, so every checkout of the same plan shares one, and keying
+well as to the plan and the stage. They are keyed by the *plan document*
+rather than by the run, so a second run of the same plan inherits what you
+declared about its stages. A plan key is a hash of the plan's repo-relative
+path, so every checkout of the same plan shares one, and keying
 by plan alone meant a declaration made in one worktree changed what another
 worktree executed — and, through the run digest the engine folds it into,
 whether that worktree's in-flight run could continue at all. Declarations made
@@ -682,21 +684,58 @@ and, when work exists elsewhere, a line naming where: *Agent Sparring has also
 discovered 1 in sporely-py-reported-statistics.* Nothing is started, adopted
 or created on your behalf.
 
-**Pinning.** Picking a row in **Select repository / run…** *pins* it. A pin is
-kept even when the window moves to another repository — that is what makes
+**Starting work, and looking at history, are two controls.** The repository
+line carries both:
+
+> Following repository: **sporely-py-reported-statistics**
+> \[ Run Plan ] \[ History / Runs… ]
+
+**Run Plan** is the ordinary workflow and asks for what it needs, in order:
+which repository, then which plan document. It then starts a **new run** of
+that plan — see "Every Run Plan is a new run" below — so starting work never
+goes by way of a list of finished runs. **History / Runs…** is that list: the
+recorded runs, including completed ones, to pin and inspect.
+
+**Pinning.** Picking a row in **History / Runs…** *pins* it. A pin is kept
+even when the window moves to another repository — that is what makes
 inspecting a finished run in another checkout possible — and both repositories
 are then named at the top, with the way out beside them:
 
 > 📌 Viewing pinned run from: **sporely-py-reported-statistics**
 > Active repository context: **sporely-py-inaturalist-republish-media**
-> \[ Select repository / run… ] \[ Follow active repository ]
+> \[ Run Plan ] \[ History / Runs… ] \[ Follow active repository ]
 
 Both lines appear whenever a pin is in force, including when the pin is in the
 repository you are already in, so the policy reads the same way every time.
-**Select repository / run…** is on every Overview screen — with a run, without
-one, and while several look active — and `Agent Sparring: Follow Active
-Repository` is in the Command Palette. Switching context never depends on a
-gesture this extension cannot observe.
+Both controls are on every Overview screen — with a run, without one, and
+while several look active — and `Agent Sparring: Follow Active Repository` is
+in the Command Palette. Switching context never depends on a gesture this
+extension cannot observe. Starting a plan run also releases a pin, so the
+cockpit follows the work that was just started rather than the finished run it
+came after.
+
+### Every Run Plan is a new run
+
+A plan document is an *input* to a run, not the run's identity. Each run has a
+**run key** of its own (`<plan key>-<8 hex>`), and Run Plan mints one, names
+the run's stage ids with it (`<run key>-stage-1-foundation`) and passes it to
+the engine as `--run-key`.
+
+So Run Plan starts new work even when the repository, the branch and the plan
+file are the ones a previous run already finished, and even when the plan's
+sections are numbered `Stage 1` again. Fresh Stage-agent and Sparrer sessions
+start; the earlier run's accepted stages are not advanced past. Nothing has to
+be deleted from `.sparring`, no stage has to be renumbered, and no adoption
+decision is involved — adoption stays what it is for, which is taking over
+hand-driven work that belongs to no run.
+
+The one thing Run Plan will not do silently is start a second run of a plan
+whose run is still **open** — running or paused — in the same worktree, since
+two live runs would compete for the same candidate. It says so and offers to
+continue that run instead. A *completed* run never stands in the way.
+
+**Resume** means continuing one specific existing run, and is the only way
+resumption is expressed.
 
 A selection stored by a version of this extension from before pins survived a
 change of repository is **not** silently promoted to one: on first start it is
@@ -729,7 +768,7 @@ The consequence worth knowing: **using the lower-left selector alone is not
 visible to this extension.** Opening a file in the repository you switched to
 is, as is focusing it in the Source Control view — and the resolved repository
 is named at the top of the Overview precisely so a disagreement is visible
-rather than silent. **Select repository / run…** overrides it.
+rather than silent. **History / Runs…** overrides it.
 
 If the built-in Git extension is disabled, not installed, or has not activated
 yet, nothing is scoped at all and every discovered run is a candidate, exactly
@@ -748,7 +787,7 @@ roots with the same directory name are qualified by their parent
 `.sparring` project in a folder that is not a git repository, or one the Git
 extension has not opened — is never selected automatically, because showing it
 under the words *Following the active repository: B* would be a claim that it
-is B's. It stays in **Select repository / run…**, and the empty state names it.
+is B's. It stays in **History / Runs…**, and the empty state names it.
 
 ### Plan run, historical stage, plan document
 

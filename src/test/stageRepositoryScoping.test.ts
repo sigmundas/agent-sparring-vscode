@@ -26,6 +26,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { planKey } from "../core/sparringCommand";
 import { declarationScope } from "../core/declarationScope";
 import { buildManifest, manifestDigest, renderManifest } from "../core/manifest";
 import {
@@ -66,6 +67,7 @@ function built(state: StageRepositories | undefined, projectDir: string) {
   const result = buildManifest({
     markdown: PLAN,
     planLabel: PLAN_LABEL,
+    runKey: planKey(PLAN_LABEL),
     planName: "reported-statistics.md",
     repositories: manifestRepositories(repositoriesForPlan(state, PLAN_KEY, projectDir), projectDir),
   });

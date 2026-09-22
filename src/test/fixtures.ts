@@ -107,9 +107,17 @@ export class Workspace {
   }
 
   async writePlanRun(
-    planKey: string,
+    /** The run key, which is the state file's name (plan.py: `run_state_path`). */
+    runKey: string,
     state: {
       plan: string;
+      /**
+       * This run instance's own key (plan.py: `PlanRunState.run`). Written
+       * only when given: a run recorded before run instances existed omits
+       * the field and is keyed by its file name, and that case has to be
+       * reproducible here.
+       */
+      run?: string;
       status: "running" | "paused" | "complete";
       current_stage_index: number;
       current_stage: string;
@@ -125,7 +133,7 @@ export class Workspace {
   ): Promise<string> {
     const dir = path.join(this.sparringDir, "plans");
     await fs.mkdir(dir, { recursive: true });
-    const file = path.join(dir, `${planKey}.json`);
+    const file = path.join(dir, `${runKey}.json`);
     const payload = {
       current_stage: state.current_stage,
       current_stage_index: state.current_stage_index,
@@ -133,6 +141,7 @@ export class Workspace {
       plan: state.plan,
       plan_digest: "0".repeat(64),
       status: state.status,
+      ...(state.run !== undefined ? { run: state.run } : {}),
       ...(state.source ? { source: state.source } : {}),
       // Written only when the caller says so, including as an explicit null:
       // a run recorded before push authorization existed has neither key at
@@ -160,11 +169,17 @@ export class Workspace {
       base_sha: string | null;
       candidate_sha: string | null;
       /**
-       * The plan key of the managed run that owns this stage (stage.py:
-       * `StageState.plan`). Written only when given, including as an
-       * explicit null: a hand-driven stage, and every stage written before
-       * ownership existed, omits the key entirely, and that case has to be
+       * The key of the managed run instance that owns this stage (stage.py:
+       * `StageState.run`). Written only when given, including as an explicit
+       * null: a hand-driven stage, and every stage written before ownership
+       * existed, omits the key entirely, and that case has to be
        * reproducible here.
+       */
+      run: string | null;
+      /**
+       * The older spelling of the same field, which held a *plan* key. Kept
+       * so a test can write a stage exactly as it exists on disk today and
+       * check that it still reads back as that plan's legacy run's stage.
        */
       plan: string | null;
     }> = {},
@@ -172,7 +187,7 @@ export class Workspace {
   ): Promise<string> {
     const dir = this.stageDir(stageId);
     await fs.mkdir(dir, { recursive: true });
-    const { plan, ...rest } = state;
+    const { run, plan, ...rest } = state;
     const payload = {
       base_sha: null,
       candidate_sha: null,
@@ -180,6 +195,7 @@ export class Workspace {
       sparring_session_id: null,
       status: "working",
       ...rest,
+      ...(run !== undefined ? { run } : {}),
       ...(plan !== undefined ? { plan } : {}),
     };
     await fs.writeFile(path.join(dir, "state.json"), JSON.stringify(payload, null, 2) + "\n");

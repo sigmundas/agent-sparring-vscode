@@ -114,7 +114,7 @@ export class ManifestReader {
 
     const others = peers.filter((peer) => !sameOwner(peer, run)).map((peer) => manifestExpectationFor(peer));
     const attempts: { file: string; parsed: ParsedManifest | undefined }[] = [{ file: current, parsed }];
-    for (const name of previousManifestFileNames(run.planKey, run.location.projectDir)) {
+    for (const name of previousManifestFileNames(run.runKey, run.location.projectDir)) {
       attempts.push({ file: path.join(directory, name), parsed: await readCached(this.manifests, path.join(directory, name), (text) => parseExecutionManifest(text)) });
     }
 
@@ -132,12 +132,12 @@ export class ManifestReader {
         best = { binding: bound, file, derived: false };
       }
     }
-    return best ?? { binding: bindParsedManifest(parsed, binding, expect), file: manifestFileName(run.planKey, run.location.projectDir), derived: false };
+    return best ?? { binding: bindParsedManifest(parsed, binding, expect), file: manifestFileName(run.runKey, run.location.projectDir), derived: false };
   }
 }
 
 function sameOwner(a: ManifestRun, b: ManifestRun): boolean {
-  return a.planKey === b.planKey && path.resolve(a.location.projectDir) === path.resolve(b.location.projectDir);
+  return a.runKey === b.runKey && path.resolve(a.location.projectDir) === path.resolve(b.location.projectDir);
 }
 
 export type { ManifestExpectation };

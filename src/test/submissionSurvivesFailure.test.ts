@@ -38,6 +38,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import { planKey } from "../core/sparringCommand";
 import { discoverRuns, selectRun } from "../core/discovery";
 import { HUMAN_GATE_MARKER } from "../core/engineFormats";
 import { humanChecksFor, humanFeedbackFor, withHumanCheck, withHumanFeedback, type CheckRecord } from "../core/humanChecks";
@@ -328,7 +329,7 @@ const WITH_HANDOFF = [
   "",
 ].join("\n");
 
-const INPUT = { planLabel: PLAN_LABEL, planName: "reported-statistics.md" };
+const INPUT = { planLabel: PLAN_LABEL, runKey: planKey(PLAN_LABEL), planName: "reported-statistics.md" };
 
 function built(markdown: string, known: KnownStage[] = []): ExecutionManifest {
   const result = buildManifest({ markdown, ...INPUT, known });

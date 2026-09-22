@@ -151,7 +151,7 @@ describe("moving a run's manifest to its scoped name", () => {
     const body = /async function writeManifestFile\([\s\S]*?\n}\n/.exec(source)?.[0] ?? "";
     assert.ok(body, "writeManifestFile exists");
     assert.match(body, /readOptional\(file\)/, "the scoped file is the first source of provenance");
-    assert.match(body, /for \(const name of previousManifestFileNames\(owner\.planKey, owner\.location\.projectDir\)\)/, "and every name manifests were written under before is the fallback");
+    assert.match(body, /for \(const name of previousManifestFileNames\(owner\.runKey, owner\.location\.projectDir\)\)/, "and every name manifests were written under before is the fallback");
     assert.match(body, /carriedForward\(manifest, previous\)/, "which is then carried forward rather than re-hashed");
     assert.ok(!/fs\.writeFile\(path\.join\(directory, name\)/.test(body), "an old name is never written to again");
 

@@ -10,6 +10,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { planKey } from "../core/sparringCommand";
 import {
   BINDING_VERSION,
   adoptionGaps,
@@ -92,7 +93,7 @@ function proposed(label: string, slug: string): string {
 }
 
 function build(known: KnownStage[] = []) {
-  return buildManifest({ markdown: PLAN, planLabel: PLAN_LABEL, planName: PLAN_NAME, known });
+  return buildManifest({ markdown: PLAN, planLabel: PLAN_LABEL, runKey: planKey(PLAN_LABEL), planName: PLAN_NAME, known });
 }
 
 describe("building an execution manifest from a human plan", () => {
@@ -123,6 +124,7 @@ describe("building an execution manifest from a human plan", () => {
     const recordOnly = buildManifest({
       markdown: `${PLAN}\n## Stage 5 handoff — 2026-09-20 (accepted)\n\nNothing defines Stage 5.\n`,
       planLabel: PLAN_LABEL,
+      runKey: planKey(PLAN_LABEL),
       planName: PLAN_NAME,
     });
     assert.ok(recordOnly.ok);
@@ -187,8 +189,8 @@ describe("building an execution manifest from a human plan", () => {
     // B is a different document in the same worktree whose sections happen
     // to be worded the same. Nothing about B may resolve to A's directories,
     // because A's accepted work is not B's Stage 1.
-    const a = buildManifest({ markdown: PLAN, planLabel: "docs/plans/a.md", planName: "a.md" });
-    const b = buildManifest({ markdown: PLAN, planLabel: "docs/plans/b.md", planName: "b.md" });
+    const a = buildManifest({ markdown: PLAN, planLabel: "docs/plans/a.md", runKey: planKey("docs/plans/a.md"), planName: "a.md" });
+    const b = buildManifest({ markdown: PLAN, planLabel: "docs/plans/b.md", runKey: planKey("docs/plans/b.md"), planName: "b.md" });
     assert.ok(a.ok && b.ok);
 
     const ids = (built: typeof a & { ok: true }) => built.manifest.stages.map((stage) => stage.stage_id);
@@ -200,7 +202,7 @@ describe("building an execution manifest from a human plan", () => {
     // And each is namespaced by its own plan, not by a random discriminator:
     // the same plan document always rebuilds to the same ids, which is what
     // lets the engine refuse a manifest that changed.
-    assert.deepEqual(ids(a), ids(buildManifest({ markdown: PLAN, planLabel: "docs/plans/a.md", planName: "a.md" }) as typeof a & { ok: true }));
+    assert.deepEqual(ids(a), ids(buildManifest({ markdown: PLAN, planLabel: "docs/plans/a.md", runKey: planKey("docs/plans/a.md"), planName: "a.md" }) as typeof a & { ok: true }));
   });
 
   it("briefs an already-executed stage from its own brief.md, and a future stage from the plan", () => {
@@ -216,6 +218,7 @@ describe("building an execution manifest from a human plan", () => {
     const built = buildManifest({
       markdown: evolved,
       planLabel: PLAN_LABEL,
+      runKey: planKey(PLAN_LABEL),
       planName: PLAN_NAME,
       known: [{ label: "3D", stageId: "stage-3d-snapshot-v2-and-attachment-export-import-transport", brief: original }],
     });
@@ -235,7 +238,7 @@ describe("building an execution manifest from a human plan", () => {
     const rewritten = PLAN.replace("## Stage 3D — Snapshot v2 and attachment/export/import transport", "## Stage 3D handoff — 2026-09-14 (candidates pushed)");
     const brief = "# Stage brief: stage-3d-snapshot-v2\n\nSnapshot v2 transport.\n";
 
-    const built = buildManifest({ markdown: rewritten, planLabel: PLAN_LABEL, planName: PLAN_NAME, known: [{ label: "3D", stageId: "stage-3d-snapshot-v2", brief }] });
+    const built = buildManifest({ markdown: rewritten, planLabel: PLAN_LABEL, runKey: planKey(PLAN_LABEL), planName: PLAN_NAME, known: [{ label: "3D", stageId: "stage-3d-snapshot-v2", brief }] });
 
     assert.ok(built.ok);
     const stage3d = built.manifest.stages.find((stage) => stage.stage_id === "stage-3d-snapshot-v2");
@@ -253,6 +256,7 @@ describe("building an execution manifest from a human plan", () => {
     const ambiguous = buildManifest({
       markdown: `${PLAN}\n## Stage 3D — Snapshot v2, revised\n\nA second definition.\n`,
       planLabel: PLAN_LABEL,
+      runKey: planKey(PLAN_LABEL),
       planName: PLAN_NAME,
       known: [{ label: "3D", stageId: "stage-3d-snapshot-v2", brief: "# Stage brief\n\nBody.\n" }],
     });
@@ -284,7 +288,7 @@ describe("building an execution manifest from a human plan", () => {
   });
 
   it("an edited plan changes the source digest even when the stage sections do not", () => {
-    const edited = buildManifest({ markdown: PLAN.replace("Prose that is not a stage.", "Edited prose."), planLabel: PLAN_LABEL, planName: PLAN_NAME });
+    const edited = buildManifest({ markdown: PLAN.replace("Prose that is not a stage.", "Edited prose."), planLabel: PLAN_LABEL, runKey: planKey(PLAN_LABEL), planName: PLAN_NAME });
     const original = build();
     assert.ok(edited.ok && original.ok);
     assert.notEqual(edited.manifest.source_digest, original.manifest.source_digest);
@@ -295,6 +299,7 @@ describe("building an execution manifest from a human plan", () => {
     const built = buildManifest({
       markdown: PLAN,
       planLabel: PLAN_LABEL,
+      runKey: planKey(PLAN_LABEL),
       planName: PLAN_NAME,
       repositories: { "3D": [{ name: "sporely-web", path: "../sporely-web-worktree", branch: "feature/cloud", candidate_sha: null }] },
     });
@@ -308,6 +313,7 @@ describe("building an execution manifest from a human plan", () => {
     const ambiguous = buildManifest({
       markdown: `${PLAN}\n## Stage 4 — Editor and UI inspection, revised\n\nA second definition.\n`,
       planLabel: PLAN_LABEL,
+      runKey: planKey(PLAN_LABEL),
       planName: PLAN_NAME,
     });
     assert.ok(!ambiguous.ok);
@@ -322,6 +328,7 @@ describe("building an execution manifest from a human plan", () => {
     const empty = buildManifest({
       markdown: ["# Plan", "", "## Stage 1 — Foundation", "", "## Stage 2 — Next", "", "Body.", ""].join("\n"),
       planLabel: PLAN_LABEL,
+      runKey: planKey(PLAN_LABEL),
       planName: PLAN_NAME,
     });
     assert.ok(!empty.ok);
@@ -329,7 +336,7 @@ describe("building an execution manifest from a human plan", () => {
   });
 
   it("refuses a plan with nothing executable in it", () => {
-    const prose = buildManifest({ markdown: "# Notes\n\nJust prose.\n", planLabel: PLAN_LABEL, planName: PLAN_NAME });
+    const prose = buildManifest({ markdown: "# Notes\n\nJust prose.\n", planLabel: PLAN_LABEL, runKey: planKey(PLAN_LABEL), planName: PLAN_NAME });
     assert.ok(!prose.ok);
     assert.match(prose.problems[0].reason, /no stage with a section to run/);
   });

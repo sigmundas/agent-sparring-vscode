@@ -9,6 +9,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import { planKey } from "../core/sparringCommand";
 import { buildManifest, renderManifest } from "../core/manifest";
 import {
   modeForStage,
@@ -36,7 +37,7 @@ const PLAN = [
 ].join("\n");
 
 function build(modes?: Record<string, "implementation" | "independent_review">) {
-  return buildManifest({ markdown: PLAN, planLabel: PLAN_LABEL, planName: PLAN_NAME, modes });
+  return buildManifest({ markdown: PLAN, planLabel: PLAN_LABEL, runKey: planKey(PLAN_LABEL), planName: PLAN_NAME, modes });
 }
 
 /** The manifest this plan builds to, as the file the engine would read. */
