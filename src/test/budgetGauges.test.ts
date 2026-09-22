@@ -7,14 +7,18 @@
  * the negative one: **a value the provider never stated must render as
  * unknown, never as zero.**
  *
- * That is not fussiness. The two providers differ — Codex reports its
- * context window and the account's rate limits, the Claude CLI reports token
- * counts and nothing else — so a design that filled the gaps would be
- * filling them for the Stage agent on every single run. A rate dial showing
- * an arc at 0% says "you have used none of your quota", which is a claim
- * about an account nobody measured; and a context ring needs a denominator
- * that would have to be guessed from a model name, where `claude-opus-5`
- * covers two models with different windows.
+ * That is not fussiness. The two providers differ — Codex states the
+ * account's rate limits and the Claude CLI does not state them at all — so a
+ * design that filled the gaps would be filling them for the Stage agent on
+ * every single run. A rate dial showing an arc at 0% says "you have used
+ * none of your quota", which is a claim about an account nobody measured.
+ *
+ * The second property, and the one that got the first version's number
+ * wrong: **the ring is how full the window is, never what the session has
+ * spent.** Both CLIs re-send the conversation on every request, so
+ * cumulative tokens pass the window several times over in an ordinary
+ * session. The two are separate fields here (`contextUsed`, `totalTokens`)
+ * and only the first is ever a numerator.
  */
 
 import assert from "node:assert/strict";
@@ -33,7 +37,8 @@ import { FOO_PLAN_KEY, FOO_PLAN_LABEL, FOO_STAGE_IDS, Workspace, event } from ".
  */
 const CODEX_FULL = foldEvents([
   event("sparrer", "provider.usage", {
-    total_tokens: 136477,
+    total_tokens: 653353,
+    context_used_tokens: 220354,
     input_tokens: 135812,
     output_tokens: 665,
     context_window: 258400,
@@ -55,12 +60,23 @@ describe("what the dials show when a provider reports everything", () => {
     const context = gauge(CODEX_FULL, "context");
 
     assert.equal(context.known, true);
-    assert.equal(context.percent, 53); // 136477 / 258400
+    assert.equal(context.percent, 85); // 220354 / 258400
     // No `value`: the ring shows its percentage, and a second number in the
     // same 36px would be two readings of one thing.
     assert.equal(context.value, undefined);
-    assert.match(context.detail, /136k of 258k tokens \(53%\)/);
+    assert.match(context.detail, /220k of 258k tokens \(85%\)/);
     assert.match(context.detail, /as this provider reported it/);
+  });
+
+  it("never draws the cumulative total as the share", () => {
+    // The session has spent 653k against a 258k window. Read as a share
+    // that is 253%, clamped to a full ring, and the dial would sit at 100%
+    // from mid-morning onwards while the window was in fact 85% full.
+    const context = gauge(CODEX_FULL, "context");
+
+    assert.equal(context.percent, 85);
+    assert.ok(!context.detail.includes("653k of"), "the spend is not a numerator");
+    assert.match(context.detail, /653k tokens spent on this session in total/, "but it is still worth reading");
   });
 
   it("names each rate window by its own length, not by a hardcoded label", () => {
@@ -75,7 +91,7 @@ describe("what the dials show when a provider reports everything", () => {
   });
 
   it("clamps a context reading at 100 rather than drawing past the ring", () => {
-    assert.equal(gauge({ totalTokens: 500, contextWindow: 100 }, "context").percent, 100);
+    assert.equal(gauge({ contextUsed: 500, contextWindow: 100 }, "context").percent, 100);
   });
 });
 
@@ -104,19 +120,19 @@ describe("what the dials show when a provider reports nothing", () => {
   });
 });
 
-describe("the Claude CLI's case: tokens, and no denominator", () => {
-  // The asymmetry that makes this feature's honesty load-bearing. Claude
-  // states counts only, so the context dial has a number to show and no
-  // share to draw, and both rate dials stay unknown.
-  const claude: ActorBudget = { inputTokens: 10, outputTokens: 5 };
+describe("the Claude CLI's case: a full ring, and no quota to show", () => {
+  // What the Stage agent's card reads on an ordinary run. The CLI states
+  // occupancy on every assistant line and the window on the final result
+  // line, so the ring is drawn from two quotations; it states no rate
+  // limits at all, so both of those stay unknown for good.
+  const claude: ActorBudget = { inputTokens: 2, outputTokens: 16, contextUsed: 181_218, contextWindow: 200_000 };
 
-  it("shows the token count but draws no arc without a stated window", () => {
+  it("draws the ring from the occupancy and the window it stated", () => {
     const context = gauge(claude, "context");
 
-    assert.equal(context.known, false, "a guessed denominator is not a measurement");
-    assert.equal(context.percent, undefined);
-    assert.equal(context.value, "15", "the count it did report is still worth reading");
-    assert.match(context.detail, /does not report the model's context size/);
+    assert.equal(context.known, true);
+    assert.equal(context.percent, 91); // 181218 / 200000
+    assert.match(context.detail, /181k of 200k tokens \(91%\)/);
   });
 
   it("leaves both rate dials unknown", () => {
@@ -124,10 +140,34 @@ describe("the Claude CLI's case: tokens, and no denominator", () => {
     assert.equal(gauge(claude, "rateWeek").known, false);
   });
 
+  it("shows the occupancy as a count before the window has been stated", () => {
+    // The window arrives on the turn's final line, so the first messages
+    // of a turn have a numerator and no denominator. That reads as a
+    // count, not as a guessed share.
+    const context = gauge({ contextUsed: 181_218 }, "context");
+
+    assert.equal(context.known, false, "a guessed denominator is not a measurement");
+    assert.equal(context.percent, undefined);
+    assert.equal(context.value, "181k");
+    assert.match(context.detail, /181k tokens in the window/);
+    assert.match(context.detail, /does not report the model's context size/);
+  });
+
+  it("says which number it is showing when only the spend is known", () => {
+    // "180k in the window" and "180k spent all session" are different
+    // facts, and a dial reading `180k` must not be ambiguous between them.
+    const context = gauge({ totalTokens: 181_218, contextWindow: 200_000 }, "context");
+
+    assert.equal(context.known, false, "a spend is not a share of the window");
+    assert.equal(context.value, "181k");
+    assert.match(context.detail, /spent on this session in total/);
+    assert.match(context.detail, /has not reported how full the window is/);
+  });
+
   it("refuses a zero window as a denominator", () => {
     // Defensive: a provider reporting `0` would otherwise divide by zero
     // and render Infinity.
-    assert.equal(gauge({ totalTokens: 10, contextWindow: 0 }, "context").known, false);
+    assert.equal(gauge({ contextUsed: 10, contextWindow: 0 }, "context").known, false);
   });
 });
 
@@ -138,12 +178,12 @@ describe("folding provider.usage out of the activity stream", () => {
     const live = foldEvents([
       event("sparrer", "session.observed", { session_id: "t1" }),
       event("sparrer", "provider.usage", { context_window: 258400, rate_limit_percent: 8, rate_limit_window_minutes: 300 }),
-      event("sparrer", "provider.usage", { total_tokens: 44085 }),
+      event("sparrer", "provider.usage", { total_tokens: 44085, context_used_tokens: 43000 }),
     ]);
 
     assert.deepEqual(
       { ...live.sparrer.budget, ts: undefined },
-      { contextWindow: 258400, primaryPercent: 8, primaryWindowMinutes: 300, totalTokens: 44085, ts: undefined },
+      { contextWindow: 258400, primaryPercent: 8, primaryWindowMinutes: 300, totalTokens: 44085, contextUsed: 43000, ts: undefined },
     );
     assert.equal(gauge(live.sparrer.budget, "context").percent, 17);
   });
@@ -242,14 +282,14 @@ describe("the markup a person actually sees", () => {
 
   it("draws an arc only for a reported number, and marks the rest unknown", async () => {
     const html = await page([
-      event("sparrer", "provider.usage", { total_tokens: 136477, context_window: 258400, rate_limit_percent: 8, rate_limit_window_minutes: 300 }),
+      event("sparrer", "provider.usage", { total_tokens: 653353, context_used_tokens: 220354, context_window: 258400, rate_limit_percent: 8, rate_limit_window_minutes: 300 }),
     ]);
 
     const context = dial(html, "sparrer", "context");
     assert.ok(!context.includes("unknown"), "a stated share is drawn");
     assert.match(context, /class="arc"/);
     assert.match(context, /stroke-dasharray/);
-    assert.match(context, />53</);
+    assert.match(context, />85</);
 
     // The same page's weekly dial was never reported, and says so.
     const week = dial(html, "sparrer", "rateWeek");
@@ -272,17 +312,25 @@ describe("the markup a person actually sees", () => {
     assert.notEqual(reportedZero, neverReported);
   });
 
-  it("greys all three of the Stage agent's dials on an ordinary Claude run", async () => {
-    // Not a contrived case: this is every run, and it is worth being blunt
-    // about. Claude reports token counts and nothing else, so both rate
-    // dials are unknown *and* so is the context ring — a count with no
-    // stated window is a numerator without a denominator. The count is
-    // still shown; only the arc is withheld.
-    const stageCard = actorCard(await page([event("stage", "provider.usage", { input_tokens: 10, output_tokens: 5 })]), "stage");
+  it("greys both of the Stage agent's rate dials on an ordinary Claude run", async () => {
+    // Not a contrived case: this is every run. The Claude CLI states no
+    // rate limits at all, so those two dials are unknown for the whole
+    // session while the context ring is drawn from its own numbers.
+    const events = [event("stage", "provider.usage", { input_tokens: 2, output_tokens: 16, context_used_tokens: 181_218, context_window: 200_000 })];
+    const stageCard = actorCard(await page(events), "stage");
 
-    assert.equal((stageCard.match(/class="gauge unknown"/g) ?? []).length, 3, "nothing Claude reports fills a ring");
-    assert.ok(!stageCard.includes('class="arc"'), "and no arc is drawn anywhere on the card");
-    assert.match(dial(await page([event("stage", "provider.usage", { input_tokens: 10, output_tokens: 5 })]), "stage", "context"), />15</, "the tokens it did report are still read");
+    assert.equal((stageCard.match(/class="gauge unknown"/g) ?? []).length, 2, "no quota was measured");
+    assert.match(dial(await page(events), "stage", "context"), />91</, "but how full the window is, is measured");
+  });
+
+  it("shows the Stage agent a count until its window has been stated", async () => {
+    // The first messages of a turn carry occupancy; the window comes on
+    // the turn's final line. Until then the dial reads as a count.
+    const stageCard = actorCard(await page([event("stage", "provider.usage", { input_tokens: 2, output_tokens: 16, context_used_tokens: 181_218 })]), "stage");
+
+    assert.equal((stageCard.match(/class="gauge unknown"/g) ?? []).length, 3);
+    assert.ok(!stageCard.includes('class="arc"'), "no arc without a denominator");
+    assert.match(stageCard, />181k</, "the tokens it did report are still read");
   });
 
   it("puts the dials beside the fields rather than under them", async () => {

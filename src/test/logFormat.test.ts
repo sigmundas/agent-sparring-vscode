@@ -25,6 +25,7 @@ describe("output channel formatting", () => {
     assert.equal(line("stage", "tool.call", { tool: "Read" }), undefined);
     assert.equal(line("stage", "command.started", { tool: "Bash" }), undefined);
     assert.equal(line("stage", "provider.result", { summary: "success, 12 turn(s)" }), undefined);
+    assert.equal(line("stage", "provider.usage", { context_used_tokens: 181218 }), undefined);
     assert.equal(line("sparrer", "command.finished", { provider: "codex-cli", tool: "shell", exit_code: 2 }), "Codex/sparrer   command exited 2");
   });
 

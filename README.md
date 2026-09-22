@@ -344,19 +344,29 @@ commit it reviewed instead of manufacturing one. Nothing is merged.
 
 #### What each agent is spending
 
-Beside Model and Effort each card carries three dials: context used, and the
-two rate-limit windows. Every number in them is a quotation from that
-provider's own output (the engine's `provider.usage` telemetry) — nothing is
-computed from a model name.
+Beside Model and Effort each card carries three dials: how full the context
+window is, and the two rate-limit windows. Every number in them is a
+quotation from that provider's own output (the engine's `provider.usage`
+telemetry) — nothing is computed from a model name.
+
+The context ring is **occupancy, not spend**. Both CLIs re-send the
+conversation on every request, so what a session has spent in total passes
+the window several times over; drawn as a share of it, every ring would sit
+full by mid-morning. The ring is the tokens the model was holding on its
+latest request, the cached prompt included, over the window that provider
+stated; the cumulative spend is in the tooltip. Claude states its occupancy
+on each assistant line and its window on the turn's final line; Codex states
+both in its own session log for the thread, which is where its rate limits
+live too — its `--json` stream carries neither.
 
 A dial the provider never reported is **greyed with no arc**, and that is
 deliberate. "Not reported" and "zero" are different facts: a rate ring drawn
 at 0% would claim you have used none of your quota, which is a measurement
-nobody took. Codex reports all three. The Claude CLI reports token counts
-only, so on an ordinary run the Stage agent's three dials are all grey — the
-context one shows the token count it did report, but draws no arc, because
-the window to divide it by would have to be guessed and `claude-opus-5`
-covers two models with different windows.
+nobody took. The Claude CLI reports no rate limits at all, so on an ordinary
+run the Stage agent's two rate dials stay grey for the whole session while
+its context ring is drawn. A dial with a numerator and no denominator —
+Claude's first messages, before the turn's final line states the window —
+reads as a count rather than as a guessed share.
 
 Both kinds of declaration are scoped to the **worktree** they were made in, as
 well as to the plan and the stage. They are keyed by the *plan document*

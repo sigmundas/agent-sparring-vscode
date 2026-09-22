@@ -68,6 +68,9 @@ describe("meaningful-event selection", () => {
     event("stage", "command.started"),
     event("stage", "command.finished", { exit_code: 0 }),
     event("stage", "provider.result"),
+    // Several a minute while a turn runs, and never a fact about the work:
+    // the numbers belong on the dials, not in the log.
+    event("stage", "provider.usage", { input_tokens: 2, output_tokens: 16 }),
     event("stage", "file.changed", { path: ".sparring/stages/x/notes.md", kind: "modify" }),
   ];
 

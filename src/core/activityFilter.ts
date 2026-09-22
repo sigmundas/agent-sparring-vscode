@@ -80,6 +80,11 @@ export function describeActivity(event: ActivityEvent): string | undefined {
       return undefined;
     case "provider.result":
       return undefined;
+    // Telemetry for the dials, several times a minute, and never a fact
+    // about the work. The numbers are on the actor cards; a line each time
+    // one ticks buries the events that do say something happened.
+    case "provider.usage":
+      return undefined;
     case "provider.error":
       return "provider error";
     // loop

@@ -984,16 +984,24 @@ function configOnlyActor(
  * The three dials, from what the provider actually said.
  *
  * The rule throughout: a gauge is `known` only when the provider stated
- * *everything* the arc needs. Tokens without a context window give a
+ * *everything* the arc needs. A token count with no context window gives a
  * readable detail and an unknown ring, because the denominator is not ours
- * to supply — the Claude CLI reports no window, and inferring one from
- * `claude-opus-5` would put a measurement's authority behind a guess.
+ * to supply — inferring one from `claude-opus-5` would put a measurement's
+ * authority behind a guess, and that name covers two different sizes.
+ *
+ * The arc is how full the window is, which is the provider's occupancy
+ * figure and never its cumulative total. Both CLIs re-send the whole
+ * conversation on every request, so a session's cumulative tokens pass the
+ * window several times over; drawn as a share of it, every dial would sit
+ * at 100% by mid-morning. The cumulative figure is still worth reading, so
+ * it goes in the tooltip.
  *
  * Always three, always in this order. A row that grows and shrinks as
  * telemetry arrives is harder to read than one with a greyed dial in it.
  */
 export function budgetGauges(budget: ActorBudget | undefined): BudgetGauge[] {
-  const used = budget?.totalTokens ?? sumTokens(budget);
+  const spent = budget?.totalTokens ?? sumTokens(budget);
+  const used = budget?.contextUsed;
   const window = budget?.contextWindow;
   const context: BudgetGauge = {
     id: "context",
@@ -1001,12 +1009,20 @@ export function budgetGauges(budget: ActorBudget | undefined): BudgetGauge[] {
     known: used !== undefined && window !== undefined && window > 0,
     detail: "Context used",
   };
+  const spentSentence = spent === undefined ? "" : ` ${compactTokens(spent)} tokens spent on this session in total.`;
   if (context.known) {
     context.percent = Math.min(100, Math.round((used! / window!) * 100));
-    context.detail = `Context: ${compactTokens(used!)} of ${compactTokens(window!)} tokens (${context.percent}%), as this provider reported it`;
-  } else if (used !== undefined) {
-    context.value = compactTokens(used);
-    context.detail = `Context: ${compactTokens(used)} tokens used. This provider does not report the model's context size, so there is nothing to show it as a share of.`;
+    context.detail = `Context: ${compactTokens(used!)} of ${compactTokens(window!)} tokens (${context.percent}%), as this provider reported it.${spentSentence}`;
+  } else if (used !== undefined || spent !== undefined) {
+    // Something was reported, but not both halves of a share. Whichever it
+    // is reads as a count, and the sentence says which count it is: "180k
+    // in the window" and "180k spent all session" are different facts and
+    // must not be shown as one.
+    context.value = compactTokens(used ?? spent!);
+    context.detail =
+      used !== undefined
+        ? `Context: ${compactTokens(used)} tokens in the window. This provider does not report the model's context size, so there is nothing to show it as a share of.${spentSentence}`
+        : `Context: ${compactTokens(spent!)} tokens spent on this session in total. This provider has not reported how full the window is, so there is no share to draw.`;
   } else {
     context.detail = "Context: this provider has not reported token usage for this session yet.";
   }

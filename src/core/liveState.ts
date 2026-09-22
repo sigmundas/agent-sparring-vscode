@@ -28,6 +28,14 @@ export interface ActorBudget {
   outputTokens?: number;
   /** The provider's own cumulative total for the session. */
   totalTokens?: number;
+  /**
+   * How full the window is right now: the tokens the model was holding
+   * on its latest request, the cached prompt included. A different fact
+   * from `totalTokens`, which only grows — every request re-sends the
+   * conversation, so a session's cumulative total passes the window
+   * several times over and is a share of nothing.
+   */
+  contextUsed?: number;
   /** The model's context size as the provider stated it. */
   contextWindow?: number;
   /** Primary rate-limit window usage, 0-100, and the window it is of. */
@@ -157,6 +165,7 @@ export function applyEvent(state: LiveState, event: ActivityEvent): LiveState {
     merge("inputTokens", stated(event.input_tokens));
     merge("outputTokens", stated(event.output_tokens));
     merge("totalTokens", stated(event.total_tokens));
+    merge("contextUsed", stated(event.context_used_tokens));
     merge("contextWindow", stated(event.context_window));
     merge("primaryPercent", stated(event.rate_limit_percent));
     merge("primaryWindowMinutes", stated(event.rate_limit_window_minutes));

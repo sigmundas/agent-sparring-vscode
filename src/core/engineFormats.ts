@@ -464,6 +464,8 @@ export interface ActivityEvent {
   input_tokens?: number;
   output_tokens?: number;
   total_tokens?: number;
+  /** How full the window is now, as against `total_tokens`, which only grows. */
+  context_used_tokens?: number;
   context_window?: number;
   rate_limit_percent?: number;
   rate_limit_window_minutes?: number;
@@ -489,6 +491,7 @@ const ACTIVITY_OPTIONAL_FIELDS = [
   "input_tokens",
   "output_tokens",
   "total_tokens",
+  "context_used_tokens",
   "context_window",
   "rate_limit_percent",
   "rate_limit_window_minutes",
