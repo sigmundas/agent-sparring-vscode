@@ -1993,7 +1993,7 @@ async function runPlanCommand(controller: SparringController, overview: Overview
   const args = buildRunPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir, runKey });
   const result = await launch(controller, location, args, "run-plan", planPath, runId);
   if (result.ok) {
-    await controller.releasePinForStartedRun(runId);
+    await controller.showStartedRun(runId);
   }
 }
 
@@ -2688,10 +2688,11 @@ async function startManagedRun(controller: SparringController, overview: Overvie
   });
   await explainLaunch(controller, result);
   if (result.ok) {
-    // The screen follows the work that was just started, rather than staying
-    // where a pin left it — typically on the finished run this new one comes
-    // after.
-    await controller.releasePinForStartedRun(runId);
+    // The screen follows the work that was just started. Automatic selection
+    // could not do this on its own: it is confined to the repository this
+    // window is following, and a run is usually started in a different
+    // checkout from the one the active editor is in.
+    await controller.showStartedRun(runId);
   }
   await overview.update();
   if (!result.ok) {

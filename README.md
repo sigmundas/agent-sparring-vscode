@@ -710,9 +710,14 @@ repository you are already in, so the policy reads the same way every time.
 Both controls are on every Overview screen — with a run, without one, and
 while several look active — and `Agent Sparring: Follow Active Repository` is
 in the Command Palette. Switching context never depends on a gesture this
-extension cannot observe. Starting a plan run also releases a pin, so the
-cockpit follows the work that was just started rather than the finished run it
-came after.
+extension cannot observe.
+
+Starting a plan run **pins that run**, so the cockpit shows the work you just
+started even though it usually lives in a different checkout from the file you
+had open. Automatic selection deliberately will not do this: it is confined to
+the repository this window is following, so that a run in another checkout
+never appears unasked — and starting one is the asking. Follow active
+repository is the way back, as for any pin.
 
 ### Every Run Plan is a new run
 

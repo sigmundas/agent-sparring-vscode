@@ -32,7 +32,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { discoverRuns, selectRun } from "../core/discovery";
+import { discoverRuns, locateAll, selectRun, type RepositoryScope } from "../core/discovery";
 import { buildManifest, manifestFileName, type KnownStage } from "../core/manifest";
 import { stageBelongsToPlan } from "../core/planMembership";
 import { newRunKey, planKey } from "../core/sparringCommand";
@@ -379,5 +379,73 @@ describe("runs recorded before run instances existed", () => {
   it("its stages are not this new run's, so a fresh run of the same document cannot take them", () => {
     const fresh = { runKey: A2, planRunId: "/repo|plan:" + A2, adopt: true };
     assert.equal(stageBelongsToPlan({ stageId: `${LEGACY}-stage-1-foundation`, owner: LEGACY, runId: "/repo|plan:" + LEGACY }, fresh), false);
+  });
+});
+
+describe("the cockpit shows the run that was just started, wherever it was started", () => {
+  /**
+   * The dogfooding report this suite gained: Run Plan was used in
+   * `sporely-py-mosaic-fix`, the engine started stage 1 of 3 in the terminal,
+   * and the cockpit went on saying *Following repository: agent-sparring* —
+   * the repository the active editor happened to be in — with the new run
+   * counted among the work discovered "elsewhere".
+   *
+   * Automatic selection cannot fix that on its own, and should not: it is
+   * deliberately confined to the repository this window is following, so that
+   * a run in another checkout never appears unasked. Starting a run *is* the
+   * asking, and the pin is what records it.
+   */
+  async function runStartedInAnotherRepository() {
+    const editing = await Workspace.create({ name: "agent-sparring" });
+    const running = await Workspace.create({ name: "sporely-py-mosaic-fix" });
+    await running.writePlan(PLAN_A_LABEL, SHARED_HEADINGS);
+    const stages = ids(PLAN_A_LABEL, A);
+    await running.writeStage(stages[0], { status: "working", run: A }, { "brief.md": `# Stage brief: ${stages[0]}\n` });
+    await running.writePlanRun(A, { plan: PLAN_A_LABEL, run: A, status: "running", current_stage_index: 0, current_stage: stages[0], source: "manifest" });
+
+    const locations = await locateAll([editing, running].map((ws) => ({ path: ws.root, name: path.basename(ws.root) })));
+    const runs = (await discoverRuns(locations)).runs;
+    const started = runs.find((run) => run.id.endsWith(`plan:${A}`))!;
+    // The window is in the repository being edited, not the one running.
+    const scope: RepositoryScope = { repoRoot: editing.root, knownRoots: [editing.root, running.root] };
+    return { runs, started, scope, locations };
+  }
+
+  it("is not selected automatically, because it is in another repository", async () => {
+    const { runs, started, scope, locations } = await runStartedInAnotherRepository();
+    const selection = selectRun(runs, undefined, undefined, scope, undefined, locations);
+
+    assert.equal(selection.selected, undefined, "the reported symptom: the cockpit stays where the window is");
+    assert.deepEqual(
+      (selection.elsewhere ?? []).map((run) => run.id),
+      [started.id],
+      "and the new run is merely counted as work elsewhere",
+    );
+  });
+
+  it("is selected once starting it pins it, with the window left where it is", async () => {
+    const { runs, started, scope, locations } = await runStartedInAnotherRepository();
+    const selection = selectRun(runs, { id: started.id, atMs: Date.now(), intent: "starting" }, undefined, scope, undefined, locations);
+
+    assert.equal(selection.selected?.id, started.id);
+    assert.equal(selection.pinned, true, "shown because it was asked for, not because the window moved");
+    assert.equal(selection.scope?.name, "agent-sparring", "and the window is still honestly named as being elsewhere");
+  });
+
+  it("a pin recorded before the engine has written the run's state is kept, not retired", async () => {
+    // The gap this exists for: `controller.launch` returns when the terminal
+    // has the command, and the engine writes `plans/<run key>.json` a moment
+    // later. A refresh landing in between must not conclude the run was
+    // deleted — which is what an ordinary pin to a missing run means.
+    const { runs, scope, locations } = await runStartedInAnotherRepository();
+    const notYet = `${planKey(PLAN_A_LABEL)}-9999eeee`;
+    const pin = { id: `${path.resolve(locations[1].projectDir)}|plan:${notYet}`, atMs: Date.now() };
+
+    const starting = selectRun(runs, { ...pin, intent: "starting" }, undefined, scope, undefined, locations);
+    assert.equal(starting.released, undefined, "the pin survives the gap");
+
+    // Any other intent means the run really is gone, and the pin is retired.
+    const following = selectRun(runs, { ...pin, intent: "follow" }, undefined, scope, undefined, locations);
+    assert.deepEqual(following.released, { id: pin.id, reason: "gone" });
   });
 });

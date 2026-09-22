@@ -655,8 +655,16 @@ export function isOpenRun(run: RunSnapshot): boolean {
  *    watch *that work*, and when the managed plan run that owns it moves on,
  *    following the plan is the continuation of the same request rather than a
  *    contradiction of it.
+ *  - `starting` — a `follow` that was recorded *before* the run existed,
+ *    because the extension had just launched it. Identical to `follow` in
+ *    every decision, with one exception: a run that is not in the discovery
+ *    yet does not release this pin, since the engine writes the run's state
+ *    a moment after the terminal is handed the command, and a refresh landing
+ *    in that gap must not conclude the run was deleted. It becomes an
+ *    ordinary `follow` the first time the run is seen, so a launch that never
+ *    produced a run does not leave a pin behind for ever.
  */
-export type PinIntent = "inspect" | "follow";
+export type PinIntent = "inspect" | "follow" | "starting";
 
 /**
  * What the user explicitly chose, when, and what choosing it meant.
@@ -738,6 +746,7 @@ export function supersedingPlanRun(
   ownership: StageOwnership,
   intent: PinIntent = "follow",
 ): PlanRunSnapshot | undefined {
+  // `starting` is a follow; see PinIntent.
   if (intent === "inspect") {
     return undefined;
   }
@@ -839,7 +848,10 @@ export function selectRun(
       // has not been located yet (a window still starting, a folder briefly
       // unreadable) must not cost someone their pin, so the pin is simply not
       // applied this pass and is kept.
-      const gone = locations.some((location) => runIdBelongsTo(pick.id, location));
+      // A pin recorded for a run that is still being started is the one
+      // case where "scanned and absent" does not mean deleted: the engine
+      // writes the run state just after the command reaches the terminal.
+      const gone = pick.intent !== "starting" && locations.some((location) => runIdBelongsTo(pick.id, location));
       return decorate({ ...selectAutomatically(inScope, stickyId), ...(gone ? { released: { id: pick.id, reason: "gone" as const } } : {}) });
     }
     const by = supersedingPlanRun(chosen, runs, pick.atMs ?? 0, ownership, pick.intent ?? "inspect");

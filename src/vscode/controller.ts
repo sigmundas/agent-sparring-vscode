@@ -429,6 +429,7 @@ export class SparringController implements vscode.Disposable {
     // is a question about recorded membership, and answering it any other way
     // is the guessing that made unrelated stages look like a plan's history.
     const ownership = stageOwnership(await this.planMemberships());
+    await this.settleStartingPin();
     this.selection = selectRun(this.discovery.runs, this.preference(), sticky, await this.repositoryScope(), ownership, this.locations);
     if (this.selection.released) {
       await this.retireReleasedPin(this.selection.released);
@@ -1264,7 +1265,7 @@ export class SparringController implements vscode.Disposable {
     return {
       id,
       atMs: this.context.workspaceState.get<number>(SELECTED_AT_KEY),
-      intent: stored === "follow" || stored === "inspect" ? stored : undefined,
+      intent: stored === "follow" || stored === "inspect" || stored === "starting" ? stored : undefined,
     };
   }
 
@@ -1325,27 +1326,51 @@ export class SparringController implements vscode.Disposable {
    * simply disagreeing with the Source Control view.
    */
   /**
-   * A new plan run has just been started, so stop holding the screen
-   * somewhere else.
+   * Show the plan run that has just been started.
    *
-   * Only a pin is released, and only one that names a different run. Nothing
-   * is pinned in its place: the run that was just started is the only *open*
-   * plan run of its repository, so ordinary automatic selection shows it as
-   * soon as the engine records it, and a second selection mechanism is not
-   * needed for that.
+   * It is pinned, with the `starting` intent, and pinning is the right
+   * mechanism rather than a heavier one: a pin is exactly "show this run
+   * whatever repository this window is in", which is what the situation
+   * needs. Automatic selection is confined to the repository the window is
+   * following, so a run started in another checkout — the ordinary case,
+   * since the plan is chosen through a repository picker and the editor is
+   * usually somewhere else — would have been classified as work
+   * `elsewhere` and never selected. Releasing an old pin, which is all this
+   * used to do, left the cockpit on whatever repository the active editor
+   * happened to be in.
    *
-   * This is what stops the cockpit from staying on a finished run while new
-   * work is running. Starting a plan is a clear statement about what the
-   * person is looking at now, and a pin taken earlier — to read that
-   * finished run's history — is not.
+   * The pin is recorded before the run exists on disk; see
+   * {@link PinIntent} for why that needs its own intent, and
+   * {@link settleStartingPin} for how it becomes an ordinary `follow`.
+   *
+   * {@link FOLLOW_ACTIVE_LABEL} is the way back, as for any pin.
    */
-  async releasePinForStartedRun(runId: string): Promise<void> {
-    const pinned = this.context.workspaceState.get<string>(SELECTED_RUN_KEY);
-    if (!pinned || pinned === runId) {
+  async showStartedRun(runId: string): Promise<void> {
+    await this.context.workspaceState.update(SELECTED_RUN_KEY, runId);
+    await this.context.workspaceState.update(SELECTED_AT_KEY, Date.now());
+    await this.context.workspaceState.update(PIN_INTENT_KEY, "starting");
+    this.log(`following the plan run just started (${runId}); it is pinned while it runs, and ${FOLLOW_ACTIVE_LABEL} goes back to following this window.`);
+    await this.refresh();
+  }
+
+  /**
+   * Turn a `starting` pin into an ordinary `follow` once its run is really
+   * there.
+   *
+   * Until this happens the pin is protected from being retired as deleted,
+   * which is right for the moment between launching the engine and the
+   * engine writing its run state — and wrong for ever after, because a
+   * launch that produced no run at all would otherwise keep the pin
+   * indefinitely.
+   */
+  private async settleStartingPin(): Promise<void> {
+    if (this.context.workspaceState.get<string>(PIN_INTENT_KEY) !== "starting") {
       return;
     }
-    this.log(`a new plan run was started, so the pin on ${pinned} is released; the cockpit follows the run you just started. ${FOLLOW_ACTIVE_LABEL} is how it goes back to following this window.`);
-    await this.chooseRun(undefined);
+    const pinned = this.context.workspaceState.get<string>(SELECTED_RUN_KEY);
+    if (pinned && this.discovery.runs.some((run) => run.id === pinned)) {
+      await this.context.workspaceState.update(PIN_INTENT_KEY, "follow");
+    }
   }
 
   async followActiveRepository(): Promise<void> {
