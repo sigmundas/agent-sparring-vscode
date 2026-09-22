@@ -22,7 +22,7 @@ import { describeRepositoryContext, emptyStateLines, emptyStateTitle, type Repos
 import { agentConfigView, providerLabel, type AgentConfigView, type ConfigRole, type EffectiveConfig } from "./effectiveConfig";
 import { parseBriefGoal, parseBriefOpening } from "./brief";
 import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
-import { activeDurationMs, formatDuration, providerDisplayName, type LiveState, type MeaningfulEvent } from "./liveState";
+import { activeDurationMs, formatDuration, providerDisplayName, type ActorBudget, type LiveState, type MeaningfulEvent } from "./liveState";
 import { DEFERRED_VERIFICATION_REQUIRED, PUSH_AUTHORIZATION_REQUIRED, obligationFailed, obligationResolved, parseHandoffBranch, type DeferredObligation, type PlanRunState, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
 import type { DeclaredRepository } from "./stageRepositories";
 import { deriveDeferredVerification, deriveVerification, draftKeyFor, HUMAN_FEEDBACK_HEADING, parseHumanEvidence, parseHumanFeedback, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
@@ -122,6 +122,42 @@ export interface ActorCard {
    * since prompt capture existed, which is an ordinary state, not an error.
    */
   prompt?: PromptView;
+  /**
+   * The budget gauges beside Model and Effort: context used, and the two
+   * rate-limit windows. Always three entries in a fixed order, so the row
+   * does not reflow as a provider starts or stops reporting; each one
+   * carries its own `known` flag and an unknown gauge renders greyed with
+   * no arc.
+   *
+   * Absent only where there is no actor at all.
+   */
+  gauges?: BudgetGauge[];
+}
+
+/**
+ * One dial. `percent` is present only when the provider stated enough to
+ * compute it, which is a stricter condition than "we have a number": a
+ * token count with no context window gives a `detail` to read but no arc
+ * to draw, because the denominator would have to be invented.
+ */
+export interface BudgetGauge {
+  /** Stable identity for styling and tests; not shown. */
+  id: "context" | "rate" | "rateWeek";
+  /** Two or three characters under the ring. */
+  label: string;
+  known: boolean;
+  /** 0-100, rounded. Absent whenever `known` is false. */
+  percent?: number;
+  /** The tooltip: what this is, and where the number came from. */
+  detail: string;
+  /**
+   * What to show inside the ring when there is no percentage — a token
+   * count the provider did report without the window to divide it by. Set
+   * only when `known` is false, because a known gauge shows its
+   * percentage; absent means there is nothing at all to show, and the
+   * dial reads as a dash.
+   */
+  value?: string;
 }
 
 /** One captured turn the caller read off disk: its index line, and the prompt file it names. */
@@ -914,7 +950,90 @@ function configOnlyActor(
     role: role === "stage" ? "Stage agent" : "Sparrer",
     configRole: role,
     provider: providerLabel(controls),
+    // No run, so nothing has been reported; three unknown dials rather
+    // than none, so the row is the same shape it will be once one starts.
+    gauges: budgetGauges(undefined),
   };
+}
+
+/**
+ * The three dials, from what the provider actually said.
+ *
+ * The rule throughout: a gauge is `known` only when the provider stated
+ * *everything* the arc needs. Tokens without a context window give a
+ * readable detail and an unknown ring, because the denominator is not ours
+ * to supply — the Claude CLI reports no window, and inferring one from
+ * `claude-opus-5` would put a measurement's authority behind a guess.
+ *
+ * Always three, always in this order. A row that grows and shrinks as
+ * telemetry arrives is harder to read than one with a greyed dial in it.
+ */
+export function budgetGauges(budget: ActorBudget | undefined): BudgetGauge[] {
+  const used = budget?.totalTokens ?? sumTokens(budget);
+  const window = budget?.contextWindow;
+  const context: BudgetGauge = {
+    id: "context",
+    label: "ctx",
+    known: used !== undefined && window !== undefined && window > 0,
+    detail: "Context used",
+  };
+  if (context.known) {
+    context.percent = Math.min(100, Math.round((used! / window!) * 100));
+    context.detail = `Context: ${compactTokens(used!)} of ${compactTokens(window!)} tokens (${context.percent}%), as this provider reported it`;
+  } else if (used !== undefined) {
+    context.value = compactTokens(used);
+    context.detail = `Context: ${compactTokens(used)} tokens used. This provider does not report the model's context size, so there is nothing to show it as a share of.`;
+  } else {
+    context.detail = "Context: this provider has not reported token usage for this session yet.";
+  }
+
+  return [context, rateGauge("rate", "5h", budget?.primaryPercent, budget?.primaryWindowMinutes), rateGauge("rateWeek", "wk", budget?.secondaryPercent, budget?.secondaryWindowMinutes)];
+}
+
+function rateGauge(id: "rate" | "rateWeek", fallbackLabel: string, percent: number | undefined, windowMinutes: number | undefined): BudgetGauge {
+  const label = windowMinutes === undefined ? fallbackLabel : compactWindow(windowMinutes);
+  if (percent === undefined) {
+    return {
+      id,
+      label,
+      known: false,
+      detail: "Rate limit: this provider does not report usage limits, so this is unknown rather than zero.",
+    };
+  }
+  const of = windowMinutes === undefined ? "its window" : `a ${compactWindow(windowMinutes, true)} window`;
+  return { id, label, known: true, percent, detail: `Rate limit: ${percent}% of ${of} used, as this provider reported it` };
+}
+
+/** Input plus output, when a provider gives those but no total of its own. */
+function sumTokens(budget: ActorBudget | undefined): number | undefined {
+  if (!budget) {
+    return undefined;
+  }
+  const parts = [budget.inputTokens, budget.outputTokens].filter((value): value is number => value !== undefined);
+  return parts.length === 0 ? undefined : parts.reduce((a, b) => a + b, 0);
+}
+
+function compactTokens(value: number): string {
+  if (value >= 1_000_000) {
+    return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}M`;
+  }
+  if (value >= 1_000) {
+    return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k`;
+  }
+  return String(value);
+}
+
+/** `300` -> `5h`, `10080` -> `7d`; `long` spells it for a sentence. */
+function compactWindow(minutes: number, long = false): string {
+  if (minutes >= 1440 && minutes % 1440 === 0) {
+    const days = minutes / 1440;
+    return long ? `${days}-day` : `${days}d`;
+  }
+  if (minutes >= 60 && minutes % 60 === 0) {
+    const hours = minutes / 60;
+    return long ? `${hours}-hour` : `${hours}h`;
+  }
+  return long ? `${minutes}-minute` : `${minutes}m`;
 }
 
 const NO_ARTIFACTS: OverviewArtifacts = { handoff: false, sparring: false, brief: false, plan: false };
@@ -2026,6 +2145,7 @@ function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveSt
     role: role === "stage" ? "Stage agent" : "Sparrer",
     configRole: role === "stage" ? "stage" : "sparring",
     provider: providerDisplayName(actor?.provider ?? (role === "stage" ? "claude-cli" : "codex-cli"), role),
+    gauges: budgetGauges(actor?.budget),
     activity,
     duration,
     sessionLabel: shortenId(sessionId),

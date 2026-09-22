@@ -14,10 +14,45 @@ import type { ActivityEvent } from "./engineFormats";
 
 export { shortId };
 
+/**
+ * What a provider last said about its own budget (`provider.usage`).
+ *
+ * Every field is optional, and `undefined` means **the provider did not
+ * say** — never zero, and never a figure derived from the model name. The
+ * two are shown differently, because a context ring drawn from a guessed
+ * window would carry a measurement's authority without being one. Codex
+ * states all of these; the Claude CLI states only the token counts.
+ */
+export interface ActorBudget {
+  inputTokens?: number;
+  outputTokens?: number;
+  /** The provider's own cumulative total for the session. */
+  totalTokens?: number;
+  /** The model's context size as the provider stated it. */
+  contextWindow?: number;
+  /** Primary rate-limit window usage, 0-100, and the window it is of. */
+  primaryPercent?: number;
+  primaryWindowMinutes?: number;
+  /** The longer window (weekly, typically). */
+  secondaryPercent?: number;
+  secondaryWindowMinutes?: number;
+  /** When the provider last stated any of the above. */
+  ts?: string;
+}
+
 export interface ActorLive {
   provider?: string;
   sessionId?: string;
   model?: string;
+  /**
+   * Merged field by field across `provider.usage` events, because one
+   * event may carry tokens and another the rate limits, and a later
+   * token-only event must not erase a context window already stated.
+   * Cleared when the session changes: these totals are per session, and
+   * carrying a finished session's context into a new one would overstate
+   * it.
+   */
+  budget?: ActorBudget;
   /** A turn started and has not yet finished/failed (as far as telemetry says). */
   busy: boolean;
   /** Timestamp of the latest turn start/resume while busy; cleared when the turn ends. */
@@ -87,6 +122,9 @@ export function applyEvent(state: LiveState, event: ActivityEvent): LiveState {
       actor.provider = event.provider;
     }
     if (event.session_id) {
+      if (actor.sessionId !== undefined && actor.sessionId !== event.session_id) {
+        actor.budget = undefined; // a different session starts a fresh context
+      }
       actor.sessionId = event.session_id;
     }
     if (event.model) {
@@ -106,6 +144,25 @@ export function applyEvent(state: LiveState, event: ActivityEvent): LiveState {
         state.recentMeaningful.splice(0, state.recentMeaningful.length - RECENT_MEANINGFUL_MAX);
       }
     }
+  }
+
+  if (event.event === "provider.usage" && actor) {
+    const budget: ActorBudget = { ...(actor.budget ?? {}), ts: event.ts };
+    const stated = (value: number | undefined) => (typeof value === "number" ? value : undefined);
+    const merge = (key: keyof ActorBudget, value: number | undefined) => {
+      if (value !== undefined) {
+        (budget as Record<string, unknown>)[key] = value;
+      }
+    };
+    merge("inputTokens", stated(event.input_tokens));
+    merge("outputTokens", stated(event.output_tokens));
+    merge("totalTokens", stated(event.total_tokens));
+    merge("contextWindow", stated(event.context_window));
+    merge("primaryPercent", stated(event.rate_limit_percent));
+    merge("primaryWindowMinutes", stated(event.rate_limit_window_minutes));
+    merge("secondaryPercent", stated(event.rate_limit_secondary_percent));
+    merge("secondaryWindowMinutes", stated(event.rate_limit_secondary_window_minutes));
+    actor.budget = budget;
   }
 
   switch (event.event) {

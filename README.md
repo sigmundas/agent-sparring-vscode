@@ -342,6 +342,22 @@ accepted candidate set with no implementation turn at all, treats a defect it
 finds as a stop rather than as work to do, and completes the stage over the
 commit it reviewed instead of manufacturing one. Nothing is merged.
 
+#### What each agent is spending
+
+Beside Model and Effort each card carries three dials: context used, and the
+two rate-limit windows. Every number in them is a quotation from that
+provider's own output (the engine's `provider.usage` telemetry) — nothing is
+computed from a model name.
+
+A dial the provider never reported is **greyed with no arc**, and that is
+deliberate. "Not reported" and "zero" are different facts: a rate ring drawn
+at 0% would claim you have used none of your quota, which is a measurement
+nobody took. Codex reports all three. The Claude CLI reports token counts
+only, so on an ordinary run the Stage agent's three dials are all grey — the
+context one shows the token count it did report, but draws no arc, because
+the window to divide it by would have to be guessed and `claude-opus-5`
+covers two models with different windows.
+
 Both kinds of declaration are scoped to the **worktree** they were made in, as
 well as to the plan and the stage. They are keyed by the *plan document*
 rather than by the run, so a second run of the same plan inherits what you

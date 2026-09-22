@@ -26,7 +26,7 @@ import {
 } from "./effectiveConfig";
 import { CHECK_OUTCOMES, isCheckKey, isDraftKey, type CheckItem, type CheckOutcome } from "./humanChecks";
 import { checkName, humanTask, splitPassCriteria } from "./humanTask";
-import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type AgentConfigSection, type BranchGuard, type ActorCard, type HistoryEntry, type OverviewModel, type PushAuthorization, type TimelineItem, type WhatsNext } from "./overviewModel";
+import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type AgentConfigSection, type BranchGuard, type ActorCard, type BudgetGauge, type HistoryEntry, type OverviewModel, type PushAuthorization, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { MatchSource } from "./planAssociation";
 import type { PromptView, PromptViewSection } from "./promptInspector";
 import type { StageRunAction } from "./runner";
@@ -1461,7 +1461,11 @@ function renderActor(card: ActorCard, controls: AgentRoleControls | undefined, c
   const statenote = notes ? `<div class="statenote">${notes}</div>` : "";
   const identity = `<div class="identity"><span class="avatar ${who}">${avatarGlyph(role)}</span>
 <div class="who"><div class="rolename ${who}">${escapeHtml(card.role)}</div><div class="provider muted">${escapeHtml(card.provider)}</div></div>${activity}</div>${statenote}`;
-  const settings = controls && configScope ? renderRoleControls(controls, configScope) : "";
+  const dials = renderGauges(card.gauges);
+  // The dials sit beside Model and Effort rather than under them, and they
+  // are drawn even where there is nothing to configure: what a provider is
+  // spending is worth seeing on a card that offers no controls too.
+  const settings = controls && configScope ? renderRoleControls(controls, configScope, dials) : dials ? `<div class="agentconfig-block">${dials}</div>` : "";
   const body = `${identity}${settings}`;
   // No captured prompt means the engine has not run a turn for this actor
   // since prompt capture existed. An ordinary state, so the card simply
@@ -1640,11 +1644,57 @@ function whoClass(name: string): string {
  * host never has to infer which repository a change was meant for from
  * whatever happens to be selected when it arrives.
  */
-function renderRoleControls(role: AgentRoleControls, scope: string): string {
+function renderRoleControls(role: AgentRoleControls, scope: string, dials = ""): string {
   const attrs = `data-role="${escapeHtml(role.role)}" data-scope="${escapeHtml(scope)}"`;
   const items = [...(role.provider.options ? [role.provider] : []), role.model, ...(role.effort ? [role.effort] : [])];
   const rows = items.map((item) => field(item.label, control(item, attrs))).join("");
-  return `<div class="agentconfig-block">${rows}</div>`;
+  // Fields left, dials right. The fields column is what gives way when the
+  // card is narrow, because a truncated dropdown is still usable and a
+  // squashed dial is not readable at all.
+  return `<div class="agentconfig-block"><div class="agentconfig-fields">${rows}</div>${dials}</div>`;
+}
+
+/**
+ * The budget dials: context used, and the two rate-limit windows.
+ *
+ * A known gauge draws its arc; an unknown one draws the track alone, greyed,
+ * with an en dash where the number would be. That difference is the point of
+ * the whole feature. "The provider did not report this" and "the provider
+ * reported zero" are different facts, and a dial that renders them alike
+ * would invite someone to act on a limit they have no reading for — which is
+ * exactly the mistake a full-looking context ring would cause.
+ *
+ * Inline SVG rather than a canvas or an image: it inherits `currentColor`,
+ * so both themes are handled by the stylesheet, and it needs no script.
+ */
+function renderGauges(gauges: readonly BudgetGauge[] | undefined): string {
+  if (!gauges || gauges.length === 0) {
+    return "";
+  }
+  return `<div class="gauges">${gauges.map(renderGauge).join("")}</div>`;
+}
+
+/** Circumference of the r=14 ring below, so the arc is set by dash length. */
+const GAUGE_CIRCUMFERENCE = 2 * Math.PI * 14;
+
+function renderGauge(gauge: BudgetGauge): string {
+  const known = gauge.known && gauge.percent !== undefined;
+  // The arc is drawn from the top and clockwise (the -90deg rotation), so a
+  // small percentage reads as a small slice rather than as a gap.
+  const arc = known
+    ? `<circle class="arc" cx="18" cy="18" r="14" stroke-dasharray="${((gauge.percent! / 100) * GAUGE_CIRCUMFERENCE).toFixed(2)} ${GAUGE_CIRCUMFERENCE.toFixed(2)}" transform="rotate(-90 18 18)"></circle>`
+    : "";
+  // Inside the ring: the percentage when there is one, otherwise whatever
+  // the provider did report (a token count with no window to divide it by),
+  // otherwise a dash. The dial stays greyed either way — a number here is
+  // not a share, and the tooltip says which it is.
+  const reading = known ? `${gauge.percent}` : (gauge.value ?? "–");
+  return `<div class="gauge${known ? "" : " unknown"}" data-gauge="${gauge.id}" title="${escapeHtml(gauge.detail)}">
+<svg viewBox="0 0 36 36" aria-hidden="true"><circle class="track" cx="18" cy="18" r="14"></circle>${arc}</svg>
+<span class="reading">${reading}</span>
+<span class="gaugelabel">${escapeHtml(gauge.label)}</span>
+<span class="sr">${escapeHtml(gauge.detail)}</span>
+</div>`;
 }
 
 function field(label: string, input: string): string {
@@ -1855,14 +1905,17 @@ pre.engineerror { margin: 6px 0 0; padding: 6px 8px; max-height: 9em; overflow: 
 .agentconfig-role { display: flex; align-items: baseline; gap: 8px; font-size: 0.92em; }
 .agentconfig-role .muted { min-width: 8.5em; }
 .agentconfig-value { font-weight: 600; overflow-wrap: anywhere; }
-.agentconfig-block { margin: 6px 0 2px; }
+.agentconfig-block { margin: 6px 0 2px; display: flex; align-items: flex-start; gap: 12px; }
+.agentconfig-fields { flex: 1; min-width: 0; }
 .agentconfig-field { display: flex; align-items: center; gap: 8px; margin-top: 3px; font-size: 0.9em; }
 .agentconfig-field > .muted { min-width: 5.5em; }
 /* Only a chooser is drawn as a control. It is the platform's own select,
    filled and with its own chevron, so the one thing on the card that can be
    changed here looks like the one thing that can be changed here. */
 .agentconfig-field select {
-  flex: 1; min-width: 0; padding: 2px 4px; font: inherit; font-size: 0.95em;
+  /* Narrower than the row now that the dials share it: the levels are one
+     short word each, so the box never needed the card's full width. */
+  flex: 0 1 9.5em; min-width: 0; padding: 2px 4px; font: inherit; font-size: 0.95em;
   color: var(--vscode-input-foreground); background: var(--vscode-input-background);
   border: 1px solid var(--vscode-input-border, var(--line)); border-radius: 3px;
 }
@@ -1874,6 +1927,28 @@ pre.engineerror { margin: 6px 0 0; padding: 6px 8px; max-height: 9em; overflow: 
 /* The absence of an override is not a value, so it never borrows a value's
    weight. */
 .agentconfig-fixed.novalue { font-weight: 400; font-style: italic; color: var(--vscode-descriptionForeground); }
+
+/* The budget dials. A fixed three-across row, so it does not reflow as a
+   provider starts or stops reporting a number. */
+.gauges { display: flex; gap: 6px; flex: 0 0 auto; }
+.gauge { position: relative; width: 38px; display: flex; flex-direction: column; align-items: center; }
+.gauge svg { width: 36px; height: 36px; display: block; }
+.gauge circle { fill: none; stroke-width: 3.5; }
+.gauge .track { stroke: var(--line); }
+.gauge .arc { stroke: currentColor; stroke-linecap: round; }
+/* The number sits inside the ring; the label under it. */
+.gauge .reading { position: absolute; top: 11px; font-size: 0.72em; font-weight: 600; line-height: 1; font-variant-numeric: tabular-nums; }
+.gauge .gaugelabel { margin-top: 1px; font-size: 0.68em; color: var(--vscode-descriptionForeground); }
+/* Unreported, not zero: no arc at all, and the whole dial reads as inactive
+   so it is never mistaken for a measurement of nothing. */
+.gauge.unknown { opacity: 0.45; }
+/* The ring and its two characters mean nothing read aloud, so each dial
+   carries its own sentence for a screen reader; the title attribute is a
+   pointer affordance and is not a substitute. */
+.gauge .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.gauge.unknown .reading { font-weight: 400; color: var(--vscode-descriptionForeground); }
+.card.actor.claude .gauge .arc { stroke: var(--claude); }
+.card.actor.codex .gauge .arc { stroke: var(--codex); }
 
 /* The freeform channel: beside the checks, never inside one of them. */
 .feedback { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }

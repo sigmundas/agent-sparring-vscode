@@ -451,6 +451,24 @@ export interface ActivityEvent {
   resumed?: boolean;
   parent_id?: string;
   tool_use_id?: string;
+  /**
+   * What the provider said about its own budget, on `provider.usage`
+   * (activity.py). Every one is optional and every one is a quotation:
+   * Codex states all of them, the Claude CLI states only the token counts.
+   *
+   * `undefined` means the provider did not say, and it must not be read as
+   * zero. Nothing here may be filled in from a model name — a context
+   * window guessed that way is an invention with a measurement's
+   * authority.
+   */
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  context_window?: number;
+  rate_limit_percent?: number;
+  rate_limit_window_minutes?: number;
+  rate_limit_secondary_percent?: number;
+  rate_limit_secondary_window_minutes?: number;
 }
 
 const ACTIVITY_OPTIONAL_FIELDS = [
@@ -468,6 +486,14 @@ const ACTIVITY_OPTIONAL_FIELDS = [
   "resumed",
   "parent_id",
   "tool_use_id",
+  "input_tokens",
+  "output_tokens",
+  "total_tokens",
+  "context_window",
+  "rate_limit_percent",
+  "rate_limit_window_minutes",
+  "rate_limit_secondary_percent",
+  "rate_limit_secondary_window_minutes",
 ] as const;
 
 /**
