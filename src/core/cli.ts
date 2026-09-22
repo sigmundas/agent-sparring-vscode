@@ -152,13 +152,43 @@ export function buildResumePlanArgs(invocation: ResumePlanInvocation): string[] 
   return args;
 }
 
+/** Reopen the run's current stage to repair a deferred check that failed. */
+export interface ReopenStageInvocation extends PlanInvocation {
+  /** As for a resume: the kind the run is recorded as, and it must agree. */
+  source: PlanRunSource;
+  /**
+   * The asking to repair, not the stage. What failed is a question, and the
+   * engine resolves the stage from it — so a surface rendered from an older
+   * state cannot ask to reopen a stage over a question the run has since
+   * replaced.
+   */
+  gateInstanceId: string;
+}
+
+export function buildReopenStageArgs(invocation: ReopenStageInvocation): string[] {
+  requireRecordedInputKind(invocation);
+  // No `--run-key`: the command takes none. The engine finds the run from the
+  // asking, which belongs to exactly one of the document's runs, and that is
+  // a stronger identification than a key this surface would have to supply.
+  return [
+    ...globalArgs(invocation),
+    "reopen-stage",
+    invocation.gateInstanceId,
+    ...planInput(invocation),
+    "--repo-root",
+    invocation.repoRoot,
+    "--expected-branch",
+    invocation.expectedBranch,
+  ];
+}
+
 /**
  * The input kind of a resume must be the recorded one. Not a warning and not
  * a fallback: building the command at all is refused, because the engine
  * would refuse the run and the person would be left with a plan that cannot
  * be continued by any button.
  */
-function requireRecordedInputKind(invocation: ResumePlanInvocation): void {
+function requireRecordedInputKind(invocation: PlanInvocation & { source: PlanRunSource }): void {
   const given: PlanRunSource = invocation.manifest ? "manifest" : "markdown";
   if (given === invocation.source) {
     return;

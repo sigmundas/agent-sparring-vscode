@@ -410,6 +410,35 @@ continues it instead of starting a second one.
 unchanged, for when you want to look before every provider turn. In automatic
 mode those actions are still there, just no longer the obvious path.
 
+## When a deferred check fails
+
+At the plan's verification checkpoint every stage is already accepted, and
+only a Pass settles a check the reviewers deferred. So recording a Fail and
+resuming does exactly what the engine says and no more: the answer is written
+into the stage that raised it, and the run stops again on the same question.
+Correct — the plan is not verified — but not a route anywhere, and the route
+must not be to make the check pass by hand.
+
+So once something here has been reported failing, the panel offers **Reopen
+stage to fix this** beside the submit action. It runs `sparring reopen-stage`,
+which puts the raising stage back from accepted to in progress, keeping its
+candidate commit, both agents' sessions and its notes, and withdraws the
+asking that failed. The stage agent reads the Fail first, because the engine
+wrote it into that stage's `notes.md` when it was recorded. The plan does not
+continue by itself; resume it when you are ready.
+
+The button is addressed by the **asking**, never the stage: a panel rendered
+from an older state cannot reopen a stage over a question the run has since
+replaced, and the engine refuses one it is no longer stopped on.
+
+It is shown whenever something has failed, and disabled with the reason when
+the engine would refuse it — most importantly when an **earlier** stage raised
+the failing check. The stages after it were accepted on top of its acceptance,
+so reopening it would rewrite their history; that repair belongs in a
+follow-up stage, and the button says so rather than going quiet. Knowing which
+of those two situations you are in is not guessable from anything else on the
+panel, which is why the offer is never simply hidden.
+
 ## Push authorization
 
 Acceptance only ever freezes a commit that is already on its intended remote

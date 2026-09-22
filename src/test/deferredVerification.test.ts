@@ -17,7 +17,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { buildResumePlanArgs } from "../core/cli";
+import { buildReopenStageArgs, buildResumePlanArgs } from "../core/cli";
 import { discoverRuns, selectRun } from "../core/discovery";
 import { DEFERRED_GATE_MARKER, DEFERRED_VERIFICATION_REQUIRED, obligationFailed, obligationResolved, parseDeferredHumanGate, parsePlanRunState, parseSparringOutcome } from "../core/engineFormats";
 import { draftKeyFor, EXCERPT_MAX_LENGTH } from "../core/humanChecks";
@@ -439,5 +439,139 @@ describe("addressing an answer back to the engine", () => {
     assert.ok(args.includes(`${INSTANCE_1}:c=blocked=no device here`));
     const plain = buildResumePlanArgs({ planPath: "docs/plans/foo.md", repoRoot: "/repo", sparringDir: "/repo/.sparring", expectedBranch: "feature/x", source: "markdown" });
     assert.ok(!plain.includes("--deferred-result"));
+  });
+});
+
+/**
+ * Repairing a check that failed.
+ *
+ * Only a Pass settles an obligation, and the engine's run loop skips
+ * accepted stages — so at this checkpoint, where every stage is accepted,
+ * reporting a Fail records the answer and stops again on the same question.
+ * That is honest (the plan is not verified) but it is not a way forward, and
+ * the way forward must not be to make the check pass by hand. So the panel
+ * offers the one action here that is not an answer: put the raising stage
+ * back to work on it.
+ *
+ * The offer is shown whenever something has failed, enabled or disabled with
+ * the reason, because which of the two situations a person is in — repairable
+ * here, or belongs in a follow-up stage — is not guessable from anything else
+ * on screen.
+ */
+describe("repairing a deferred check that failed", () => {
+  /** A checkpoint whose failing check was raised by the run's *current* stage. */
+  async function raisedByCurrent(outcome: "fail" | "blocked" | "pass" = "fail") {
+    const ws = await Workspace.create();
+    await ws.writePlan(FOO_PLAN_LABEL, FOO_PLAN_MARKDOWN);
+    await ws.writePlanRun(FOO_PLAN_KEY, {
+      plan: FOO_PLAN_LABEL,
+      status: "paused",
+      current_stage_index: 2,
+      current_stage: STAGE_3,
+      awaiting: { kind: DEFERRED_VERIFICATION_REQUIRED, reason: "plan_completion", instance_ids: [INSTANCE_1] },
+      deferred_human_checks: [
+        obligation(STAGE_3, INSTANCE_1, "mosaic-live-sync", "Confirm live convergence", RATIONALE_1, [
+          { check_id: "mosaic-live-sync", outcome, note: "still no mosaic images" },
+        ]),
+      ],
+    });
+    for (const stageId of [STAGE_1, STAGE_2, STAGE_3]) {
+      await ws.writeStage(stageId, { status: "accepted", candidate_sha: "a".repeat(40) });
+    }
+    return render(ws);
+  }
+
+  it("offers reopening the stage that raised the failing check", async () => {
+    const { model, html } = await raisedByCurrent();
+    const repair = model.actionRequired!.repair!;
+    assert.equal(repair.enabled, true);
+    assert.equal(repair.instanceId, INSTANCE_1);
+    assert.equal(repair.stageId, STAGE_3);
+    // Addressed by the asking, because that is what failed and what the
+    // engine resolves the stage from.
+    assert.match(repair.detail, /reopen-stage/);
+    assert.match(repair.detail, /candidate commit, both agents' sessions and its notes are kept|candidate, both agents' sessions and its notes are kept/);
+    assert.match(html, /Reopen stage to fix this/);
+  });
+
+  it("says the repair belongs in a follow-up stage when an earlier stage raised it", async () => {
+    // Stage 1 deferred, and stages 2 and 3 were accepted on top of it.
+    // Reopening stage 1 would rewrite the history they were accepted on, so
+    // the engine refuses — and the panel says so instead of going quiet.
+    const { model, html } = await atCheckpoint({ results: [{ check_id: "resize-readability", outcome: "fail", note: "labels overlap" }] });
+    const repair = model.actionRequired!.repair!;
+    assert.equal(repair.enabled, false);
+    assert.equal(repair.stageId, STAGE_1);
+    assert.match(repair.detail, /follow-up stage/);
+    assert.match(repair.detail, /stays recorded in that stage's notes\.md/);
+    // Still rendered, so the person can read why.
+    assert.match(html, /Reopen stage to fix this/);
+  });
+
+  it("is not offered at all when nothing has been reported failing", async () => {
+    for (const outcome of ["pass", "blocked"] as const) {
+      const { model, html } = await raisedByCurrent(outcome);
+      assert.equal(model.actionRequired?.repair, undefined, outcome);
+      assert.ok(!html.includes("Reopen stage to fix this"), outcome);
+    }
+    const untouched = await atCheckpoint();
+    assert.equal(untouched.model.actionRequired?.repair, undefined, "nothing answered yet");
+  });
+
+  it("prefers a failure the engine would accept over an older one it would refuse", async () => {
+    // A checkpoint can hold both: stage 1's old failure, and the current
+    // stage's. Offering the refusable one would tell the person there is no
+    // route when there is.
+    const ws = await Workspace.create();
+    await ws.writePlan(FOO_PLAN_LABEL, FOO_PLAN_MARKDOWN);
+    await ws.writePlanRun(FOO_PLAN_KEY, {
+      plan: FOO_PLAN_LABEL,
+      status: "paused",
+      current_stage_index: 2,
+      current_stage: STAGE_3,
+      awaiting: { kind: DEFERRED_VERIFICATION_REQUIRED, reason: "plan_completion", instance_ids: [INSTANCE_1, INSTANCE_2] },
+      deferred_human_checks: [
+        obligation(STAGE_1, INSTANCE_1, "resize-readability", "Check readability", RATIONALE_1, [
+          { check_id: "resize-readability", outcome: "fail", note: "overlaps" },
+        ]),
+        obligation(STAGE_3, INSTANCE_2, "mosaic-live-sync", "Confirm convergence", RATIONALE_2, [
+          { check_id: "mosaic-live-sync", outcome: "fail", note: "no images" },
+        ]),
+      ],
+    });
+    for (const stageId of [STAGE_1, STAGE_2, STAGE_3]) {
+      await ws.writeStage(stageId, { status: "accepted", candidate_sha: "a".repeat(40) });
+    }
+    const { model } = await render(ws);
+    const repair = model.actionRequired!.repair!;
+    assert.equal(repair.stageId, STAGE_3);
+    assert.equal(repair.enabled, true);
+  });
+
+  it("builds the engine command from the asking, with no run key", () => {
+    const args = buildReopenStageArgs({
+      source: "markdown",
+      planPath: "docs/plan.md",
+      repoRoot: "/repo",
+      expectedBranch: "feature/x",
+      gateInstanceId: INSTANCE_1,
+    });
+    assert.deepEqual(args, ["reopen-stage", INSTANCE_1, "docs/plan.md", "--repo-root", "/repo", "--expected-branch", "feature/x"]);
+  });
+
+  it("refuses to build a reopen from the wrong kind of plan input", () => {
+    // The same rule as a resume: the engine refuses a run continued from a
+    // different kind of input, so the command is never built.
+    assert.throws(
+      () =>
+        buildReopenStageArgs({
+          source: "manifest",
+          planPath: "docs/plan.md",
+          repoRoot: "/repo",
+          expectedBranch: "feature/x",
+          gateInstanceId: INSTANCE_1,
+        }),
+      /refusing to build a resume from a markdown one/,
+    );
   });
 });

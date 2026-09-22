@@ -54,6 +54,7 @@ export type OverviewAction =
   | "openPlanRun"
   | "openPlanSection"
   | "submitForReview"
+  | "reopenStage"
   | "sendFeedbackForReview"
   | "dismissSubmissionFailure"
   | "confirmRunnerInactive"
@@ -707,6 +708,14 @@ function renderActionRequired(model: OverviewModel, panel: ActionRequired, scope
   // stage that raised the check.
   if (!deferred) {
     buttons.push(button("sendFeedbackForReview", panel.feedback.send.label, panel.feedback.send.enabled, panel.feedback.send.detail));
+  }
+  // Only once something has been reported failing, and then always — enabled
+  // or disabled with the reason. A person looking at their own Fail needs to
+  // know whether the work can be put back in front of the agents or whether
+  // the repair belongs in a follow-up stage, and the answer is not guessable
+  // from anything else on the panel.
+  if (panel.repair) {
+    buttons.push(button("reopenStage", panel.repair.label, panel.repair.enabled, panel.repair.detail));
   }
   if (panel.planSection) {
     buttons.push(button("openPlanSection", "Open plan section", true, `Open the document ${model.planName ?? "the plan"} at this stage's section`));

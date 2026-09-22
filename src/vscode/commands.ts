@@ -10,7 +10,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { acceptStage, type AcceptStageResult } from "../core/acceptance";
-import { buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, readGitBranch, type DeferredResultAnswer } from "../core/cli";
+import { buildReopenStageArgs, buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, readGitBranch, type DeferredResultAnswer } from "../core/cli";
 import {
   BINDING_VERSION,
   adoptionGaps,
@@ -619,6 +619,9 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
     case "submitForReview":
       await submitForReviewCommand(controller, overview);
       return;
+    case "reopenStage":
+      await reopenStageCommand(controller, overview);
+      return;
     case "sendFeedbackForReview":
       await sendFeedbackForReviewCommand(controller, overview);
       return;
@@ -1075,6 +1078,96 @@ async function submitDeferredVerification(
       results: answers.length,
       stageId: run.currentStage.stageId,
     });
+  }
+  await overview.update();
+}
+
+/**
+ * Put the raising stage back to work on a deferred check the person reported
+ * failing (`sparring reopen-stage`).
+ *
+ * The one action at this checkpoint that is not an answer. Answering is how
+ * a check is settled, and only a Pass settles one; this is for when the
+ * honest answer is a Fail and the plan therefore cannot finish. Without it
+ * the person's only routes were to make the check pass by hand or to leave
+ * the run paused forever, because the engine's run loop skips accepted
+ * stages and every stage at this checkpoint is accepted.
+ *
+ * Addressed by the asking, not the stage, exactly like a deferred result:
+ * the engine resolves the stage from the asking and refuses one this run is
+ * no longer stopped on, so a panel rendered from an older state cannot reopen
+ * a stage over a question that has since been replaced.
+ */
+async function reopenStageCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
+  const run = controller.currentSelection.selected;
+  if (!run || run.kind !== "plan") {
+    return;
+  }
+  const model = await overview.buildModel();
+  const repair = model.actionRequired?.repair;
+  if (!repair) {
+    void vscode.window.showInformationMessage("Agent Sparring: there is no failed verification check to repair here.");
+    return;
+  }
+  if (!repair.enabled) {
+    // The same sentence the disabled button carries — including the one that
+    // says the repair belongs in a follow-up stage.
+    void vscode.window.showInformationMessage(`Agent Sparring: ${repair.detail}`);
+    return;
+  }
+  const choice = await vscode.window.showWarningMessage(
+    `Reopen ${stageDisplayName(run.currentStage)} to fix this?`,
+    {
+      modal: true,
+      detail: [
+        "This stage goes from accepted back to in progress. Its candidate commit, both agents' sessions and its notes are kept, and nothing earlier in the plan is touched.",
+        "",
+        "The failed asking is withdrawn from the engine's ledger, because it asked about a candidate that is about to be replaced. If it still applies to the repaired work, the next review asks it again. What you reported stays in this stage's notes.md, and the stage agent reads it first.",
+        "",
+        "The plan does not continue on its own: resume it when you are ready.",
+      ].join("\n"),
+    },
+    "Reopen stage",
+  );
+  if (choice !== "Reopen stage") {
+    return;
+  }
+  const expectedBranch = await resolveExpectedBranch(run.location, run.state.expectedBranch);
+  if (!expectedBranch) {
+    return;
+  }
+  const input = await planInvocationFor(controller, run);
+  if (!input) {
+    return;
+  }
+  const args = buildReopenStageArgs({
+    ...input,
+    repoRoot: run.location.repoRoot,
+    expectedBranch,
+    sparringDir: run.location.sparringDir,
+    gateInstanceId: repair.instanceId,
+  });
+  // `runCommand`, not `launch`: this edits recorded state and exits. It
+  // starts no agent, so there is no runner to track and no run id to file it
+  // under, and its refusals are worth showing as refusals rather than
+  // leaving in a terminal the person may not be looking at.
+  controller.log(`Reopen stage: ${repair.stageId} for failed asking ${repair.instanceId}`);
+  const result = await controller.runCommand({
+    configured: configuredExecutable(),
+    args,
+    cwd: run.location.repoRoot,
+    name: `Reopen stage: ${repair.stageId}`,
+    repoRoot: run.location.repoRoot,
+    sparringDir: run.location.sparringDir,
+  });
+  if (!result.ok) {
+    // Every refusal happens before the engine writes anything, so the run is
+    // exactly as it was and saying so is accurate.
+    void vscode.window.showErrorMessage(`Agent Sparring: the stage was not reopened: ${result.error}`);
+  } else {
+    void vscode.window.showInformationMessage(
+      `Agent Sparring: ${stageDisplayName(run.currentStage)} is open again, with your report in its notes. Resume the plan to let its agents work on it.`,
+    );
   }
   await overview.update();
 }

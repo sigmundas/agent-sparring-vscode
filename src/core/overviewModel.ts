@@ -596,6 +596,30 @@ export interface ActionRequired extends VerificationView {
    */
   submit: { label: string; enabled: boolean; detail: string };
   /**
+   * `deferred_verification` only, and only once something here has been
+   * reported failing: put the raising stage back to work on it
+   * (`sparring reopen-stage`).
+   *
+   * Offered because a Fail at this checkpoint otherwise has nowhere to go.
+   * Only a Pass settles an obligation and the engine's run loop skips
+   * accepted stages, so reporting a failure and resuming records the answer
+   * and stops again on the same question — correctly, since the plan is not
+   * verified, but with no route to making it true other than by hand.
+   *
+   * Shown disabled with the reason rather than hidden when the engine would
+   * refuse it, because a person looking at a failed check needs to know
+   * which of those two situations they are in.
+   */
+  repair?: {
+    /** The asking to repair; the engine is addressed by it, not by the stage. */
+    instanceId: string;
+    /** The stage whose review raised it, which is the stage that reopens. */
+    stageId: string;
+    label: string;
+    enabled: boolean;
+    detail: string;
+  };
+  /**
    * The freeform channel beside the structured checks: what the human found
    * that is not a result for any requested check.
    *
@@ -1554,6 +1578,7 @@ function deferredVerification(
       { label: "What submitting does", value: "sparring resume-plan … --deferred-result '<gate instance>:<check id>=<pass|fail|blocked>[=note]'. The engine records it in its own ledger and in the originating stage's notes.md; the plan completes only once every obligation passes." },
     ],
     submit: { label: "Submit verification and finish", enabled: submitEnabled, detail: submitDetail },
+    repair: repairOffer(run, obligations, { branchGuard, submitting, model }),
     feedback: {
       draft: artifacts.humanFeedback?.trim() ? artifacts.humanFeedback : undefined,
       submitted: parseHumanFeedback(artifacts.notesText),
@@ -1567,6 +1592,68 @@ function deferredVerification(
     planSection: false,
     review: artifacts.sparring,
   };
+}
+
+/**
+ * Whether reopening the raising stage is offered, and what it says.
+ *
+ * `undefined` when nothing has been reported failing: there is then nothing
+ * to repair, and an offer to throw away an accepted candidate over a check
+ * nobody has answered is an offer the engine refuses anyway.
+ *
+ * The first failed asking is the one offered. A checkpoint gathers several
+ * askings and more than one of them can hold a failure, but only the current
+ * stage's can be reopened — so where the choice matters there is only one
+ * candidate, and where it does not the offer is disabled either way.
+ */
+function repairOffer(
+  run: RunSnapshot & { kind: "plan" },
+  obligations: DeferredObligation[],
+  context: { branchGuard: BranchGuard | undefined; submitting: unknown; model: OverviewModel },
+): ActionRequired["repair"] {
+  const failed = obligations.filter(obligationFailed);
+  if (failed.length === 0) {
+    return undefined;
+  }
+  // Prefer one the engine would actually accept, so a checkpoint holding an
+  // earlier stage's old failure alongside the current stage's does not
+  // present the refusable one and call the route unavailable.
+  const current = failed.find((obligation) => obligation.stageId === run.state.currentStage);
+  const obligation = current ?? failed[0];
+  const label = "Reopen stage to fix this";
+  const base = {
+    instanceId: obligation.gate.instanceId as string,
+    stageId: obligation.stageId,
+    label,
+  };
+  if (!current) {
+    return {
+      ...base,
+      enabled: false,
+      detail: `The failing check was raised by ${stageLabel(obligation.stageId)}, and the run has moved past it. Reopening it would rewrite the history the stages after it were accepted on, so the engine refuses: this repair belongs in a follow-up stage. What you reported stays recorded in that stage's notes.md.`,
+    };
+  }
+  if (context.branchGuard) {
+    return { ...base, enabled: false, detail: `Switch to ${context.branchGuard.expected} first; the engine refuses to reopen a stage of this run from another branch.` };
+  }
+  if (context.submitting) {
+    return { ...base, enabled: false, detail: "Your results are still with the engine. Wait for that to finish before reopening the stage." };
+  }
+  if (blocked(context.model)) {
+    return { ...base, enabled: false, detail: blockedDetail(context.model) };
+  }
+  return {
+    ...base,
+    enabled: true,
+    detail:
+      "Puts this stage back to work on the failure you reported (sparring reopen-stage). Its candidate, both agents' sessions and its notes are kept — the stage agent reads your Fail first, because the engine already wrote it there. The failed asking is withdrawn; if it still applies to the repaired work, the next review asks it again. Nothing earlier in the plan is touched.",
+  };
+}
+
+/** `…-stage-3-prove-the-chain` as `stage 3`, or the bare id when it carries no number. */
+function stageLabel(stageId: string): string {
+  const numbered = /-?stage-(\d+[a-z]?)-/.exec(stageId);
+  return numbered ? `stage ${numbered[1]}` : stageId;
 }
 
 /**
