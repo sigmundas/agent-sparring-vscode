@@ -2357,11 +2357,23 @@ function declarationsFor(controller: SparringController, key: string, location: 
  * Undefined means nothing can be launched, and the reason has already been
  * shown to the person.
  */
-type PlanResumeInput = ({ planPath: string } | { manifest: string }) & { source: PlanRunSource };
+type PlanResumeInput = ({ planPath: string } | { manifest: string }) & {
+  source: PlanRunSource;
+  /**
+   * Which run is being continued, as `resume-plan --run-key`.
+   *
+   * Always sent, although the engine would resolve a document's single open
+   * run without it: the extension knows exactly which run the person is
+   * looking at, and a resume that named only the document would depend on
+   * there never being a second open run of it — an invariant this code does
+   * not own, since the CLI can be used directly.
+   */
+  runKey: string;
+};
 
 async function planInvocationFor(controller: SparringController, run: PlanRunSnapshot): Promise<PlanResumeInput | undefined> {
   if (run.state.source !== "manifest") {
-    return { planPath: run.planPath, source: "markdown" };
+    return { planPath: run.planPath, source: "markdown", runKey: run.runKey };
   }
   const markdown = await readOptional(run.planPath);
   if (markdown === undefined) {
@@ -2386,7 +2398,7 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
   }
   try {
     await controller.manifestDirectory();
-    return { manifest: await writeManifestFile(controller, run, built.manifest), source: "manifest" };
+    return { manifest: await writeManifestFile(controller, run, built.manifest), source: "manifest", runKey: run.runKey };
   } catch (error) {
     void vscode.window.showErrorMessage(`Agent Sparring: could not write the execution manifest: ${(error as Error).message}. Nothing was started.`);
     return undefined;
