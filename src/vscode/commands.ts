@@ -54,7 +54,7 @@ import { buildStageIndex, locateStage, parsePlanHeadings, sectionSummary, type H
 import { stageBelongsToPlan, type PlanScope, type StageOrigin } from "../core/planMembership";
 import { stageMatchRows, type StageMatchRow, type StageToMatch } from "../core/stageMatches";
 import { buildRunPickGroups, describeRun } from "../core/runPick";
-import { humanizeStageId, stageDisplayName } from "../core/presentation";
+import { dialogQuote, humanizeStageId, stageDisplayName } from "../core/presentation";
 import { stageActions, stageRunAction } from "../core/runner";
 import { newRunKey, planKey, planLabel, planRunId, type SparringSubcommand } from "../core/sparringCommand";
 import { chooseLaunchRepository, launchTargets } from "../core/launchRepositories";
@@ -965,7 +965,7 @@ async function submitForReviewCommand(controller: SparringController, overview: 
   }
   const count = recorded.length;
   const what = run.kind === "plan" ? "the engine records the evidence and continues the plan at this same stage" : "the independent reviewer reads it and rules again; the stage agent is not started";
-  const detail = [`${count} result${count === 1 ? "" : "s"} will be recorded under '## Human evidence', then ${what}.`, "", entry].join("\n");
+  const detail = [`${count} result${count === 1 ? "" : "s"} will be recorded under '## Human evidence', then ${what}.`, "", dialogQuote(entry)].join("\n");
   const choice = await vscode.window.showInformationMessage("Submit for review?", { modal: true, detail }, "Submit for review");
   if (choice !== "Submit for review") {
     return;
@@ -1034,13 +1034,21 @@ async function submitDeferredVerification(
   }
   const failing = answers.filter((answer) => answer.outcome !== "pass").length;
   const summary = answers.map((answer) => `${OUTCOME_WORDS[answer.outcome]} — ${answer.checkId}${answer.note ? `: ${answer.note}` : ""}`).join("\n");
+  // The same lines, with each note shortened, for the confirmation dialog
+  // only. A modal grows to fit its detail and its buttons sit underneath, so
+  // a pasted log in a note makes the dialog taller than the screen and the
+  // button that accepts it unreachable — the dialog has no scroll of its own.
+  // What is confirmed here is which checks get which outcome; the note is
+  // shown to identify the answer, not to be re-read in full, and the whole
+  // note is what `answers` carries to the engine.
+  const confirmSummary = dialogQuote(summary);
   const consequence =
     failing === 0
       ? "Every deferred check passes, so the engine completes the plan. Nothing already accepted is re-run."
       : `${failing} of them ${failing === 1 ? "is not a pass" : "are not passes"}, so the plan stays open. A Fail is written into the stage that raised the check, where that stage's agents read it; Can't test records that no result could be obtained.`;
   const choice = await vscode.window.showInformationMessage(
     "Submit deferred verification?",
-    { modal: true, detail: [`${answers.length} result${answers.length === 1 ? "" : "s"} will be recorded against the askings that raised them.`, "", summary, "", consequence].join("\n") },
+    { modal: true, detail: [`${answers.length} result${answers.length === 1 ? "" : "s"} will be recorded against the askings that raised them.`, "", confirmSummary, "", consequence].join("\n") },
     "Submit verification",
   );
   if (choice !== "Submit verification") {
@@ -1123,7 +1131,7 @@ async function sendFeedbackForReviewCommand(controller: SparringController, over
   const detail = [
     `This text goes to the reviewer as human evidence against the unchanged candidate, and the reviewer rules again. ${stay}`,
     "",
-    entry,
+    dialogQuote(entry),
   ].join("\n");
   const choice = await vscode.window.showInformationMessage("Send this feedback to the reviewer?", { modal: true, detail }, "Send feedback for review");
   if (choice !== "Send feedback for review") {

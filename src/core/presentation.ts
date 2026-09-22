@@ -60,6 +60,46 @@ export function truncateLabel(text: string, max = 28): string {
 }
 
 /**
+ * How many lines, and how many characters, of a person's own text a modal
+ * confirmation may quote back to them.
+ *
+ * A VS Code modal has no scroll of its own: it grows to fit its detail, and
+ * its buttons sit underneath. So text that is long enough pushes the button
+ * that accepts the dialog past the bottom of the screen, where it cannot be
+ * clicked and cannot be reached — the dialog becomes unanswerable. A person
+ * answering a manual verification check pastes what they saw, and a pasted
+ * sync log or stack trace is thousands of characters, so this is reached in
+ * ordinary use rather than only by abuse.
+ *
+ * Deliberately generous: enough to recognise what is about to be submitted,
+ * which is all a confirmation is for. The text itself is never shortened —
+ * only this quotation of it is.
+ */
+export const DIALOG_QUOTE_MAX_LINES = 12;
+export const DIALOG_QUOTE_MAX_CHARS = 800;
+
+/**
+ * `text` as a modal's detail may quote it: at most
+ * {@link DIALOG_QUOTE_MAX_LINES} lines and {@link DIALOG_QUOTE_MAX_CHARS}
+ * characters, with a plain note of how much was left out so the reader knows
+ * the dialog is showing part of something rather than all of a short thing.
+ */
+export function dialogQuote(text: string): string {
+  const lines = text.split("\n");
+  let kept = lines.slice(0, DIALOG_QUOTE_MAX_LINES).join("\n");
+  let elided = lines.length > DIALOG_QUOTE_MAX_LINES;
+  if (kept.length > DIALOG_QUOTE_MAX_CHARS) {
+    kept = kept.slice(0, DIALOG_QUOTE_MAX_CHARS).trimEnd();
+    elided = true;
+  }
+  if (!elided) {
+    return text;
+  }
+  const hidden = text.length - kept.length;
+  return `${kept}\n… ${hidden} more character${hidden === 1 ? "" : "s"}, submitted in full but not shown here.`;
+}
+
+/**
  * Presentation states. The engine's own words (READY, SEND_BACK, NEEDS_YOU,
  * ESCALATE, FROZEN, ACCEPTED) stay in `raw` for logs, tooltips and the
  * metadata footer; nothing in `label`/`detail` uses them.

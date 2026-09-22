@@ -20,7 +20,7 @@ import { describe, it } from "node:test";
 import { buildResumePlanArgs } from "../core/cli";
 import { discoverRuns, selectRun } from "../core/discovery";
 import { DEFERRED_GATE_MARKER, DEFERRED_VERIFICATION_REQUIRED, obligationFailed, obligationResolved, parseDeferredHumanGate, parsePlanRunState, parseSparringOutcome } from "../core/engineFormats";
-import { draftKeyFor } from "../core/humanChecks";
+import { draftKeyFor, EXCERPT_MAX_LENGTH } from "../core/humanChecks";
 import { renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel, type OverviewArtifacts } from "../core/overviewModel";
 import { FOO_PLAN_KEY, FOO_PLAN_LABEL, FOO_PLAN_MARKDOWN, FOO_STAGE_IDS, Workspace, normalUi } from "./fixtures";
@@ -317,6 +317,34 @@ describe("the plan's verification checkpoint", () => {
       assert.match(panel.submit.detail, /Record a result for/, outcome);
       assert.ok(!panel.submit.detail.includes("nothing further to send"), outcome);
     }
+  });
+
+  it("shows the beginning of a pasted log, not the whole thing", async () => {
+    // A person answering a device check pastes what they saw, and what they
+    // saw is a sync log. Rendered whole it is the tallest thing on the page,
+    // and it sits *above* the Pass / Fail / Can't test controls and the
+    // submit button for the check it belongs to — so the affordances for
+    // answering the check are pushed off the screen by the previous answer
+    // to that same check. The note is kept whole where it is authoritative
+    // (the engine's ledger, and the raising stage's notes.md); only the
+    // panel's quotation of it is bounded.
+    const log = `Sync failed: ${"image 3258 ImageIdentityConflictError; ".repeat(200)}`;
+    assert.ok(log.length > 5000, "the fixture has to be big enough to be the problem");
+    const { model, html } = await atCheckpoint({ results: [{ check_id: "resize-readability", outcome: "fail", note: log }] });
+    const shown = model.actionRequired!.required[0].previous[0].excerpt;
+    assert.ok(shown.length <= EXCERPT_MAX_LENGTH, `excerpt was ${shown.length} characters`);
+    assert.match(shown, /^Sync failed: image 3258/, "the beginning is what is kept");
+    assert.ok(shown.endsWith("…"), "and it says it was cut");
+    assert.ok(!html.includes(log), "the whole log must not reach the page");
+  });
+
+  it("bounds a passed check's evidence excerpt the same way", async () => {
+    // The settled branch reads the same note from the same ledger, and got
+    // the same unbounded rendering. A Pass is quieter but not smaller.
+    const log = `Verified: ${"observation 917 uploaded; ".repeat(300)}`;
+    const { model } = await atCheckpoint({ results: [{ check_id: "resize-readability", outcome: "pass", note: log }] });
+    const shown = model.actionRequired!.recorded[0].evidence!.excerpt;
+    assert.ok(shown.length <= EXCERPT_MAX_LENGTH, `excerpt was ${shown.length} characters`);
   });
 
   it("explains a still-owed check as the person's own result, not as the reviewer asking again", async () => {

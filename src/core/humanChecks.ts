@@ -1073,7 +1073,7 @@ export function deriveDeferredVerification(
         // Settled. A person who already passed this at an earlier visit to
         // the checkpoint must not be asked again, and must not have their
         // answer re-sent.
-        item.evidence = { excerpt: recorded.note ?? item.text, outcome: "pass", how: "id" };
+        item.evidence = { excerpt: excerpt(recorded.note ?? item.text), outcome: "pass", how: "id" };
       } else {
         // Answered, and still owed. Shown as history so the person can see
         // what they reported last time and why they are being asked again.
@@ -1083,7 +1083,13 @@ export function deriveDeferredVerification(
         // which is not the stage this panel is looking at, so mining this
         // stage's `## Human evidence` would be looking in the wrong file and
         // finding nothing — which reads like code that does something.
-        item.previous = recorded ? [{ excerpt: recorded.note ?? item.text, outcome: recorded.outcome, how: "id" }] : [];
+        // Through `excerpt` like every other recorded answer on this panel.
+        // A person answering a manual check pastes what they saw, and a
+        // pasted sync log is thousands of characters: rendered whole it
+        // pushes the controls that answer the check off the screen, so the
+        // panel shows the beginning and the note itself stays whole in the
+        // ledger and in the originating stage's notes.md.
+        item.previous = recorded ? [{ excerpt: excerpt(recorded.note ?? item.text), outcome: recorded.outcome, how: "id" }] : [];
         item.record = drafts[item.draftKey];
       }
       items.push(item);
