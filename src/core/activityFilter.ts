@@ -103,6 +103,11 @@ export function describeActivity(event: ActivityEvent): string | undefined {
       return `accepted ${shortId(event.sha, 8) ?? ""}`.trim();
     case "gate.refused":
       return `refused${summary}`;
+    // Worth a line precisely because it is the thing nobody could see from
+    // inside one turn: the reviewer is asking again for something already
+    // answered "I can't do this".
+    case "gate.repeated":
+      return `gate re-asks blocked checks${summary}`;
     // plan
     case "plan.stage.entered":
       return `entered${summary.replace(":", "")}`;

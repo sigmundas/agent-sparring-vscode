@@ -19,6 +19,10 @@ describe("output channel formatting", () => {
     assert.equal(line("gate", "candidate.accepted", { sha: "0123456789abcdef" }), "Gate            accepted 01234567…");
     assert.equal(line("plan", "plan.stage.entered", { summary: "Stage 3/6" }), "Plan            entered Stage 3/6");
     assert.equal(line("plan", "plan.paused", { action: "NEEDS_YOU" }), "Plan            paused (NEEDS_YOU)");
+    assert.equal(
+      line("plan", "gate.repeated", { summary: "asking 2 of the same blocked checks" }),
+      "Plan            gate re-asks blocked checks: asking 2 of the same blocked checks",
+    );
   });
 
   it("drops noisy per-tool events and never prints payloads", () => {
