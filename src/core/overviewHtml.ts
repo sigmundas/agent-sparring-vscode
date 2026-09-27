@@ -502,6 +502,7 @@ ${
     ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}Approval refused by the engine. Nothing was approved.</p><pre class="engineerror">${escapeHtml(intake.refusal.text)}</pre></div>`
     : ""
 }
+${intake.unconfirmed ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}${escapeHtml(intake.unconfirmed.text)}</p></div>` : ""}
 <ul class="intake-slices">${slices}</ul>
 <div class="actions">${intake.action ? intakeButton(intake.action) : ""}${button("openIntakeReport", "Open intake report", true, undefined, intake.action ? "" : "primary")}${intake.hasSource ? button("openIntakeSource", "Open plan") : ""}${button("showLog", "Show log")}</div>
 ${intake.command ? `<details class="intake-command"><summary>Engine command</summary><pre class="command">${escapeHtml(intake.command)}</pre></details>` : ""}

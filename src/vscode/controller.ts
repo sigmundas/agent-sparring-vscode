@@ -452,6 +452,9 @@ export class SparringController implements vscode.Disposable {
     if (this.selection.released) {
       await this.retireReleasedPin(this.selection.released);
     }
+    if (this.selection.attachedAt) {
+      await this.context.workspaceState.update(PIN_ACTIVE_ROOT_KEY, this.selection.attachedAt);
+    }
     if (this.selection.selected && this.selection.selected.id !== this.context.workspaceState.get<string>(STICKY_RUN_KEY)) {
       await this.context.workspaceState.update(STICKY_RUN_KEY, this.selection.selected.id);
     }
@@ -1381,7 +1384,10 @@ export class SparringController implements vscode.Disposable {
    */
   private async recordPinOrigin(origin: PinOrigin | undefined): Promise<void> {
     await this.context.workspaceState.update(PIN_ORIGIN_KEY, origin);
-    await this.context.workspaceState.update(PIN_ACTIVE_ROOT_KEY, origin === "action" ? this.activeRepository.activeRepoRoot : undefined);
+    // Spelled as the selection will compare it: the aligned scope root, not
+    // the Git extension's raw path, or a symlinked spelling would read as a
+    // repository move on the very next refresh.
+    await this.context.workspaceState.update(PIN_ACTIVE_ROOT_KEY, origin === "action" ? (await this.repositoryScope())?.repoRoot : undefined);
   }
 
   /**

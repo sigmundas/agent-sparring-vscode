@@ -603,6 +603,13 @@ export interface RunSelection {
   released?: { id: string; reason: "superseded"; by: PlanRunSnapshot } | { id: string; reason: "gone" } | { id: string; reason: "repository"; to: string };
   /** Why {@link pinned} holds: a person's explicit pin, or an action attachment. */
   pinOrigin?: PinOrigin;
+  /**
+   * The active repository has moved *into* one that owns an action
+   * attachment's work. The caller records this as the attachment's new
+   * reference repository, so that moving on again — including back to where
+   * it was made — releases it.
+   */
+  attachedAt?: string;
 }
 
 /**
@@ -947,15 +954,17 @@ export function selectRun(
     const chosen = runs.find((run) => run.id === pick.id);
     // An action attachment ends when the active repository has moved since
     // it was made, to one that does not own what it shows.
+    let attachedAt: string | undefined;
     if (origin === "action" && scope && !sameRoot(scope.repoRoot, pick.activeRootAtPin)) {
       const target = chosen ?? pinnedIntake;
       if (!target || attributeRun(target, scope.repoRoot, scope.knownRoots ?? []) !== "here") {
         return decorate({ ...selectAutomatically(inScope, stickyId, intakesInScope), released: { id: pick.id, reason: "repository", to: scope.repoRoot } });
       }
+      attachedAt = scope.repoRoot;
     }
     if (pick.id.includes("|intake:")) {
       if (pinnedIntake) {
-        return decorate({ ambiguous: [], intake: pinnedIntake, pinned: true, pinOrigin: origin });
+        return decorate({ ambiguous: [], intake: pinnedIntake, pinned: true, pinOrigin: origin, ...(attachedAt ? { attachedAt } : {}) });
       }
       const gone = locations.some((location) => runIdBelongsTo(pick.id, location));
       return decorate({ ...selectAutomatically(inScope, stickyId, intakesInScope), ...(gone ? { released: { id: pick.id, reason: "gone" as const } } : {}) });
@@ -974,7 +983,7 @@ export function selectRun(
     }
     const by = supersedingPlanRun(chosen, runs, pick.atMs ?? 0, ownership, pick.intent ?? "inspect");
     if (!by) {
-      return decorate({ selected: chosen, ambiguous: [], pinned: true, pinOrigin: origin });
+      return decorate({ selected: chosen, ambiguous: [], pinned: true, pinOrigin: origin, ...(attachedAt ? { attachedAt } : {}) });
     }
     return decorate({ ...selectAutomatically(inScope, stickyId, intakesInScope), released: { id: pick.id, reason: "superseded", by } });
   }

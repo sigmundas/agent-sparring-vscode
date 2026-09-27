@@ -216,6 +216,34 @@ describe("the engine commands, built from the engine's own records", () => {
     assert.ok(html.includes("waits for gate &#39;release&#39;") || html.includes("waits for gate 'release'"));
   });
 
+  it("a launch that could not be confirmed is never shown as an engine refusal", async () => {
+    const { location } = await project("prepared");
+    const intake = await onlyIntake(location);
+    const unseen = intakeView(intake, undefined, { state: "unconfirmed", message: "the shell never reported that the command started.", mayHaveRun: true });
+    assert.equal(unseen.refusal, undefined);
+    assert.match(unseen.unconfirmed?.text ?? "", /could not confirm whether approve-plan finished/);
+    assert.match(unseen.unconfirmed?.text ?? "", /approving again is safe/);
+    const html = renderOverviewHtml({ kind: "intake", title: "t", intake: unseen }, "nonce", "csp");
+    assert.ok(!html.includes("Approval refused by the engine"));
+    const notStarted = intakeView(intake, undefined, { state: "unconfirmed", message: "sparring was not found.", mayHaveRun: false });
+    assert.match(notStarted.unconfirmed?.text ?? "", /^approve-plan was not started: sparring was not found\./);
+    const source = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "commands.ts"), "utf8");
+    const body = /async function handleIntakeAction[\s\S]*?\n}\n/.exec(source)?.[0] ?? "";
+    assert.match(body, /if \(!result\.ok\) \{[\s\S]*?state: "unconfirmed"/, "a launcher failure is unconfirmed, not refused");
+    assert.match(body, /intakeApproval\(intake\.dir, next\.slice\.runId\)\?\.state === "approving"\) \{[\s\S]*?return;/, "a second click while approving does nothing");
+    assert.match(body, /changed while the confirmation was open/, "Start re-checks after the dialog");
+  });
+
+  it("Start finds the slice's project when the engine's resolved path and the window's spelling differ", async () => {
+    const { location } = await project("approved");
+    const intake = await onlyIntake(location);
+    const slice = intake.slices[0];
+    const aliased = { ...slice, approval: slice.approval && { ...slice.approval, sparringDir: `/resolved${location.sparringDir}` } };
+    assert.equal(startInvocation(aliased, [location]).ok, false, "different spellings are different without resolution");
+    const canonical = (file: string) => file.replace(/^\/resolved/, "");
+    assert.equal(startInvocation(aliased, [location], canonical).ok, true);
+  });
+
   it("while approving, the button says so and cannot be pressed twice", async () => {
     const { location } = await project("prepared");
     const view = intakeView(await onlyIntake(location), undefined, { state: "approving" });
@@ -327,6 +355,21 @@ describe("following the active repository", () => {
     assert.equal(selectRun(discovery.runs, attachment, undefined, scope(web), undefined, [py, web]).selected?.id, runOf(py));
     // Opening a sporely-py file is not a move away from what is shown.
     assert.equal(selectRun(discovery.runs, attachment, undefined, scope(py), undefined, [py, web]).selected?.id, runOf(py));
+  });
+
+  it("A → B → A: moving into the repository that owns the work re-anchors the attachment, and moving back releases it", async () => {
+    const { py, web, discovery, scope, runOf } = await twoRepositories();
+    // In sporely-web, a sporely-py run was started: attached, anchored at web.
+    let attachment = { id: runOf(py), intent: "follow" as const, origin: "action" as const, activeRootAtPin: web.repoRoot };
+    const intoOwner = selectRun(discovery.runs, attachment, undefined, scope(py), undefined, [py, web]);
+    assert.equal(intoOwner.selected?.id, runOf(py));
+    assert.equal(intoOwner.attachedAt, py.repoRoot, "the caller re-anchors the attachment at the owning repository");
+    attachment = { ...attachment, activeRootAtPin: intoOwner.attachedAt ?? attachment.activeRootAtPin };
+    const back = selectRun(discovery.runs, attachment, undefined, scope(web), undefined, [py, web]);
+    assert.equal(back.selected?.id, runOf(web));
+    assert.equal(back.released?.reason, "repository");
+    const source = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "controller.ts"), "utf8");
+    assert.match(source, /if \(this\.selection\.attachedAt\) \{\n\s+await this\.context\.workspaceState\.update\(PIN_ACTIVE_ROOT_KEY, this\.selection\.attachedAt\);/);
   });
 
   it("an explicit pin survives every repository change, and is marked in the status bar", async () => {

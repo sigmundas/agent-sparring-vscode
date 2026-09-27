@@ -801,6 +801,8 @@ export interface IntakeView {
   requirements: string[];
   /** The engine's refusal of the last approval of this slice, verbatim. */
   refusal?: { text: string };
+  /** The last approval of this slice could not be confirmed either way; see IntakeApprovalAttempt. */
+  unconfirmed?: { text: string };
   /** The engine command the action runs, for the details layer. */
   command?: string;
   hasSource: boolean;
@@ -808,7 +810,16 @@ export interface IntakeView {
 }
 
 /** An approval of one slice this window has asked the engine for. */
-export type IntakeApprovalAttempt = { state: "approving" } | { state: "refused"; output: string; exitCode?: number };
+export type IntakeApprovalAttempt =
+  | { state: "approving" }
+  /** approve-plan ran and exited non-zero: the engine's refusal. */
+  | { state: "refused"; output: string; exitCode?: number }
+  /**
+   * approve-plan did not report an exit code: not submitted, or submitted and
+   * never seen to start or finish. Never shown as a refusal — the approval
+   * may have landed, and approval.json on disk is what would say so.
+   */
+  | { state: "unconfirmed"; message: string; mayHaveRun: boolean };
 
 export interface OverviewModel {
   kind: "empty" | "ambiguous" | "run" | "intake";
@@ -1215,6 +1226,15 @@ export function intakeView(intake: DiscoveredIntake, sourceText: string | undefi
     ...(blocked ? { blocked } : {}),
     requirements: next.kind === "approve" ? requirementLines(slice) : [],
     ...(next.kind === "approve" && attempt?.state === "refused" ? { refusal: { text: attempt.output } } : {}),
+    ...(next.kind === "approve" && attempt?.state === "unconfirmed"
+      ? {
+          unconfirmed: {
+            text: attempt.mayHaveRun
+              ? `Agent Sparring could not confirm whether approve-plan finished: ${attempt.message} If it did, the approval appears here on its own; approving again is safe, because the engine returns an identical approval rather than a second one.`
+              : `approve-plan was not started: ${attempt.message}`,
+          },
+        }
+      : {}),
     ...(command ? { command } : {}),
     hasSource: intake.record.sourcePath !== undefined,
     intakeId: intake.record.intakeId,

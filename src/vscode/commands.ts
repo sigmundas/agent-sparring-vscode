@@ -6,6 +6,7 @@
  * a run, and the Run Overview panel and its actions.
  */
 
+import { realpathSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
@@ -522,6 +523,15 @@ async function exists(file: string): Promise<boolean> {
 
 // ---------------------------------------------------------------- plan intake
 
+/** A path with symlinks resolved, or the path itself when it cannot be resolved. */
+function canonicalPathOrSelf(file: string): string {
+  try {
+    return realpathSync(file);
+  } catch {
+    return file;
+  }
+}
+
 /**
  * Approve or start the exact run slice the intake screen was drawn for.
  *
@@ -542,6 +552,10 @@ async function handleIntakeAction(controller: SparringController, overview: Over
   }
   const locations = controller.currentDiscovery.locations;
   if (next.kind === "approve") {
+    if (controller.intakeApproval(intake.dir, next.slice.runId)?.state === "approving") {
+      // A second click before the page redrew: the first approve-plan is still running.
+      return;
+    }
     const invocation = approveInvocation(intake, next.slice, locations);
     if (!invocation.ok) {
       void vscode.window.showWarningMessage(`Agent Sparring: ${invocation.problem}`);
@@ -560,8 +574,14 @@ async function handleIntakeAction(controller: SparringController, overview: Over
       sparringDir: invocation.sparringDir,
     });
     if (!result.ok) {
-      controller.setIntakeApproval(intake.dir, next.slice.runId, { state: "refused", output: result.error });
+      // Not an engine refusal: nothing was submitted, or it was and was never
+      // seen to start. The launcher's own classification says which.
+      controller.setIntakeApproval(intake.dir, next.slice.runId, { state: "unconfirmed", message: result.error, mayHaveRun: result.problem === "unconfirmed" });
       await explainCommandProblem(controller, result);
+      await controller.refresh();
+    } else if (result.outcome.exitCode === undefined) {
+      controller.setIntakeApproval(intake.dir, next.slice.runId, { state: "unconfirmed", message: "no exit code was reported.", mayHaveRun: true });
+      await controller.refresh();
     } else if (result.outcome.exitCode === 0) {
       // Only an exit code of 0 is an approval; approval.json is then on disk and discovery shows it.
       controller.setIntakeApproval(intake.dir, next.slice.runId, undefined);
@@ -575,7 +595,7 @@ async function handleIntakeAction(controller: SparringController, overview: Over
     await overview.update();
     return;
   }
-  const invocation = startInvocation(next.slice, locations);
+  const invocation = startInvocation(next.slice, locations, canonicalPathOrSelf);
   if (!invocation.ok) {
     void vscode.window.showWarningMessage(`Agent Sparring: ${invocation.problem}`);
     return;
@@ -602,6 +622,15 @@ async function handleIntakeAction(controller: SparringController, overview: Over
     "Start slice",
   );
   if (choice !== "Start slice") {
+    return;
+  }
+  // The dialog may have been open a while: the slice must still be the one
+  // offered for Start, and no runner for it may have appeared meanwhile.
+  const still = (controller.currentDiscovery.intakes ?? []).find((candidate) => samePath(candidate.dir, message.intakeDir));
+  const nextNow = still ? intakeNextAction(still) : undefined;
+  if (!nextNow || nextNow.kind !== "start" || nextNow.slice.runId !== message.runId || controller.livenessFor(invocation.runId).state === "running") {
+    void vscode.window.showInformationMessage(`Agent Sparring: run slice ${message.runId} changed while the confirmation was open, so it was not started. Check the updated screen.`);
+    await overview.update();
     return;
   }
   controller.log(`Intake: ${invocation.describe}`);

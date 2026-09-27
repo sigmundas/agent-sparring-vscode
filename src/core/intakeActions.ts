@@ -52,13 +52,18 @@ export function approveInvocation(intake: IntakeSnapshot, slice: IntakeSliceSnap
  * written somewhere the cockpit cannot see, and its duplicate guard would
  * be keyed to a project it does not know.
  */
-export function startInvocation(slice: IntakeSliceSnapshot, locations: readonly SparringLocation[]): IntakeStartInvocation {
+export function startInvocation(
+  slice: IntakeSliceSnapshot,
+  locations: readonly SparringLocation[],
+  /** Resolves symlinks: the engine records `sparring_dir` fully resolved, and a window may spell it otherwise. */
+  canonical: (file: string) => string = (file) => file,
+): IntakeStartInvocation {
   const approval = slice.approval;
   if (slice.state !== "approved" || !approval || !slice.manifestPath) {
     return { ok: false, problem: `run slice ${slice.runId} has no sealed approval without a run.` };
   }
   const recordedIn = approval.sparringDir ?? path.join(approval.repoRoot, ".sparring");
-  const location = locations.find((candidate) => samePath(candidate.sparringDir, recordedIn));
+  const location = locations.find((candidate) => samePath(candidate.sparringDir, recordedIn) || samePath(canonical(candidate.sparringDir), canonical(recordedIn)));
   if (!location) {
     return { ok: false, problem: `run slice ${slice.runId} runs in ${approval.repoRoot}, which is not open in this window. Open that repository, then start the slice.` };
   }
