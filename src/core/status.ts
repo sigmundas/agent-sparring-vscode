@@ -13,7 +13,9 @@
  * No dependency on the vscode API.
  */
 
+import * as path from "node:path";
 import { describeRepositoryContext, emptyStateLines, emptyStateTitle } from "./activeRepository";
+import { intakeStateLabel } from "./intake";
 import { currentStageOf, runLabel, totalStagesOf, type RunSelection, type RunSnapshot } from "./discovery";
 import type { RunnerLiveness } from "./liveness";
 import { providerDisplayName, type LiveState } from "./liveState";
@@ -40,6 +42,15 @@ const REPOSITORY_NAME_MAX = 44;
  * worded as certain work only when a process observation backs it.
  */
 export function deriveStatus(selection: RunSelection, live: LiveState | undefined, nowMs: number, liveness?: RunnerLiveness): StatusView {
+  if (!selection.selected && selection.intake) {
+    const intake = selection.intake;
+    const word = intake.state === "approved" ? "slice approved" : "intake awaiting approval";
+    return {
+      text: `$(checklist) ${PREFIX}: ${truncateLabel(path.basename(intake.record.planLabel), 28)} · ${word}`,
+      tooltip: [`Plan intake: ${intake.record.planLabel}`, intakeStateLabel(intake.state), `Repository: ${intake.location.folderName}`, describeRepositoryContext(selection).text].join("\n"),
+      severity: "none",
+    };
+  }
   if (!selection.selected) {
     if (selection.ambiguous.length > 0) {
       const lines = selection.ambiguous.map((run) => `• ${run.location.folderName}: ${runLabel(run)} (${authoritativeWord(run)})`);

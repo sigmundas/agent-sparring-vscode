@@ -192,7 +192,10 @@ describe("the automatic path is one engine call, not a loop", () => {
 
   it("resumes a manifest-started run with --manifest, because the engine refuses the other input", async () => {
     const source = fn(await commandsSource(), "planInvocationFor");
-    assert.match(source, /run\.state\.source !== "manifest"/, "the engine's own record of which input the run executes");
+    // Each recorded kind is named explicitly; nothing falls through to Markdown.
+    assert.match(source, /const source = run\.state\.source;/, "the engine's own record of which input the run executes");
+    assert.match(source, /if \(source === "markdown"\) \{/, "Markdown only when the engine recorded Markdown");
+    assert.match(source, /if \(source === "intake-manifest"\) \{/, "and an approved intake slice is its own kind");
     assert.match(source, /return \{ planPath: run\.planPath, source: "markdown", runKey: run\.runKey \}/, "a markdown run keeps its plan path, and names the run it continues");
     assert.match(source, /buildManifest\(\{/, "a manifest run gets its manifest rebuilt, deterministically");
     assert.match(source, /source: "manifest", runKey: run\.runKey \}/, "and says that too, so the builder can check it");

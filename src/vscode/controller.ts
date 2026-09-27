@@ -370,7 +370,17 @@ export class SparringController implements vscode.Disposable {
     // the activity stream, at any depth so nested projects are covered too.
     // The base is a workspace folder, so this filters the workspace watcher's
     // existing event stream rather than starting a new recursive watcher.
-    const authoritative = ["**/.sparring/plans/*.json", "**/.sparring/stages/*/state.json", "**/.sparring/stages/*/sparring.md"];
+    // Plan intake: its record, each slice's sealed approval and the registry
+    // entry an approval writes — enough to see an intake appear, get approved
+    // and gain a run. Its report, briefs and prompt are not state.
+    const authoritative = [
+      "**/.sparring/plans/*.json",
+      "**/.sparring/stages/*/state.json",
+      "**/.sparring/stages/*/sparring.md",
+      "**/.sparring/intake/*/intake.json",
+      "**/.sparring/intake/*/runs/*/approval.json",
+      "**/.sparring/intake/registry/*.json",
+    ];
     for (const glob of authoritative) {
       const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, glob));
       const onChange = () => this.scheduleRefresh();
@@ -430,7 +440,7 @@ export class SparringController implements vscode.Disposable {
     // is the guessing that made unrelated stages look like a plan's history.
     const ownership = stageOwnership(await this.planMemberships());
     await this.settleStartingPin();
-    this.selection = selectRun(this.discovery.runs, this.preference(), sticky, await this.repositoryScope(), ownership, this.locations);
+    this.selection = selectRun(this.discovery.runs, this.preference(), sticky, await this.repositoryScope(), ownership, this.locations, this.discovery.intakes);
     if (this.selection.released) {
       await this.retireReleasedPin(this.selection.released);
     }
@@ -620,7 +630,17 @@ export class SparringController implements vscode.Disposable {
    * call, and its header says why a cache must never hold the conclusion.
    */
   async manifestStagesFor(run: RunSnapshot): Promise<ManifestStageIdentity[] | undefined> {
-    if (run.kind !== "plan" || run.state.source !== "manifest") {
+    if (run.kind !== "plan") {
+      return undefined;
+    }
+    if (run.state.source === "intake-manifest") {
+      // The approved slice's own manifest, already read and matched to this
+      // run key by discovery (core/intake.ts). The seal is the engine's to
+      // verify; no sidecar binding applies to a manifest this extension did
+      // not write.
+      return run.intake?.stages;
+    }
+    if (run.state.source !== "manifest") {
       return undefined;
     }
     // The other discovered plan runs, so a manifest written before sidecars

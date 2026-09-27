@@ -18,10 +18,11 @@
  * tooltips and the footer.
  */
 
-import { describeRepositoryContext, emptyStateLines, emptyStateTitle, type RepositoryContextView } from "./activeRepository";
+import { describeRepositoryContext, emptyStateLines, emptyStateTitle, SELECT_RUN_LABEL, type RepositoryContextView } from "./activeRepository";
 import { agentConfigView, providerLabel, type AgentConfigView, type ConfigRole, type EffectiveConfig } from "./effectiveConfig";
 import { parseBriefGoal, parseBriefOpening } from "./brief";
-import { currentStageOf, runLabel, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
+import { currentStageOf, runLabel, type DiscoveredIntake, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
+import { intakeStateLabel, nextIntakeSlice } from "./intake";
 import { activeDurationMs, formatDuration, providerDisplayName, type ActorBudget, type LiveState, type MeaningfulEvent } from "./liveState";
 import { DEFERRED_VERIFICATION_REQUIRED, PUSH_AUTHORIZATION_REQUIRED, obligationFailed, obligationResolved, parseHandoffBranch, type DeferredObligation, type PlanRunState, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
 import type { DeclaredRepository } from "./stageRepositories";
@@ -768,8 +769,33 @@ export interface AgentConfigOutcome {
 export const APPLIES_NEXT_TURN =
   "This run is active. A change here applies to the next agent turn; it does not affect a turn already running.";
 
+/**
+ * A plan intake with no run yet, shown in place of older finished work.
+ *
+ * Everything here is what the engine's intake files record. "Approved" is
+ * never "will run": the engine re-checks the approval and the repositories
+ * when `run-plan` starts.
+ */
+export interface IntakeView {
+  /** The source plan's own `# ` title, else its label. */
+  planName: string;
+  planLabel: string;
+  /** `Prepared — awaiting review and approval`, `Slice approved — ready to run`. */
+  stateLabel: string;
+  /** What the person does next, in the engine's own commands. */
+  lines: string[];
+  /** The run slice the intake is waiting on, with its stages as the intake names them. */
+  slices: { runId: string; stateLabel: string; stages: string[]; current: boolean }[];
+  /** `sparring run-plan …` exactly as approve-plan printed it, for an approved slice. */
+  runCommand?: string;
+  hasSource: boolean;
+  intakeId: string;
+}
+
 export interface OverviewModel {
-  kind: "empty" | "ambiguous" | "run";
+  kind: "empty" | "ambiguous" | "run" | "intake";
+  /** Set when `kind` is `intake`. */
+  intake?: IntakeView;
   /** The plan the stage belongs to (managed run or associated file), for the header. */
   planName?: string;
   /** The checked-out branch is not this stage's; nothing that runs the engine is offered while it is set. */
@@ -1076,6 +1102,39 @@ function compactWindow(minutes: number, long = false): string {
   return long ? `${minutes}-minute` : `${minutes}m`;
 }
 
+/** The intake screen; `sourceText` is the source plan's text, read only for its title. */
+export function intakeView(intake: DiscoveredIntake, sourceText: string | undefined): IntakeView {
+  const next = nextIntakeSlice(intake);
+  const approved = next?.state === "approved" ? next : undefined;
+  const lines: string[] = [];
+  if (approved?.approval && approved.manifestPath) {
+    lines.push(`Run slice ${approved.runId} is approved for branch ${approved.approval.expectedBranch}. Start it from a terminal with the command below; the engine re-checks the approval and the repositories before anything runs.`);
+  } else {
+    lines.push(`The engine prepared this plan for review. Nothing has run. Read the report, then approve a run slice with sparring approve-plan.`);
+  }
+  if (intake.slices.some((slice) => slice.state === "complete")) {
+    lines.push(`Earlier run slices of this intake are complete; ${SELECT_RUN_LABEL} still opens them.`);
+  }
+  return {
+    planName: (sourceText ? planTitle(sourceText) : undefined) ?? intake.record.planLabel,
+    planLabel: intake.record.planLabel,
+    stateLabel: intakeStateLabel(intake.state),
+    lines,
+    slices: intake.slices.map((slice) => ({
+      runId: slice.runId,
+      stateLabel: intakeStateLabel(slice.state),
+      stages: slice.stages.map((stage) => `${stage.label} — ${stage.title}`),
+      current: slice === next,
+    })),
+    runCommand:
+      approved?.approval && approved.manifestPath
+        ? `sparring run-plan --manifest ${approved.manifestPath} --run-key ${approved.runKey} --repo-root ${approved.approval.repoRoot} --expected-branch ${approved.approval.expectedBranch}`
+        : undefined,
+    hasSource: intake.record.sourcePath !== undefined,
+    intakeId: intake.record.intakeId,
+  };
+}
+
 const NO_ARTIFACTS: OverviewArtifacts = { handoff: false, sparring: false, brief: false, plan: false };
 
 export function buildOverviewModel(
@@ -1086,6 +1145,10 @@ export function buildOverviewModel(
   execution?: ExecutionRecord,
 ): OverviewModel {
   const repositoryContext = describeRepositoryContext(selection);
+  if (!selection.selected && selection.intake) {
+    const intake = intakeView(selection.intake, artifacts.planText);
+    return { kind: "intake", title: `Plan intake: ${intake.planName}`, intake, repositoryContext };
+  }
   if (!selection.selected) {
     if (selection.ambiguous.length > 0) {
       return {
@@ -2042,7 +2105,7 @@ function continueAutomatically(
     // Saying `--manifest` for a run the engine recorded as a Markdown one
     // described a command that would be refused, and was how the wrong one
     // came to be issued.
-    const input = run.state.source === "manifest" ? "--manifest …" : `${plan.name}`;
+    const input = run.state.source === "markdown" ? `${plan.name}` : run.state.source === "intake-manifest" ? "--manifest <approved intake manifest>" : "--manifest …";
     return {
       label: "Continue automatically",
       primary: true,
@@ -2366,7 +2429,9 @@ export function shortenId(id: string | undefined | null, keep = 8): string | und
  * a claim nothing supports.
  */
 function manifestView(run: RunSnapshot, artifacts: OverviewArtifacts): ManifestView | undefined {
-  if (run.kind !== "plan" || run.state.source !== "manifest") {
+  // An intake run's approved manifest is the same authority as a manifest
+  // run's written one: its stages, its labels, its order.
+  if (run.kind !== "plan" || run.state.source === "markdown") {
     return undefined;
   }
   const stages = artifacts.manifestStages;
@@ -2414,6 +2479,9 @@ function timeline(run: PlanRunSnapshot, manifest: ManifestView | undefined): Pic
     if (run.state.source === "manifest") {
       return { timelineNote: "This run executes an execution manifest; its own list of stages could not be read here, so only the recorded stage is shown." };
     }
+    if (run.state.source === "intake-manifest") {
+      return { timelineNote: `This run executes an approved plan intake; its approved manifest could not be read here (${run.planError ?? "not found"}), so only the recorded stage is shown.` };
+    }
     return { timelineNote: `Plan document unavailable (${run.planError ?? "no stages"}); showing the recorded stage only.` };
   }
   const current = run.state.currentStageIndex;
@@ -2460,7 +2528,10 @@ function planContext(run: RunSnapshot, stage: StageSnapshot, artifacts: Overview
   if (run.kind === "plan") {
     const stages = run.planStages;
     const index = run.state.currentStageIndex;
-    const nextHeading = stages?.[index + 1];
+    // An intake run's stage list is its approved manifest's, whose names are
+    // labels (`Stage 1A`), not the Markdown's 1..N numbering; the manifest
+    // branch below names its next stage.
+    const nextHeading = run.state.source === "intake-manifest" ? undefined : stages?.[index + 1];
     let next: PlanContext["next"];
     if (nextHeading) {
       // The engine parsed the heading; its line and opening paragraph come

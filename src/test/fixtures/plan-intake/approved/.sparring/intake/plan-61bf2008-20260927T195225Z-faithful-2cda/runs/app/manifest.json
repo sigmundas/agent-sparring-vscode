@@ -1,0 +1,25 @@
+{
+  "intake_manifest": 1,
+  "intake_id": "plan-61bf2008-20260927T195225Z-faithful-2cda",
+  "run_id": "app",
+  "run_key": "app-run-0001",
+  "manifest": {
+    "version": 1,
+    "plan_label": "docs/plan.md",
+    "source_digest": "sha256:740e5f11746f2c5541efbe88b198ee5023fe1ac34f1e5e7ce63e42c6f32ec200",
+    "stages": [
+      {
+        "stage_id": "app-run-0001-stage-0-audit",
+        "label": "Stage 0",
+        "title": "Audit",
+        "brief": "# Stage brief: app-run-0001-stage-0-audit\n\nStage 0 (1 of 2 in run slice `app`) from plan `docs/plan.md`, prepared by plan intake. Implement only this stage; the other stages are separate.\n\nPrimary repository: `app`. Sibling repositories: none.\n\n# Plan context\n\nPlan-wide text this stage is bound by, quoted verbatim from the source plan.\n\n<!-- source plan lines 1–3 -->\n\n# Widget overhaul\n\nStatus: planned. No stage may touch production without its own go-ahead.\n\n<!-- source plan lines 5–8 -->\n\n## Principles\n\n- Widget identity never changes.\n- Names are display metadata, never identity.\n\n# Stage source\n\n<!-- source plan lines 12–16 -->\n\n## Stage 0 — Audit\n\nRepos: app. Measure the widget population.\n\nAcceptance: counts reproduce from a clean checkout.\n"
+      },
+      {
+        "stage_id": "app-run-0001-stage-1a-app-change",
+        "label": "Stage 1A",
+        "title": "App change",
+        "brief": "# Stage brief: app-run-0001-stage-1a-app-change\n\nStage 1A (2 of 2 in run slice `app`) from plan `docs/plan.md`, prepared by plan intake. Implement only this stage; the other stages are separate.\n\nPrimary repository: `app`. Sibling repositories: none.\n\n# Plan context\n\nPlan-wide text this stage is bound by, quoted verbatim from the source plan.\n\n<!-- source plan lines 5–8 -->\n\n## Principles\n\n- Widget identity never changes.\n- Names are display metadata, never identity.\n\n# Stage source\n\n<!-- source plan lines 18–22 -->\n\n## Stage 1A — App change\n\nRepos: app. Emit reviewed widget records.\n\nAcceptance: tests pass; no identity changes.\n"
+      }
+    ]
+  }
+}

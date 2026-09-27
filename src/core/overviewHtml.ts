@@ -60,7 +60,9 @@ export type OverviewAction =
   | "confirmRunnerInactive"
   | "allowPush"
   | "doNotAllowPush"
-  | "openSettings";
+  | "openSettings"
+  | "openIntakeSource"
+  | "openIntakeReport";
 
 /** A Pass / Fail / Can't test click or a note edit on one manual check, posted by the webview as it happens. */
 export interface HumanCheckMessage {
@@ -325,6 +327,8 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "allowPush",
   "doNotAllowPush",
   "openSettings",
+  "openIntakeSource",
+  "openIntakeReport",
 ];
 
 const ACTIONS: ReadonlySet<string> = new Set<string>(OVERVIEW_ACTIONS);
@@ -456,6 +460,24 @@ function renderBody(model: OverviewModel): string {
 ${(model.emptyLines ?? []).map((line) => `<p class="muted">${escapeHtml(line)}</p>`).join("\n")}
 ${renderActors(model, discloseScope(model))}
 <div class="actions">${button("runPlan", "Run plan…")}${button("showLog", "Show log")}</div>`;
+  }
+  if (model.kind === "intake" && model.intake) {
+    const intake = model.intake;
+    const slices = intake.slices
+      .map(
+        (slice) =>
+          `<li${slice.current ? ' class="current"' : ""}><strong>Run slice ${escapeHtml(slice.runId)}</strong> <span class="muted">— ${escapeHtml(slice.stateLabel)}</span>${
+            slice.stages.length > 0 ? `<ul>${slice.stages.map((stage) => `<li>${escapeHtml(stage)}</li>`).join("")}</ul>` : ""
+          }</li>`,
+      )
+      .join("");
+    return `${renderRepositoryContext(model)}
+<header class="top"><div><h1>${escapeHtml(intake.planName)}</h1><div class="run muted">Plan intake · ${escapeHtml(intake.stateLabel)}</div></div></header>
+${intake.lines.map((line) => `<p>${escapeHtml(line)}</p>`).join("\n")}
+${intake.runCommand ? `<pre class="command">${escapeHtml(intake.runCommand)}</pre>` : ""}
+<ul class="intake-slices">${slices}</ul>
+<div class="actions">${button("openIntakeReport", "Open intake report")}${intake.hasSource ? button("openIntakeSource", "Open plan") : ""}${button("showLog", "Show log")}</div>
+<p class="muted small">Intake ${escapeHtml(intake.intakeId)} · ${escapeHtml(intake.planLabel)}</p>`;
   }
   if (model.kind === "ambiguous") {
     return `${renderRepositoryContext(model)}
@@ -1965,6 +1987,8 @@ pre.engineerror { margin: 6px 0 0; padding: 6px 8px; max-height: 9em; overflow: 
 .feedback .helper { margin: 0 0 6px; }
 textarea.freeform { display: block; width: 100%; box-sizing: border-box; min-height: 58px; padding: 6px 8px; font-family: inherit; font-size: 0.92em; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border, var(--line)); border-radius: 6px; resize: vertical; }
 textarea.freeform:focus { outline: 1px solid var(--vscode-focusBorder); }
+pre.command { margin: 6px 0; padding: 6px 8px; background: var(--vscode-editor-background); border: 1px solid var(--line); border-radius: 4px; font-family: var(--vscode-editor-font-family); font-size: 0.88em; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+ul.intake-slices li.current > strong { text-decoration: underline; }
 pre.sent { margin: 6px 0 0; padding: 6px 10px; border-left: 2px solid var(--line); background: var(--vscode-textBlockQuote-background); font-family: var(--vscode-editor-font-family); font-size: 0.92em; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* One structured gate: the requirement, the steps, the pass line. */

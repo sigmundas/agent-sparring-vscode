@@ -578,7 +578,9 @@ run them.
 | --- | --- |
 | running / paused / complete, current stage index and id | `.sparring/plans/<key>.json` |
 | working / frozen / accepted per stage | `.sparring/stages/<id>/state.json` |
-| stage count and titles | the plan Markdown named in the run state |
+| stage count and titles | the plan Markdown named in the run state — except for a run recorded with `source: "intake-manifest"` |
+| an approved plan-intake run's stage ids, labels (`Stage 0`, `Stage 1A`), titles, count and current stage | that slice's sealed manifest, `.sparring/intake/<id>/runs/<run>/manifest.json`, found through `.sparring/intake/registry/<run key>.json` and the `approval.json` whose `run_key` is the run's. The source Markdown is only the readable plan: it is never read with the strict `## Stage <n>` parser for such a run, and **Continue** resumes with `resume-plan --manifest <that manifest> --run-key <key>`, never with the Markdown. The seal is the engine's to check — the extension matches the envelope's `run_key` and nothing more. An unknown `source` value is a discovery problem, never read as Markdown |
+| **Plan intake** — *Prepared — awaiting review and approval*, *Slice approved — ready to run* | `.sparring/intake/<id>/intake.json` (version 2), each slice's sealed `runs/<run>/approval.json` (version 2, `decision: approved`), slice stage names from `interpretation.json`, and whether `.sparring/plans/<run key>.json` exists. *Approved* is not *will run*: the engine re-checks the approval and the repositories when `run-plan` starts. Once a slice has a plan run, that run's state is the authority and the intake is not shown for it. The run command shown is the one `approve-plan` prints. Nothing here prepares or approves anything |
 | Changes requested / Needs you / Escalated / Review complete | `## Routing outcome` in the current stage's `sparring.md` |
 | **Manual check required** — the gate title, the task, the results | the structured `human_gate` of the recorded verdict: the JSON block behind the `<!-- human-gate:v1 -->` marker in `sparring.md`. The gate's `title` is the requirement, stated once; each `checks` entry becomes one task — its `instruction` laid out as its own sentences, one **Pass if** line from its `pass_criteria`, and Pass / Fail / Can't test keyed by its stable `id`. Nothing is shortened or reworded: the split is a layout, and the verbatim text is in **Show technical details**. Nothing is added from the plan and nothing is inferred from prose — the engine requires a NEEDS_YOU to name what blocks the stage, and things the reviewer says about *after* acceptance (deployment, rollout, monitoring) belong to `findings`/`deferred` and are not shown as checks |
 | **Show technical details** | the demoted layer of the same panel: the routing action, the gate's category and title, each check's id, its verbatim instruction and pass criteria (including the reviewer's *Fail if* wording), where the check is defined, and the plan and line the stage was located at. Never a prerequisite for doing the check; never deleted either |
@@ -703,7 +705,14 @@ In order:
    else;
 2. the active managed plan run of the project;
 3. the active standalone stage;
-4. otherwise the remembered run, then the most recent finished one.
+4. a plan intake that is prepared or slice-approved and has no run yet, when
+   it is **newer** than every finished run there — judged by the
+   `created_at` (or a later `approved_at`) the engine recorded. An intake
+   whose `created_at` is missing or has no time zone is never assumed newer:
+   it stays discoverable and never takes the screen. Only the newest intake
+   of a plan counts;
+5. otherwise the remembered run, then the most recent finished one.
+   Finished runs stay reachable through **History / Runs…** whichever is shown.
 
 A choice stops holding when a managed plan run of the same project has
 **advanced past** the finished stage you had chosen — which is what happens

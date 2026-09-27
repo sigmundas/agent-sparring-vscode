@@ -1,0 +1,146 @@
+{
+  "verdict": "executable_with_recommendations",
+  "summary": "Two run slices separated by the production release.",
+  "context": [
+    {
+      "id": "status",
+      "title": "Status",
+      "ranges": [
+        {
+          "start": 1,
+          "end": 3
+        }
+      ],
+      "reason": "authorization"
+    },
+    {
+      "id": "principles",
+      "title": "Principles",
+      "ranges": [
+        {
+          "start": 5,
+          "end": 8
+        }
+      ],
+      "reason": "invariants"
+    }
+  ],
+  "runs": [
+    {
+      "id": "app",
+      "primary_repository": "app",
+      "expected_branch": "feature/widgets",
+      "rationale": "app-only stages",
+      "stages": [
+        {
+          "label": "0",
+          "title": "Audit",
+          "source_ranges": [
+            {
+              "start": 12,
+              "end": 16
+            }
+          ],
+          "context_ids": [
+            "status",
+            "principles"
+          ],
+          "repositories": [],
+          "depends_on": [],
+          "mode": "implementation",
+          "intake_scope": null,
+          "rationale": ""
+        },
+        {
+          "label": "1A",
+          "title": "App change",
+          "source_ranges": [
+            {
+              "start": 18,
+              "end": 22
+            }
+          ],
+          "context_ids": [
+            "principles"
+          ],
+          "repositories": [],
+          "depends_on": [
+            "0"
+          ],
+          "mode": "implementation",
+          "intake_scope": null,
+          "rationale": ""
+        }
+      ]
+    },
+    {
+      "id": "web",
+      "primary_repository": "web",
+      "expected_branch": null,
+      "rationale": "web-only, after the release",
+      "stages": [
+        {
+          "label": "1B",
+          "title": "Web repair",
+          "source_ranges": [
+            {
+              "start": 24,
+              "end": 28
+            }
+          ],
+          "context_ids": [
+            "principles"
+          ],
+          "repositories": [],
+          "depends_on": [
+            "1A"
+          ],
+          "mode": "implementation",
+          "intake_scope": "Implementation and dry run only; the production run is gate `repair-run`.",
+          "rationale": ""
+        }
+      ]
+    }
+  ],
+  "gates": [
+    {
+      "id": "release",
+      "title": "Production release activation",
+      "kind": "production",
+      "ranges": [
+        {
+          "start": 30,
+          "end": 32
+        }
+      ],
+      "after_stage": "1A",
+      "blocks_stages": [
+        "1B"
+      ],
+      "reason": "1B needs the active release"
+    }
+  ],
+  "excluded": [
+    {
+      "ranges": [
+        {
+          "start": 34,
+          "end": 36
+        }
+      ],
+      "reason": "references"
+    }
+  ],
+  "findings": [
+    {
+      "code": "stale_baseline_fact",
+      "severity": "info",
+      "stages": [
+        "0"
+      ],
+      "ranges": [],
+      "message": "counts should be recomputed"
+    }
+  ],
+  "amended_plan": null
+}

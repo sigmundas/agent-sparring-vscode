@@ -137,7 +137,16 @@ export interface DeferredVerificationRequired {
   instanceIds: string[];
 }
 
-export type PlanRunSource = "markdown" | "manifest";
+/**
+ * plan_model.py `PlanSource.kind`: which plan input a run executes.
+ *
+ * `intake-manifest` is intake_approval.py `SOURCE_KIND`: an approved plan-intake
+ * slice, whose sealed manifest lives under `.sparring/intake/<id>/runs/<run>/`
+ * and whose stages come from that manifest, never from the source Markdown.
+ */
+export type PlanRunSource = "markdown" | "manifest" | "intake-manifest";
+
+const PLAN_RUN_SOURCES: ReadonlySet<string> = new Set<PlanRunSource>(["markdown", "manifest", "intake-manifest"]);
 
 /** push_gate.py: the one typed reason a managed run stops on today. */
 export const PUSH_AUTHORIZATION_REQUIRED = "push_authorization_required";
@@ -194,8 +203,16 @@ export function parsePlanRunState(text: string): PlanRunState {
   if (!Number.isInteger(currentStageIndex) || currentStageIndex < 0) {
     throw new EngineFormatError("current_stage_index must be a non-negative integer");
   }
-  const rawSource = payload["source"];
-  const source: PlanRunSource = rawSource === "manifest" ? "manifest" : "markdown";
+  // Absent is the engine's own reading of state written before manifests
+  // existed (plan.py: `source: str = "markdown"`). Any other value is a plan
+  // input this extension does not know, and treating it as Markdown would
+  // resume the run from the wrong input, so it is refused like an unknown
+  // status.
+  const rawSource = payload["source"] ?? "markdown";
+  if (typeof rawSource !== "string" || !PLAN_RUN_SOURCES.has(rawSource)) {
+    throw new EngineFormatError(`unsupported plan input kind ${JSON.stringify(rawSource)}; this version of the extension does not know how to continue it`);
+  }
+  const source = rawSource as PlanRunSource;
   return {
     plan,
     run: optionalString(payload, "run"),
@@ -539,6 +556,11 @@ export interface PlanStageHeading {
   number: number;
   title: string;
   stageId: string;
+  /**
+   * What the plan calls the stage, when a manifest named it (`Stage 1A`).
+   * Absent for headings parsed from Markdown, whose name is `Stage <number>`.
+   */
+  label?: string;
 }
 
 /**

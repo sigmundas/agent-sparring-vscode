@@ -122,7 +122,7 @@ export class Workspace {
       current_stage_index: number;
       current_stage: string;
       expected_branch?: string;
-      source?: "markdown" | "manifest";
+      source?: "markdown" | "manifest" | "intake-manifest";
       /** The engine's typed pause (plan.py: `PlanRunState.awaiting`), verbatim. */
       awaiting?: Record<string, unknown> | null;
       /** The recorded push permission (push_gate.py: `PushAuthorization`), verbatim. */

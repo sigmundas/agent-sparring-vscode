@@ -1,0 +1,72 @@
+{
+  "version": 2,
+  "decision": "approved",
+  "approved_at": "2026-09-27T19:52:25.502774+00:00",
+  "intake_id": "plan-61bf2008-20260927T195225Z-faithful-2cda",
+  "intake_dir": "__ROOT__/app/.sparring/intake/plan-61bf2008-20260927T195225Z-faithful-2cda",
+  "run_id": "app",
+  "run_key": "app-run-0001",
+  "primary_repository": "app",
+  "sparring_dir": "__ROOT__/app/.sparring",
+  "source": {
+    "path": "__ROOT__/app/docs/plan.md",
+    "label": "docs/plan.md",
+    "digest": "740e5f11746f2c5541efbe88b198ee5023fe1ac34f1e5e7ce63e42c6f32ec200"
+  },
+  "intake_record_sha256": "c92fd4b0cba3144d191c7b869dbe488a4a2987e31bf2d0d76a41d7d817dfac9a",
+  "interpretation_digest": "556e89da0ba3cb82e5fbcd013cb52525a4bb3498b25cc7017333f7736aecc9f2",
+  "report_digest": "78023b0cd02ca243b29eaa1878a8d532aed6f411740727ca375b53d1860e2a8b",
+  "manifest_sha256": "3e5afbe9eb4dc0104e082f3255985cb9e21d6bc1508d3b532baea56d90feb9e0",
+  "manifest_digest": "7a63a30333a49133a69f3a13c3c7833b527ad6ea4645eaaea8ad84e503c7956f",
+  "stage_ids": [
+    "app-run-0001-stage-0-audit",
+    "app-run-0001-stage-1a-app-change"
+  ],
+  "starting_snapshot": {
+    "path": "__ROOT__/app",
+    "git_common_dir": "__ROOT__/app/.git",
+    "branch": "feature/widgets",
+    "head": "c634a7a2cc3508026a0bbb7e24ab7d66bb05bf6e"
+  },
+  "repositories": {
+    "inspected": {
+      "app": {
+        "path": "__ROOT__/app",
+        "git_common_dir": "__ROOT__/app/.git",
+        "branch": "feature/widgets",
+        "head": "c634a7a2cc3508026a0bbb7e24ab7d66bb05bf6e",
+        "dirty_paths": []
+      },
+      "web": {
+        "path": "__ROOT__/web",
+        "git_common_dir": "__ROOT__/web/.git",
+        "branch": "feature/web",
+        "head": "340d9b56c4fde9cc0114a4450a941d11e6bb87bf",
+        "dirty_paths": []
+      }
+    },
+    "at_approval": {
+      "app": {
+        "path": "__ROOT__/app",
+        "git_common_dir": "__ROOT__/app/.git",
+        "branch": "feature/widgets",
+        "head": "c634a7a2cc3508026a0bbb7e24ab7d66bb05bf6e",
+        "dirty_paths": []
+      },
+      "web": {
+        "path": "__ROOT__/web",
+        "git_common_dir": "__ROOT__/web/.git",
+        "branch": "feature/web",
+        "head": "340d9b56c4fde9cc0114a4450a941d11e6bb87bf",
+        "dirty_paths": []
+      }
+    }
+  },
+  "prerequisites": {
+    "gates_confirmed": [],
+    "earlier_slices": []
+  },
+  "expected_branch": "feature/widgets",
+  "confirmed_gates": [],
+  "without_amendment": false
+}

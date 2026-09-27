@@ -392,6 +392,12 @@ export class OverviewPanelManager implements vscode.Disposable {
         agentConfig,
       };
     }
+    if (!selection.selected && selection.intake?.record.sourcePath) {
+      // Only for the plan's own title: the intake screen names the plan as its document does.
+      const planText = await readHead(selection.intake.record.sourcePath, PLAN_READ_LIMIT);
+      artifacts = { ...artifacts, plan: planText !== undefined, planText };
+      repository = selection.intake.location.folderName;
+    }
     const model = buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.executionFor(selection.selected?.id));
     return { model, source: { model, artifacts, sparringText, repository } };
   }

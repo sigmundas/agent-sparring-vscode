@@ -522,6 +522,16 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       return openStageFile(controller, overview, SPARRING_FILENAME);
     case "openBrief":
       return openStageFile(controller, overview, BRIEF_FILENAME);
+    case "openIntakeReport":
+    case "openIntakeSource": {
+      // Acts on the intake the Overview is showing; engine-written files, opened read-only in intent.
+      const intake = controller.currentSelection.intake;
+      const file = intake ? (action === "openIntakeReport" ? intake.reportPath : intake.record.sourcePath) : undefined;
+      if (file) {
+        await openDocument(file, `${path.basename(file)} is missing.`, overview.documentColumn);
+      }
+      return;
+    }
     case "openPlan": {
       if (!run) {
         return;
@@ -1067,7 +1077,7 @@ async function submitDeferredVerification(
   }
   const args = buildResumePlanArgs({ ...input, repoRoot: run.location.repoRoot, expectedBranch, sparringDir: run.location.sparringDir, deferredResults: answers });
   controller.log(`Submit deferred verification: ${answers.length} result(s) passed to resume-plan --deferred-result`);
-  const result = await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, "manifest" in input ? input.manifest : undefined);
+  const result = await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, manifestArgumentOf(input));
   if (result.ok) {
     await controller.beginSubmission({
       runId: run.id,
@@ -1279,7 +1289,7 @@ async function askReviewerAgain(controller: SparringController, run: RunSnapshot
     }
     const args = buildResumePlanArgs({ ...input, repoRoot: run.location.repoRoot, expectedBranch, sparringDir: run.location.sparringDir, evidence: entry });
     controller.log(`${logPrefix} passed to resume-plan --evidence for ${run.currentStage.stageId}`);
-    const result = await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, "manifest" in input ? input.manifest : undefined);
+    const result = await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, manifestArgumentOf(input));
     return result.ok ? { launched: true, executionId: result.record.id } : { launched: false };
   }
   const expectedBranch = await currentBranch(run.location.repoRoot);
@@ -1395,7 +1405,7 @@ async function allowPushCommand(controller: SparringController, overview: Overvi
   controller.log(
     `Allow push: authorizing ${panel.candidateSha} for ${panel.target}${forRun ? ", and this run's later verified candidates" : ""}; the engine performs the push and then its own acceptance gate`,
   );
-  const result = await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, "manifest" in input ? input.manifest : undefined);
+  const result = await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, manifestArgumentOf(input));
   if (!result.ok) {
     await overview.update();
     return { ok: false, reason: "launch", message: result.error };
@@ -2180,7 +2190,7 @@ async function resumePlanCommand(controller: SparringController, preselected?: P
     sparringDir: run.location.sparringDir,
     evidence,
   });
-  await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, "manifest" in input ? input.manifest : undefined);
+  await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, manifestArgumentOf(input));
 }
 
 function describeEntry(entry: StageEntry): string {
@@ -2458,7 +2468,7 @@ function declarationsFor(controller: SparringController, key: string, location: 
  * Undefined means nothing can be launched, and the reason has already been
  * shown to the person.
  */
-type PlanResumeInput = ({ planPath: string } | { manifest: string }) & {
+type PlanResumeInput = ({ planPath: string } | { manifest: string } | { intakeManifest: string }) & {
   source: PlanRunSource;
   /**
    * Which run is being continued, as `resume-plan --run-key`.
@@ -2473,8 +2483,22 @@ type PlanResumeInput = ({ planPath: string } | { manifest: string }) & {
 };
 
 async function planInvocationFor(controller: SparringController, run: PlanRunSnapshot): Promise<PlanResumeInput | undefined> {
-  if (run.state.source !== "manifest") {
+  const source = run.state.source;
+  if (source === "markdown") {
     return { planPath: run.planPath, source: "markdown", runKey: run.runKey };
+  }
+  if (source === "intake-manifest") {
+    // An approved intake slice continues from the sealed manifest it was
+    // approved as, found by discovery from the engine's own registry and
+    // approval. Never rebuilt, never rewritten, and never the source
+    // Markdown: the engine re-verifies the seal on every resume.
+    if (!run.intake) {
+      void vscode.window.showWarningMessage(
+        `Agent Sparring: this run was started from an approved plan intake, and its approved manifest could not be found${run.planError ? ` (${run.planError})` : ""}. Nothing was started.`,
+      );
+      return undefined;
+    }
+    return { intakeManifest: run.intake.manifestPath, source: "intake-manifest", runKey: run.runKey };
   }
   const markdown = await readOptional(run.planPath);
   if (markdown === undefined) {
@@ -2827,14 +2851,14 @@ async function continueManagedRun(
   if (!input) {
     return { ok: false, reason: "manifest" }; // planInvocationFor said why
   }
-  const manifest = "manifest" in input ? input.manifest : undefined;
+  const manifest = manifestArgumentOf(input);
 
   if (await refusedByPreflight(controller, overview, context.stage, { location, adopt: false, onDisk: new Set<string>(), expectedBranch })) {
     return { ok: false, reason: "preflight", message: "preflight" };
   }
 
   if (context.confirm) {
-    const stages = declaredStages(context.markdown);
+    const stages = declaredStagesOf(run, context.markdown);
     const choice = await vscode.window.showInformationMessage(
       "Run this plan automatically until Agent Sparring needs you?",
       {
@@ -2862,7 +2886,7 @@ async function continueManagedRun(
   if (!result.ok) {
     return { ok: false, reason: "write", message: result.error };
   }
-  return { ok: true, runId: run.id, manifest, kind: "resume-plan", input: input.source, adopt: false, stages: declaredStages(context.markdown) ?? 0 };
+  return { ok: true, runId: run.id, manifest, kind: "resume-plan", input: input.source, adopt: false, stages: declaredStagesOf(run, context.markdown) ?? 0 };
 }
 
 /** How many `## Stage <n> — <title>` sections a plan declares, when it parses at all. */
@@ -2872,6 +2896,16 @@ function declaredStages(markdown: string): number | undefined {
   } catch {
     return undefined;
   }
+}
+
+/** The file a resume passes as `--manifest`, of either manifest kind; what the tracker matches the launch by. */
+function manifestArgumentOf(input: PlanResumeInput): string | undefined {
+  return "manifest" in input ? input.manifest : "intakeManifest" in input ? input.intakeManifest : undefined;
+}
+
+/** How many stages the run declares: its approved manifest's for an intake run, else the Markdown's sections. */
+function declaredStagesOf(run: PlanRunSnapshot, markdown: string): number | undefined {
+  return run.state.source === "intake-manifest" ? run.planStages?.length : declaredStages(markdown);
 }
 
 /**

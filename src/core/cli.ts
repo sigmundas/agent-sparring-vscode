@@ -33,6 +33,13 @@ export interface PlanInvocation {
    * order, with those exact briefs (manifest.ts).
    */
   manifest?: string;
+  /**
+   * An approved plan-intake slice's sealed manifest
+   * (`.sparring/intake/<id>/runs/<run>/manifest.json`), also passed as
+   * `--manifest`. Kept apart from {@link manifest} because it is a different
+   * recorded input kind (`intake-manifest`), and the builder checks the kind.
+   */
+  intakeManifest?: string;
   repoRoot: string;
   expectedBranch: string;
   /** Passed as the global `--sparring-dir` when it is not `<repoRoot>/.sparring`. */
@@ -189,7 +196,7 @@ export function buildReopenStageArgs(invocation: ReopenStageInvocation): string[
  * be continued by any button.
  */
 function requireRecordedInputKind(invocation: PlanInvocation & { source: PlanRunSource }): void {
-  const given: PlanRunSource = invocation.manifest ? "manifest" : "markdown";
+  const given: PlanRunSource = invocation.intakeManifest ? "intake-manifest" : invocation.manifest ? "manifest" : "markdown";
   if (given === invocation.source) {
     return;
   }
@@ -201,6 +208,12 @@ function requireRecordedInputKind(invocation: PlanInvocation & { source: PlanRun
 
 /** Exactly one plan input, as the engine requires: the manifest flag or the positional plan. */
 function planInput(invocation: PlanInvocation): string[] {
+  if (invocation.intakeManifest && invocation.manifest) {
+    throw new Error("a plan invocation takes one manifest, not both an execution manifest and an intake manifest");
+  }
+  if (invocation.intakeManifest) {
+    return ["--manifest", invocation.intakeManifest];
+  }
   if (invocation.manifest) {
     return ["--manifest", invocation.manifest];
   }

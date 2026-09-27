@@ -1,0 +1,9 @@
+{
+  "run_key": "app-run-0001",
+  "intake_dir": "__ROOT__/app/.sparring/intake/plan-61bf2008-20260927T195225Z-faithful-2cda",
+  "run_id": "app",
+  "stage_ids": [
+    "app-run-0001-stage-0-audit",
+    "app-run-0001-stage-1a-app-change"
+  ]
+}

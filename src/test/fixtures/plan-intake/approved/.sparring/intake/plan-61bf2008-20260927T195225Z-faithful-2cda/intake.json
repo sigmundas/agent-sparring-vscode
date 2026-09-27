@@ -1,0 +1,44 @@
+{
+  "version": 2,
+  "intake_id": "plan-61bf2008-20260927T195225Z-faithful-2cda",
+  "mode": "faithful",
+  "created_at": "2026-09-27T19:52:25.425171+00:00",
+  "plan_label": "docs/plan.md",
+  "source_path": "__ROOT__/app/docs/plan.md",
+  "source_digest": "740e5f11746f2c5541efbe88b198ee5023fe1ac34f1e5e7ce63e42c6f32ec200",
+  "interpretation_digest": "556e89da0ba3cb82e5fbcd013cb52525a4bb3498b25cc7017333f7736aecc9f2",
+  "primary_repository": "app",
+  "context_repositories": {
+    "web": "__ROOT__/web"
+  },
+  "run_keys": {
+    "app": "app-run-0001",
+    "web": "web-run-0002"
+  },
+  "briefs": {
+    "app-run-0001-stage-0-audit": "3c7b2bee540e573d3a5994a46596e12b6cccf9176934d9f5f241971ac71a40ee",
+    "app-run-0001-stage-1a-app-change": "39e18e406f5cc312a377c35ea11c1d4770694a4bbc088b2fc98df2b6b0aa7117",
+    "web-run-0002-stage-1b-web-repair": "0c0fe9bbcb9b4d8c6894791ddadc40888e4001bad5636a6bbb2222b1d3e1cfb3"
+  },
+  "provider": {},
+  "provider_session_id": "t-1",
+  "amendment_proposed": false,
+  "repositories": {
+    "app": {
+      "path": "__ROOT__/app",
+      "git_common_dir": "__ROOT__/app/.git",
+      "branch": "feature/widgets",
+      "head": "c634a7a2cc3508026a0bbb7e24ab7d66bb05bf6e",
+      "dirty_paths": []
+    },
+    "web": {
+      "path": "__ROOT__/web",
+      "git_common_dir": "__ROOT__/web/.git",
+      "branch": "feature/web",
+      "head": "340d9b56c4fde9cc0114a4450a941d11e6bb87bf",
+      "dirty_paths": []
+    }
+  },
+  "report_intake_dir": "__ROOT__/app/.sparring/intake/plan-61bf2008-20260927T195225Z-faithful-2cda",
+  "report_digest": "78023b0cd02ca243b29eaa1878a8d532aed6f411740727ca375b53d1860e2a8b"
+}

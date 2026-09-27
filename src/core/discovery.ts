@@ -4,8 +4,11 @@
  * selection rule that never guesses between genuinely ambiguous active runs.
  *
  * Authoritative inputs only: `.sparring/plans/<key>.json`, each stage's
- * `state.json`, the plan Markdown (for stage titles/total) and the current
- * stage's `sparring.md` routing outcome. `activity.jsonl` is never read here.
+ * `state.json`, the plan Markdown (for stage titles/total) — or, for a run
+ * of an approved plan-intake slice, that slice's sealed manifest — and the
+ * current stage's `sparring.md` routing outcome. `.sparring/intake/` is read
+ * to show a plan intake that has no run yet (core/intake.ts); once a run
+ * exists, its state file is the authority. `activity.jsonl` is never read here.
  *
  * No dependency on the vscode API.
  */
@@ -23,6 +26,7 @@ import {
   type SparringOutcome,
   type StageState,
 } from "./engineFormats";
+import { discoverIntakes, isPreRunIntake, resolveIntakeRun, type IntakeRunBinding, type IntakeSnapshot } from "./intake";
 import { planTitle } from "./planAssociation";
 
 export const SPARRING_DIRNAME = ".sparring";
@@ -111,9 +115,19 @@ export interface PlanRunSnapshot {
    * engine-shaped stage parser refuses it.
    */
   planDocumentTitle?: string;
-  /** Parsed headings, or undefined if the plan is unreadable/malformed. */
+  /**
+   * The run's stage list, or undefined if it could not be read. From the plan
+   * Markdown's headings, except for an `intake-manifest` run, whose stages are
+   * its approved manifest's ({@link intake}) and never the Markdown's.
+   */
   planStages?: PlanStageHeading[];
   planError?: string;
+  /**
+   * For an `intake-manifest` run: the approved slice it executes. `planPath`
+   * is then the source Markdown the approval recorded — the human-readable
+   * plan, not the input the run resumes from.
+   */
+  intake?: IntakeRunBinding;
   stages: StageSnapshot[];
   currentStage: StageSnapshot;
   /** Routing outcome recorded in the current stage's sparring.md, if any. */
@@ -132,10 +146,20 @@ export interface StandaloneStageSnapshot {
 
 export type RunSnapshot = PlanRunSnapshot | StandaloneStageSnapshot;
 
+/** A plan intake, and the project it was found in. */
+export interface DiscoveredIntake extends IntakeSnapshot {
+  location: SparringLocation;
+}
+
 export interface Discovery {
   locations: SparringLocation[];
   runs: RunSnapshot[];
-  /** Plan-run state files that exist but could not be parsed. */
+  /**
+   * Every plan intake found under `.sparring/intake/`, whatever its state.
+   * Absent from a discovery built before intakes were read, which means none.
+   */
+  intakes?: DiscoveredIntake[];
+  /** Plan-run state files (and intake records) that exist but could not be parsed. */
   problems: { path: string; error: string }[];
 }
 
@@ -322,7 +346,16 @@ export async function discoverRuns(locations: SparringLocation[]): Promise<Disco
     runs.push(...planRuns);
     runs.push(...(await discoverStandaloneStages(location, planRuns)));
   }
-  return { locations, runs, problems };
+  // Run keys are minted unique, and a slice may be run from another project
+  // than the one that prepared it, so every discovered run answers for its key.
+  const statusByRunKey = new Map(runs.filter((run): run is PlanRunSnapshot => run.kind === "plan").map((run) => [run.runKey, run.state.status]));
+  const intakes: DiscoveredIntake[] = [];
+  for (const location of locations) {
+    const found = await discoverIntakes(location.sparringDir, statusByRunKey);
+    intakes.push(...found.intakes.map((intake) => ({ ...intake, location })));
+    problems.push(...found.problems);
+  }
+  return { locations, runs, intakes, problems };
 }
 
 async function discoverPlanRuns(location: SparringLocation, problems: Discovery["problems"]): Promise<PlanRunSnapshot[]> {
@@ -350,17 +383,37 @@ async function snapshotPlanRun(location: SparringLocation, statePath: string): P
   // for another run's stages.
   const runKey = state.run ?? path.basename(statePath, ".json");
   const planKey = planKeyOf(state.plan);
-  const planPath = resolvePlanPath(state.plan, location.repoRoot);
 
   let planStages: PlanStageHeading[] | undefined;
   let planError: string | undefined;
   let planText: string | undefined;
+  let intake: IntakeRunBinding | undefined;
+  if (state.source === "intake-manifest") {
+    // The approved manifest is the authority for this run's stages: the
+    // source Markdown's labels (Stage 0, 1A, 1B) are not what the strict
+    // 1..N heading parser reads, and the run executes the manifest anyway.
+    try {
+      intake = await resolveIntakeRun(location.sparringDir, runKey);
+      planStages = intake.stages.map((stage, index) => ({ number: index + 1, stageId: stage.stageId, title: stage.title, label: stage.label }));
+      if (planStages.length === 0) {
+        planStages = undefined;
+        planError = "the approved intake manifest declares no stages";
+      }
+    } catch (error) {
+      planError = (error as Error).message;
+    }
+  }
+  const planPath = intake?.sourcePath ?? resolvePlanPath(state.plan, location.repoRoot);
   try {
     planText = await fs.readFile(planPath, "utf8");
   } catch (error) {
-    planError = (error as Error).message;
+    // For an intake run the Markdown is only the readable source; its absence
+    // says nothing about the run's stages.
+    if (state.source !== "intake-manifest") {
+      planError = (error as Error).message;
+    }
   }
-  if (planText !== undefined) {
+  if (planText !== undefined && state.source !== "intake-manifest") {
     // The document's own title is kept whatever the engine-shaped stage parser
     // makes of the rest of it: a plan that carries handoff records is refused
     // as a stage list and still has a name a person recognises.
@@ -406,6 +459,7 @@ async function snapshotPlanRun(location: SparringLocation, statePath: string): P
     planDocumentTitle: planText === undefined ? undefined : planTitle(planText),
     planStages,
     planError,
+    ...(intake ? { intake } : {}),
     stages,
     currentStage,
     currentOutcome,
@@ -488,6 +542,12 @@ async function listDir(dir: string): Promise<string[]> {
 
 export interface RunSelection {
   selected?: RunSnapshot;
+  /**
+   * A plan intake that has no run yet and is newer than the finished work in
+   * scope, shown in place of that work. Only ever set by automatic selection,
+   * and only when {@link selected} is not.
+   */
+  intake?: DiscoveredIntake;
   /** Non-empty when several runs look active and none was explicitly chosen. */
   ambiguous: RunSnapshot[];
   /**
@@ -622,7 +682,7 @@ export type RunAttribution = "here" | "elsewhere" | "unattributed";
  * stays out of automatic selection and stays in the explicit picker, because
  * "Following the active repository: B" has to mean the run really is B's.
  */
-export function attributeRun(run: RunSnapshot, repoRoot: string, knownRoots: readonly string[] = []): RunAttribution {
+export function attributeRun(run: Pick<RunSnapshot, "location">, repoRoot: string, knownRoots: readonly string[] = []): RunAttribution {
   const roots = [...new Set([repoRoot, ...knownRoots].map((root) => path.resolve(root)))];
   const owner = repositoryOwning(run.location, roots);
   if (owner === undefined) {
@@ -797,7 +857,13 @@ export const NO_STAGE_OWNERSHIP: StageOwnership = new Map<string, string>();
  *  3. several open plan runs: the remembered (`stickyId`) one if it is among
  *     them, otherwise ambiguous and nothing is selected;
  *  4. no open plan run: the same for open standalone stages;
- *  5. nothing open: the remembered run if it still exists (a run that just
+ *  5. nothing open, and a plan intake in scope is waiting on a person or a
+ *     first `run-plan` (prepared or slice-approved) and is *newer* than every
+ *     finished run: that intake (`intake`), with no run selected. Newer is
+ *     judged only from the time the engine recorded for the intake; one whose
+ *     `created_at` cannot be read is never promoted, so an abandoned or
+ *     unreadable intake cannot take the screen from finished work;
+ *  6. otherwise: the remembered run if it still exists (a run that just
  *     finished stays on screen), else the most recently written terminal run
  *     (complete plan or accepted stage), else nothing.
  *
@@ -817,6 +883,8 @@ export function selectRun(
    * conservative answer.
    */
   locations: readonly SparringLocation[] = [],
+  /** The discovery's plan intakes; see rule 5. */
+  intakes: readonly DiscoveredIntake[] = [],
 ): RunSelection {
   const view: RepositoryScopeView | undefined = scope
     ? { repoRoot: path.resolve(scope.repoRoot), name: repositoryDisplayName(scope.repoRoot, scope.knownRoots ?? []) }
@@ -824,6 +892,7 @@ export function selectRun(
   const inScope: RunSnapshot[] = [];
   const elsewhere: RunSnapshot[] = [];
   const unattributed: RunSnapshot[] = [];
+  const intakesInScope = scope ? intakes.filter((intake) => attributeRun(intake, scope.repoRoot, scope.knownRoots ?? []) === "here") : intakes;
   for (const run of runs) {
     if (!scope) {
       inScope.push(run);
@@ -852,15 +921,47 @@ export function selectRun(
       // case where "scanned and absent" does not mean deleted: the engine
       // writes the run state just after the command reaches the terminal.
       const gone = pick.intent !== "starting" && locations.some((location) => runIdBelongsTo(pick.id, location));
-      return decorate({ ...selectAutomatically(inScope, stickyId), ...(gone ? { released: { id: pick.id, reason: "gone" as const } } : {}) });
+      return decorate({ ...selectAutomatically(inScope, stickyId, intakesInScope), ...(gone ? { released: { id: pick.id, reason: "gone" as const } } : {}) });
     }
     const by = supersedingPlanRun(chosen, runs, pick.atMs ?? 0, ownership, pick.intent ?? "inspect");
     if (!by) {
       return decorate({ selected: chosen, ambiguous: [], pinned: true });
     }
-    return decorate({ ...selectAutomatically(inScope, stickyId), released: { id: pick.id, reason: "superseded", by } });
+    return decorate({ ...selectAutomatically(inScope, stickyId, intakesInScope), released: { id: pick.id, reason: "superseded", by } });
   }
-  return decorate(selectAutomatically(inScope, stickyId));
+  return decorate(selectAutomatically(inScope, stickyId, intakesInScope));
+}
+
+/**
+ * The pre-run plan intake that should take the place of finished work, if any
+ * (rule 5 of {@link selectRun}).
+ *
+ * Only the newest intake of each plan counts — preparing a plan again
+ * supersedes the earlier proposal — and only while it is prepared or
+ * slice-approved. It must be strictly newer than every finished run in
+ * scope, judged by the time the engine recorded for it; with no readable
+ * `created_at` it has no age and is never promoted.
+ */
+export function promotableIntake(intakes: readonly DiscoveredIntake[], runs: readonly RunSnapshot[]): DiscoveredIntake | undefined {
+  const newestPerPlan = new Map<string, DiscoveredIntake>();
+  for (const intake of intakes) {
+    const created = intake.record.createdAtMs;
+    if (created === undefined) {
+      continue;
+    }
+    const key = `${intake.location.projectDir}|${intake.record.planLabel}`;
+    const held = newestPerPlan.get(key);
+    if (!held || created > (held.record.createdAtMs ?? -Infinity)) {
+      newestPerPlan.set(key, intake);
+    }
+  }
+  const candidates = [...newestPerPlan.values()].filter((intake) => isPreRunIntake(intake) && intake.activityMs !== undefined);
+  if (candidates.length === 0) {
+    return undefined;
+  }
+  const newest = candidates.sort((a, b) => (b.activityMs ?? 0) - (a.activityMs ?? 0))[0];
+  const lastFinishedMs = runs.filter((run) => !isOpenRun(run)).reduce((latest, run) => Math.max(latest, run.stateMtimeMs), -Infinity);
+  return (newest.activityMs ?? -Infinity) > lastFinishedMs ? newest : undefined;
 }
 
 /** Whether a run id names a run of this location; run ids are `<projectDir>|<kind>:<key>`. */
@@ -869,7 +970,7 @@ function runIdBelongsTo(runId: string, location: SparringLocation): boolean {
   return at > 0 && samePath(runId.slice(0, at), location.projectDir);
 }
 
-function selectAutomatically(runs: RunSnapshot[], stickyId?: string): RunSelection {
+function selectAutomatically(runs: RunSnapshot[], stickyId?: string, intakes: readonly DiscoveredIntake[] = []): RunSelection {
   const sticky = stickyId ? runs.find((run) => run.id === stickyId) : undefined;
 
   const openPlans = runs.filter((run): run is PlanRunSnapshot => run.kind === "plan" && isOpenRun(run));
@@ -885,6 +986,10 @@ function selectAutomatically(runs: RunSnapshot[], stickyId?: string): RunSelecti
   }
   if (openStages.length > 1) {
     return sticky && openStages.includes(sticky as StandaloneStageSnapshot) ? { selected: sticky, ambiguous: [] } : { ambiguous: openStages };
+  }
+  const intake = promotableIntake(intakes, runs);
+  if (intake) {
+    return { ambiguous: [], intake };
   }
   if (sticky) {
     return { selected: sticky, ambiguous: [] };
