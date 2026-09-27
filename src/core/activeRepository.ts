@@ -377,6 +377,7 @@ export const SELECT_RUN_LABEL = "History / Runs…";
 export const CONTEXT_HEADLINE = {
   following: "Following repository",
   pinned: "Viewing pinned run from",
+  attached: "Showing work in",
   unscoped: "Repository context",
 } as const;
 
@@ -394,7 +395,12 @@ export const ACTIVE_CONTEXT_HEADLINE = "Active repository context";
  * existed.
  */
 export interface RepositoryContextView {
-  mode: "following" | "pinned" | "unscoped";
+  /**
+   * `pinned` is a person's explicit pin; `attached` is the cockpit showing
+   * work it was just asked to start or open, which the active repository
+   * ends (see `RunPreference.origin`).
+   */
+  mode: "following" | "pinned" | "attached" | "unscoped";
   /** `Following repository` / `Viewing pinned run from` / `Repository context`. */
   headline: string;
   /** The repository named under that headline; absent only when nothing could be resolved. */
@@ -418,6 +424,7 @@ export interface RepositoryContextView {
 const FOLLOWING_EXPLANATION =
   "Agent Sparring follows the repository of the active editor or the Source Control view's focus. VS Code's own repository selector in the status bar is not readable by extensions, so it is not what this follows; Run Plan asks which repository, and History / Runs pins one explicitly.";
 const PINNED_EXPLANATION = `This run was pinned through ${SELECT_RUN_LABEL}, and a pin is kept even when the window moves to another repository so that history stays open while you work elsewhere. ${FOLLOW_ACTIVE_LABEL} releases it, and starting a new plan run releases it too.`;
+const ATTACHED_EXPLANATION = `Agent Sparring is showing work you just started or opened. This is not a pin: opening a file in another repository goes back to following that repository, and ${FOLLOW_ACTIVE_LABEL} does it now.`;
 const UNSCOPED_EXPLANATION =
   "No repository could be resolved: the built-in Git extension has opened none, or has not answered yet. Nothing is scoped away, so every discovered run is a candidate.";
 
@@ -431,9 +438,22 @@ const UNSCOPED_EXPLANATION =
  */
 export function describeRepositoryContext(selection: RunSelection): RepositoryContextView {
   const scope = selection.scope;
-  if (selection.pinned && selection.selected) {
-    const pinnedTo = selection.selected.location.folderName;
-    const away = Boolean(scope) && !samePath(selection.selected.location.repoRoot, scope?.repoRoot ?? "");
+  const held = selection.selected ?? selection.intake;
+  if (selection.pinned && held && selection.pinOrigin === "action") {
+    const shownIn = held.location.folderName;
+    return {
+      mode: "attached",
+      headline: CONTEXT_HEADLINE.attached,
+      repository: shownIn,
+      activeRepository: scope?.name,
+      text: `Showing work in ${shownIn}; opening a file in another repository follows that repository.`,
+      release: FOLLOW_ACTIVE_LABEL,
+      explanation: ATTACHED_EXPLANATION,
+    };
+  }
+  if (selection.pinned && held) {
+    const pinnedTo = held.location.folderName;
+    const away = Boolean(scope) && !samePath(held.location.repoRoot, scope?.repoRoot ?? "");
     return {
       mode: "pinned",
       headline: CONTEXT_HEADLINE.pinned,

@@ -5,7 +5,7 @@
   "deferred_human_checks": [],
   "expected_branch": "feature/widgets",
   "plan": "docs/plan.md",
-  "plan_digest": "962bc81bcac926a8bd6bf0356dbbf7ad9c797e886e644e2143386f69507444fc",
+  "plan_digest": "380c8fe7594b478ff28d027bdd952d95879919fedf7db932c5f37fa4d5a13f06",
   "push_authorization": null,
   "run": "app-run-0001",
   "source": "intake-manifest",

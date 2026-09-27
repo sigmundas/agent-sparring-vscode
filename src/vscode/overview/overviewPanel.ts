@@ -11,10 +11,13 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, type PlanRunSnapshot, type RunSnapshot } from "../../core/discovery";
 import { stageScopeOf } from "../../core/stageScope";
+import { intakeNextAction } from "../../core/intake";
+import { approveInvocation, startInvocation } from "../../core/intakeActions";
 import { parseStageState, type StageStatus } from "../../core/engineFormats";
 import { planRunDisplayName } from "../../core/planMembership";
 import {
   isActionMessage,
+  isIntakeActionMessage,
   isAutoPushMessage,
   isCopyMessage,
   isCopyPromptMessage,
@@ -30,6 +33,7 @@ import {
   type CopyPromptMessage,
   type HumanCheckMessage,
   type HumanFeedbackMessage,
+  type IntakeActionMessage,
   type OpenPromptSourceMessage,
   type OverviewAction,
   type StopMessage,
@@ -61,6 +65,7 @@ export class OverviewPanelManager implements vscode.Disposable {
   constructor(
     private readonly controller: SparringController,
     private readonly onAction: (action: OverviewAction) => Promise<void>,
+    private readonly onIntakeAction: (message: IntakeActionMessage) => Promise<void> = async () => undefined,
   ) {
     this.subscriptions.push(controller.onDidChange(() => this.scheduleUpdate()));
   }
@@ -89,6 +94,8 @@ export class OverviewPanelManager implements vscode.Disposable {
     this.panel.webview.onDidReceiveMessage((message: unknown) => {
       if (isActionMessage(message)) {
         void this.onAction(message.action);
+      } else if (isIntakeActionMessage(message)) {
+        void this.onIntakeAction(message);
       } else if (isHumanCheckMessage(message)) {
         void this.recordHumanCheck(message);
       } else if (isHumanFeedbackMessage(message)) {
@@ -392,11 +399,22 @@ export class OverviewPanelManager implements vscode.Disposable {
         agentConfig,
       };
     }
-    if (!selection.selected && selection.intake?.record.sourcePath) {
-      // Only for the plan's own title: the intake screen names the plan as its document does.
-      const planText = await readHead(selection.intake.record.sourcePath, PLAN_READ_LIMIT);
-      artifacts = { ...artifacts, plan: planText !== undefined, planText };
-      repository = selection.intake.location.folderName;
+    if (!selection.selected && selection.intake) {
+      const intake = selection.intake;
+      // The source plan is read only for its own title: the intake screen
+      // names the plan as its document does.
+      const planText = intake.record.sourcePath ? await readHead(intake.record.sourcePath, PLAN_READ_LIMIT) : undefined;
+      const next = intakeNextAction(intake);
+      const locations = this.controller.currentDiscovery.locations;
+      const invocation = next.kind === "approve" ? approveInvocation(intake, next.slice, locations) : next.kind === "start" ? startInvocation(next.slice, locations) : undefined;
+      artifacts = {
+        ...artifacts,
+        plan: planText !== undefined,
+        planText,
+        intakeApproval: next.kind === "approve" ? this.controller.intakeApproval(intake.dir, next.slice.runId) : undefined,
+        intakeCommand: invocation ? (invocation.ok ? `sparring ${invocation.args.join(" ")}` : invocation.problem) : undefined,
+      };
+      repository = intake.location.folderName;
     }
     const model = buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.executionFor(selection.selected?.id));
     return { model, source: { model, artifacts, sparringText, repository } };

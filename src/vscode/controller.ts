@@ -26,6 +26,9 @@ import {
   type Discovery,
   type LocateOptions,
   type RunPreference,
+  type DiscoveredIntake,
+  type PinOrigin,
+  intakeIdFor,
   type RepositoryScope,
   type RunSelection,
   type PlanRunSnapshot,
@@ -87,6 +90,7 @@ import {
 } from "../core/stageModes";
 import { migrateToStageScope, stageScopeKey, type StageScope } from "../core/stageScope";
 import { deriveStatus } from "../core/status";
+import type { IntakeApprovalAttempt } from "../core/overviewModel";
 import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
 import { TerminalPool } from "./terminalPool";
 import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult, type StopOutcome, type StopTarget } from "./executionTracker";
@@ -123,6 +127,10 @@ const PIN_POLICY = "repository-scoped-pin-v1";
  * the person who made it.
  */
 const PIN_INTENT_KEY = "agentSparring.pinIntent";
+/** Whether the stored selection is a person's explicit pin or an action attachment (`RunPreference.origin`). */
+const PIN_ORIGIN_KEY = "agentSparring.pinOrigin";
+/** The active repository when an action attachment was made; a move away from it ends the attachment. */
+const PIN_ACTIVE_ROOT_KEY = "agentSparring.pinActiveRoot";
 const OUTPUT_CHANNEL_NAME = "Agent Sparring";
 /** How often the process table may be read for one run whose liveness nothing in this window watched. */
 const PROBE_COOLDOWN_MS = 15_000;
@@ -569,6 +577,28 @@ export class SparringController implements vscode.Disposable {
     }
     this.render();
     return result;
+  }
+
+  /**
+   * This window's approvals of intake slices, by `<intake dir>#<run id>`:
+   * in flight, or refused with the engine's own output. In memory only — an
+   * approval that landed is on disk as `approval.json`, and a refusal is
+   * something to read now, not state to keep.
+   */
+  private readonly intakeApprovals = new Map<string, IntakeApprovalAttempt>();
+
+  intakeApproval(intakeDir: string, runId: string): IntakeApprovalAttempt | undefined {
+    return this.intakeApprovals.get(`${intakeDir}#${runId}`);
+  }
+
+  setIntakeApproval(intakeDir: string, runId: string, attempt: IntakeApprovalAttempt | undefined): void {
+    const key = `${intakeDir}#${runId}`;
+    if (attempt) {
+      this.intakeApprovals.set(key, attempt);
+    } else {
+      this.intakeApprovals.delete(key);
+    }
+    this.render();
   }
 
   /** Run one short sparring command to completion (see SparringCommandRunner). */
@@ -1282,10 +1312,13 @@ export class SparringController implements vscode.Disposable {
       return undefined;
     }
     const stored = this.context.workspaceState.get<string>(PIN_INTENT_KEY);
+    const origin = this.context.workspaceState.get<string>(PIN_ORIGIN_KEY);
     return {
       id,
       atMs: this.context.workspaceState.get<number>(SELECTED_AT_KEY),
       intent: stored === "follow" || stored === "inspect" || stored === "starting" ? stored : undefined,
+      origin: origin === "action" || origin === "explicit" ? origin : undefined,
+      activeRootAtPin: this.context.workspaceState.get<string>(PIN_ACTIVE_ROOT_KEY),
     };
   }
 
@@ -1298,11 +1331,12 @@ export class SparringController implements vscode.Disposable {
    * next refresh the first has often become the second, and nothing on disk
    * remembers which it was.
    */
-  async chooseRun(run: RunSnapshot | undefined): Promise<void> {
+  async chooseRun(run: RunSnapshot | undefined, origin: PinOrigin): Promise<void> {
     const intent = run ? intentForChoosing(run) : undefined;
     await this.context.workspaceState.update(SELECTED_RUN_KEY, run?.id);
     await this.context.workspaceState.update(SELECTED_AT_KEY, run ? Date.now() : undefined);
     await this.context.workspaceState.update(PIN_INTENT_KEY, intent);
+    await this.recordPinOrigin(run ? origin : undefined);
     if (run) {
       this.log(
         intent === "inspect"
@@ -1329,12 +1363,38 @@ export class SparringController implements vscode.Disposable {
     await this.context.workspaceState.update(SELECTED_RUN_KEY, undefined);
     await this.context.workspaceState.update(SELECTED_AT_KEY, undefined);
     await this.context.workspaceState.update(PIN_INTENT_KEY, undefined);
+    await this.recordPinOrigin(undefined);
     const stage = released.id.split("|").pop();
     this.log(
       released.reason === "superseded"
         ? `the pinned stage ${stage} was being followed while it ran, and the plan run that executed it has moved on to ${released.by.currentStage.stageId}; following that plan run. The stage is still in Select repository / run.`
-        : `the pinned run ${stage} is no longer on disk in a project that was scanned; the pin is released and automatic selection applies.`,
+        : released.reason === "repository"
+          ? `the active repository is now ${path.basename(released.to)}; ${stage} was shown because it had just been started or opened, not pinned, so Agent Sparring follows ${path.basename(released.to)} again.`
+          : `the pinned run ${stage} is no longer on disk in a project that was scanned; the pin is released and automatic selection applies.`,
     );
+  }
+
+  /**
+   * Record why the stored selection exists. An action attachment also keeps
+   * the repository the window was in at that moment, so it is released by
+   * the person *moving*, never by where the editor already was.
+   */
+  private async recordPinOrigin(origin: PinOrigin | undefined): Promise<void> {
+    await this.context.workspaceState.update(PIN_ORIGIN_KEY, origin);
+    await this.context.workspaceState.update(PIN_ACTIVE_ROOT_KEY, origin === "action" ? this.activeRepository.activeRepoRoot : undefined);
+  }
+
+  /**
+   * Pin a plan intake a person chose to keep viewing (History / Runs). An
+   * intake has no running/finished intent of its own; it is inspected.
+   */
+  async chooseIntake(intake: DiscoveredIntake): Promise<void> {
+    await this.context.workspaceState.update(SELECTED_RUN_KEY, intakeIdFor(intake.location, intake.record.intakeId));
+    await this.context.workspaceState.update(SELECTED_AT_KEY, Date.now());
+    await this.context.workspaceState.update(PIN_INTENT_KEY, "inspect");
+    await this.recordPinOrigin("explicit");
+    this.log(`pinned to the plan intake ${intake.record.intakeId} in ${intake.location.folderName}; ${FOLLOW_ACTIVE_LABEL} goes back to automatic selection.`);
+    await this.refresh();
   }
 
   /**
@@ -1369,7 +1429,8 @@ export class SparringController implements vscode.Disposable {
     await this.context.workspaceState.update(SELECTED_RUN_KEY, runId);
     await this.context.workspaceState.update(SELECTED_AT_KEY, Date.now());
     await this.context.workspaceState.update(PIN_INTENT_KEY, "starting");
-    this.log(`following the plan run just started (${runId}); it is pinned while it runs, and ${FOLLOW_ACTIVE_LABEL} goes back to following this window.`);
+    await this.recordPinOrigin("action");
+    this.log(`showing the plan run just started (${runId}); opening a file in another repository, or ${FOLLOW_ACTIVE_LABEL}, goes back to following the active repository.`);
     await this.refresh();
   }
 
@@ -1396,7 +1457,7 @@ export class SparringController implements vscode.Disposable {
   async followActiveRepository(): Promise<void> {
     const root = this.activeRepository.activeRepoRoot;
     this.log(root ? `following the active repository again: ${path.basename(root)}` : "following the active repository again; this window is in no repository the Git extension has opened");
-    await this.chooseRun(undefined);
+    await this.chooseRun(undefined, "explicit");
   }
 
   private async attachToSelected(): Promise<void> {

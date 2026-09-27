@@ -1,9 +1,9 @@
 {
   "version": 2,
   "decision": "approved",
-  "approved_at": "2026-09-27T19:52:25.502774+00:00",
-  "intake_id": "plan-61bf2008-20260927T195225Z-faithful-2cda",
-  "intake_dir": "__ROOT__/app/.sparring/intake/plan-61bf2008-20260927T195225Z-faithful-2cda",
+  "approved_at": "2026-09-27T20:49:30.380749+00:00",
+  "intake_id": "plan-61bf2008-20260927T204930Z-faithful-fb55",
+  "intake_dir": "__ROOT__/app/.sparring/intake/plan-61bf2008-20260927T204930Z-faithful-fb55",
   "run_id": "app",
   "run_key": "app-run-0001",
   "primary_repository": "app",
@@ -13,10 +13,10 @@
     "label": "docs/plan.md",
     "digest": "740e5f11746f2c5541efbe88b198ee5023fe1ac34f1e5e7ce63e42c6f32ec200"
   },
-  "intake_record_sha256": "c92fd4b0cba3144d191c7b869dbe488a4a2987e31bf2d0d76a41d7d817dfac9a",
+  "intake_record_sha256": "c35b03b12239aee137a57057ee28a06d90750b3184887b29989b5d6f3c88260e",
   "interpretation_digest": "556e89da0ba3cb82e5fbcd013cb52525a4bb3498b25cc7017333f7736aecc9f2",
-  "report_digest": "78023b0cd02ca243b29eaa1878a8d532aed6f411740727ca375b53d1860e2a8b",
-  "manifest_sha256": "3e5afbe9eb4dc0104e082f3255985cb9e21d6bc1508d3b532baea56d90feb9e0",
+  "report_digest": "229200c1a285cbf0e7f47d46c172e67831a03d25e8e3d0da9364ae52ef1185d0",
+  "manifest_sha256": "985116be911ae32185188d8af656cab2204059f7752b24649cb29b4aa96c89c1",
   "manifest_digest": "7a63a30333a49133a69f3a13c3c7833b527ad6ea4645eaaea8ad84e503c7956f",
   "stage_ids": [
     "app-run-0001-stage-0-audit",
@@ -26,7 +26,7 @@
     "path": "__ROOT__/app",
     "git_common_dir": "__ROOT__/app/.git",
     "branch": "feature/widgets",
-    "head": "c634a7a2cc3508026a0bbb7e24ab7d66bb05bf6e"
+    "head": "2c2ea6ed908071d42dbfbbb4f10353af888bd50d"
   },
   "repositories": {
     "inspected": {
@@ -34,14 +34,14 @@
         "path": "__ROOT__/app",
         "git_common_dir": "__ROOT__/app/.git",
         "branch": "feature/widgets",
-        "head": "c634a7a2cc3508026a0bbb7e24ab7d66bb05bf6e",
+        "head": "2c2ea6ed908071d42dbfbbb4f10353af888bd50d",
         "dirty_paths": []
       },
       "web": {
         "path": "__ROOT__/web",
         "git_common_dir": "__ROOT__/web/.git",
         "branch": "feature/web",
-        "head": "340d9b56c4fde9cc0114a4450a941d11e6bb87bf",
+        "head": "130d797c307fc4d9b71d90776f2dcbd5fa2cd6c1",
         "dirty_paths": []
       }
     },
@@ -50,14 +50,14 @@
         "path": "__ROOT__/app",
         "git_common_dir": "__ROOT__/app/.git",
         "branch": "feature/widgets",
-        "head": "c634a7a2cc3508026a0bbb7e24ab7d66bb05bf6e",
+        "head": "2c2ea6ed908071d42dbfbbb4f10353af888bd50d",
         "dirty_paths": []
       },
       "web": {
         "path": "__ROOT__/web",
         "git_common_dir": "__ROOT__/web/.git",
         "branch": "feature/web",
-        "head": "340d9b56c4fde9cc0114a4450a941d11e6bb87bf",
+        "head": "130d797c307fc4d9b71d90776f2dcbd5fa2cd6c1",
         "dirty_paths": []
       }
     }

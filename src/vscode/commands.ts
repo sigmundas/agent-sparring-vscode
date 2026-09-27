@@ -35,12 +35,17 @@ import {
   currentStageOf,
   isInsidePath,
   runIdFor,
+  samePath,
   type PlanRunSnapshot,
   type RunSnapshot,
   type SparringLocation,
   type StageSnapshot,
   type StandaloneStageSnapshot,
+  type DiscoveredIntake,
 } from "../core/discovery";
+import { intakeNextAction, intakeStateLabel } from "../core/intake";
+import type { IntakeActionMessage } from "../core/overviewHtml";
+import { approveInvocation, startInvocation } from "../core/intakeActions";
 import { stageScopeOf } from "../core/stageScope";
 import { FOLLOW_ACTIVE_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
@@ -74,7 +79,11 @@ import { settingsTarget } from "../core/settingsTarget";
 import { OverviewPanelManager } from "./overview/overviewPanel";
 
 export function registerCommands(context: vscode.ExtensionContext, controller: SparringController): void {
-  const overview: OverviewPanelManager = new OverviewPanelManager(controller, (action) => handleOverviewAction(controller, overview, action));
+  const overview: OverviewPanelManager = new OverviewPanelManager(
+    controller,
+    (action) => handleOverviewAction(controller, overview, action),
+    (message) => handleIntakeAction(controller, overview, message),
+  );
   context.subscriptions.push(
     overview,
     vscode.commands.registerCommand("agentSparring.showLog", () => controller.showLog()),
@@ -107,7 +116,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     // Not contributed in package.json (never in the palette): hooks for the
     // extension-host integration tests, which cannot drive QuickPicks.
     vscode.commands.registerCommand("agentSparring._test.chooseRun", async (runId: string) => {
-      await controller.chooseRun(controller.currentDiscovery.runs.find((run) => run.id === runId));
+      await controller.chooseRun(controller.currentDiscovery.runs.find((run) => run.id === runId), "explicit");
       return controller.currentSelection.selected?.id;
     }),
     vscode.commands.registerCommand("agentSparring._test.liveness", (runId: string) => {
@@ -289,6 +298,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     }),
     // The webview's own actions, as the Overview's buttons deliver them.
     vscode.commands.registerCommand("agentSparring._test.overviewAction", (action: OverviewAction) => handleOverviewAction(controller, overview, action)),
+    vscode.commands.registerCommand("agentSparring._test.intakeAction", (message: IntakeActionMessage) => handleIntakeAction(controller, overview, message)),
     vscode.commands.registerCommand("agentSparring._test.recordHumanCheck", async (key: string, outcome: "pass" | "fail" | "blocked", note?: string) => {
       const run = controller.currentSelection.selected;
       if (!run) {
@@ -333,11 +343,13 @@ let lastEngineFailure: EngineFailure | undefined;
 
 interface RunItem extends vscode.QuickPickItem {
   run?: RunSnapshot;
+  intake?: DiscoveredIntake;
 }
 
 async function selectRunCommand(controller: SparringController): Promise<void> {
   const runs = controller.currentDiscovery.runs;
-  if (runs.length === 0) {
+  const intakes = controller.currentDiscovery.intakes ?? [];
+  if (runs.length === 0 && intakes.length === 0) {
     const choice = await vscode.window.showInformationMessage(
       "Agent Sparring: no recorded plan runs or stages in this workspace.",
       "Diagnose Discovery",
@@ -359,6 +371,20 @@ async function selectRunCommand(controller: SparringController): Promise<void> {
       items.push({ label: item.label, description: item.description, detail: item.detail, run: item.run });
     }
   }
+  if (intakes.length > 0) {
+    // Plan intakes, newest first, whatever their state: an intake can be
+    // pinned and kept on screen like any run.
+    items.push({ label: "PLAN INTAKES", kind: vscode.QuickPickItemKind.Separator });
+    for (const intake of intakes.slice().sort((a, b) => (b.record.createdAtMs ?? 0) - (a.record.createdAtMs ?? 0))) {
+      const shown = controller.currentSelection.intake?.dir === intake.dir;
+      items.push({
+        label: `${shown ? "$(eye) " : ""}${intake.record.planLabel}`,
+        description: `${intake.location.folderName} · ${intakeStateLabel(intake.state)}`,
+        detail: intake.record.intakeId,
+        intake,
+      });
+    }
+  }
   // Picking a row *pins* it: it is kept even when this window moves to
   // another repository, which is the point of opening history there. The way
   // back is the same list, so the two modes are named next to each other
@@ -367,9 +393,9 @@ async function selectRunCommand(controller: SparringController): Promise<void> {
   const context = describeRepositoryContext(selection);
   items.push({ label: "REPOSITORY CONTEXT", kind: vscode.QuickPickItemKind.Separator });
   items.push({
-    label: `${context.mode === "pinned" ? "" : "$(check) "}$(sync) ${FOLLOW_ACTIVE_LABEL}`,
+    label: `${context.mode === "pinned" || context.mode === "attached" ? "" : "$(check) "}$(sync) ${FOLLOW_ACTIVE_LABEL}`,
     description: selection.scope ? `automatic selection in ${selection.scope.name}` : "automatic selection; no active repository resolved",
-    detail: context.mode === "pinned" ? "Releases the pin above." : "Already following; every row above pins instead.",
+    detail: context.mode === "pinned" ? "Releases the pin above." : context.mode === "attached" ? "Goes back to following now." : "Already following; every row above pins instead.",
     run: undefined,
   });
   const picked = await vscode.window.showQuickPick(items, {
@@ -378,7 +404,11 @@ async function selectRunCommand(controller: SparringController): Promise<void> {
   if (!picked) {
     return;
   }
-  await controller.chooseRun(picked.run);
+  if (picked.intake) {
+    await controller.chooseIntake(picked.intake);
+    return;
+  }
+  await controller.chooseRun(picked.run, "explicit");
 }
 
 // ---------------------------------------------------------------- overview
@@ -488,6 +518,111 @@ async function exists(file: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+// ---------------------------------------------------------------- plan intake
+
+/**
+ * Approve or start the exact run slice the intake screen was drawn for.
+ *
+ * The slice named by the click must still be the one the intake offers that
+ * action for; if the intake has moved on (an approval landed, a run began,
+ * the intake was prepared again) nothing is done and the screen is redrawn.
+ * Everything about *whether* a slice may be approved or started is the
+ * engine's: approve-plan and run-plan are invoked, and their answer stands.
+ */
+async function handleIntakeAction(controller: SparringController, overview: OverviewPanelManager, message: IntakeActionMessage): Promise<void> {
+  const intake = (controller.currentDiscovery.intakes ?? []).find((candidate) => samePath(candidate.dir, message.intakeDir));
+  const next = intake ? intakeNextAction(intake) : undefined;
+  if (!intake || !next || next.kind !== message.action || next.slice.runId !== message.runId) {
+    controller.log(`Intake: ${message.action} of run slice ${message.runId} not done — the intake changed since the screen was drawn.`);
+    void vscode.window.showInformationMessage(`Agent Sparring: the intake changed since this screen was drawn, so run slice ${message.runId} was not ${message.action === "approve" ? "approved" : "started"}. Check the updated screen.`);
+    await overview.update();
+    return;
+  }
+  const locations = controller.currentDiscovery.locations;
+  if (next.kind === "approve") {
+    const invocation = approveInvocation(intake, next.slice, locations);
+    if (!invocation.ok) {
+      void vscode.window.showWarningMessage(`Agent Sparring: ${invocation.problem}`);
+      return;
+    }
+    controller.setIntakeApproval(intake.dir, next.slice.runId, { state: "approving" });
+    await overview.update();
+    controller.log(`Intake: ${invocation.describe}`);
+    const result = await controller.runCommand({
+      configured: configuredExecutable(),
+      args: invocation.args,
+      cwd: invocation.cwd,
+      name: `Approve run slice ${next.slice.runId}`,
+      operation: { subcommand: "approve-plan", target: `${intake.dir}#${next.slice.runId}` },
+      repoRoot: invocation.repoRoot,
+      sparringDir: invocation.sparringDir,
+    });
+    if (!result.ok) {
+      controller.setIntakeApproval(intake.dir, next.slice.runId, { state: "refused", output: result.error });
+      await explainCommandProblem(controller, result);
+    } else if (result.outcome.exitCode === 0) {
+      // Only an exit code of 0 is an approval; approval.json is then on disk and discovery shows it.
+      controller.setIntakeApproval(intake.dir, next.slice.runId, undefined);
+      controller.log(`Intake: run slice ${next.slice.runId} approved by the engine.`);
+      await controller.refresh();
+    } else {
+      const output = result.outcome.output.trim() || `approve-plan exited with ${result.outcome.exitCode ?? "no exit code"} and printed nothing.`;
+      controller.setIntakeApproval(intake.dir, next.slice.runId, { state: "refused", output, exitCode: result.outcome.exitCode });
+      controller.log(`Intake: approve-plan refused run slice ${next.slice.runId}: ${output.split("\n")[0]}`);
+    }
+    await overview.update();
+    return;
+  }
+  const invocation = startInvocation(next.slice, locations);
+  if (!invocation.ok) {
+    void vscode.window.showWarningMessage(`Agent Sparring: ${invocation.problem}`);
+    return;
+  }
+  if (controller.livenessFor(invocation.runId).state === "running") {
+    await sayRunnerAlive(controller, overview, `a runner for run slice ${next.slice.runId} is already alive in a terminal of this window.`, invocation.runId);
+    return;
+  }
+  const stages = next.slice.stages.map((stage) => `${stage.label} — ${stage.title}`);
+  const choice = await vscode.window.showInformationMessage(
+    `Start run slice ${next.slice.runId}?`,
+    {
+      modal: true,
+      detail: [
+        `The engine runs the approved manifest of ${intake.record.planLabel}, run slice ${next.slice.runId}, until it needs you.`,
+        "",
+        `Branch: ${invocation.expectedBranch}`,
+        `Repository: ${invocation.location.folderName}`,
+        ...(stages.length > 0 ? ["", ...stages] : []),
+        "",
+        "It re-checks the approval and the repositories before anything runs, and refuses if they changed.",
+      ].join("\n"),
+    },
+    "Start slice",
+  );
+  if (choice !== "Start slice") {
+    return;
+  }
+  controller.log(`Intake: ${invocation.describe}`);
+  const result = await controller.launch({
+    configured: configuredExecutable(),
+    args: invocation.args,
+    cwd: invocation.cwd,
+    name: `run-plan: ${next.slice.runId}`,
+    runId: invocation.runId,
+    kind: "run-plan",
+    planPath: intake.record.sourcePath ?? invocation.manifestPath,
+    manifest: invocation.manifestPath,
+    reveal: true,
+  });
+  await explainLaunch(controller, result);
+  if (result.ok) {
+    // Once plans/<run key>.json exists the managed run is the authority; until
+    // then the screen is attached to the run it is about to become.
+    await controller.showStartedRun(invocation.runId);
+  }
+  await overview.update();
 }
 
 /**
@@ -1975,7 +2110,7 @@ async function sayRunnerAlive(controller: SparringController, overview: Overview
 
 /** Follow `run` in the Overview: it becomes the explicit selection and the panel opens. */
 async function showRun(controller: SparringController, overview: OverviewPanelManager, run: RunSnapshot): Promise<void> {
-  await controller.chooseRun(run);
+  await controller.chooseRun(run, "action");
   await overview.show();
   await overview.update();
 }
@@ -2272,7 +2407,7 @@ async function performStartNextStage(controller: SparringController, overview: O
   if (existing) {
     const choice = options.confirm ? await vscode.window.showInformationMessage(`Agent Sparring: ${proposal.stageId} already exists in ${location.folderName}.`, "Show that stage") : undefined;
     if (choice === "Show that stage") {
-      await controller.chooseRun(existing);
+      await controller.chooseRun(existing, "action");
       await overview.update();
     }
     return { ok: false, reason: "exists", stageId: proposal.stageId };
@@ -2330,7 +2465,7 @@ async function performStartNextStage(controller: SparringController, overview: O
   await controller.refresh();
   const created = controller.currentDiscovery.runs.find((candidate) => candidate.id === newRunId);
   if (created) {
-    await controller.chooseRun(created);
+    await controller.chooseRun(created, "action");
   }
   await overview.update();
   if (options.confirm) {
@@ -2593,7 +2728,7 @@ async function performContinueAutomatically(controller: SparringController, over
       "Back to plan run",
     ).then(async (choice) => {
       if (choice === "Back to plan run") {
-        await controller.chooseRun(controller.currentDiscovery.runs.find((candidate) => candidate.id === owner.runId));
+        await controller.chooseRun(controller.currentDiscovery.runs.find((candidate) => candidate.id === owner.runId), "action");
         await overview.update();
       }
     });

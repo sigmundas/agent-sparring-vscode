@@ -14,7 +14,7 @@
  */
 
 import * as path from "node:path";
-import { describeRepositoryContext, emptyStateLines, emptyStateTitle } from "./activeRepository";
+import { FOLLOW_ACTIVE_LABEL, describeRepositoryContext, emptyStateLines, emptyStateTitle } from "./activeRepository";
 import { intakeStateLabel } from "./intake";
 import { currentStageOf, runLabel, totalStagesOf, type RunSelection, type RunSnapshot } from "./discovery";
 import type { RunnerLiveness } from "./liveness";
@@ -42,6 +42,17 @@ const REPOSITORY_NAME_MAX = 44;
  * worded as certain work only when a process observation backs it.
  */
 export function deriveStatus(selection: RunSelection, live: LiveState | undefined, nowMs: number, liveness?: RunnerLiveness): StatusView {
+  const view = deriveUnpinnedStatus(selection, live, nowMs, liveness);
+  // A person's explicit pin is visible without opening anything; an action
+  // attachment is not a pin and the active repository ends it, so it is not
+  // marked as one.
+  if (selection.pinned && selection.pinOrigin !== "action") {
+    return { ...view, text: view.text.replace(/^(\$\([a-z-]+\) )?/, (icon) => `$(pin) ${icon}`), tooltip: `${view.tooltip}\nPinned — ${FOLLOW_ACTIVE_LABEL} from the Overview or History / Runs to go back to following the active repository.` };
+  }
+  return view;
+}
+
+function deriveUnpinnedStatus(selection: RunSelection, live: LiveState | undefined, nowMs: number, liveness?: RunnerLiveness): StatusView {
   if (!selection.selected && selection.intake) {
     const intake = selection.intake;
     const word = intake.state === "approved" ? "slice approved" : "intake awaiting approval";

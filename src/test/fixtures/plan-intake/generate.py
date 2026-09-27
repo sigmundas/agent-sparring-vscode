@@ -1,6 +1,8 @@
 """Regenerate the plan-intake fixtures from the engine itself.
 
-Run from the agent-sparring engine checkout (feature/plan-intake or later):
+Run from an agent-sparring engine checkout whose prepare-plan records the
+display metadata (`findings`, `approval_requirements` in intake.json) --
+feature/intake-display-metadata, or later:
 
     .venv/bin/python <this file> <output dir>
 

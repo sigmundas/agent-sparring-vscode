@@ -22,7 +22,7 @@ import { describeRepositoryContext, emptyStateLines, emptyStateTitle, SELECT_RUN
 import { agentConfigView, providerLabel, type AgentConfigView, type ConfigRole, type EffectiveConfig } from "./effectiveConfig";
 import { parseBriefGoal, parseBriefOpening } from "./brief";
 import { currentStageOf, runLabel, type DiscoveredIntake, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
-import { intakeStateLabel, nextIntakeSlice } from "./intake";
+import { intakeNextAction, intakeStateLabel, type IntakeSliceSnapshot } from "./intake";
 import { activeDurationMs, formatDuration, providerDisplayName, type ActorBudget, type LiveState, type MeaningfulEvent } from "./liveState";
 import { DEFERRED_VERIFICATION_REQUIRED, PUSH_AUTHORIZATION_REQUIRED, obligationFailed, obligationResolved, parseHandoffBranch, type DeferredObligation, type PlanRunState, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
 import type { DeclaredRepository } from "./stageRepositories";
@@ -249,6 +249,10 @@ export interface AssociatedPlan {
 }
 
 export interface OverviewArtifacts {
+  /** For the intake screen: this window's last approval of the slice it offers. */
+  intakeApproval?: IntakeApprovalAttempt;
+  /** For the intake screen: the engine command its action runs, shown in the details layer. */
+  intakeCommand?: string;
   handoff: boolean;
   sparring: boolean;
   brief: boolean;
@@ -772,25 +776,39 @@ export const APPLIES_NEXT_TURN =
 /**
  * A plan intake with no run yet, shown in place of older finished work.
  *
- * Everything here is what the engine's intake files record. "Approved" is
- * never "will run": the engine re-checks the approval and the repositories
- * when `run-plan` starts.
+ * Everything here is what the engine's intake files record. The one action
+ * offered is decided by `intakeNextAction` from recorded state alone;
+ * whether an approval or a start succeeds is always the engine's answer.
  */
 export interface IntakeView {
   /** The source plan's own `# ` title, else its label. */
   planName: string;
   planLabel: string;
-  /** `Prepared — awaiting review and approval`, `Slice approved — not yet run`. */
+  /** `Prepared — 0 blocking findings, 6 recommendations`, `Approved — ready to start`, … */
   stateLabel: string;
-  /** What the person does next, in the engine's own commands. */
+  /** What is going on and what happens next, in the engine's terms. */
   lines: string[];
-  /** The run slice the intake is waiting on, with its stages as the intake names them. */
+  /** Every run slice with its stages as the intake names them. */
   slices: { runId: string; stateLabel: string; stages: string[]; current: boolean }[];
-  /** `sparring run-plan …` exactly as approve-plan printed it, for an approved slice. */
-  runCommand?: string;
+  /**
+   * The primary action, carrying the exact slice it acts on — the host acts
+   * on that slice or on nothing, never on a fresh lookup at click time.
+   */
+  action?: { kind: "approve" | "start"; label: string; detail: string; intakeDir: string; runId: string; enabled: boolean };
+  /** Blocked, or not approvable from this intake: the reason, and no action. */
+  blocked?: string;
+  /** What approve-plan said it will ask for this slice (gates, siblings, …), from the engine's record. */
+  requirements: string[];
+  /** The engine's refusal of the last approval of this slice, verbatim. */
+  refusal?: { text: string };
+  /** The engine command the action runs, for the details layer. */
+  command?: string;
   hasSource: boolean;
   intakeId: string;
 }
+
+/** An approval of one slice this window has asked the engine for. */
+export type IntakeApprovalAttempt = { state: "approving" } | { state: "refused"; output: string; exitCode?: number };
 
 export interface OverviewModel {
   kind: "empty" | "ambiguous" | "run" | "intake";
@@ -1102,37 +1120,102 @@ function compactWindow(minutes: number, long = false): string {
   return long ? `${minutes}-minute` : `${minutes}m`;
 }
 
-/** The intake screen; `sourceText` is the source plan's text, read only for its title. */
-export function intakeView(intake: DiscoveredIntake, sourceText: string | undefined): IntakeView {
-  const next = nextIntakeSlice(intake);
-  const approved = next?.state === "approved" ? next : undefined;
+/** The finding counts prepare-plan recorded, said plainly; undefined when none were recorded. */
+function findingsPhrase(intake: DiscoveredIntake): string | undefined {
+  const counts = intake.record.findings;
+  if (!counts) {
+    return undefined;
+  }
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  return `${plural(counts.blocking, "blocking finding")}, ${plural(counts.recommendation, "recommendation")}`;
+}
+
+function requirementLines(slice: IntakeSliceSnapshot | undefined): string[] {
+  const needs = slice?.requirements;
+  if (!needs) {
+    return [];
+  }
   const lines: string[] = [];
-  const ran = intake.slices.filter((slice) => slice.state === "complete");
-  if (approved?.approval && approved.manifestPath) {
-    lines.push(`Run slice ${approved.runId} is approved for branch ${approved.approval.expectedBranch} and has not run. It is started from a terminal with the command below; the engine re-checks the approval and the repositories before anything runs, and may refuse.`);
-  } else if (next) {
-    // Whether it can be approved is the engine's decision (blocking findings,
-    // prerequisites); the report is where they are, so nothing is promised.
-    lines.push(`${ran.length > 0 ? `Run slice ${next.runId} has not been approved.` : "The engine prepared this plan for review; no run slice has run."} The report says what it found; approval is sparring approve-plan.`);
+  if (needs.earlierSlices.length > 0) {
+    lines.push(`Waits for run slice${needs.earlierSlices.length === 1 ? "" : "s"} ${needs.earlierSlices.join(", ")} to be approved and complete.`);
+  }
+  if (needs.gates.length > 0) {
+    lines.push(`Needs a person to confirm gate${needs.gates.length === 1 ? "" : "s"} ${needs.gates.join(", ")} (sparring approve-plan --confirm-prerequisite) once actually satisfied.`);
+  }
+  if (needs.siblings.length > 0) {
+    lines.push(`Needs a path and branch for sibling repositor${needs.siblings.length === 1 ? "y" : "ies"} ${needs.siblings.join(", ")} (--repository, --repository-branch).`);
+  }
+  if (needs.withoutAmendment) {
+    lines.push("Intake proposed an amendment to the plan (amendment.diff); approving the unamended plan needs --without-amendment.");
+  }
+  return lines;
+}
+
+/**
+ * The intake screen. `sourceText` is the source plan's text, read only for
+ * its title; `attempt` is this window's last approval of the next slice.
+ */
+export function intakeView(intake: DiscoveredIntake, sourceText: string | undefined, attempt?: IntakeApprovalAttempt, command?: string): IntakeView {
+  const next = intakeNextAction(intake);
+  const slice = next.kind === "none" ? undefined : next.slice;
+  const ran = intake.slices.filter((entry) => entry.state === "complete");
+  const findings = findingsPhrase(intake);
+  const lines: string[] = [];
+  let stateLabel = intakeStateLabel(intake.state);
+  let action: IntakeView["action"];
+  let blocked: string | undefined;
+  switch (next.kind) {
+    case "start": {
+      stateLabel = intakeStateLabel("approved");
+      const approval = next.slice.approval;
+      lines.push(`Run slice ${next.slice.runId} is approved${approval ? ` for branch ${approval.expectedBranch}` : ""} and has not run. Start slice runs its sealed manifest; the engine re-checks the approval and the repositories first, and may refuse.`);
+      action = { kind: "start", label: "Start slice", detail: `Run the approved manifest of run slice ${next.slice.runId}`, intakeDir: intake.dir, runId: next.slice.runId, enabled: true };
+      break;
+    }
+    case "blocked":
+      stateLabel = `Prepared — ${findings ?? `${next.blocking} blocking findings`}`;
+      blocked = `Approval is blocked: prepare-plan recorded ${next.blocking} blocking finding${next.blocking === 1 ? "" : "s"}. The report lists them; resolving them means editing the plan and preparing it again.`;
+      break;
+    case "unapprovable":
+      stateLabel = findings ? `Prepared — ${findings}` : stateLabel;
+      blocked = `Run slice ${next.slice.runId} cannot be approved from this intake: ${next.reason}`;
+      break;
+    case "approve": {
+      stateLabel = findings ? `Prepared — ${findings}` : "Prepared — findings not recorded; see the report";
+      const approving = attempt?.state === "approving";
+      lines.push(`${ran.length > 0 ? `Run slice ${next.slice.runId} has not been approved.` : "The engine prepared this plan for review; no run slice has run."} Approving asks the engine to seal run slice ${next.slice.runId}; it checks everything again and may refuse.`);
+      action = {
+        kind: "approve",
+        label: approving ? "Approving…" : "Approve next slice",
+        detail: `sparring approve-plan for run slice ${next.slice.runId}${next.slice.primaryRepository ? `, from ${next.slice.primaryRepository}` : ""}`,
+        intakeDir: intake.dir,
+        runId: next.slice.runId,
+        enabled: !approving,
+      };
+      break;
+    }
+    case "none":
+      break;
   }
   if (ran.length > 0) {
-    lines.push(`Run slice${ran.length === 1 ? "" : "s"} ${ran.map((slice) => slice.runId).join(", ")} of this intake ${ran.length === 1 ? "is" : "are"} complete; ${SELECT_RUN_LABEL} still opens ${ran.length === 1 ? "it" : "them"}.`);
+    lines.push(`Run slice${ran.length === 1 ? "" : "s"} ${ran.map((entry) => entry.runId).join(", ")} of this intake ${ran.length === 1 ? "is" : "are"} complete; ${SELECT_RUN_LABEL} still opens ${ran.length === 1 ? "it" : "them"}.`);
   }
   return {
     planName: (sourceText ? planTitle(sourceText) : undefined) ?? intake.record.planLabel,
     planLabel: intake.record.planLabel,
-    stateLabel: intakeStateLabel(intake.state),
+    stateLabel,
     lines,
-    slices: intake.slices.map((slice) => ({
-      runId: slice.runId,
-      stateLabel: intakeStateLabel(slice.state),
-      stages: slice.stages.map((stage) => `${stage.label} — ${stage.title}`),
-      current: slice === next,
+    slices: intake.slices.map((entry) => ({
+      runId: entry.runId,
+      stateLabel: intakeStateLabel(entry.state),
+      stages: entry.stages.map((stage) => `${stage.label} — ${stage.title}`),
+      current: entry === slice,
     })),
-    runCommand:
-      approved?.approval && approved.manifestPath
-        ? `sparring run-plan --manifest ${approved.manifestPath} --run-key ${approved.runKey} --repo-root ${approved.approval.repoRoot} --expected-branch ${approved.approval.expectedBranch}`
-        : undefined,
+    ...(action ? { action } : {}),
+    ...(blocked ? { blocked } : {}),
+    requirements: next.kind === "approve" ? requirementLines(slice) : [],
+    ...(next.kind === "approve" && attempt?.state === "refused" ? { refusal: { text: attempt.output } } : {}),
+    ...(command ? { command } : {}),
     hasSource: intake.record.sourcePath !== undefined,
     intakeId: intake.record.intakeId,
   };
@@ -1149,7 +1232,7 @@ export function buildOverviewModel(
 ): OverviewModel {
   const repositoryContext = describeRepositoryContext(selection);
   if (!selection.selected && selection.intake) {
-    const intake = intakeView(selection.intake, artifacts.planText);
+    const intake = intakeView(selection.intake, artifacts.planText, artifacts.intakeApproval, artifacts.intakeCommand);
     return { kind: "intake", title: `Plan intake: ${intake.planName}`, intake, repositoryContext };
   }
   if (!selection.selected) {

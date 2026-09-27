@@ -64,6 +64,44 @@ export interface IntakeRecord {
   sourcePath?: string;
   /** `run_keys`, in the order the engine wrote them: run slice id → run key. */
   runKeys: { runId: string; runKey: string }[];
+  /** `repositories`: every repository intake inspected, by name → its recorded path. */
+  repositories: Record<string, string>;
+  /**
+   * `findings`: how many findings of each severity prepare-plan found.
+   * Display metadata: approval recomputes and enforces findings itself.
+   * Absent from an intake prepared before the engine recorded it.
+   */
+  findings?: IntakeFindingCounts;
+  /**
+   * `approval_requirements`: per run slice, what approve-plan will ask for,
+   * from the same engine code that writes the report's "Next step". Display
+   * metadata, never an input to approval. Absent from older intakes.
+   */
+  requirements?: Record<string, IntakeSliceRequirements>;
+}
+
+export interface IntakeFindingCounts {
+  blocking: number;
+  recommendation: number;
+  info: number;
+  verdict?: string;
+}
+
+/** intake.py `approval_requirements`, one slice. */
+export interface IntakeSliceRequirements {
+  /** Whether this intake can approve the slice at all; `reason` says why not. */
+  approvable: boolean;
+  reason?: string;
+  primaryRepository: string;
+  expectedBranch?: string;
+  /** Sibling repositories approve-plan needs a path and branch for. */
+  siblings: string[];
+  /** Gate ids a person confirms with `--confirm-prerequisite`. */
+  gates: string[];
+  /** Earlier run slices that must be approved and complete first. */
+  earlierSlices: string[];
+  /** Whether approval needs `--without-amendment`. */
+  withoutAmendment: boolean;
 }
 
 /** One stage of a run slice as the interpretation names it. Display only. */
@@ -155,7 +193,68 @@ export function parseIntakeRecord(text: string): IntakeRecord {
     createdAtMs: parseEngineTimestamp(payload["created_at"]),
     sourcePath: typeof sourcePath === "string" && sourcePath ? sourcePath : undefined,
     runKeys,
+    repositories: recordedRepositories(payload["repositories"]),
+    findings: findingCounts(payload["findings"]),
+    requirements: sliceRequirements(payload["approval_requirements"]),
   };
+}
+
+function recordOf(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function strings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+}
+
+function recordedRepositories(value: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, snapshot] of Object.entries(recordOf(value) ?? {})) {
+    const recorded = recordOf(snapshot)?.["path"];
+    if (typeof recorded === "string" && recorded) {
+      out[name] = recorded;
+    }
+  }
+  return out;
+}
+
+/** Counts only when every one is a non-negative integer; anything else is "not recorded", never zero. */
+function findingCounts(value: unknown): IntakeFindingCounts | undefined {
+  const payload = recordOf(value);
+  if (!payload) {
+    return undefined;
+  }
+  const counts = ["blocking", "recommendation", "info"].map((key) => payload[key]);
+  if (!counts.every((count) => typeof count === "number" && Number.isInteger(count) && count >= 0)) {
+    return undefined;
+  }
+  const [blocking, recommendation, info] = counts as number[];
+  return { blocking, recommendation, info, ...(typeof payload["verdict"] === "string" ? { verdict: payload["verdict"] } : {}) };
+}
+
+function sliceRequirements(value: unknown): Record<string, IntakeSliceRequirements> | undefined {
+  const payload = recordOf(value);
+  if (!payload) {
+    return undefined;
+  }
+  const out: Record<string, IntakeSliceRequirements> = {};
+  for (const [runId, raw] of Object.entries(payload)) {
+    const entry = recordOf(raw);
+    if (!entry || typeof entry["approvable"] !== "boolean" || typeof entry["primary_repository"] !== "string") {
+      continue; // not recorded for this slice; nothing is assumed in its place
+    }
+    out[runId] = {
+      approvable: entry["approvable"],
+      ...(typeof entry["reason"] === "string" && entry["reason"] ? { reason: entry["reason"] } : {}),
+      primaryRepository: entry["primary_repository"],
+      ...(typeof entry["expected_branch"] === "string" ? { expectedBranch: entry["expected_branch"] } : {}),
+      siblings: strings(entry["siblings"]),
+      gates: strings(entry["gates"]),
+      earlierSlices: strings(entry["earlier_slices"]),
+      withoutAmendment: entry["without_amendment"] === true,
+    };
+  }
+  return out;
 }
 
 /**
@@ -163,6 +262,18 @@ export function parseIntakeRecord(text: string): IntakeRecord {
  * names are read; everything else in it is the engine's to validate, and a
  * file it would refuse simply yields no names here.
  */
+/** `interpretation.json`'s primary repository name per run slice id. */
+export function parseIntakeSlicePrimaries(text: string): Map<string, string> {
+  const runs = objectOf(text, "interpretation")["runs"];
+  const out = new Map<string, string>();
+  for (const run of Array.isArray(runs) ? runs : []) {
+    if (run && typeof run.id === "string" && typeof run.primary_repository === "string" && run.primary_repository) {
+      out.set(run.id, run.primary_repository);
+    }
+  }
+  return out;
+}
+
 export function parseIntakeSliceStages(text: string): Map<string, IntakeStageName[]> {
   const payload = objectOf(text, "interpretation");
   const runs = payload["runs"];
@@ -351,6 +462,12 @@ export interface IntakeSliceSnapshot {
   manifestPath?: string;
   /** From the interpretation; empty when it could not be read. */
   stages: IntakeStageName[];
+  /** The repository the slice is approved and run from, by the name intake gave it. */
+  primaryRepository?: string;
+  /** That repository's path as intake recorded it. */
+  primaryPath?: string;
+  /** What approve-plan will ask for, when the engine recorded it. */
+  requirements?: IntakeSliceRequirements;
 }
 
 export interface IntakeSnapshot {
@@ -404,8 +521,11 @@ export async function discoverIntakes(sparringDir: string, runs: PlanRunStatusBy
 
 async function snapshotIntake(dir: string, sparringDir: string, record: IntakeRecord, runs: PlanRunStatusByKey): Promise<IntakeSnapshot> {
   let names = new Map<string, IntakeStageName[]>();
+  let primaries = new Map<string, string>();
   try {
-    names = parseIntakeSliceStages(await fs.readFile(path.join(dir, INTAKE_INTERPRETATION_FILENAME), "utf8"));
+    const interpretation = await fs.readFile(path.join(dir, INTAKE_INTERPRETATION_FILENAME), "utf8");
+    names = parseIntakeSliceStages(interpretation);
+    primaries = parseIntakeSlicePrimaries(interpretation);
   } catch {
     // Names are a courtesy; the record alone says what exists.
   }
@@ -425,7 +545,19 @@ async function snapshotIntake(dir: string, sparringDir: string, record: IntakeRe
     const approved = found && found.approval.runId === runId ? found : undefined;
     const status = runs.get(runKey) ?? (await recordedRunStatus([sparringDir, approved?.approval.sparringDir], runKey));
     const state: IntakeState = status === "complete" ? "complete" : status !== undefined ? "running" : approved ? "approved" : "prepared";
-    slices.push({ runId, runKey, state, approval: approved?.approval, manifestPath: approved?.manifestPath, stages: names.get(runId) ?? [] });
+    const requirements = record.requirements?.[runId];
+    const primaryRepository = requirements?.primaryRepository ?? primaries.get(runId);
+    slices.push({
+      runId,
+      runKey,
+      state,
+      approval: approved?.approval,
+      manifestPath: approved?.manifestPath,
+      stages: names.get(runId) ?? [],
+      ...(primaryRepository ? { primaryRepository } : {}),
+      ...(primaryRepository && record.repositories[primaryRepository] ? { primaryPath: record.repositories[primaryRepository] } : {}),
+      ...(requirements ? { requirements } : {}),
+    });
   }
   let activityMs = record.createdAtMs;
   if (activityMs !== undefined) {
@@ -489,13 +621,54 @@ export function nextIntakeSlice(intake: IntakeSnapshot): IntakeSliceSnapshot | u
   return intake.slices.find((slice) => slice.state === "approved") ?? intake.slices.find((slice) => slice.state === "prepared");
 }
 
+/**
+ * What the intake screen offers next, decided only from what the engine
+ * recorded — never from approval rules re-implemented here.
+ *
+ *  - `start`: the next slice has a sealed approval and no run.
+ *  - `blocked`: prepare-plan recorded blocking findings, which refuse every
+ *    slice; the report is the way forward.
+ *  - `unapprovable`: the engine recorded that this intake cannot approve the
+ *    next slice at all (`reason` is its sentence).
+ *  - `approve`: otherwise, for the next unapproved slice. Gates, sibling
+ *    repositories, amendments and earlier slices are shown from the recorded
+ *    requirements and left for approve-plan to enforce; an intake that
+ *    recorded no counts or requirements is offered Approve too, and the
+ *    engine's answer is the answer.
+ *  - `none`: nothing is waiting (every slice has a run).
+ */
+export type IntakeNextAction =
+  | { kind: "start"; slice: IntakeSliceSnapshot }
+  | { kind: "approve"; slice: IntakeSliceSnapshot }
+  | { kind: "blocked"; blocking: number; slice?: IntakeSliceSnapshot }
+  | { kind: "unapprovable"; reason: string; slice: IntakeSliceSnapshot }
+  | { kind: "none" };
+
+export function intakeNextAction(intake: IntakeSnapshot): IntakeNextAction {
+  const next = nextIntakeSlice(intake);
+  if (!next) {
+    return { kind: "none" };
+  }
+  if (next.state === "approved") {
+    return { kind: "start", slice: next };
+  }
+  const blocking = intake.record.findings?.blocking;
+  if (blocking !== undefined && blocking > 0) {
+    return { kind: "blocked", blocking, slice: next };
+  }
+  if (next.requirements && !next.requirements.approvable) {
+    return { kind: "unapprovable", reason: next.requirements.reason ?? "the engine recorded that this intake cannot approve it", slice: next };
+  }
+  return { kind: "approve", slice: next };
+}
+
 /** A person's words for an intake state. */
 export function intakeStateLabel(state: IntakeState): string {
   switch (state) {
     case "prepared":
       return "Prepared — awaiting review and approval";
     case "approved":
-      return "Slice approved — not yet run";
+      return "Approved — ready to start";
     case "running":
       return "Running";
     case "complete":

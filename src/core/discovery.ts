@@ -63,6 +63,11 @@ export interface SparringLocation {
   folderName: string;
 }
 
+/** A plan intake's selection id, in the same `<projectDir>|<kind>:<key>` space as runs. */
+export function intakeIdFor(location: SparringLocation, intakeId: string): string {
+  return `${location.projectDir}|intake:${intakeId}`;
+}
+
 export function runIdFor(location: SparringLocation, kind: "plan" | "stage", key: string): string {
   return `${location.projectDir}|${kind}:${key}`;
 }
@@ -595,7 +600,9 @@ export interface RunSelection {
    *  - `gone` — the pinned run is not in this discovery although its project
    *    still is, so it was deleted rather than merely not scanned yet.
    */
-  released?: { id: string; reason: "superseded"; by: PlanRunSnapshot } | { id: string; reason: "gone" };
+  released?: { id: string; reason: "superseded"; by: PlanRunSnapshot } | { id: string; reason: "gone" } | { id: string; reason: "repository"; to: string };
+  /** Why {@link pinned} holds: a person's explicit pin, or an action attachment. */
+  pinOrigin?: PinOrigin;
 }
 
 /**
@@ -752,7 +759,32 @@ export interface RunPreference {
    * screen out from under them.
    */
   intent?: PinIntent;
+  /**
+   * Why the selection exists, which decides whether the active repository
+   * can end it.
+   *
+   *  - `explicit` — the person chose this run or intake to keep viewing
+   *    (History / Runs). It survives every repository change and only
+   *    Follow active repository or another choice ends it.
+   *  - `action` — the cockpit attached to it as a side effect of starting,
+   *    navigating to or creating work. It is not a pin the person made, and
+   *    it ends the moment the active repository moves to one that does not
+   *    own it.
+   *
+   * Absent — a selection stored before this was recorded — reads as
+   * `explicit`, the reading that cannot lose someone's place.
+   */
+  origin?: PinOrigin;
+  /**
+   * The active repository when an `action` attachment was made. A move is
+   * measured against it, so an attachment made while the editor was already
+   * elsewhere (the ordinary case: a plan started in another checkout) is not
+   * released until the person actually changes repository.
+   */
+  activeRootAtPin?: string;
 }
+
+export type PinOrigin = "explicit" | "action";
 
 /** The intent a run being chosen *now* implies: history is inspected, live work is followed. */
 export function intentForChoosing(run: RunSnapshot): PinIntent {
@@ -908,9 +940,26 @@ export function selectRun(
     ...(unattributed.length > 0 ? { unattributed } : {}),
   });
 
-  const pick = typeof preferred === "string" ? { id: preferred } : preferred;
+  const pick: RunPreference | undefined = typeof preferred === "string" ? { id: preferred } : preferred;
   if (pick) {
+    const origin: PinOrigin = pick.origin ?? "explicit";
+    const pinnedIntake = intakes.find((intake) => intakeIdFor(intake.location, intake.record.intakeId) === pick.id);
     const chosen = runs.find((run) => run.id === pick.id);
+    // An action attachment ends when the active repository has moved since
+    // it was made, to one that does not own what it shows.
+    if (origin === "action" && scope && !sameRoot(scope.repoRoot, pick.activeRootAtPin)) {
+      const target = chosen ?? pinnedIntake;
+      if (!target || attributeRun(target, scope.repoRoot, scope.knownRoots ?? []) !== "here") {
+        return decorate({ ...selectAutomatically(inScope, stickyId, intakesInScope), released: { id: pick.id, reason: "repository", to: scope.repoRoot } });
+      }
+    }
+    if (pick.id.includes("|intake:")) {
+      if (pinnedIntake) {
+        return decorate({ ambiguous: [], intake: pinnedIntake, pinned: true, pinOrigin: origin });
+      }
+      const gone = locations.some((location) => runIdBelongsTo(pick.id, location));
+      return decorate({ ...selectAutomatically(inScope, stickyId, intakesInScope), ...(gone ? { released: { id: pick.id, reason: "gone" as const } } : {}) });
+    }
     if (!chosen) {
       // Absent from the discovery. That is only a *release* when the project
       // it belongs to was scanned and the run was not there; a project that
@@ -925,7 +974,7 @@ export function selectRun(
     }
     const by = supersedingPlanRun(chosen, runs, pick.atMs ?? 0, ownership, pick.intent ?? "inspect");
     if (!by) {
-      return decorate({ selected: chosen, ambiguous: [], pinned: true });
+      return decorate({ selected: chosen, ambiguous: [], pinned: true, pinOrigin: origin });
     }
     return decorate({ ...selectAutomatically(inScope, stickyId, intakesInScope), released: { id: pick.id, reason: "superseded", by } });
   }
@@ -966,6 +1015,10 @@ export function promotableIntake(intakes: readonly DiscoveredIntake[], runs: rea
   const newest = candidates.sort((a, b) => (b.activityMs ?? 0) - (a.activityMs ?? 0))[0];
   const lastFinishedMs = runs.filter((run) => !isOpenRun(run)).reduce((latest, run) => Math.max(latest, run.stateMtimeMs), -Infinity);
   return (newest.activityMs ?? -Infinity) > lastFinishedMs ? newest : undefined;
+}
+
+function sameRoot(a: string | undefined, b: string | undefined): boolean {
+  return a === undefined || b === undefined ? a === b : samePath(a, b);
 }
 
 /** Whether a run id names a run of this location; run ids are `<projectDir>|<kind>:<key>`. */

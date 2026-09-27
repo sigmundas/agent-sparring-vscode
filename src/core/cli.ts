@@ -82,6 +82,39 @@ export function buildRunPlanArgs(invocation: PlanInvocation & { adopt?: boolean;
 }
 
 /**
+ * `sparring [--sparring-dir DIR] approve-plan INTAKE_DIR --run RUN_ID --repo-root ROOT --repository-name NAME`
+ * (cli.py: _cmd_approve_plan).
+ *
+ * Only what identifies the slice and where it is approved from. Gate
+ * confirmations, sibling repositories and `--without-amendment` are a
+ * person's statements to the engine and are never supplied here; the engine
+ * refuses without them and says which it needs. `--repository-name` is the
+ * name intake gave the slice's primary repository, which the engine checks
+ * against the repository it inspected under that name.
+ */
+export interface ApprovePlanInvocation {
+  intakeDir: string;
+  runId: string;
+  repoRoot: string;
+  repositoryName: string;
+  sparringDir?: string;
+}
+
+export function buildApprovePlanArgs(invocation: ApprovePlanInvocation): string[] {
+  return [
+    ...globalArgs(invocation),
+    "approve-plan",
+    invocation.intakeDir,
+    "--run",
+    invocation.runId,
+    "--repo-root",
+    invocation.repoRoot,
+    "--repository-name",
+    invocation.repositoryName,
+  ];
+}
+
+/**
  * A person's answer to the engine's push-authorization request.
  *
  * `candidateSha` is the exact commit that was on screen, and it is always

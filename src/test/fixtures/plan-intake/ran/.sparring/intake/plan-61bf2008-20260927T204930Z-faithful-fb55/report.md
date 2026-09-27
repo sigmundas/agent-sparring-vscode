@@ -63,8 +63,8 @@ Each run slice becomes one manifest, run in its primary repository on one expect
 ## Repositories inspected
 
 Approval refuses if any of these has moved to another branch or commit, except to a commit an earlier run slice of this intake was accepted at.
-- `app`: `__ROOT__/app` on `feature/widgets` at `c634a7a2cc35`
-- `web`: `__ROOT__/web` on `feature/web` at `340d9b56c4fd`
+- `app`: `__ROOT__/app` on `feature/widgets` at `2c2ea6ed9080`
+- `web`: `__ROOT__/web` on `feature/web` at `130d797c307f`
 
 ## Proposed amendment
 
@@ -72,5 +72,5 @@ None.
 
 ## Next step
 
-- From the `app` project: `sparring approve-plan __ROOT__/app/.sparring/intake/plan-61bf2008-20260927T195225Z-faithful-2cda --run app`
-- From the `web` project, once `app` completed (confirm each gate only once it is actually satisfied): `sparring approve-plan __ROOT__/app/.sparring/intake/plan-61bf2008-20260927T195225Z-faithful-2cda --run web --confirm-prerequisite release`
+- From the `app` project: `sparring approve-plan __ROOT__/app/.sparring/intake/plan-61bf2008-20260927T204930Z-faithful-fb55 --run app`
+- From the `web` project, once `app` completed (confirm each gate only once it is actually satisfied): `sparring approve-plan __ROOT__/app/.sparring/intake/plan-61bf2008-20260927T204930Z-faithful-fb55 --run web --confirm-prerequisite release`

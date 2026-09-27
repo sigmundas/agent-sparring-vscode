@@ -210,6 +210,27 @@ export function isCopyPromptMessage(message: unknown): message is CopyPromptMess
  * all. A webview message is still untrusted input: what is loosened here is
  * only the key's shape, to the one definition the renderer also uses.
  */
+/** Approve or start one exact run slice of one intake, as the intake screen rendered it. */
+export interface IntakeActionMessage {
+  type: "intake";
+  action: "approve" | "start";
+  intakeDir: string;
+  runId: string;
+}
+
+export function isIntakeActionMessage(message: unknown): message is IntakeActionMessage {
+  const record = asRecord(message);
+  return (
+    record !== undefined &&
+    record["type"] === "intake" &&
+    (record["action"] === "approve" || record["action"] === "start") &&
+    typeof record["intakeDir"] === "string" &&
+    record["intakeDir"] !== "" &&
+    typeof record["runId"] === "string" &&
+    record["runId"] !== ""
+  );
+}
+
 export function isActionMessage(message: unknown): message is ActionMessage {
   const record = asRecord(message);
   return record !== undefined && record["type"] === "action" && ACTIONS.has(String(record["action"]));
@@ -473,10 +494,17 @@ ${renderActors(model, discloseScope(model))}
       .join("");
     return `${renderRepositoryContext(model)}
 <header class="top"><div><h1>${escapeHtml(intake.planName)}</h1><div class="run muted">Plan intake · ${escapeHtml(intake.stateLabel)}</div></div></header>
+${intake.blocked ? `<p class="intake-blocked"><strong>${escapeHtml(intake.blocked)}</strong></p>` : ""}
 ${intake.lines.map((line) => `<p>${escapeHtml(line)}</p>`).join("\n")}
-${intake.runCommand ? `<pre class="command">${escapeHtml(intake.runCommand)}</pre>` : ""}
+${intake.requirements.length > 0 ? `<ul class="intake-requirements">${intake.requirements.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul>` : ""}
+${
+  intake.refusal
+    ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}Approval refused by the engine. Nothing was approved.</p><pre class="engineerror">${escapeHtml(intake.refusal.text)}</pre></div>`
+    : ""
+}
 <ul class="intake-slices">${slices}</ul>
-<div class="actions">${button("openIntakeReport", "Open intake report")}${intake.hasSource ? button("openIntakeSource", "Open plan") : ""}${button("showLog", "Show log")}</div>
+<div class="actions">${intake.action ? intakeButton(intake.action) : ""}${button("openIntakeReport", "Open intake report", true, undefined, intake.action ? "" : "primary")}${intake.hasSource ? button("openIntakeSource", "Open plan") : ""}${button("showLog", "Show log")}</div>
+${intake.command ? `<details class="intake-command"><summary>Engine command</summary><pre class="command">${escapeHtml(intake.command)}</pre></details>` : ""}
 <p class="muted small">Intake ${escapeHtml(intake.intakeId)} · ${escapeHtml(intake.planLabel)}</p>`;
   }
   if (model.kind === "ambiguous") {
@@ -569,6 +597,7 @@ function renderRepositoryContext(model: OverviewModel): string {
     return "";
   }
   const pinned = context.mode === "pinned";
+  const releasable = pinned || context.mode === "attached";
   const lines = [contextLine(context.headline, context.repository, pinned)];
   if (pinned && context.activeRepository) {
     lines.push(contextLine(ACTIVE_CONTEXT_HEADLINE, context.activeRepository, false));
@@ -576,7 +605,7 @@ function renderRepositoryContext(model: OverviewModel): string {
   const controls = [
     button("runPlan", "Run Plan", true, "Choose a repository and a plan document, and start a new run of it"),
     button("selectRun", SELECT_RUN_LABEL, true, "Pin a recorded run — including a finished one — to inspect it", "quiet"),
-    pinned ? button("followActiveRepository", FOLLOW_ACTIVE_LABEL, true, context.explanation) : "",
+    releasable ? button("followActiveRepository", FOLLOW_ACTIVE_LABEL, true, context.explanation) : "",
   ].join("");
   return `<section class="repocontext${pinned ? " pinned" : ""}${context.away ? " away" : ""}" title="${escapeHtml(context.explanation)}">
 <div class="names">${lines.join("")}</div>
@@ -1779,6 +1808,16 @@ function button(action: OverviewAction, label: string, enabled = true, title?: s
 }
 
 /**
+ * The intake screen's one engine action. It carries the intake directory and
+ * run slice it was rendered for, so the host acts on exactly that slice or on
+ * nothing — a panel drawn before an approval landed cannot start or approve
+ * whatever slice happens to be next when the click arrives.
+ */
+function intakeButton(action: NonNullable<NonNullable<OverviewModel["intake"]>["action"]>): string {
+  return `<button type="button" class="primary" data-intake="${action.kind}" data-intake-dir="${escapeHtml(action.intakeDir)}" data-intake-run="${escapeHtml(action.runId)}" title="${escapeHtml(action.detail)}"${action.enabled ? "" : " disabled"}>${escapeHtml(action.label)}</button>`;
+}
+
+/**
  * A copy-for-chat control. It carries `data-copy` rather than `data-action`
  * because it is the one button kind that acts on a *named part* of the page,
  * and the check's key travels with the click; see {@link CopyMessage}.
@@ -2422,6 +2461,11 @@ const SCRIPT = `
     var copyPrompt = element ? element.closest('button[data-copyprompt]') : null;
     if (copyPrompt && !copyPrompt.disabled) {
       vscode.postMessage({ type: 'copyPrompt', role: copyPrompt.getAttribute('data-copyprompt') });
+      return;
+    }
+    var intakeTarget = element ? element.closest('button[data-intake]') : null;
+    if (intakeTarget && !intakeTarget.disabled) {
+      vscode.postMessage({ type: 'intake', action: intakeTarget.getAttribute('data-intake'), intakeDir: intakeTarget.getAttribute('data-intake-dir'), runId: intakeTarget.getAttribute('data-intake-run') });
       return;
     }
     var target = element ? element.closest('button[data-action]') : null;
