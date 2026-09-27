@@ -944,12 +944,16 @@ export function selectRun(
  */
 export function promotableIntake(intakes: readonly DiscoveredIntake[], runs: readonly RunSnapshot[]): DiscoveredIntake | undefined {
   const newestPerPlan = new Map<string, DiscoveredIntake>();
+  // A plan with an intake whose age cannot be read has no knowable newest
+  // intake — the unreadable one may be the prepare that replaced the others —
+  // so none of that plan's intakes is promoted.
+  const unordered = new Set(intakes.filter((intake) => intake.record.createdAtMs === undefined).map((intake) => `${intake.location.projectDir}|${intake.record.planLabel}`));
   for (const intake of intakes) {
     const created = intake.record.createdAtMs;
-    if (created === undefined) {
+    const key = `${intake.location.projectDir}|${intake.record.planLabel}`;
+    if (created === undefined || unordered.has(key)) {
       continue;
     }
-    const key = `${intake.location.projectDir}|${intake.record.planLabel}`;
     const held = newestPerPlan.get(key);
     if (!held || created > (held.record.createdAtMs ?? -Infinity)) {
       newestPerPlan.set(key, intake);

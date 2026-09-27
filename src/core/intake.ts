@@ -24,7 +24,7 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { EngineFormatError, type PlanRunStatus } from "./engineFormats";
+import { EngineFormatError, parsePlanRunState, type PlanRunStatus } from "./engineFormats";
 import { parseExecutionManifest, type ManifestStageIdentity } from "./manifest";
 
 export const INTAKE_DIRNAME = "intake";
@@ -84,6 +84,11 @@ export interface IntakeApprovalRecord {
   expectedBranch: string;
   /** `starting_snapshot.path`: the primary worktree the slice was approved in and must run from. */
   repoRoot: string;
+  /**
+   * `sparring_dir`: the `.sparring` the slice's run is recorded in, which is
+   * the project that runs it — not necessarily the one that prepared it.
+   */
+  sparringDir?: string;
 }
 
 /**
@@ -213,6 +218,7 @@ export function parseIntakeApproval(text: string): IntakeApprovalRecord {
     sourcePath,
     expectedBranch: nonEmpty(payload, "expected_branch", "approval"),
     repoRoot,
+    sparringDir: typeof payload["sparring_dir"] === "string" && payload["sparring_dir"] ? (payload["sparring_dir"] as string) : undefined,
   };
 }
 
@@ -327,7 +333,7 @@ export async function resolveIntakeRun(sparringDir: string, runKey: string): Pro
  * What an intake's files record, never what it would be allowed to do.
  *
  *  - `prepared` — reviewed proposal, no sealed approval for the next slice yet.
- *  - `approved` — a slice has a sealed approval and no run of it exists yet.
+ *  - `approved` — a slice has a sealed approval and no recorded run yet.
  *    "Approved", not "runnable": the engine re-checks the seal and the
  *    repositories when `run-plan` starts, and may refuse.
  *  - `running` — a plan run of one of its slices exists and is not complete.
@@ -413,13 +419,14 @@ async function snapshotIntake(dir: string, sparringDir: string, record: IntakeRe
       // No approval, or one the engine would refuse: not approved.
     }
   }
-  const slices: IntakeSliceSnapshot[] = record.runKeys.map(({ runId, runKey }) => {
+  const slices: IntakeSliceSnapshot[] = [];
+  for (const { runId, runKey } of record.runKeys) {
     const found = approvals.get(runKey);
     const approved = found && found.approval.runId === runId ? found : undefined;
-    const status = runs.get(runKey);
+    const status = runs.get(runKey) ?? (await recordedRunStatus([sparringDir, approved?.approval.sparringDir], runKey));
     const state: IntakeState = status === "complete" ? "complete" : status !== undefined ? "running" : approved ? "approved" : "prepared";
-    return { runId, runKey, state, approval: approved?.approval, manifestPath: approved?.manifestPath, stages: names.get(runId) ?? [] };
-  });
+    slices.push({ runId, runKey, state, approval: approved?.approval, manifestPath: approved?.manifestPath, stages: names.get(runId) ?? [] });
+  }
   let activityMs = record.createdAtMs;
   if (activityMs !== undefined) {
     for (const slice of slices) {
@@ -429,6 +436,33 @@ async function snapshotIntake(dir: string, sparringDir: string, record: IntakeRe
     }
   }
   return { dir, sparringDir, record, slices, state: intakeState(slices), reportPath: path.join(dir, INTAKE_REPORT_FILENAME), activityMs };
+}
+
+/**
+ * The status of run `runKey` when it was not among the discovered runs: its
+ * state file in this `.sparring`, or in the one the approval says runs the
+ * slice (a slice may be run from a project this window has not opened).
+ *
+ * A state file that exists but cannot be read — a newer engine's plan input
+ * kind, say — is a run that exists with an unknown status, never "no run":
+ * it is answered as `running`, which keeps the slice from being shown as
+ * approved-and-not-yet-run.
+ */
+async function recordedRunStatus(sparringDirs: readonly (string | undefined)[], runKey: string): Promise<PlanRunStatus | undefined> {
+  for (const dir of new Set(sparringDirs.filter((entry): entry is string => Boolean(entry)))) {
+    let text: string;
+    try {
+      text = await fs.readFile(path.join(dir, "plans", `${runKey}.json`), "utf8");
+    } catch {
+      continue;
+    }
+    try {
+      return parsePlanRunState(text).status;
+    } catch {
+      return "running";
+    }
+  }
+  return undefined;
 }
 
 /** The intake's own state from its slices; see {@link IntakeState}. */
@@ -461,7 +495,7 @@ export function intakeStateLabel(state: IntakeState): string {
     case "prepared":
       return "Prepared — awaiting review and approval";
     case "approved":
-      return "Slice approved — ready to run";
+      return "Slice approved — not yet run";
     case "running":
       return "Running";
     case "complete":

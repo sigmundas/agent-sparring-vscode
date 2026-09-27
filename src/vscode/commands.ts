@@ -683,7 +683,13 @@ async function nextHeadingLine(controller: SparringController, run: RunSnapshot,
     const headings = parsePlanHeadings(await fs.readFile(file, "utf8"));
     if (run.kind === "plan") {
       const next = run.planStages?.[run.state.currentStageIndex + 1];
-      return next ? headings.find((heading) => heading.label === String(next.number) && heading.title === next.title)?.line : undefined;
+      if (!next) {
+        return undefined;
+      }
+      // A stage named by a manifest (`Stage 1A`) is found by that label; a
+      // Markdown heading by the engine's own numbering.
+      const label = next.label ? next.label.replace(/^Stage\s+/i, "") : String(next.number);
+      return headings.find((heading) => heading.label?.toUpperCase() === label.toUpperCase() && heading.title === next.title)?.line;
     }
     const stage = currentStageOf(run);
     const briefText = await readOptional(path.join(stage.dir, BRIEF_FILENAME));
@@ -2600,7 +2606,10 @@ async function performContinueAutomatically(controller: SparringController, over
     void vscode.window.showInformationMessage("Agent Sparring: choose a plan for this stage first; automatic continuation runs that plan's stages.");
     return { ok: false, reason: "no-plan" };
   }
-  const markdown = await readOptional(planPath);
+  // An approved intake run resumes from its sealed manifest; its source
+  // Markdown is only the readable plan, so its absence stops nothing.
+  const intakeRun = run.kind === "plan" && run.state.source === "intake-manifest";
+  const markdown = (await readOptional(planPath)) ?? (intakeRun ? "" : undefined);
   if (markdown === undefined) {
     void vscode.window.showWarningMessage(`Agent Sparring: the plan document ${path.basename(planPath)} could not be read.`);
     return { ok: false, reason: "unreadable" };

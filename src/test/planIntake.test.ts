@@ -242,6 +242,28 @@ describe("pre-run intake state", () => {
     assert.equal((await discoverRuns([location])).intakes?.[0].state, "complete");
   });
 
+  it("a slice run from another project, which this window has not opened, is not shown as approved", async () => {
+    const { root, location } = await project("approved");
+    const other = path.join(path.dirname(root), "web", ".sparring");
+    const approvalFile = path.join(root, ".sparring", "intake", INTAKE_ID, "runs", "app", "approval.json");
+    await writeJson(approvalFile, { ...JSON.parse(await fs.readFile(approvalFile, "utf8")), sparring_dir: other });
+    await writeJson(path.join(other, "plans", `${RUN_KEY}.json`), { current_stage: "app-run-0001-stage-0-audit", current_stage_index: 0, expected_branch: "feature/widgets", plan: "docs/plan.md", plan_digest: "0".repeat(64), run: RUN_KEY, source: "intake-manifest", status: "complete" });
+    const discovery = await discoverRuns([location]);
+    const [intake] = discovery.intakes ?? [];
+    assert.deepEqual(intake.slices.map((slice) => [slice.runId, slice.state]), [["app", "complete"], ["web", "prepared"]]);
+  });
+
+  it("a run state file that cannot be read still counts as a run of its slice", async () => {
+    const { root, location } = await project("approved");
+    await writeJson(path.join(root, ".sparring", "plans", `${RUN_KEY}.json`), { run: RUN_KEY, source: "future-kind", status: "running", current_stage: "x", current_stage_index: 0, expected_branch: "b", plan: "p", plan_digest: "0" });
+    const discovery = await discoverRuns([location]);
+    assert.ok(discovery.problems.length > 0);
+    const [intake] = discovery.intakes ?? [];
+    assert.equal(intake.slices[0].state, "running");
+    assert.equal(intake.state, "running");
+    assert.equal(selectRun(discovery.runs, undefined, undefined, { repoRoot: root }, undefined, [location], discovery.intakes).intake, undefined);
+  });
+
   it("engine timestamps are read only with an explicit offset", () => {
     assert.equal(parseEngineTimestamp("2026-09-27T19:52:25.425171+00:00"), CREATED_AT_MS);
     assert.equal(parseEngineTimestamp("2026-09-27T19:52:25"), undefined, "no offset: local time would be a guess");
@@ -301,6 +323,37 @@ describe("selection: a newer pre-run intake replaces older finished work", () =>
     }
   });
 
+  it("of two intakes of one plan, only the newer is considered; an unreadable age makes the plan's intakes unorderable", async () => {
+    const { root, location } = await project("approved");
+    const intakeRoot = path.join(root, ".sparring", "intake");
+    const record = JSON.parse(await fs.readFile(path.join(intakeRoot, INTAKE_ID, "intake.json"), "utf8"));
+    // A later prepare of the same plan whose one slice already ran to completion.
+    const newer = "plan-61bf2008-20260928T080000Z-faithful-abcd";
+    await writeJson(path.join(intakeRoot, newer, "intake.json"), { ...record, intake_id: newer, created_at: "2026-09-28T08:00:00+00:00", run_keys: { app: "app-run-0009" } });
+    await writeJson(path.join(root, ".sparring", "plans", "app-run-0009.json"), { current_stage: "s", current_stage_index: 0, expected_branch: "feature/widgets", plan: "docs/plan.md", plan_digest: "0".repeat(64), run: "app-run-0009", source: "markdown", status: "complete" });
+    await fs.utimes(path.join(root, ".sparring", "plans", "app-run-0009.json"), new Date(CREATED_AT_MS - 1), new Date(CREATED_AT_MS - 1));
+    let discovery = await discoverRuns([location]);
+    assert.equal(selectRun(discovery.runs, undefined, undefined, { repoRoot: root }, undefined, [location], discovery.intakes).intake, undefined, "the older approved intake was replaced");
+
+    await writeJson(path.join(intakeRoot, newer, "intake.json"), { ...record, intake_id: newer, created_at: "no time", run_keys: { app: "app-run-0009" } });
+    discovery = await discoverRuns([location]);
+    assert.equal(selectRun(discovery.runs, undefined, undefined, { repoRoot: root }, undefined, [location], discovery.intakes).intake, undefined, "which intake is newest cannot be known");
+  });
+
+  it("a slice approved after an earlier slice finished is newer than that run", async () => {
+    const { root, location } = await project("ran");
+    const runState = path.join(root, ".sparring", "plans", `${RUN_KEY}.json`);
+    await fs.utimes(runState, new Date(CREATED_AT_MS + 60_000), new Date(CREATED_AT_MS + 60_000));
+    const intakeDir = path.join(root, ".sparring", "intake", INTAKE_ID);
+    let discovery = await discoverRuns([location]);
+    assert.equal(selectRun(discovery.runs, undefined, undefined, { repoRoot: root }, undefined, [location], discovery.intakes).intake, undefined, "prepared before the run finished: not promoted");
+    const appApproval = JSON.parse(await fs.readFile(path.join(intakeDir, "runs", "app", "approval.json"), "utf8"));
+    await writeJson(path.join(intakeDir, "runs", "web", "approval.json"), { ...appApproval, run_id: "web", run_key: "web-run-0002", approved_at: new Date(CREATED_AT_MS + 120_000).toISOString().replace("Z", "+00:00") });
+    discovery = await discoverRuns([location]);
+    const selection = selectRun(discovery.runs, undefined, undefined, { repoRoot: root }, undefined, [location], discovery.intakes);
+    assert.equal(selection.intake?.state, "approved");
+  });
+
   it("with nothing finished at all, a pre-run intake is shown", async () => {
     const { root, location } = await project("approved");
     const discovery = await discoverRuns([location]);
@@ -355,7 +408,7 @@ describe("the intake screen and status bar", () => {
     const model = buildOverviewModel(selection, undefined, { handoff: false, sparring: false, brief: false, plan: true, planText });
     assert.equal(model.kind, "intake");
     assert.equal(model.intake?.planName, "Widget overhaul");
-    assert.equal(model.intake?.stateLabel, "Slice approved — ready to run");
+    assert.equal(model.intake?.stateLabel, "Slice approved — not yet run");
     assert.deepEqual(model.intake?.slices.map((slice) => [slice.runId, slice.current, slice.stages]), [
       ["app", true, ["Stage 0 — Audit", "Stage 1A — App change"]],
       ["web", false, ["Stage 1B — Web repair"]],
@@ -367,16 +420,34 @@ describe("the intake screen and status bar", () => {
     assert.match(status.text, /plan\.md · slice approved/);
   });
 
-  it("a prepared intake offers no run command", async () => {
-    const { root, location } = await project("ran");
+  it("a partly run intake offers no run command and never says nothing has run", async () => {
+    const { location } = await project("ran");
     const discovery = await discoverRuns([location]);
     const intake = discovery.intakes?.[0];
     assert.ok(intake);
     const model = buildOverviewModel({ ambiguous: [], intake }, undefined);
     assert.equal(model.intake?.stateLabel, "Prepared — awaiting review and approval");
     assert.equal(model.intake?.runCommand, undefined);
-    assert.ok(model.intake?.lines.some((line) => /approve-plan/.test(line)));
-    void root;
+    const text = model.intake?.lines.join("\n") ?? "";
+    assert.match(text, /Run slice web has not been approved/);
+    assert.match(text, /Run slice app of this intake is complete/);
+    assert.ok(!/no run slice has run|Nothing has run/i.test(text), text);
+    assert.ok(!/ready to run|will run/i.test(text), text);
+  });
+
+  it("an untouched intake says no slice has run and promises no approval", async () => {
+    const { root, location } = await project("approved");
+    await fs.rm(path.join(root, ".sparring", "intake", INTAKE_ID, "runs"), { recursive: true });
+    const intake = (await discoverRuns([location])).intakes?.[0];
+    assert.ok(intake);
+    const text = buildOverviewModel({ ambiguous: [], intake }, undefined).intake?.lines.join("\n") ?? "";
+    assert.match(text, /no run slice has run/);
+    assert.ok(!/then approve/.test(text), "whether it can be approved is the engine's decision");
+  });
+
+  it("Continue automatically does not need the source Markdown of an intake run", async () => {
+    const source = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "commands.ts"), "utf8");
+    assert.match(source, /const markdown = \(await readOptional\(planPath\)\) \?\? \(intakeRun \? "" : undefined\);/);
   });
 
   it("the controller watches the intake files, and nothing else under intake/", async () => {

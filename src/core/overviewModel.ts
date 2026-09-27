@@ -780,7 +780,7 @@ export interface IntakeView {
   /** The source plan's own `# ` title, else its label. */
   planName: string;
   planLabel: string;
-  /** `Prepared — awaiting review and approval`, `Slice approved — ready to run`. */
+  /** `Prepared — awaiting review and approval`, `Slice approved — not yet run`. */
   stateLabel: string;
   /** What the person does next, in the engine's own commands. */
   lines: string[];
@@ -1107,13 +1107,16 @@ export function intakeView(intake: DiscoveredIntake, sourceText: string | undefi
   const next = nextIntakeSlice(intake);
   const approved = next?.state === "approved" ? next : undefined;
   const lines: string[] = [];
+  const ran = intake.slices.filter((slice) => slice.state === "complete");
   if (approved?.approval && approved.manifestPath) {
-    lines.push(`Run slice ${approved.runId} is approved for branch ${approved.approval.expectedBranch}. Start it from a terminal with the command below; the engine re-checks the approval and the repositories before anything runs.`);
-  } else {
-    lines.push(`The engine prepared this plan for review. Nothing has run. Read the report, then approve a run slice with sparring approve-plan.`);
+    lines.push(`Run slice ${approved.runId} is approved for branch ${approved.approval.expectedBranch} and has not run. It is started from a terminal with the command below; the engine re-checks the approval and the repositories before anything runs, and may refuse.`);
+  } else if (next) {
+    // Whether it can be approved is the engine's decision (blocking findings,
+    // prerequisites); the report is where they are, so nothing is promised.
+    lines.push(`${ran.length > 0 ? `Run slice ${next.runId} has not been approved.` : "The engine prepared this plan for review; no run slice has run."} The report says what it found; approval is sparring approve-plan.`);
   }
-  if (intake.slices.some((slice) => slice.state === "complete")) {
-    lines.push(`Earlier run slices of this intake are complete; ${SELECT_RUN_LABEL} still opens them.`);
+  if (ran.length > 0) {
+    lines.push(`Run slice${ran.length === 1 ? "" : "s"} ${ran.map((slice) => slice.runId).join(", ")} of this intake ${ran.length === 1 ? "is" : "are"} complete; ${SELECT_RUN_LABEL} still opens ${ran.length === 1 ? "it" : "them"}.`);
   }
   return {
     planName: (sourceText ? planTitle(sourceText) : undefined) ?? intake.record.planLabel,
