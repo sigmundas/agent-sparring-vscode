@@ -55,7 +55,7 @@ export function deriveStatus(selection: RunSelection, live: LiveState | undefine
 function deriveUnpinnedStatus(selection: RunSelection, live: LiveState | undefined, nowMs: number, liveness?: RunnerLiveness): StatusView {
   if (!selection.selected && selection.intake) {
     const intake = selection.intake;
-    const word = intake.state === "approved" ? "slice approved" : "intake awaiting approval";
+    const word = intake.state === "approved" ? "approved, ready to start" : "intake awaiting approval";
     return {
       text: `$(checklist) ${PREFIX}: ${truncateLabel(path.basename(intake.record.planLabel), 28)} · ${word}`,
       tooltip: [`Plan intake: ${intake.record.planLabel}`, intakeStateLabel(intake.state), `Repository: ${intake.location.folderName}`, describeRepositoryContext(selection).text].join("\n"),

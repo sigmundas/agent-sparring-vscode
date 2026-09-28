@@ -14,7 +14,7 @@
  * meaningful event on the right); provider cards; recent events; metadata.
  */
 
-import { ACTIVE_CONTEXT_HEADLINE, FOLLOW_ACTIVE_LABEL, SELECT_RUN_LABEL } from "./activeRepository";
+import { ACTIVE_CONTEXT_HEADLINE, CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, SELECT_RUN_LABEL } from "./activeRepository";
 import {
   CONFIG_FIELDS,
   CONFIG_ROLES,
@@ -41,6 +41,8 @@ export type OverviewAction =
   | "showLog"
   | "selectRun"
   | "followActiveRepository"
+  | "chooseRepository"
+  | "followActiveEditor"
   | "runPlan"
   | "resumePlan"
   | "runStage"
@@ -329,6 +331,8 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "showLog",
   "selectRun",
   "followActiveRepository",
+  "chooseRepository",
+  "followActiveEditor",
   "runPlan",
   "resumePlan",
   "runStage",
@@ -487,7 +491,7 @@ ${renderActors(model, discloseScope(model))}
     const slices = intake.slices
       .map(
         (slice) =>
-          `<li${slice.current ? ' class="current"' : ""}><strong>Run slice ${escapeHtml(slice.runId)}</strong> <span class="muted">— ${escapeHtml(slice.stateLabel)}</span>${
+          `<li${slice.current ? ' class="current"' : ""}><strong>${escapeHtml(slice.heading)}</strong> <span class="muted">— ${escapeHtml(slice.stateLabel)}</span>${
             slice.stages.length > 0 ? `<ul>${slice.stages.map((stage) => `<li>${escapeHtml(stage)}</li>`).join("")}</ul>` : ""
           }</li>`,
       )
@@ -506,6 +510,14 @@ ${intake.unconfirmed ? `<div class="subfail"><p class="preserved">${icon("warn",
 <ul class="intake-slices">${slices}</ul>
 <div class="actions">${intake.action ? intakeButton(intake.action) : ""}${button("openIntakeReport", "Open intake report", true, undefined, intake.action ? "" : "primary")}${intake.hasSource ? button("openIntakeSource", "Open plan") : ""}${button("showLog", "Show log")}</div>
 ${intake.command ? `<details class="intake-command"><summary>Engine command</summary><pre class="command">${escapeHtml(intake.command)}</pre></details>` : ""}
+<details class="intake-technical"><summary>Technical details</summary><ul class="intake-technical-list">${intake.slices
+  .map(
+    (slice) =>
+      `<li><strong>${escapeHtml(slice.heading)}</strong>: run slice <code>${escapeHtml(slice.technical.runId)}</code> · run key <code>${escapeHtml(slice.technical.runKey)}</code>${
+        slice.technical.repository ? ` · repository ${escapeHtml(slice.technical.repository)}` : ""
+      }${slice.technical.manifestPath ? ` · manifest <code>${escapeHtml(slice.technical.manifestPath)}</code>` : ""}</li>`,
+  )
+  .join("")}</ul></details>
 <p class="muted small">Intake ${escapeHtml(intake.intakeId)} · ${escapeHtml(intake.planLabel)}</p>`;
   }
   if (model.kind === "ambiguous") {
@@ -599,14 +611,17 @@ function renderRepositoryContext(model: OverviewModel): string {
   }
   const pinned = context.mode === "pinned";
   const releasable = pinned || context.mode === "attached";
-  const lines = [contextLine(context.headline, context.repository, pinned)];
+  // The followed repository's name is itself the control that changes it: the
+  // second line while a pin holds the first, else the first.
+  const lines = [contextLine(context.headline, context.repository, pinned, !(pinned && context.activeRepository) && context.mode !== "attached")];
   if (pinned && context.activeRepository) {
-    lines.push(contextLine(ACTIVE_CONTEXT_HEADLINE, context.activeRepository, false));
+    lines.push(contextLine(ACTIVE_CONTEXT_HEADLINE, context.activeRepository, false, true));
   }
   const controls = [
     button("runPlan", "Run Plan", true, "Choose a repository and a plan document, and start a new run of it"),
     button("selectRun", SELECT_RUN_LABEL, true, "Pin a recorded run — including a finished one — to inspect it", "quiet"),
     releasable ? button("followActiveRepository", FOLLOW_ACTIVE_LABEL, true, context.explanation) : "",
+    context.chosen ? button("followActiveEditor", FOLLOW_EDITOR_LABEL, true, "Follow the repository of the active editor or Source Control focus again", "quiet") : "",
   ].join("");
   return `<section class="repocontext${pinned ? " pinned" : ""}${context.away ? " away" : ""}" title="${escapeHtml(context.explanation)}">
 <div class="names">${lines.join("")}</div>
@@ -614,9 +629,12 @@ function renderRepositoryContext(model: OverviewModel): string {
 </section>`;
 }
 
-function contextLine(headline: string, repository: string | undefined, pinned: boolean): string {
+function contextLine(headline: string, repository: string | undefined, pinned: boolean, choosable = false): string {
   const name = repository ?? "not resolved";
-  return `<div class="line"><span class="headline">${pinned ? icon("pin", "pin") : ""}${escapeHtml(headline)}:</span><span class="name">${escapeHtml(name)}</span></div>`;
+  const shown = choosable
+    ? `<button type="button" class="name chooser" data-action="chooseRepository" title="${escapeHtml(CHOOSE_REPOSITORY_LABEL)}" aria-haspopup="listbox">${escapeHtml(name)}<span class="caret" aria-hidden="true">▾</span></button>`
+    : `<span class="name">${escapeHtml(name)}</span>`;
+  return `<div class="line"><span class="headline">${pinned ? icon("pin", "pin") : ""}${escapeHtml(headline)}:</span>${shown}</div>`;
 }
 
 function renderHeader(model: OverviewModel): string {
@@ -2253,6 +2271,9 @@ button.quiet { background: transparent; color: var(--vscode-descriptionForegroun
 .repocontext .line { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .repocontext .headline { display: inline-flex; align-items: center; gap: 4px; color: var(--vscode-descriptionForeground); }
 .repocontext .name { font-weight: 600; color: var(--vscode-foreground); overflow-wrap: anywhere; }
+.repocontext .chooser { display: inline-flex; align-items: center; gap: 4px; margin: 0; padding: 1px 6px; font: inherit; font-weight: 600; background: transparent; color: var(--vscode-foreground); border: 1px solid var(--vscode-dropdown-border, var(--line)); border-radius: 3px; cursor: pointer; }
+.repocontext .chooser:hover { background: var(--vscode-toolbar-hoverBackground, transparent); }
+.repocontext .chooser .caret { opacity: 0.75; font-size: 0.9em; }
 .repocontext .actions { margin: 0; gap: 6px; }
 .repocontext.pinned { padding-left: 8px; border-left: 2px solid var(--vscode-textLink-foreground); }
 /* A pin holding the cockpit away from the repository this window is in is the

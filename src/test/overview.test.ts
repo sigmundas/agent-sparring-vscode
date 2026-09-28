@@ -353,6 +353,6 @@ describe("overview HTML", () => {
     );
     assert.match(html, /<li>&lt;b&gt;.md<\/li>/);
     assert.match(html, /data-action="selectRun"/);
-    assert.ok(html.includes('Following repository:</span><span class="name">beta'));
+    assert.ok(html.includes('Following repository:</span><button type="button" class="name chooser" data-action="chooseRepository" title="Choose repository to follow" aria-haspopup="listbox">beta'));
   });
 });

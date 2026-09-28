@@ -71,6 +71,16 @@
         "category": "Agent Sparring"
       },
       {
+        "command": "agentSparring.chooseRepository",
+        "title": "Choose Repository to Follow",
+        "category": "Agent Sparring"
+      },
+      {
+        "command": "agentSparring.followActiveEditor",
+        "title": "Follow Active Editor",
+        "category": "Agent Sparring"
+      },
+      {
         "command": "agentSparring.refresh",
         "title": "Rediscover State",
         "category": "Agent Sparring"

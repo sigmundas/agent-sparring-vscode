@@ -400,7 +400,7 @@ describe("selection: a newer pre-run intake replaces older finished work", () =>
 });
 
 describe("the intake screen and status bar", () => {
-  it("names the plan, the state and the slices, and offers Start slice for the exact approved slice", async () => {
+  it("names the plan, the state and the stages, and offers Start for the exact approved slice", async () => {
     const { root, location } = await project("approved");
     const discovery = await discoverRuns([location]);
     const selection = selectRun(discovery.runs, undefined, undefined, { repoRoot: root }, undefined, [location], discovery.intakes);
@@ -409,19 +409,20 @@ describe("the intake screen and status bar", () => {
     assert.equal(model.kind, "intake");
     assert.equal(model.intake?.planName, "Widget overhaul");
     assert.equal(model.intake?.stateLabel, "Approved — ready to start");
-    assert.deepEqual(model.intake?.slices.map((slice) => [slice.runId, slice.current, slice.stages]), [
-      ["app", true, ["Stage 0 — Audit", "Stage 1A — App change"]],
-      ["web", false, ["Stage 1B — Web repair"]],
+    assert.deepEqual(model.intake?.slices.map((slice) => [slice.runId, slice.heading, slice.current, slice.stages]), [
+      ["app", "Execution group — Stages 0 + 1A", true, ["Stage 0 — Audit", "Stage 1A — App change"]],
+      ["web", "Stage 1B — Web repair", false, []],
     ]);
+    assert.deepEqual(model.intake?.slices[1].technical && { ...model.intake.slices[1].technical }, { runId: "web", runKey: "web-run-0002", repository: "web" }, "the engine's identifiers stay available");
     assert.deepEqual(model.intake?.action && { kind: model.intake.action.kind, label: model.intake.action.label, runId: model.intake.action.runId, intakeDir: model.intake.action.intakeDir }, {
       kind: "start",
-      label: "Start slice",
+      label: "Start Stages 0 + 1A",
       runId: "app",
       intakeDir: path.join(root, ".sparring", "intake", INTAKE_ID),
     });
 
     const status = deriveStatus(selection, undefined, Date.now());
-    assert.match(status.text, /plan\.md · slice approved/);
+    assert.match(status.text, /plan\.md · approved, ready to start/);
   });
 
   it("a partly run intake offers Approve for the next slice and never says nothing has run", async () => {
@@ -434,9 +435,12 @@ describe("the intake screen and status bar", () => {
     assert.equal(model.intake?.action?.kind, "approve");
     assert.equal(model.intake?.action?.runId, "web");
     const text = model.intake?.lines.join("\n") ?? "";
-    assert.match(text, /Run slice web has not been approved/);
-    assert.match(text, /Run slice app of this intake is complete/);
-    assert.ok(!/no run slice has run|Nothing has run/i.test(text), text);
+    assert.match(text, /Stage 1B is next and has not been approved/);
+    assert.match(text, /Stages 0 \+ 1A are complete/);
+    assert.ok(!/no stage of it has run|Nothing has run/i.test(text), text);
+    assert.ok(!/run slice/i.test(text), "the engine's noun is not the Overview's");
+    assert.deepEqual(model.intake?.slices.map((slice) => slice.stateLabel), ["Complete", "Ready for approval"]);
+    assert.equal(model.intake?.action?.label, "Approve Stage 1B");
     assert.ok(!/ready to run|will run/i.test(text), text);
   });
 
@@ -446,7 +450,7 @@ describe("the intake screen and status bar", () => {
     const intake = (await discoverRuns([location])).intakes?.[0];
     assert.ok(intake);
     const text = buildOverviewModel({ ambiguous: [], intake }, undefined).intake?.lines.join("\n") ?? "";
-    assert.match(text, /no run slice has run/);
+    assert.match(text, /no stage of it has run/);
     assert.ok(!/then approve/.test(text), "whether it can be approved is the engine's decision");
   });
 

@@ -629,6 +629,8 @@ export interface RepositoryScope {
   repoRoot: string;
   /** Every repository root the window can see, including `repoRoot`. */
   knownRoots?: readonly string[];
+  /** `repoRoot` was chosen in Agent Sparring, not taken from the active editor / Source Control focus. */
+  chosen?: boolean;
 }
 
 export interface RepositoryScopeView {
@@ -636,6 +638,8 @@ export interface RepositoryScopeView {
   repoRoot: string;
   /** What to call it: the root directory's own name, disambiguated when another known root shares it. */
   name: string;
+  /** See {@link RepositoryScope.chosen}. */
+  chosen?: boolean;
 }
 
 /**
@@ -934,7 +938,7 @@ export function selectRun(
   intakes: readonly DiscoveredIntake[] = [],
 ): RunSelection {
   const view: RepositoryScopeView | undefined = scope
-    ? { repoRoot: path.resolve(scope.repoRoot), name: repositoryDisplayName(scope.repoRoot, scope.knownRoots ?? []) }
+    ? { repoRoot: path.resolve(scope.repoRoot), name: repositoryDisplayName(scope.repoRoot, scope.knownRoots ?? []), ...(scope.chosen ? { chosen: true } : {}) }
     : undefined;
   const inScope: RunSnapshot[] = [];
   const elsewhere: RunSnapshot[] = [];

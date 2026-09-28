@@ -8,7 +8,7 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { ActivityTailer } from "../core/activityTailer";
-import { FOLLOW_ACTIVE_LABEL } from "../core/activeRepository";
+import { FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, followedRepository, repositoryChoices, type RepositoryChoice } from "../core/activeRepository";
 import { diagnoseDiscovery, renderDiagnostic, type DiscoveryDiagnostic } from "../core/diagnose";
 import {
   DEFAULT_NESTED_SEARCH_DEPTH,
@@ -131,6 +131,11 @@ const PIN_INTENT_KEY = "agentSparring.pinIntent";
 const PIN_ORIGIN_KEY = "agentSparring.pinOrigin";
 /** The active repository when an action attachment was made; a move away from it ends the attachment. */
 const PIN_ACTIVE_ROOT_KEY = "agentSparring.pinActiveRoot";
+/**
+ * The repository chosen in Agent Sparring to follow, per workspace; absent
+ * while following the active editor. Display/navigation state only.
+ */
+const CHOSEN_REPOSITORY_KEY = "agentSparring.chosenRepositoryRoot";
 const OUTPUT_CHANNEL_NAME = "Agent Sparring";
 /** How often the process table may be read for one run whose liveness nothing in this window watched. */
 const PROBE_COOLDOWN_MS = 15_000;
@@ -511,13 +516,40 @@ export class SparringController implements vscode.Disposable {
    * it.
    */
   private async repositoryScope(): Promise<RepositoryScope | undefined> {
-    const active = this.activeRepository.activeRepoRoot;
-    if (!active) {
+    const followed = followedRepository(this.context.workspaceState.get<string>(CHOSEN_REPOSITORY_KEY), this.activeRepository.activeRepoRoot, this.activeRepository.knownRepoRoots);
+    const root = followed.root;
+    if (!root) {
       return undefined;
     }
-    const known = this.activeRepository.knownRepoRoots ?? [active];
-    const aligned = await this.alignRoots([active, ...known]);
-    return { repoRoot: aligned[0], knownRoots: aligned };
+    const known = this.activeRepository.knownRepoRoots ?? [root];
+    const aligned = await this.alignRoots([root, ...known]);
+    return { repoRoot: aligned[0], knownRoots: aligned, ...(followed.chosen ? { chosen: true } : {}) };
+  }
+
+  /** The repositories this window knows — the Git extension's and the discovered projects' — to choose from. */
+  async repositoryChoices(): Promise<RepositoryChoice[]> {
+    await this.activeRepository.ready();
+    const roots = await this.alignRoots([...(this.activeRepository.knownRepoRoots ?? []), ...this.locations.map((location) => location.repoRoot)]);
+    return repositoryChoices(roots, (await this.repositoryScope())?.repoRoot);
+  }
+
+  /**
+   * Follow `root`'s current work, whatever editor is active, until another
+   * repository is chosen or {@link followActiveEditor}. Choosing a repository
+   * asks for its current work, so a run pin is released as well.
+   */
+  async chooseRepository(root: string): Promise<void> {
+    await this.context.workspaceState.update(CHOSEN_REPOSITORY_KEY, root);
+    this.log(`following ${path.basename(root)}, chosen in Agent Sparring; opening files in other repositories does not change it. ${FOLLOW_EDITOR_LABEL} goes back to the active editor's repository.`);
+    await this.chooseRun(undefined, "explicit");
+  }
+
+  /** Forget the chosen repository and any run pin: follow the active editor / Source Control focus again. */
+  async followActiveEditor(): Promise<void> {
+    await this.context.workspaceState.update(CHOSEN_REPOSITORY_KEY, undefined);
+    const root = this.activeRepository.activeRepoRoot;
+    this.log(root ? `following the active editor's repository again: ${path.basename(root)}` : "following the active editor's repository again; this window is in no repository the Git extension has opened");
+    await this.chooseRun(undefined, "explicit");
   }
 
   /**
@@ -1460,9 +1492,17 @@ export class SparringController implements vscode.Disposable {
     }
   }
 
+  /** Release a run pin and show the followed repository's current work — the chosen one, if a repository was chosen. */
   async followActiveRepository(): Promise<void> {
-    const root = this.activeRepository.activeRepoRoot;
-    this.log(root ? `following the active repository again: ${path.basename(root)}` : "following the active repository again; this window is in no repository the Git extension has opened");
+    const scope = await this.repositoryScope();
+    const root = scope?.repoRoot;
+    this.log(
+      scope?.chosen && root
+        ? `released the pin; following ${path.basename(root)}, the repository chosen in Agent Sparring`
+        : root
+          ? `following the active repository again: ${path.basename(root)}`
+          : "following the active repository again; this window is in no repository the Git extension has opened",
+    );
     await this.chooseRun(undefined, "explicit");
   }
 

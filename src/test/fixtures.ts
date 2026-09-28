@@ -7,7 +7,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { isInsidePath, samePath, type PlanRunSnapshot, type RunSnapshot, type SparringLocation, type StageOwnership } from "../core/discovery";
+import { discoverRuns, intakeIdFor, isInsidePath, runIdFor, samePath, type PlanRunSnapshot, type RunSnapshot, type SparringLocation, type StageOwnership } from "../core/discovery";
 import type { GitWorkTreeProbe } from "../core/launchRepositories";
 import type { ActivityEvent } from "../core/engineFormats";
 import { BINDING_VERSION, bindManifest, bindingPathFor, manifestExpectationFor, manifestPathFor, parseExecutionManifest, renderBindingRecord, type ManifestStageIdentity } from "../core/manifest";
@@ -397,4 +397,64 @@ export async function membershipsOf(runs: readonly RunSnapshot[], store: Manifes
 /** …and the ownership edges `selectRun` takes. */
 export async function ownershipOf(runs: readonly RunSnapshot[], store: ManifestStore): Promise<StageOwnership> {
   return stageOwnership(await membershipsOf(runs, store));
+}
+
+const INTAKE_FIXTURES = path.join(__dirname, "..", "..", "src", "test", "fixtures", "plan-intake");
+const INTAKE_ID = "plan-61bf2008-20260927T204930Z-faithful-fb55";
+const OLD_STAGE = "finds-prefetch-and-enrichment";
+
+async function copyTree(from: string, to: string, root: string): Promise<void> {
+  for (const entry of await fs.readdir(from, { withFileTypes: true })) {
+    const source = path.join(from, entry.name);
+    const target = path.join(to, entry.name);
+    if (entry.isDirectory()) {
+      await fs.mkdir(target, { recursive: true });
+      await copyTree(source, target, root);
+    } else {
+      await fs.writeFile(target, (await fs.readFile(source, "utf8")).split("__ROOT__").join(root));
+    }
+  }
+}
+
+export async function snapshotTree(dir: string): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  for (const entry of await fs.readdir(dir, { withFileTypes: true, recursive: true })) {
+    if (entry.isFile()) {
+      const file = path.join(entry.parentPath, entry.name);
+      out[file] = await fs.readFile(file, "utf8");
+    }
+  }
+  return out;
+}
+
+/**
+ * The cross-repository intake world: `<base>/app` prepared the engine-generated
+ * `plan-intake/ran` intake and ran slice `app`; its next slice `web` belongs to
+ * `<base>/web`, which has only an unrelated standalone stage written after all
+ * of it. Shared by the current-work and followed-repository tests.
+ *
+ * `<base>/app` prepared the intake and ran slice `app`; `<base>/web` has only an old accepted stage, newer than all of it. */
+export async function crossRepositoryIntake(options: { webStage?: "accepted" | "working" } = {}) {
+  const base = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "agent-sparring-current-work-")));
+  const appRoot = path.join(base, "app");
+  await fs.mkdir(appRoot, { recursive: true });
+  await copyTree(path.join(INTAKE_FIXTURES, "ran"), appRoot, base);
+  const app: SparringLocation = { sparringDir: path.join(appRoot, ".sparring"), projectDir: appRoot, repoRoot: appRoot, workspaceFolder: appRoot, folderName: "app" };
+  const webWs = await Workspace.createNested(base, "web");
+  const stageState = await webWs.writeStage(OLD_STAGE, options.webStage === "working" ? { status: "working" } : { status: "accepted", candidate_sha: "abc" });
+  const later = new Date(Date.now() + 60_000);
+  await fs.utimes(path.join(stageState, "state.json"), later, later).catch(() => undefined);
+  const web = webWs.location;
+  const knownRoots = [app.repoRoot, web.repoRoot];
+  const scope = (location: SparringLocation) => ({ repoRoot: location.repoRoot, knownRoots });
+  return {
+    app,
+    web,
+    scope,
+    discover: () => discoverRuns([app, web]),
+    intakeId: intakeIdFor(app, INTAKE_ID),
+    stageId: runIdFor(web, "stage", OLD_STAGE),
+    appRunId: runIdFor(app, "plan", "app-run-0001"),
+    intakeDir: path.join(app.sparringDir, "intake", INTAKE_ID),
+  };
 }

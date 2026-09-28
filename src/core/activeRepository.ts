@@ -50,7 +50,7 @@
  * No dependency on the vscode API.
  */
 
-import { canonicalPath, isInsidePath, samePath, type RunSelection, type RunSnapshot } from "./discovery";
+import { canonicalPath, isInsidePath, repositoryDisplayName, samePath, type RunSelection, type RunSnapshot } from "./discovery";
 import { pathDepth } from "./launchRepositories";
 
 export interface ActiveRepositorySignal {
@@ -361,6 +361,66 @@ export function repositoryOfPath(git: GitSource, fsPath: string): string | undef
 // wording: the contract, said out loud
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// the followed repository: chosen in Agent Sparring, else the active one
+// ---------------------------------------------------------------------------
+
+/**
+ * The repository whose current work the cockpit follows.
+ *
+ * A repository chosen in Agent Sparring wins over the active editor / Source
+ * Control focus, so opening a file elsewhere does not move the cockpit; only
+ * choosing again, or {@link FOLLOW_EDITOR_LABEL}, does. A chosen repository
+ * the Git extension no longer has open is set aside — the window cannot be
+ * scoped to a repository it does not have — and applies again once it is
+ * back. `knownRoots` undefined means the Git extension has said nothing yet,
+ * which is not a reason to ignore the choice.
+ *
+ * This is display and navigation state only: it decides which repository's
+ * runs and intakes are candidates, never what the engine may do.
+ */
+export function followedRepository(
+  chosenRoot: string | undefined,
+  activeRoot: string | undefined,
+  knownRoots: readonly string[] | undefined,
+): { root?: string; chosen: boolean } {
+  if (chosenRoot && (knownRoots === undefined || knownRoots.some((root) => samePath(root, chosenRoot)))) {
+    return { root: chosenRoot, chosen: true };
+  }
+  return { root: activeRoot, chosen: false };
+}
+
+export interface RepositoryChoice {
+  root: string;
+  /** What the context line calls it. */
+  name: string;
+  /** Whether the cockpit follows it now. */
+  current: boolean;
+}
+
+/**
+ * The repositories a person can choose to follow: every root this window
+ * already knows — the Git extension's and the discovered projects' — once
+ * each, by name. Nothing is invented; a repository neither knows is not offered.
+ */
+export function repositoryChoices(roots: readonly string[], followedRoot: string | undefined): RepositoryChoice[] {
+  const unique: string[] = [];
+  for (const root of roots) {
+    if (!unique.some((seen) => samePath(seen, root))) {
+      unique.push(root);
+    }
+  }
+  return unique
+    .map((root) => ({ root, name: repositoryDisplayName(root, unique), current: followedRoot !== undefined && samePath(root, followedRoot) }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/** The control that chooses the followed repository directly. */
+export const CHOOSE_REPOSITORY_LABEL = "Choose repository to follow";
+
+/** Going back to following the active editor / Source Control focus. */
+export const FOLLOW_EDITOR_LABEL = "Follow active editor";
+
 /** The one name for going back to automatic selection, wherever it is offered. */
 export const FOLLOW_ACTIVE_LABEL = "Follow active repository";
 /** The one name for Agent Sparring's own repository/run chooser. */
@@ -411,6 +471,8 @@ export interface RepositoryContextView {
    * the same way every time.
    */
   activeRepository?: string;
+  /** The followed repository was chosen in Agent Sparring rather than taken from the active editor. */
+  chosen?: boolean;
   /** Present when a pin is holding the cockpit away from the active repository. */
   away?: boolean;
   /** One line for a tooltip or the status bar. */
@@ -425,6 +487,7 @@ const FOLLOWING_EXPLANATION =
   "Agent Sparring follows the repository of the active editor or the Source Control view's focus. VS Code's own repository selector in the status bar is not readable by extensions, so it is not what this follows; Run Plan asks which repository, and History / Runs pins one explicitly.";
 const PINNED_EXPLANATION = `This run was pinned through ${SELECT_RUN_LABEL}, and a pin is kept even when the window moves to another repository so that history stays open while you work elsewhere. ${FOLLOW_ACTIVE_LABEL} releases it, and starting a new plan run releases it too.`;
 const ATTACHED_EXPLANATION = `Agent Sparring is showing work you just started or opened. This is not a pin: opening a file in another repository goes back to following that repository, and ${FOLLOW_ACTIVE_LABEL} does it now.`;
+const CHOSEN_EXPLANATION = `This repository was chosen in Agent Sparring, so opening files in other repositories does not change it. Choose another repository here, or ${FOLLOW_EDITOR_LABEL} to go back to the repository of the active editor or Source Control focus.`;
 const UNSCOPED_EXPLANATION =
   "No repository could be resolved: the built-in Git extension has opened none, or has not answered yet. Nothing is scoped away, so every discovered run is a candidate.";
 
@@ -467,6 +530,16 @@ export function describeRepositoryContext(selection: RunSelection): RepositoryCo
           : `Pinned to a run in ${pinnedTo}; no active repository could be resolved.`,
       release: FOLLOW_ACTIVE_LABEL,
       explanation: PINNED_EXPLANATION,
+    };
+  }
+  if (scope?.chosen) {
+    return {
+      mode: "following",
+      headline: CONTEXT_HEADLINE.following,
+      repository: scope.name,
+      chosen: true,
+      text: `Following ${scope.name}, chosen in Agent Sparring; opening files in other repositories does not change it.`,
+      explanation: CHOSEN_EXPLANATION,
     };
   }
   if (scope) {

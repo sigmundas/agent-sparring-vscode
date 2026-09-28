@@ -17,7 +17,7 @@
 import * as path from "node:path";
 import { buildApprovePlanArgs, buildRunPlanArgs } from "./cli";
 import { runIdFor, samePath, type SparringLocation } from "./discovery";
-import type { IntakeSliceSnapshot, IntakeSnapshot } from "./intake";
+import { sliceStageName, type IntakeSliceSnapshot, type IntakeSnapshot } from "./intake";
 
 export type IntakeInvocation =
   | { ok: true; args: string[]; cwd: string; repoRoot: string; sparringDir: string; describe: string }
@@ -34,10 +34,10 @@ function sparringDirFor(repoRoot: string, locations: readonly SparringLocation[]
 
 export function approveInvocation(intake: IntakeSnapshot, slice: IntakeSliceSnapshot, locations: readonly SparringLocation[]): IntakeInvocation {
   if (!slice.primaryRepository) {
-    return { ok: false, problem: `the intake does not record which repository run slice ${slice.runId} is approved from. Open the intake report.` };
+    return { ok: false, problem: `the intake does not record which repository ${sliceStageName(slice)} (run slice ${slice.runId}) is approved from. Open the intake report.` };
   }
   if (!slice.primaryPath) {
-    return { ok: false, problem: `intake did not record a path for repository ${slice.primaryRepository}, where run slice ${slice.runId} is approved. Open the intake report.` };
+    return { ok: false, problem: `intake did not record a path for repository ${slice.primaryRepository}, where ${sliceStageName(slice)} (run slice ${slice.runId}) is approved. Open the intake report.` };
   }
   const repoRoot = slice.primaryPath;
   const sparringDir = sparringDirFor(repoRoot, locations);
@@ -60,12 +60,12 @@ export function startInvocation(
 ): IntakeStartInvocation {
   const approval = slice.approval;
   if (slice.state !== "approved" || !approval || !slice.manifestPath) {
-    return { ok: false, problem: `run slice ${slice.runId} has no sealed approval without a run.` };
+    return { ok: false, problem: `${sliceStageName(slice)} has no sealed approval that has not already run.` };
   }
   const recordedIn = approval.sparringDir ?? path.join(approval.repoRoot, ".sparring");
   const location = locations.find((candidate) => samePath(candidate.sparringDir, recordedIn) || samePath(canonical(candidate.sparringDir), canonical(recordedIn)));
   if (!location) {
-    return { ok: false, problem: `run slice ${slice.runId} runs in ${approval.repoRoot}, which is not open in this window. Open that repository, then start the slice.` };
+    return { ok: false, problem: `${sliceStageName(slice)} runs in ${approval.repoRoot}, which is not open in this window. Open that repository, then start it.` };
   }
   const args = buildRunPlanArgs({
     intakeManifest: slice.manifestPath,

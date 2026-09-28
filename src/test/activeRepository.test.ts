@@ -627,7 +627,7 @@ describe("the repository context on screen", () => {
     const html = renderOverviewHtml(buildOverviewModel(pinned, undefined, undefined, NOW), "n", "vscode-resource:");
     assert.ok(html.includes(`${CONTEXT_HEADLINE.pinned}:</span><span class="name">sporely-py-reported-statistics`), "the pinned repository is named");
     assert.ok(
-      html.includes(`${ACTIVE_CONTEXT_HEADLINE}:</span><span class="name">sporely-py-inaturalist-republish-media`),
+      html.includes(`${ACTIVE_CONTEXT_HEADLINE}:</span><button type="button" class="name chooser" data-action="chooseRepository" title="Choose repository to follow" aria-haspopup="listbox">sporely-py-inaturalist-republish-media`),
       "and so is the repository this window is in",
     );
 
@@ -653,7 +653,7 @@ describe("the repository context on screen", () => {
     await b.writeStage("stage-b", { status: "working" });
     const runs = (await discoverRuns(await folders(b))).runs;
     const html = renderOverviewHtml(buildOverviewModel(selectRun(runs, undefined, undefined, scopeOf(b)), undefined, undefined, NOW), "n", "vscode-resource:");
-    assert.ok(html.includes(`${CONTEXT_HEADLINE.following}:</span><span class="name">beta`));
+    assert.ok(html.includes(`${CONTEXT_HEADLINE.following}:</span><button type="button" class="name chooser" data-action="chooseRepository" title="Choose repository to follow" aria-haspopup="listbox">beta`), "the followed repository's name is the control that changes it");
     assert.doesNotMatch(html, /data-action="followActiveRepository"/, "there is no pin to release, so the control would do nothing");
   });
 

@@ -44,11 +44,11 @@ import {
   type StandaloneStageSnapshot,
   type DiscoveredIntake,
 } from "../core/discovery";
-import { intakeNextAction, intakeStateLabel } from "../core/intake";
+import { intakeNextAction, intakeStateLabel, sliceStageName } from "../core/intake";
 import type { IntakeActionMessage } from "../core/overviewHtml";
 import { approveInvocation, startInvocation } from "../core/intakeActions";
 import { stageScopeOf } from "../core/stageScope";
-import { FOLLOW_ACTIVE_LABEL, describeRepositoryContext } from "../core/activeRepository";
+import { CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
 import { parseHandoffBranch, parsePlanStages, type PlanRunSource } from "../core/engineFormats";
 import { appendHumanEvidence, OUTCOME_WORDS, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
@@ -92,6 +92,8 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.refresh", () => controller.refresh()),
     vscode.commands.registerCommand("agentSparring.selectRun", () => selectRunCommand(controller)),
     vscode.commands.registerCommand("agentSparring.followActiveRepository", () => controller.followActiveRepository()),
+    vscode.commands.registerCommand("agentSparring.chooseRepository", () => chooseRepositoryCommand(controller)),
+    vscode.commands.registerCommand("agentSparring.followActiveEditor", () => controller.followActiveEditor()),
     vscode.commands.registerCommand("agentSparring.diagnoseDiscovery", () => controller.diagnoseDiscovery()),
     vscode.commands.registerCommand("agentSparring.openOverview", () => openOverviewCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.runPlan", () => runPlanCommand(controller, overview)),
@@ -546,7 +548,8 @@ async function handleIntakeAction(controller: SparringController, overview: Over
   const next = intake ? intakeNextAction(intake) : undefined;
   if (!intake || !next || next.kind !== message.action || next.slice.runId !== message.runId) {
     controller.log(`Intake: ${message.action} of run slice ${message.runId} not done — the intake changed since the screen was drawn.`);
-    void vscode.window.showInformationMessage(`Agent Sparring: the intake changed since this screen was drawn, so run slice ${message.runId} was not ${message.action === "approve" ? "approved" : "started"}. Check the updated screen.`);
+    const drawn = intake?.slices.find((entry) => entry.runId === message.runId);
+    void vscode.window.showInformationMessage(`Agent Sparring: the intake changed since this screen was drawn, so ${drawn ? sliceStageName(drawn) : "that stage"} was not ${message.action === "approve" ? "approved" : "started"}. Check the updated screen.`);
     await overview.update();
     return;
   }
@@ -568,7 +571,7 @@ async function handleIntakeAction(controller: SparringController, overview: Over
       configured: configuredExecutable(),
       args: invocation.args,
       cwd: invocation.cwd,
-      name: `Approve run slice ${next.slice.runId}`,
+      name: `Approve ${sliceStageName(next.slice)}`,
       operation: { subcommand: "approve-plan", target: `${intake.dir}#${next.slice.runId}` },
       repoRoot: invocation.repoRoot,
       sparringDir: invocation.sparringDir,
@@ -585,12 +588,12 @@ async function handleIntakeAction(controller: SparringController, overview: Over
     } else if (result.outcome.exitCode === 0) {
       // Only an exit code of 0 is an approval; approval.json is then on disk and discovery shows it.
       controller.setIntakeApproval(intake.dir, next.slice.runId, undefined);
-      controller.log(`Intake: run slice ${next.slice.runId} approved by the engine.`);
+      controller.log(`Intake: ${sliceStageName(next.slice)} (run slice ${next.slice.runId}) approved by the engine.`);
       await controller.refresh();
     } else {
       const output = result.outcome.output.trim() || `approve-plan exited with ${result.outcome.exitCode ?? "no exit code"} and printed nothing.`;
       controller.setIntakeApproval(intake.dir, next.slice.runId, { state: "refused", output, exitCode: result.outcome.exitCode });
-      controller.log(`Intake: approve-plan refused run slice ${next.slice.runId}: ${output.split("\n")[0]}`);
+      controller.log(`Intake: approve-plan refused ${sliceStageName(next.slice)} (run slice ${next.slice.runId}): ${output.split("\n")[0]}`);
     }
     await overview.update();
     return;
@@ -601,27 +604,31 @@ async function handleIntakeAction(controller: SparringController, overview: Over
     return;
   }
   if (controller.livenessFor(invocation.runId).state === "running") {
-    await sayRunnerAlive(controller, overview, `a runner for run slice ${next.slice.runId} is already alive in a terminal of this window.`, invocation.runId);
+    await sayRunnerAlive(controller, overview, `a runner for ${sliceStageName(next.slice)} is already alive in a terminal of this window.`, invocation.runId);
     return;
   }
   const stages = next.slice.stages.map((stage) => `${stage.label} — ${stage.title}`);
+  const startName = sliceStageName(next.slice);
+  const startLabel = `Start ${startName}`;
   const choice = await vscode.window.showInformationMessage(
-    `Start run slice ${next.slice.runId}?`,
+    `${startLabel}?`,
     {
       modal: true,
       detail: [
-        `The engine runs the approved manifest of ${intake.record.planLabel}, run slice ${next.slice.runId}, until it needs you.`,
+        `The engine runs the approved plan of ${intake.record.planLabel}, ${startName}, until it needs you.`,
         "",
         `Branch: ${invocation.expectedBranch}`,
         `Repository: ${invocation.location.folderName}`,
         ...(stages.length > 0 ? ["", ...stages] : []),
         "",
         "It re-checks the approval and the repositories before anything runs, and refuses if they changed.",
+        "",
+        `Technical: run slice ${next.slice.runId}, run key ${next.slice.runKey}.`,
       ].join("\n"),
     },
-    "Start slice",
+    startLabel,
   );
-  if (choice !== "Start slice") {
+  if (choice !== startLabel) {
     return;
   }
   // The dialog may have been open a while: the slice must still be the one
@@ -629,7 +636,7 @@ async function handleIntakeAction(controller: SparringController, overview: Over
   const still = (controller.currentDiscovery.intakes ?? []).find((candidate) => samePath(candidate.dir, message.intakeDir));
   const nextNow = still ? intakeNextAction(still) : undefined;
   if (!nextNow || nextNow.kind !== "start" || nextNow.slice.runId !== message.runId || controller.livenessFor(invocation.runId).state === "running") {
-    void vscode.window.showInformationMessage(`Agent Sparring: run slice ${message.runId} changed while the confirmation was open, so it was not started. Check the updated screen.`);
+    void vscode.window.showInformationMessage(`Agent Sparring: ${startName} changed while the confirmation was open, so it was not started. Check the updated screen.`);
     await overview.update();
     return;
   }
@@ -742,6 +749,14 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       return;
     case "followActiveRepository":
       await controller.followActiveRepository();
+      await overview.update();
+      return;
+    case "chooseRepository":
+      await chooseRepositoryCommand(controller);
+      await overview.update();
+      return;
+    case "followActiveEditor":
+      await controller.followActiveEditor();
       await overview.update();
       return;
     case "runPlan":
@@ -3697,5 +3712,35 @@ async function explainNextStageProblem(controller: SparringController, overview:
     if (controller.currentSelection.selected?.id === run.id) {
       await matchStageCommand(controller, overview);
     }
+  }
+}
+
+/**
+ * Choose the followed repository directly, from the repositories this window
+ * already knows, or go back to following the active editor. Navigation only:
+ * nothing is started, approved or written to engine state.
+ */
+async function chooseRepositoryCommand(controller: SparringController): Promise<void> {
+  const choices = await controller.repositoryChoices();
+  const chosen = controller.currentSelection.scope?.chosen === true;
+  type Item = vscode.QuickPickItem & { root?: string; editor?: true };
+  const items: Item[] = [
+    { label: `${chosen ? "" : "$(check) "}${FOLLOW_EDITOR_LABEL}`, description: chosen ? undefined : "current", detail: "Follow the repository of the active editor or Source Control focus", editor: true },
+    { label: "Repositories", kind: vscode.QuickPickItemKind.Separator },
+    ...choices.map((choice) => ({
+      label: `${chosen && choice.current ? "$(check) " : ""}${choice.name}`,
+      description: choice.current ? (chosen ? "followed" : "active editor") : undefined,
+      detail: choice.root,
+      root: choice.root,
+    })),
+  ];
+  const picked = await vscode.window.showQuickPick(items, { title: CHOOSE_REPOSITORY_LABEL, placeHolder: "Which repository's current work should Agent Sparring follow?", matchOnDetail: true });
+  if (!picked) {
+    return;
+  }
+  if (picked.editor) {
+    await controller.followActiveEditor();
+  } else if (picked.root) {
+    await controller.chooseRepository(picked.root);
   }
 }

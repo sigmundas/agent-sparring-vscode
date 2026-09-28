@@ -662,6 +662,40 @@ export function intakeNextAction(intake: IntakeSnapshot): IntakeNextAction {
   return { kind: "approve", slice: next };
 }
 
+/**
+ * What a person calls a run slice: its plan stages, never the engine's slice
+ * id. `Stage 1B` for a slice of one stage; `Stages 2 + 3P` for one that runs
+ * several, which is an execution group and not pretended to be one stage.
+ * Only when the intake recorded no stage names is the slice id itself used.
+ * Presentation only — the engine's slice model and ids are unchanged.
+ */
+export function sliceStageName(slice: Pick<IntakeSliceSnapshot, "runId" | "stages">): string {
+  const labels = slice.stages.map((stage) => stage.label);
+  if (labels.length === 0) {
+    return `Execution slice ${slice.runId}`;
+  }
+  if (labels.length === 1) {
+    return labels[0];
+  }
+  return `Stages ${labels.map((label) => label.replace(/^Stage\s+/i, "")).join(" + ")}`;
+}
+
+/** Whether a run slice runs more than one plan stage. */
+export function isExecutionGroup(slice: Pick<IntakeSliceSnapshot, "stages">): boolean {
+  return slice.stages.length > 1;
+}
+
+/** The row heading for a run slice: `Stage 1B — Title`, or `Execution group — Stages 2 + 3P`. */
+export function sliceHeading(slice: Pick<IntakeSliceSnapshot, "runId" | "stages">): string {
+  if (slice.stages.length === 1) {
+    return `${slice.stages[0].label} — ${slice.stages[0].title}`;
+  }
+  if (isExecutionGroup(slice)) {
+    return `Execution group — ${sliceStageName(slice)}`;
+  }
+  return `Execution slice ${slice.runId}`;
+}
+
 /** A person's words for an intake state. */
 export function intakeStateLabel(state: IntakeState): string {
   switch (state) {

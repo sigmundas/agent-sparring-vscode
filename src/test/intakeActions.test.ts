@@ -100,12 +100,12 @@ describe("the action comes from what the engine recorded", () => {
     assert.match(html, /data-action="openIntakeReport"[^>]*>Open intake report|class="primary" data-action="openIntakeReport"/);
   });
 
-  it("no blocking findings: Approve next slice, for the first unapproved slice, with the counts in the header", async () => {
+  it("no blocking findings: Approve, named by the first unapproved slice's stages, with the counts in the header", async () => {
     const { location, intakeDir } = await project("prepared");
     const intake = await onlyIntake(location);
     const model = buildOverviewModel({ ambiguous: [], intake }, undefined);
     assert.equal(model.intake?.stateLabel, "Prepared — 0 blocking findings, 0 recommendations");
-    assert.deepEqual(model.intake?.action && [model.intake.action.kind, model.intake.action.label, model.intake.action.runId, model.intake.action.intakeDir], ["approve", "Approve next slice", "app", intakeDir]);
+    assert.deepEqual(model.intake?.action && [model.intake.action.kind, model.intake.action.label, model.intake.action.runId, model.intake.action.intakeDir], ["approve", "Approve Stages 0 + 1A", "app", intakeDir]);
     const html = renderOverviewHtml(model, "nonce", "csp");
     assert.match(html, new RegExp(`data-intake="approve" data-intake-dir="${intakeDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" data-intake-run="app"`));
   });
@@ -138,7 +138,7 @@ describe("the action comes from what the engine recorded", () => {
     const model = buildOverviewModel({ ambiguous: [], intake }, undefined);
     assert.equal(model.intake?.action?.runId, "web");
     assert.deepEqual(model.intake?.requirements, [
-      "Waits for run slice app to be approved and complete.",
+      "Waits for Stages 0 + 1A to be approved and complete.",
       "Needs a person to confirm gate release (sparring approve-plan --confirm-prerequisite) once actually satisfied.",
     ]);
   });
