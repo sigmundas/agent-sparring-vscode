@@ -239,7 +239,7 @@ export class SparringController implements vscode.Disposable {
         if (event.affectsConfiguration("agentSparring.pollIntervalMs")) {
           this.armPolling();
         }
-        if (event.affectsConfiguration("agentSparring.nestedSearchDepth")) {
+        if (event.affectsConfiguration("agentSparring.nestedSearchDepth") || event.affectsConfiguration("agentSparring.modelChoices")) {
           this.scheduleRefresh();
         }
       }),

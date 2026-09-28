@@ -42,9 +42,12 @@ export async function readEffectiveConfig(configured: string | undefined, projec
     return { kind: "unavailable", reason: "The sparring CLI could not be resolved from this window, so the agent configuration is not shown." };
   }
   const file = planned.plan.path;
-  const stamp = `${file}\u0000${sparringDir}\u0000${await configStamp(sparringDir)}`;
   const key = `${file}\u0000${sparringDir}`;
   const known = cache.get(key);
+  // A local override the engine reported is part of the answer too: a change
+  // made to it from a terminal must not be answered from before it.
+  const localPath = known?.value.kind === "report" ? known.value.report.local_config_path : undefined;
+  const stamp = `${file}\u0000${sparringDir}\u0000${await configStamp(sparringDir)}\u0000${localPath ? await fileStamp(localPath) : ""}`;
   if (known && known.stamp === stamp) {
     return known.value;
   }
@@ -55,8 +58,12 @@ export async function readEffectiveConfig(configured: string | undefined, projec
 
 /** A cheap fingerprint of the project.toml, so an edit re-probes and nothing else does. */
 async function configStamp(sparringDir: string): Promise<string> {
+  return fileStamp(path.join(sparringDir, PROJECT_CONFIG_FILENAME));
+}
+
+async function fileStamp(file: string): Promise<string> {
   try {
-    const info = await stat(path.join(sparringDir, PROJECT_CONFIG_FILENAME));
+    const info = await stat(file);
     return `${info.mtimeMs}:${info.size}`;
   } catch {
     return "absent";
@@ -122,6 +129,13 @@ export async function writeAgentConfig(
   role: ConfigRole,
   field: ConfigField,
   value: string | null,
+  /**
+   * Write this worktree's local override (`set-config --local`) instead of
+   * project.toml, so the change dirties nothing and a running loop keeps
+   * going. Only for model and effort, and only when the engine reported a
+   * local override location.
+   */
+  local = false,
 ): Promise<ConfigWriteResult> {
   const planned = await planExecutable(configured, hostEnv(projectDir), false);
   if (!planned.ok || planned.plan.kind === "shell") {
@@ -132,6 +146,9 @@ export async function writeAgentConfig(
   const args = ["--sparring-dir", sparringDir, "set-config", role, flag];
   if (value !== null) {
     args.push(value);
+  }
+  if (local) {
+    args.push("--local");
   }
   cache.delete(`${file}\u0000${sparringDir}`);
   return new Promise((resolve) => {

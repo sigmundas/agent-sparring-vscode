@@ -52,6 +52,14 @@ export interface EngineRoleConfig {
 export interface EngineConfigReport {
   config_path: string;
   config_exists: boolean;
+  /**
+   * Where `set-config --local` writes this worktree's model/effort overrides:
+   * a file in the git directory that no dirty-tree check sees. Absent from an
+   * engine without local overrides, or outside git; the cockpit then writes
+   * project.toml as before.
+   */
+  local_config_path?: string;
+  local_config_exists?: boolean;
   project: string | null;
   /** Set when the engine refused to resolve the configuration; then no role is reported. */
   error: string | null;
@@ -68,7 +76,16 @@ export interface EngineConfigReport {
  * about models rather than guessing.
  */
 export type EffectiveConfig =
-  | { kind: "report"; report: EngineConfigReport }
+  | {
+      kind: "report";
+      report: EngineConfigReport;
+      /**
+       * The model names to offer per provider id, from the
+       * `agentSparring.modelChoices` setting. Only what the dropdown lists: the
+       * provider remains the authority on which names exist.
+       */
+      modelChoices?: Readonly<Record<string, readonly string[]>>;
+    }
   | { kind: "unavailable"; reason: string };
 
 const ROLE_LABEL: Record<string, string> = { stage: "Stage agent", sparring: "Sparrer" };
@@ -112,6 +129,10 @@ export function parseEngineConfig(stdout: string): EngineConfigReport | undefine
     project: typeof record["project"] === "string" ? record["project"] : null,
     error,
   };
+  if (typeof record["local_config_path"] === "string" && record["local_config_path"]) {
+    report.local_config_path = record["local_config_path"];
+    report.local_config_exists = record["local_config_exists"] === true;
+  }
   if (isRole(record["stage"])) {
     report.stage = record["stage"];
   }
@@ -136,6 +157,7 @@ export interface AgentConfigLine {
 const SOURCE_WORD: Record<string, string> = {
   cli: "a command-line override",
   project: "project.toml",
+  local: "this worktree's local override",
   "engine-default": "the engine default",
   "provider-default": "the provider's own default",
 };
@@ -203,6 +225,14 @@ export type ConfigField = (typeof CONFIG_FIELDS)[number];
 export const PROVIDER_DEFAULT_LABEL = "Provider default";
 export const PROVIDER_DEFAULT_VALUE = "";
 
+/**
+ * The same sentinel's words when changes are written as this worktree's
+ * local override: clearing one falls back to project.toml's value (or the
+ * provider's default when project.toml sets none), not straight to the
+ * provider's default.
+ */
+export const PROJECT_SETTING_LABEL = "Project setting";
+
 /** One `<option>` of an effort or provider control. */
 export interface ControlOption {
   value: string;
@@ -249,6 +279,43 @@ export interface AgentRoleControls {
    * merely unavailable, which is a different and untrue thing.
    */
   effort?: AgentFieldControl;
+}
+
+/**
+ * The model field: a dropdown of the names configured for this provider in
+ * `agentSparring.modelChoices`, or read-only text when none are.
+ *
+ * The provider is the authority on which names exist -- neither installed
+ * CLI enumerates them -- so the list is the person's own, and the engine's
+ * current value is always among the options even when the list does not
+ * name it: a control must never show a model other than the one a turn
+ * would run with.
+ */
+function modelControl(role: EngineRoleConfig, provider: string, choices: readonly string[] | undefined, clearLabel: string, where: string): AgentFieldControl {
+  const current = role.model ?? PROVIDER_DEFAULT_VALUE;
+  const detail = `${
+    role.model ? `Model ${role.model} from ${sourcePhrase(role.model_source)}.` : `No model configured, so ${provider} chooses its own.`
+  }`;
+  const names = [...new Set((choices ?? []).map((name) => name.trim()).filter((name) => name.length > 0))];
+  if (names.length === 0) {
+    return {
+      field: "model",
+      label: "Model",
+      value: current,
+      fixedText: role.model ?? PROVIDER_DEFAULT_LABEL,
+      detail: `${detail} Add names for ${role.provider} to the agentSparring.modelChoices setting to choose one here.`,
+    };
+  }
+  if (role.model && !names.includes(role.model)) {
+    names.unshift(role.model);
+  }
+  return {
+    field: "model",
+    label: "Model",
+    value: current,
+    options: [{ value: PROVIDER_DEFAULT_VALUE, label: clearLabel }, ...names.map((name) => ({ value: name, label: name }))],
+    detail: `${detail} ${clearLabel} removes the override. ${where}.`,
+  };
 }
 
 /**
@@ -317,7 +384,9 @@ export function agentConfigView(config: EffectiveConfig | undefined): AgentConfi
   const roles = [report.stage, report.sparring].filter((role): role is EngineRoleConfig => role !== undefined);
   return {
     lines: roles.map(describeRole),
-    controls: roles.map(roleControls).filter((control): control is AgentRoleControls => control !== undefined),
+    controls: roles
+      .map((role) => roleControls(role, config.modelChoices?.[role.provider], report.local_config_path !== undefined))
+      .filter((control): control is AgentRoleControls => control !== undefined),
     configPath: report.config_path,
     configExists: report.config_exists,
     note: report.config_exists ? undefined : "No project.toml yet; these are the engine's defaults.",
@@ -342,10 +411,12 @@ function isConfigRole(role: string): role is ConfigRole {
  * a future engine adds) is skipped rather than rendered with a guessed
  * label: the read-only line above still describes it honestly.
  */
-function roleControls(role: EngineRoleConfig): AgentRoleControls | undefined {
+function roleControls(role: EngineRoleConfig, modelChoices: readonly string[] | undefined, local: boolean): AgentRoleControls | undefined {
   if (!isConfigRole(role.role)) {
     return undefined;
   }
+  const clearLabel = local ? PROJECT_SETTING_LABEL : PROVIDER_DEFAULT_LABEL;
+  const where = local ? "Changes apply to this worktree only, from the next stage, and leave the repository clean" : "Changes are written to this project's project.toml";
   const provider = role.provider_display_name?.trim() || role.provider;
   const choices = role.provider_choices ?? [];
   const controls: AgentRoleControls = {
@@ -367,21 +438,7 @@ function roleControls(role: EngineRoleConfig): AgentRoleControls | undefined {
           }
         : { fixedText: provider }),
     },
-    // Shown, never chosen. There is no catalogue of models behind this
-    // field -- both installed CLIs take free-form names and neither reports
-    // what it accepts -- so a control here could only be a box that takes
-    // any string and finds out it was wrong on the next turn. The model is
-    // reported as the engine resolved it, and changed in the project.toml
-    // the Settings button opens.
-    model: {
-      field: "model",
-      label: "Model",
-      value: role.model ?? PROVIDER_DEFAULT_VALUE,
-      fixedText: role.model ?? PROVIDER_DEFAULT_LABEL,
-      detail: role.model
-        ? `Model ${role.model} from ${sourcePhrase(role.model_source)}. Change it in this project's project.toml.`
-        : `No model configured, so ${provider} chooses its own. Pin one in this project's project.toml.`,
-    },
+    model: modelControl(role, provider, modelChoices, clearLabel, where),
   };
   const levels = role.effort_levels ?? [];
   if (role.effort_supported !== false && levels.length > 0) {
@@ -390,12 +447,12 @@ function roleControls(role: EngineRoleConfig): AgentRoleControls | undefined {
       label: "Effort",
       value: role.effort ?? PROVIDER_DEFAULT_VALUE,
       options: [
-        { value: PROVIDER_DEFAULT_VALUE, label: PROVIDER_DEFAULT_LABEL },
+        { value: PROVIDER_DEFAULT_VALUE, label: clearLabel },
         ...levels.map((level) => ({ value: level, label: level })),
       ],
-      detail: role.effort
-        ? `Effort ${role.effort} from ${sourcePhrase(role.effort_source)}. ${PROVIDER_DEFAULT_LABEL} removes the override.`
-        : `No effort configured, so ${provider} uses its default.`,
+      detail: `${
+        role.effort ? `Effort ${role.effort} from ${sourcePhrase(role.effort_source)}. ${clearLabel} removes the override.` : `No effort configured, so ${provider} uses its default.`
+      } ${where}.`,
     };
   }
   return controls;

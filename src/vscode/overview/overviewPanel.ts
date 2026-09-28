@@ -265,6 +265,11 @@ export class OverviewPanelManager implements vscode.Disposable {
       await this.forceUpdate();
       return { applied: false, refused: "the active repository changed" };
     }
+    // Model and effort go to this worktree's local override whenever the
+    // engine offers one, so changing them mid-run leaves the repository
+    // clean and the loop running; the provider stays a project.toml change.
+    const current = await readEffectiveConfig(configuredExecutable(), target.projectDir, target.sparringDir);
+    const local = message.field !== "provider" && current.kind === "report" && current.report.local_config_path !== undefined;
     const result = await writeAgentConfig(
       configuredExecutable(),
       target.projectDir,
@@ -272,6 +277,7 @@ export class OverviewPanelManager implements vscode.Disposable {
       message.role,
       message.field,
       message.value,
+      local,
     );
     if (!result.ok) {
       // The engine's own diagnostic, unedited: it knows why it refused.
@@ -435,7 +441,8 @@ export class OverviewPanelManager implements vscode.Disposable {
       return undefined;
     }
     try {
-      return await readEffectiveConfig(configuredExecutable(), target.projectDir, target.sparringDir);
+      const config = await readEffectiveConfig(configuredExecutable(), target.projectDir, target.sparringDir);
+      return config.kind === "report" ? { ...config, modelChoices: configuredModelChoices() } : config;
     } catch (error) {
       return { kind: "unavailable", reason: `The agent configuration could not be read: ${error instanceof Error ? error.message : String(error)}` };
     }
@@ -774,4 +781,22 @@ export function overviewRenderKey(model: OverviewModel): string {
       submittable: panel.submittable.map(item => ({ ...item, record: { outcome: item.record.outcome } })),
     },
   });
+}
+
+/**
+ * `agentSparring.modelChoices`: model names to offer per provider id. Only
+ * string lists survive; anything else in the setting offers nothing rather
+ * than a guess.
+ */
+function configuredModelChoices(): Record<string, string[]> {
+  const raw = vscode.workspace.getConfiguration("agentSparring").get<unknown>("modelChoices");
+  const out: Record<string, string[]> = {};
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [provider, names] of Object.entries(raw as Record<string, unknown>)) {
+      if (Array.isArray(names)) {
+        out[provider] = names.filter((name): name is string => typeof name === "string");
+      }
+    }
+  }
+  return out;
 }

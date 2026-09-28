@@ -159,6 +159,18 @@
           "default": "",
           "markdownDescription": "Full path to the `sparring` executable. Leave empty to let your integrated shell resolve `sparring` from its own `PATH` (the same way it does when you type the command). Set it when the shell reports the command as not found, or when terminal shell integration is unavailable."
         },
+        "agentSparring.modelChoices": {
+          "type": "object",
+          "markdownDescription": "Model names the Overview's **Model** dropdown offers, per provider id (`claude-cli`, `codex-cli`). The provider decides which names actually exist; the engine's current model is always shown even when it is not listed. When the engine supports it, a choice is written as this worktree's local override (in the git directory), so changing it during a run does not dirty the repository or stop the loop; it applies from the next stage.",
+          "additionalProperties": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "default": {
+            "claude-cli": ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5", "claude-haiku-4-5-20251001"],
+            "codex-cli": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
+          }
+        },
         "agentSparring.planContinuation": {
           "type": "string",
           "enum": [

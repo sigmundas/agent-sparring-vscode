@@ -556,3 +556,58 @@ describe("the rendered controls are self-describing", () => {
     assert.match(renderOverviewHtml(busy, "nonce", "csp:"), /data-field="effort"/);
   });
 });
+
+describe("choosing the model from a configured list", () => {
+  const CHOICES = { "claude-cli": ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5", "claude-haiku-4-5-20251001"], "codex-cli": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"] };
+  const withChoices = (overrides: Record<string, unknown> = {}, modelChoices: Record<string, string[]> = CHOICES): EffectiveConfig => {
+    const base = parsed(overrides);
+    return base.kind === "report" ? { ...base, modelChoices } : base;
+  };
+  const controls = (config: EffectiveConfig, which: ConfigRole) => agentConfigView(config)?.controls.find((control) => control.role === which);
+
+  it("offers each provider's own list, keeping the engine's current model even when the list does not name it", () => {
+    const stage = controls(withChoices(), "stage")!;
+    assert.equal(stage.model.fixedText, undefined);
+    assert.equal(stage.model.value, "opus");
+    assert.deepEqual(stage.model.options?.map((option) => option.value), [PROVIDER_DEFAULT_VALUE, "opus", "claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5", "claude-haiku-4-5-20251001"]);
+    const sparring = controls(withChoices(), "sparring")!;
+    assert.deepEqual(sparring.model.options?.map((option) => option.value), [PROVIDER_DEFAULT_VALUE, "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"], "gpt-5.6-terra is listed, so it is not repeated");
+    assert.equal(sparring.model.value, "gpt-5.6-terra");
+  });
+
+  it("renders the model as a dropdown that posts the same agentConfig message as effort", () => {
+    const html = renderOverviewHtml(buildOverviewModel({ ambiguous: [] }, undefined, { handoff: false, sparring: false, brief: false, plan: false, agentConfig: withChoices() } as OverviewArtifacts, NOW), "n", "c");
+    assert.match(html, /<select [^>]*data-field="model"[^>]*>[\s\S]*?<option value="claude-fable-5-1">claude-fable-5-1<\/option>/);
+  });
+
+  it("with no names configured for a provider, the model stays read-only as before", () => {
+    assert.equal(controls(withChoices({}, {}), "stage")!.model.fixedText, "opus");
+  });
+
+  it("reads where local overrides go, and then names the clear option for what it does", () => {
+    const local = withChoices({ local_config_path: "/repo/.git/agent-sparring/.sparring.toml", local_config_exists: false });
+    assert.equal(local.kind === "report" ? local.report.local_config_path : undefined, "/repo/.git/agent-sparring/.sparring.toml");
+    const stage = controls(local, "stage")!;
+    assert.equal(stage.model.options?.[0]?.label, "Project setting", "clearing a local override falls back to project.toml");
+    assert.equal(stage.effort?.options?.[0]?.label, "Project setting");
+    assert.match(stage.model.detail, /this worktree only, from the next stage, and leave the repository clean/);
+    assert.equal(controls(withChoices(), "stage")!.model.options?.[0]?.label, PROVIDER_DEFAULT_LABEL, "an engine without local overrides writes project.toml, as before");
+  });
+
+  it("reports a value from the local override as such", () => {
+    const view = agentConfigView(
+      withChoices({
+        local_config_path: "/repo/.git/agent-sparring/.sparring.toml",
+        stage: { role: "stage", provider: "claude-cli", provider_display_name: "Claude", provider_source: "project", model: "claude-fable-5-1", model_source: "local", effort: "high", effort_source: "project", effort_supported: true, effort_levels: ["low", "high"] },
+      }),
+    );
+    assert.match(view?.lines[0]?.detail ?? "", /Model claude-fable-5-1 from this worktree's local override/);
+  });
+
+  it("the write goes to --local for model and effort only, and only when the engine reported a local location", async () => {
+    const panel = stripComments(await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "overview", "overviewPanel.ts"), "utf8"));
+    assert.match(panel, /const local = message\.field !== "provider" && current\.kind === "report" && current\.report\.local_config_path !== undefined;/);
+    const probe = stripComments(await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "configProbe.ts"), "utf8"));
+    assert.match(probe, /if \(local\) \{\s*args\.push\("--local"\);/);
+  });
+});
