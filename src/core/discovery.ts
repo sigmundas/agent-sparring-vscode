@@ -26,7 +26,7 @@ import {
   type SparringOutcome,
   type StageState,
 } from "./engineFormats";
-import { discoverIntakes, isPreRunIntake, resolveIntakeRun, type IntakeRunBinding, type IntakeSnapshot } from "./intake";
+import { discoverIntakes, isPreRunIntake, nextIntakeSlice, resolveIntakeRun, type IntakeRunBinding, type IntakeSnapshot } from "./intake";
 import { planTitle } from "./planAssociation";
 
 export const SPARRING_DIRNAME = ".sparring";
@@ -548,8 +548,9 @@ async function listDir(dir: string): Promise<string[]> {
 export interface RunSelection {
   selected?: RunSnapshot;
   /**
-   * A plan intake that has no run yet and is newer than the finished work in
-   * scope, shown in place of that work. Only ever set by automatic selection,
+   * A plan intake shown in place of finished work: one whose next eligible
+   * slice is this repository's (rule 5), or one with no run yet that is newer
+   * than the finished work in scope (rule 6). Only ever set by automatic selection,
    * and only when {@link selected} is not.
    */
   intake?: DiscoveredIntake;
@@ -669,13 +670,13 @@ export function repositoryDisplayName(repoRoot: string, otherRoots: readonly str
  * shallowest-first would hand every nested project to the container and make
  * two unrelated repositories look like one.
  */
-export function repositoryOwning(location: SparringLocation, roots: readonly string[]): string | undefined {
+export function repositoryOwning(location: Pick<SparringLocation, "repoRoot" | "projectDir">, roots: readonly string[]): string | undefined {
   return roots
     .filter((root) => containsProject(location, root))
     .sort((a, b) => canonicalPath(b).length - canonicalPath(a).length)[0];
 }
 
-function containsProject(location: SparringLocation, root: string): boolean {
+function containsProject(location: Pick<SparringLocation, "repoRoot" | "projectDir">, root: string): boolean {
   for (const dir of [location.repoRoot, location.projectDir]) {
     if (samePath(dir, root) || isInsidePath(dir, root)) {
       return true;
@@ -896,13 +897,20 @@ export const NO_STAGE_OWNERSHIP: StageOwnership = new Map<string, string>();
  *  3. several open plan runs: the remembered (`stickyId`) one if it is among
  *     them, otherwise ambiguous and nothing is selected;
  *  4. no open plan run: the same for open standalone stages;
- *  5. nothing open, and a plan intake in scope is waiting on a person or a
+ *  5. nothing open, and a plan intake is *continuing* here: the run of an
+ *     earlier slice of it is complete, and its next
+ *     eligible slice — every earlier slice the engine recorded for it
+ *     complete — belongs to this repository (see {@link continuingIntake}).
+ *     That intake is current work wherever it was prepared, and outranks
+ *     every finished run whatever their times: the plan's next step is not
+ *     history. Only the newest intake of a plan counts;
+ *  6. nothing open, and a plan intake in scope is waiting on a person or a
  *     first `run-plan` (prepared or slice-approved) and is *newer* than every
  *     finished run: that intake (`intake`), with no run selected. Newer is
  *     judged only from the time the engine recorded for the intake; one whose
  *     `created_at` cannot be read is never promoted, so an abandoned or
  *     unreadable intake cannot take the screen from finished work;
- *  6. otherwise: the remembered run if it still exists (a run that just
+ *  7. otherwise: the remembered run if it still exists (a run that just
  *     finished stays on screen), else the most recently written terminal run
  *     (complete plan or accepted stage), else nothing.
  *
@@ -922,7 +930,7 @@ export function selectRun(
    * conservative answer.
    */
   locations: readonly SparringLocation[] = [],
-  /** The discovery's plan intakes; see rule 5. */
+  /** The discovery's plan intakes; see rules 5 and 6. */
   intakes: readonly DiscoveredIntake[] = [],
 ): RunSelection {
   const view: RepositoryScopeView | undefined = scope
@@ -932,6 +940,8 @@ export function selectRun(
   const elsewhere: RunSnapshot[] = [];
   const unattributed: RunSnapshot[] = [];
   const intakesInScope = scope ? intakes.filter((intake) => attributeRun(intake, scope.repoRoot, scope.knownRoots ?? []) === "here") : intakes;
+  const continuing = continuingIntake(intakes, scope);
+  const automatic = (): RunSelection => selectAutomatically(inScope, stickyId, intakesInScope, continuing);
   for (const run of runs) {
     if (!scope) {
       inScope.push(run);
@@ -957,8 +967,9 @@ export function selectRun(
     let attachedAt: string | undefined;
     if (origin === "action" && scope && !sameRoot(scope.repoRoot, pick.activeRootAtPin)) {
       const target = chosen ?? pinnedIntake;
-      if (!target || attributeRun(target, scope.repoRoot, scope.knownRoots ?? []) !== "here") {
-        return decorate({ ...selectAutomatically(inScope, stickyId, intakesInScope), released: { id: pick.id, reason: "repository", to: scope.repoRoot } });
+      const owned = chosen ? attributeRun(chosen, scope.repoRoot, scope.knownRoots ?? []) === "here" : pinnedIntake !== undefined && (attributeRun(pinnedIntake, scope.repoRoot, scope.knownRoots ?? []) === "here" || pinnedIntake === continuing);
+      if (!target || !owned) {
+        return decorate({ ...automatic(), released: { id: pick.id, reason: "repository", to: scope.repoRoot } });
       }
       attachedAt = scope.repoRoot;
     }
@@ -967,7 +978,7 @@ export function selectRun(
         return decorate({ ambiguous: [], intake: pinnedIntake, pinned: true, pinOrigin: origin, ...(attachedAt ? { attachedAt } : {}) });
       }
       const gone = locations.some((location) => runIdBelongsTo(pick.id, location));
-      return decorate({ ...selectAutomatically(inScope, stickyId, intakesInScope), ...(gone ? { released: { id: pick.id, reason: "gone" as const } } : {}) });
+      return decorate({ ...automatic(), ...(gone ? { released: { id: pick.id, reason: "gone" as const } } : {}) });
     }
     if (!chosen) {
       // Absent from the discovery. That is only a *release* when the project
@@ -979,32 +990,25 @@ export function selectRun(
       // case where "scanned and absent" does not mean deleted: the engine
       // writes the run state just after the command reaches the terminal.
       const gone = pick.intent !== "starting" && locations.some((location) => runIdBelongsTo(pick.id, location));
-      return decorate({ ...selectAutomatically(inScope, stickyId, intakesInScope), ...(gone ? { released: { id: pick.id, reason: "gone" as const } } : {}) });
+      return decorate({ ...automatic(), ...(gone ? { released: { id: pick.id, reason: "gone" as const } } : {}) });
     }
     const by = supersedingPlanRun(chosen, runs, pick.atMs ?? 0, ownership, pick.intent ?? "inspect");
     if (!by) {
       return decorate({ selected: chosen, ambiguous: [], pinned: true, pinOrigin: origin, ...(attachedAt ? { attachedAt } : {}) });
     }
-    return decorate({ ...selectAutomatically(inScope, stickyId, intakesInScope), released: { id: pick.id, reason: "superseded", by } });
+    return decorate({ ...automatic(), released: { id: pick.id, reason: "superseded", by } });
   }
-  return decorate(selectAutomatically(inScope, stickyId, intakesInScope));
+  return decorate(automatic());
 }
 
 /**
- * The pre-run plan intake that should take the place of finished work, if any
- * (rule 5 of {@link selectRun}).
- *
- * Only the newest intake of each plan counts — preparing a plan again
- * supersedes the earlier proposal — and only while it is prepared or
- * slice-approved. It must be strictly newer than every finished run in
- * scope, judged by the time the engine recorded for it; with no readable
- * `created_at` it has no age and is never promoted.
+ * The newest intake of each plan, per project. Preparing a plan again
+ * supersedes the earlier proposal. A plan with an intake whose age cannot be
+ * read has no knowable newest intake — the unreadable one may be the prepare
+ * that replaced the others — so none of that plan's intakes is returned.
  */
-export function promotableIntake(intakes: readonly DiscoveredIntake[], runs: readonly RunSnapshot[]): DiscoveredIntake | undefined {
+function newestIntakePerPlan(intakes: readonly DiscoveredIntake[]): DiscoveredIntake[] {
   const newestPerPlan = new Map<string, DiscoveredIntake>();
-  // A plan with an intake whose age cannot be read has no knowable newest
-  // intake — the unreadable one may be the prepare that replaced the others —
-  // so none of that plan's intakes is promoted.
   const unordered = new Set(intakes.filter((intake) => intake.record.createdAtMs === undefined).map((intake) => `${intake.location.projectDir}|${intake.record.planLabel}`));
   for (const intake of intakes) {
     const created = intake.record.createdAtMs;
@@ -1017,7 +1021,74 @@ export function promotableIntake(intakes: readonly DiscoveredIntake[], runs: rea
       newestPerPlan.set(key, intake);
     }
   }
-  const candidates = [...newestPerPlan.values()].filter((intake) => isPreRunIntake(intake) && intake.activityMs !== undefined);
+  return [...newestPerPlan.values()];
+}
+
+/**
+ * The repository an intake's next slice is approved in and run from: the
+ * approval's worktree once it has one, else the path intake recorded for the
+ * slice's primary repository. Display attribution only — approve-plan and
+ * run-plan re-check the repository, branch and HEAD themselves.
+ */
+export function nextIntakeSliceRoot(intake: IntakeSnapshot): string | undefined {
+  const next = nextIntakeSlice(intake);
+  return next?.approval?.repoRoot ?? next?.primaryPath;
+}
+
+/**
+ * The intake whose plan continues in the followed repository (rule 5 of
+ * {@link selectRun}), if any.
+ *
+ * Continuing means: it is waiting on a person or a first `run-plan` (not
+ * running), the run of at least one of its slices is complete — the plan has
+ * actually advanced, so an approval that was never started is still judged
+ * by rule 6's age test, which keeps an abandoned intake from taking the
+ * screen — its next slice's
+ * earlier slices — as the engine recorded them — are all complete, and that
+ * next slice's repository is `scope`'s. The intake's own location does not
+ * matter: a plan prepared in one repository hands its next slice to another.
+ * Without a scope, any continuing intake qualifies. When several do, the
+ * most recently active wins; one whose activity cannot be read never does.
+ *
+ * Eligibility here decides only what is shown. Whether the slice may be
+ * approved or started is the engine's answer, not this function's.
+ */
+export function continuingIntake(intakes: readonly DiscoveredIntake[], scope?: RepositoryScope): DiscoveredIntake | undefined {
+  const candidates = newestIntakePerPlan(intakes).filter((intake) => {
+    if (!isPreRunIntake(intake) || intake.activityMs === undefined || !intake.slices.some((slice) => slice.state === "complete")) {
+      return false;
+    }
+    const next = nextIntakeSlice(intake);
+    const root = nextIntakeSliceRoot(intake);
+    if (!next || !root) {
+      return false;
+    }
+    const complete = new Set(intake.slices.filter((slice) => slice.state === "complete").map((slice) => slice.runId));
+    if (!(next.requirements?.earlierSlices ?? []).every((runId) => complete.has(runId))) {
+      return false;
+    }
+    if (!scope) {
+      return true;
+    }
+    const roots = [...new Set([scope.repoRoot, ...(scope.knownRoots ?? [])].map((entry) => path.resolve(entry)))];
+    const owner = repositoryOwning({ repoRoot: root, projectDir: root }, roots);
+    return owner !== undefined && samePath(owner, scope.repoRoot);
+  });
+  return candidates.sort((a, b) => (b.activityMs ?? 0) - (a.activityMs ?? 0))[0];
+}
+
+/**
+ * The pre-run plan intake that should take the place of finished work, if any
+ * (rule 6 of {@link selectRun}).
+ *
+ * Only the newest intake of each plan counts — preparing a plan again
+ * supersedes the earlier proposal — and only while it is prepared or
+ * slice-approved. It must be strictly newer than every finished run in
+ * scope, judged by the time the engine recorded for it; with no readable
+ * `created_at` it has no age and is never promoted.
+ */
+export function promotableIntake(intakes: readonly DiscoveredIntake[], runs: readonly RunSnapshot[]): DiscoveredIntake | undefined {
+  const candidates = newestIntakePerPlan(intakes).filter((intake) => isPreRunIntake(intake) && intake.activityMs !== undefined);
   if (candidates.length === 0) {
     return undefined;
   }
@@ -1036,7 +1107,7 @@ function runIdBelongsTo(runId: string, location: SparringLocation): boolean {
   return at > 0 && samePath(runId.slice(0, at), location.projectDir);
 }
 
-function selectAutomatically(runs: RunSnapshot[], stickyId?: string, intakes: readonly DiscoveredIntake[] = []): RunSelection {
+function selectAutomatically(runs: RunSnapshot[], stickyId?: string, intakes: readonly DiscoveredIntake[] = [], continuing?: DiscoveredIntake): RunSelection {
   const sticky = stickyId ? runs.find((run) => run.id === stickyId) : undefined;
 
   const openPlans = runs.filter((run): run is PlanRunSnapshot => run.kind === "plan" && isOpenRun(run));
@@ -1052,6 +1123,9 @@ function selectAutomatically(runs: RunSnapshot[], stickyId?: string, intakes: re
   }
   if (openStages.length > 1) {
     return sticky && openStages.includes(sticky as StandaloneStageSnapshot) ? { selected: sticky, ambiguous: [] } : { ambiguous: openStages };
+  }
+  if (continuing) {
+    return { ambiguous: [], intake: continuing };
   }
   const intake = promotableIntake(intakes, runs);
   if (intake) {
