@@ -77,6 +77,7 @@ import { manifestSupport } from "./engineProbe";
 import { openCandidateDiff } from "./overview/gitDiff";
 import { configuredExecutable } from "./engineExecutable";
 import { settingsTarget } from "../core/settingsTarget";
+import { fixSetup } from "./configProbe";
 import { OverviewPanelManager } from "./overview/overviewPanel";
 
 export function registerCommands(context: vscode.ExtensionContext, controller: SparringController): void {
@@ -750,6 +751,9 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
     case "followActiveRepository":
       await controller.followActiveRepository();
       await overview.update();
+      return;
+    case "fixConfiguration":
+      await fixConfigurationCommand(controller, overview);
       return;
     case "chooseRepository":
       await chooseRepositoryCommand(controller);
@@ -3743,4 +3747,29 @@ async function chooseRepositoryCommand(controller: SparringController): Promise<
   } else if (picked.root) {
     await controller.chooseRepository(picked.root);
   }
+}
+
+/**
+ * The setup notice's button: ask the engine to fix what it reported, then
+ * re-read. The result names the file to commit; an engine refusal is shown
+ * in its own words.
+ */
+async function fixConfigurationCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
+  const target = settingsTarget(controller.currentSelection);
+  if (!target) {
+    void vscode.window.showWarningMessage("Agent Sparring: no repository is selected, so there is no setup to fix.");
+    return;
+  }
+  const result = await fixSetup(configuredExecutable(), target.projectDir, target.sparringDir);
+  if (result.ok) {
+    const file = result.gitignore ? path.basename(path.dirname(result.gitignore)) + "/.gitignore" : ".gitignore";
+    controller.log(`fix-config: ${result.added.length > 0 ? `added ${result.added.join(", ")} to ${result.gitignore ?? ".gitignore"}` : "nothing to fix"}`);
+    void vscode.window.showInformationMessage(
+      result.added.length > 0 ? `Agent Sparring: added ${result.added.join(", ")} to ${file}. Commit it so the fix is kept.` : "Agent Sparring: the setup was already correct; nothing was changed.",
+    );
+  } else {
+    controller.log(`fix-config refused: ${result.error}`);
+    void vscode.window.showErrorMessage(`Agent Sparring: could not fix the setup: ${result.error}`);
+  }
+  await overview.forceRefresh();
 }

@@ -47,7 +47,9 @@ export async function readEffectiveConfig(configured: string | undefined, projec
   // A local override the engine reported is part of the answer too: a change
   // made to it from a terminal must not be answered from before it.
   const localPath = known?.value.kind === "report" ? known.value.report.local_config_path : undefined;
-  const stamp = `${file}\u0000${sparringDir}\u0000${await configStamp(sparringDir)}\u0000${localPath ? await fileStamp(localPath) : ""}`;
+  // So is setup, which the repository's .gitignore decides: fixing it by
+  // hand must clear the notice without waiting for project.toml to change.
+  const stamp = `${file}\u0000${sparringDir}\u0000${await configStamp(sparringDir)}\u0000${localPath ? await fileStamp(localPath) : ""}\u0000${await fileStamp(path.join(projectDir, ".gitignore"))}`;
   if (known && known.stamp === stamp) {
     return known.value;
   }
@@ -163,6 +165,46 @@ export async function writeAgentConfig(
         }
         const output = `${stderr ?? ""}${stdout ?? ""}`.trim();
         resolve({ ok: false, error: output || error.message });
+      },
+    );
+  });
+}
+
+export type SetupFixResult = { ok: true; added: string[]; gitignore?: string } | { ok: false; error: string };
+
+/**
+ * Repair the setup problems the engine reported, through the engine:
+ * `sparring fix-config --json` appends exactly the missing .gitignore lines.
+ * The extension never edits .gitignore itself. The cache is dropped so the
+ * next read shows the engine's answer after the fix.
+ */
+export async function fixSetup(configured: string | undefined, projectDir: string, sparringDir: string): Promise<SetupFixResult> {
+  const planned = await planExecutable(configured, hostEnv(projectDir), false);
+  if (!planned.ok || planned.plan.kind === "shell") {
+    return { ok: false, error: "The sparring CLI could not be resolved from this window." };
+  }
+  const file = planned.plan.path;
+  cache.delete(`${file}\u0000${sparringDir}`);
+  return new Promise((resolve) => {
+    execFile(
+      file,
+      ["--sparring-dir", sparringDir, "fix-config", "--json"],
+      { cwd: projectDir, timeout: 15_000, maxBuffer: 1024 * 1024, windowsHide: true },
+      (error, stdout, stderr) => {
+        let payload: Record<string, unknown> | undefined;
+        try {
+          const parsed: unknown = JSON.parse(stdout ?? "");
+          payload = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : undefined;
+        } catch {
+          payload = undefined;
+        }
+        if (!error && payload && payload["fixed"] === true) {
+          const added = Array.isArray(payload["added"]) ? payload["added"].filter((line): line is string => typeof line === "string") : [];
+          resolve({ ok: true, added, ...(typeof payload["gitignore"] === "string" ? { gitignore: payload["gitignore"] } : {}) });
+          return;
+        }
+        const reason = typeof payload?.["error"] === "string" ? payload["error"] : `${stderr ?? ""}${stdout ?? ""}`.trim() || error?.message || "fix-config reported nothing.";
+        resolve({ ok: false, error: reason });
       },
     );
   });

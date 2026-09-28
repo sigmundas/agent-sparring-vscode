@@ -26,7 +26,7 @@ import {
 } from "./effectiveConfig";
 import { CHECK_OUTCOMES, isCheckKey, isDraftKey, type CheckItem, type CheckOutcome } from "./humanChecks";
 import { checkName, humanTask, splitPassCriteria } from "./humanTask";
-import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type AgentConfigSection, type BranchGuard, type ActorCard, type BudgetGauge, type HistoryEntry, type OverviewModel, type PushAuthorization, type TimelineItem, type WhatsNext } from "./overviewModel";
+import { FIX_CONFIGURATION_LABEL, RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type AgentConfigSection, type BranchGuard, type ActorCard, type BudgetGauge, type HistoryEntry, type OverviewModel, type PushAuthorization, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { MatchSource } from "./planAssociation";
 import type { PromptView, PromptViewSection } from "./promptInspector";
 import type { StageRunAction } from "./runner";
@@ -42,6 +42,7 @@ export type OverviewAction =
   | "selectRun"
   | "followActiveRepository"
   | "chooseRepository"
+  | "fixConfiguration"
   | "followActiveEditor"
   | "runPlan"
   | "resumePlan"
@@ -332,6 +333,7 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "selectRun",
   "followActiveRepository",
   "chooseRepository",
+  "fixConfiguration",
   "followActiveEditor",
   "runPlan",
   "resumePlan",
@@ -604,7 +606,29 @@ ${intake.command ? `<details class="intake-command"><summary>Engine command</sum
  * of old runs: reading finished history is not how work is started, and one
  * control named "Select repository / run…" made it look as though it were.
  */
+/**
+ * A fixable setup problem: plain sentences and one button, with the engine's
+ * own text folded away under Technical details. Placed with the repository
+ * context, so it is on every screen of the repository it concerns.
+ */
+function renderSetupNotice(model: OverviewModel): string {
+  const setup = model.setup;
+  if (!setup) {
+    return "";
+  }
+  return `<section class="setupnotice" role="alert">
+<p class="setup-headline">${icon("warn", "escalate")}<strong>${escapeHtml(setup.headline)}</strong></p>
+<ul class="setup-lines">${setup.lines.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul>
+<div class="actions">${button("fixConfiguration", FIX_CONFIGURATION_LABEL, true, `Add the missing lines to ${setup.gitignore ?? ".gitignore"} (sparring fix-config); commit it afterwards`, "primary")}</div>
+<details class="setup-technical"><summary>Technical details</summary><pre class="engineerror">${escapeHtml(setup.technical)}</pre></details>
+</section>`;
+}
+
 function renderRepositoryContext(model: OverviewModel): string {
+  return renderRepositoryLine(model) + renderSetupNotice(model);
+}
+
+function renderRepositoryLine(model: OverviewModel): string {
   const context = model.repositoryContext;
   if (!context) {
     return "";
@@ -2273,6 +2297,10 @@ button.quiet { background: transparent; color: var(--vscode-descriptionForegroun
 .repocontext .name { font-weight: 600; color: var(--vscode-foreground); overflow-wrap: anywhere; }
 .repocontext .chooser { display: inline-flex; align-items: center; gap: 4px; margin: 0; padding: 1px 6px; font: inherit; font-weight: 600; background: transparent; color: var(--vscode-foreground); border: 1px solid var(--vscode-dropdown-border, var(--line)); border-radius: 3px; cursor: pointer; }
 .repocontext .chooser:hover { background: var(--vscode-toolbar-hoverBackground, transparent); }
+.setupnotice { margin: 0 0 12px; padding: 8px 12px; border: 1px solid var(--warn-border); border-radius: 4px; background: var(--vscode-inputValidation-warningBackground, transparent); }
+.setupnotice .setup-headline { display: flex; align-items: center; gap: 6px; margin: 0 0 4px; }
+.setupnotice .setup-lines { margin: 0 0 8px; padding-left: 20px; }
+.setupnotice .actions { margin: 0 0 6px; }
 .repocontext .chooser .caret { opacity: 0.75; font-size: 0.9em; }
 .repocontext .actions { margin: 0; gap: 6px; }
 .repocontext.pinned { padding-left: 8px; border-left: 2px solid var(--vscode-textLink-foreground); }

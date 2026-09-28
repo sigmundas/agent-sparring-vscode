@@ -295,6 +295,11 @@ export class OverviewPanelManager implements vscode.Disposable {
    * asked for, in a control disabled while it waited. Rebuilding the page is
    * what puts the engine's value back in front of the person.
    */
+  /** Re-render from a fresh engine read, even if nothing on screen would differ. */
+  async forceRefresh(): Promise<void> {
+    await this.forceUpdate();
+  }
+
   private async forceUpdate(): Promise<void> {
     this.lastHtmlKey = undefined;
     await this.update();

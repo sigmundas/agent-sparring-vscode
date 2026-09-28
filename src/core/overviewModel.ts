@@ -832,7 +832,40 @@ export type IntakeApprovalAttempt =
    */
   | { state: "unconfirmed"; message: string; mayHaveRun: boolean };
 
+/**
+ * A fixable setup problem, said as a person reads it, on every screen of the
+ * repository it concerns. Built only from the engine's `setup_problems`;
+ * the fix is the engine's `fix-config`.
+ */
+export interface SetupNotice {
+  headline: string;
+  /** One sentence per problem: `.sparring/intake/ must be ignored by Git.` */
+  lines: string[];
+  /** The engine's own text, for the Technical details disclosure. */
+  technical: string;
+  /** The .gitignore the fix edits, so the result can say which file to commit. */
+  gitignore?: string;
+}
+
+export const SETUP_HEADLINE = "Agent Sparring setup needs updating:";
+export const FIX_CONFIGURATION_LABEL = "Fix configuration";
+
+export function setupNotice(config: EffectiveConfig | undefined): SetupNotice | undefined {
+  const problems = config?.kind === "report" ? (config.report.setup_problems ?? []) : [];
+  if (problems.length === 0) {
+    return undefined;
+  }
+  return {
+    headline: SETUP_HEADLINE,
+    lines: problems.map((problem) => `${problem.ignore_line} must be ignored by Git.`),
+    technical: problems.map((problem) => problem.message).join("\n\n"),
+    gitignore: problems[0].gitignore,
+  };
+}
+
 export interface OverviewModel {
+  /** A fixable setup problem of this repository; see {@link SetupNotice}. */
+  setup?: SetupNotice;
   kind: "empty" | "ambiguous" | "run" | "intake";
   /** Set when `kind` is `intake`. */
   intake?: IntakeView;
@@ -1284,6 +1317,18 @@ export function buildOverviewModel(
   rawLive: LiveState | undefined,
   artifacts: OverviewArtifacts = NO_ARTIFACTS,
   nowMs: number = Date.now(),
+  execution?: ExecutionRecord,
+): OverviewModel {
+  const model = buildScreen(selection, rawLive, artifacts, nowMs, execution);
+  const setup = setupNotice(artifacts.agentConfig);
+  return setup ? { ...model, setup } : model;
+}
+
+function buildScreen(
+  selection: RunSelection,
+  rawLive: LiveState | undefined,
+  artifacts: OverviewArtifacts,
+  nowMs: number,
   execution?: ExecutionRecord,
 ): OverviewModel {
   const repositoryContext = describeRepositoryContext(selection);

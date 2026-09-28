@@ -49,6 +49,20 @@ export interface EngineRoleConfig {
 }
 
 /** The whole payload of one `show-config --json` invocation. */
+/** One entry of `setup_problems`, verbatim. */
+export interface EngineSetupProblem {
+  /** `not-ignored`: a workflow-state directory git can see. */
+  kind: string;
+  /** What is affected, as the engine names it (`plan intake`). */
+  what: string;
+  /** The .gitignore line that fixes it (`.sparring/intake/`). */
+  ignore_line: string;
+  /** The .gitignore fix-config appends to. */
+  gitignore: string;
+  /** The engine's full refusal text, for technical details. */
+  message: string;
+}
+
 export interface EngineConfigReport {
   config_path: string;
   config_exists: boolean;
@@ -60,6 +74,14 @@ export interface EngineConfigReport {
    */
   local_config_path?: string;
   local_config_exists?: boolean;
+  /**
+   * Fixable setup problems the engine found (`sparring fix-config` repairs
+   * them). Absent from an engine that does not report setup; an empty list
+   * means it checked and found none.
+   */
+  setup_problems?: EngineSetupProblem[];
+  /** Why setup could not be checked, when it could not. */
+  setup_error?: string;
   project: string | null;
   /** Set when the engine refused to resolve the configuration; then no role is reported. */
   error: string | null;
@@ -108,6 +130,14 @@ function isRole(value: unknown): value is EngineRoleConfig {
  * version of the engine promises. Nothing is reconstructed from a partial
  * payload: a half-understood answer about what will run is not useful.
  */
+function isSetupProblem(value: unknown): value is EngineSetupProblem {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return ["kind", "what", "ignore_line", "gitignore", "message"].every((key) => typeof record[key] === "string");
+}
+
 export function parseEngineConfig(stdout: string): EngineConfigReport | undefined {
   let payload: unknown;
   try {
@@ -132,6 +162,12 @@ export function parseEngineConfig(stdout: string): EngineConfigReport | undefine
   if (typeof record["local_config_path"] === "string" && record["local_config_path"]) {
     report.local_config_path = record["local_config_path"];
     report.local_config_exists = record["local_config_exists"] === true;
+  }
+  if (Array.isArray(record["setup_problems"])) {
+    report.setup_problems = record["setup_problems"].filter(isSetupProblem);
+  }
+  if (typeof record["setup_error"] === "string" && record["setup_error"]) {
+    report.setup_error = record["setup_error"];
   }
   if (isRole(record["stage"])) {
     report.stage = record["stage"];
