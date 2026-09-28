@@ -115,7 +115,16 @@ export async function gitContext(repoRoot: string): Promise<{ branch?: string; h
     ?.filter((repo) => owns(repo, repoRoot))
     .sort((a, b) => path.resolve(b.rootPath).length - path.resolve(a.rootPath).length)[0];
   if (owner) {
-    return { branch: owner.branch?.trim() || undefined, head: owner.head };
+    // VS Code's git extension notices a checkout made outside the editor
+    // (the engine's `slice-branch --create`, a terminal) only after a delay.
+    // The branch on disk is the truth; when they disagree the API is behind,
+    // and its HEAD is not trusted either.
+    const reported = owner.branch?.trim() || undefined;
+    const onDisk = await readGitBranch(repoRoot);
+    if (onDisk && onDisk !== reported) {
+      return { branch: onDisk };
+    }
+    return { branch: reported, head: owner.head };
   }
   const branch = await readGitBranch(repoRoot);
   return branch ? { branch } : undefined;
