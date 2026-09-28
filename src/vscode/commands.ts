@@ -6,6 +6,8 @@
  * a run, and the Run Overview panel and its actions.
  */
 
+import { branchNotice, sliceBranchTargetOf } from "../core/sliceBranch";
+import { changeSliceBranch, readSliceBranch } from "./sliceBranchProbe";
 import { realpathSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -754,6 +756,9 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       return;
     case "fixConfiguration":
       await fixConfigurationCommand(controller, overview);
+      return;
+    case "sliceBranch":
+      await sliceBranchCommand(controller, overview);
       return;
     case "chooseRepository":
       await chooseRepositoryCommand(controller);
@@ -3771,5 +3776,54 @@ async function fixConfigurationCommand(controller: SparringController, overview:
     controller.log(`fix-config refused: ${result.error}`);
     void vscode.window.showErrorMessage(`Agent Sparring: could not fix the setup: ${result.error}`);
   }
+  await overview.forceRefresh();
+}
+
+/**
+ * The branch notice's button: ask the engine again what this slice needs
+ * (never acting on what an earlier render showed), confirm, and have the
+ * engine create the branch or move the approval. Every check behind a move
+ * is the engine's; its refusal is shown in its own words.
+ */
+async function sliceBranchCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
+  const target = sliceBranchTargetOf(controller.currentSelection, controller.currentDiscovery.locations);
+  const report = target ? await readSliceBranch(configuredExecutable(), target, true) : undefined;
+  const notice = branchNotice(report);
+  if (!target || !report || !notice) {
+    void vscode.window.showInformationMessage("Agent Sparring: this stage does not need a feature branch now.");
+    await overview.forceRefresh();
+    return;
+  }
+  const action = notice.action;
+  if (!action) {
+    void vscode.window.showWarningMessage(`Agent Sparring: ${notice.headline}, and the engine cannot move it: ${report.blocked ?? report.problem ?? ""}`);
+    await overview.forceRefresh();
+    return;
+  }
+  const branch = action.kind === "create-branch" ? action.branch : report.currentBranch;
+  const confirm = action.kind === "create-branch" ? "Create branch" : "Move approval";
+  const question = action.kind === "create-branch"
+    ? `Create branch ${branch} in ${report.repository} at the current commit${report.approvedBranch ? ` and move ${report.stages}'s approval to it` : ""}?`
+    : `Move ${report.stages}'s approval from ${report.approvedBranch ?? ""} to ${branch}, at the same commit?`;
+  const detail = report.approvedBranch
+    ? "The approval is not rewritten: the engine records the move beside it, and refuses if anything has run or the commit or worktree changed. Nothing is started."
+    : "Your working-tree changes stay as they are. Nothing is approved or started.";
+  const choice = await vscode.window.showWarningMessage(question, { modal: true, detail }, confirm);
+  if (choice !== confirm) {
+    return;
+  }
+  const result = await changeSliceBranch(configuredExecutable(), target, action.kind === "create-branch" && branch ? { create: branch } : { move: true });
+  if (result.ok) {
+    controller.log(`slice-branch: ${result.created ? `created ${result.created}` : ""}${result.movedTo ? `${result.created ? "; " : ""}moved ${report.stages} from ${result.movedFrom} to ${result.movedTo}` : ""}`);
+    void vscode.window.showInformationMessage(
+      result.movedTo
+        ? `Agent Sparring: ${report.stages} now runs on ${result.movedTo}. It has not been started.`
+        : `Agent Sparring: checked out ${result.created ?? branch}. ${report.stages} can be approved there.`,
+    );
+  } else {
+    controller.log(`slice-branch refused: ${result.error}`);
+    void vscode.window.showErrorMessage(`Agent Sparring: could not change ${report.stages}'s branch: ${result.error}`);
+  }
+  await controller.refresh();
   await overview.forceRefresh();
 }

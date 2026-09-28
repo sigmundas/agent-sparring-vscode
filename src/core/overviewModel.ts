@@ -37,6 +37,7 @@ import { buildPromptView, latestCapture, type CaptureEntry, type PromptView } fr
 import { briefMentionedStages, buildStageIndex, locateStage, parsePlanHeadings, planTitle, sectionSummary, type HeadingRef, type MatchSource, type PlanHeading } from "./planAssociation";
 import { actionWord, presentStage, stageDisplayName, type StagePresentation } from "./presentation";
 import { hasSessions, planAction, stageActions, type PlanAction, type StageRunAction } from "./runner";
+import { branchNotice, branchStateLabel, reportFor, type BranchNotice, type SliceBranchReport } from "./sliceBranch";
 import { QUIET_AFTER_MS, formatAge } from "./status";
 
 export type TimelineState = "accepted" | "finalizing" | "active" | "paused" | "working" | "future";
@@ -368,6 +369,12 @@ export interface OverviewArtifacts {
    * extension never derives any of it from project.toml itself.
    */
   agentConfig?: EffectiveConfig;
+  /**
+   * The engine's `slice-branch` answer for the intake slice on screen (the
+   * next slice of an intake, or the slice a sealed run executes). Whether a
+   * branch is needed is the engine's answer, never worked out here.
+   */
+  sliceBranch?: SliceBranchReport;
 }
 
 /** The managed plan run the standalone stage on screen is a stage of. */
@@ -866,6 +873,8 @@ export function setupNotice(config: EffectiveConfig | undefined): SetupNotice | 
 export interface OverviewModel {
   /** A fixable setup problem of this repository; see {@link SetupNotice}. */
   setup?: SetupNotice;
+  /** The slice on screen needs a feature branch; see {@link BranchNotice}. */
+  branch?: BranchNotice;
   kind: "empty" | "ambiguous" | "run" | "intake";
   /** Set when `kind` is `intake`. */
   intake?: IntakeView;
@@ -1225,9 +1234,13 @@ function sliceStateLabel(entry: IntakeSliceSnapshot, offered: IntakeNextAction["
  * The intake screen. `sourceText` is the source plan's text, read only for
  * its title; `attempt` is this window's last approval of the next slice.
  */
-export function intakeView(intake: DiscoveredIntake, sourceText: string | undefined, attempt?: IntakeApprovalAttempt, command?: string): IntakeView {
+export function intakeView(intake: DiscoveredIntake, sourceText: string | undefined, attempt?: IntakeApprovalAttempt, command?: string, branchReport?: SliceBranchReport): IntakeView {
   const next = intakeNextAction(intake);
   const slice = next.kind === "none" ? undefined : next.slice;
+  // The engine said this slice cannot run (or be approved) on the branch it
+  // is on: the branch notice says what to do, and nothing here offers the
+  // step the engine would refuse.
+  const needsBranch = slice ? reportFor(branchReport, slice)?.needsBranch === true : false;
   const ran = intake.slices.filter((entry) => entry.state === "complete");
   const findings = findingsPhrase(intake);
   const lines: string[] = [];
@@ -1236,9 +1249,14 @@ export function intakeView(intake: DiscoveredIntake, sourceText: string | undefi
   let blocked: string | undefined;
   switch (next.kind) {
     case "start": {
-      stateLabel = intakeStateLabel("approved");
       const approval = next.slice.approval;
       const name = sliceStageName(next.slice);
+      if (needsBranch && branchReport) {
+        stateLabel = branchStateLabel(branchReport);
+        lines.push(`${name} is approved${approval ? ` for branch ${approval.expectedBranch}` : ""}, but it cannot start there: it needs a feature branch first. Nothing has run.`);
+        break;
+      }
+      stateLabel = intakeStateLabel("approved");
       lines.push(`${name} is approved${approval ? ` for branch ${approval.expectedBranch}` : ""} and has not started. Starting it runs its sealed, approved plan; the engine re-checks the approval and the repositories first, and may refuse.`);
       action = { kind: "start", label: `Start ${name}`, detail: `Run the approved manifest of ${name}`, intakeDir: intake.dir, runId: next.slice.runId, enabled: true };
       break;
@@ -1255,6 +1273,10 @@ export function intakeView(intake: DiscoveredIntake, sourceText: string | undefi
       stateLabel = findings ? `Prepared — ${findings}` : "Prepared — findings not recorded; see the report";
       const approving = attempt?.state === "approving";
       const name = sliceStageName(next.slice);
+      if (needsBranch) {
+        lines.push(`${name} is next. It needs a feature branch before it can be approved, because implementation agents never run on the branch checked out now.`);
+        break;
+      }
       lines.push(`${ran.length > 0 ? `${name} is next and has not been approved.` : "The engine prepared this plan for review; no stage of it has run."} Approving asks the engine to seal ${name}; it checks everything again and may refuse.`);
       action = {
         kind: "approve",
@@ -1281,7 +1303,7 @@ export function intakeView(intake: DiscoveredIntake, sourceText: string | undefi
     slices: intake.slices.map((entry) => ({
       runId: entry.runId,
       heading: sliceHeading(entry),
-      stateLabel: sliceStateLabel(entry, entry === slice ? next.kind : undefined),
+      stateLabel: entry === slice && needsBranch && branchReport ? branchStateLabel(branchReport) : sliceStateLabel(entry, entry === slice ? next.kind : undefined),
       stages: isExecutionGroup(entry) ? entry.stages.map((stage) => `${stage.label} — ${stage.title}`) : [],
       current: entry === slice,
       technical: {
@@ -1293,7 +1315,7 @@ export function intakeView(intake: DiscoveredIntake, sourceText: string | undefi
     })),
     ...(action ? { action } : {}),
     ...(blocked ? { blocked } : {}),
-    requirements: next.kind === "approve" ? requirementLines(slice, intake) : [],
+    requirements: next.kind === "approve" && !needsBranch ? requirementLines(slice, intake) : [],
     ...(next.kind === "approve" && attempt?.state === "refused" ? { refusal: { text: attempt.output } } : {}),
     ...(next.kind === "approve" && attempt?.state === "unconfirmed"
       ? {
@@ -1321,7 +1343,8 @@ export function buildOverviewModel(
 ): OverviewModel {
   const model = buildScreen(selection, rawLive, artifacts, nowMs, execution);
   const setup = setupNotice(artifacts.agentConfig);
-  return setup ? { ...model, setup } : model;
+  const branch = branchNotice(artifacts.sliceBranch);
+  return { ...model, ...(setup ? { setup } : {}), ...(branch ? { branch } : {}) };
 }
 
 function buildScreen(
@@ -1333,7 +1356,7 @@ function buildScreen(
 ): OverviewModel {
   const repositoryContext = describeRepositoryContext(selection);
   if (!selection.selected && selection.intake) {
-    const intake = intakeView(selection.intake, artifacts.planText, artifacts.intakeApproval, artifacts.intakeCommand);
+    const intake = intakeView(selection.intake, artifacts.planText, artifacts.intakeApproval, artifacts.intakeCommand, artifacts.sliceBranch);
     return { kind: "intake", title: `Plan intake: ${intake.planName}`, intake, repositoryContext };
   }
   if (!selection.selected) {

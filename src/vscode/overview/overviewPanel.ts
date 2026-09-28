@@ -5,6 +5,8 @@
  * nothing but itself.
  */
 
+import { sliceBranchTargetOf, type SliceBranchReport } from "../../core/sliceBranch";
+import { readSliceBranch } from "../sliceBranchProbe";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -427,6 +429,10 @@ export class OverviewPanelManager implements vscode.Disposable {
       };
       repository = intake.location.folderName;
     }
+    const sliceBranch = await this.sliceBranch();
+    if (sliceBranch) {
+      artifacts = { ...artifacts, sliceBranch };
+    }
     const model = buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.executionFor(selection.selected?.id));
     return { model, source: { model, artifacts, sparringText, repository } };
   }
@@ -440,6 +446,23 @@ export class OverviewPanelManager implements vscode.Disposable {
    * one-line note, never a crash and never a guess — a failure here must
    * not take the rest of the Overview with it.
    */
+  /**
+   * Whether the intake slice on screen needs a feature branch, asked of the
+   * engine (see core/sliceBranch.ts). No answer is no notice: a failure
+   * here must not take the rest of the Overview with it.
+   */
+  private async sliceBranch(): Promise<SliceBranchReport | undefined> {
+    const target = sliceBranchTargetOf(this.controller.currentSelection, this.controller.currentDiscovery.locations);
+    if (!target) {
+      return undefined;
+    }
+    try {
+      return await readSliceBranch(configuredExecutable(), target);
+    } catch {
+      return undefined;
+    }
+  }
+
   private async agentConfig(): Promise<EffectiveConfig | undefined> {
     const target = settingsTarget(this.controller.currentSelection);
     if (!target) {

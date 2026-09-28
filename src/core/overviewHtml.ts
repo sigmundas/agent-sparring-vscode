@@ -43,6 +43,7 @@ export type OverviewAction =
   | "followActiveRepository"
   | "chooseRepository"
   | "fixConfiguration"
+  | "sliceBranch"
   | "followActiveEditor"
   | "runPlan"
   | "resumePlan"
@@ -334,6 +335,7 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "followActiveRepository",
   "chooseRepository",
   "fixConfiguration",
+  "sliceBranch",
   "followActiveEditor",
   "runPlan",
   "resumePlan",
@@ -624,8 +626,26 @@ function renderSetupNotice(model: OverviewModel): string {
 </section>`;
 }
 
+/**
+ * The slice on screen needs a feature branch: what that means, and the one
+ * branch action the engine offers, with the engine's text under Technical
+ * details. Shown instead of a Start that the engine would refuse.
+ */
+function renderBranchNotice(model: OverviewModel): string {
+  const branch = model.branch;
+  if (!branch) {
+    return "";
+  }
+  const action = branch.action ? `<div class="actions">${button("sliceBranch", branch.action.label, true, branch.action.detail, "primary")}</div>` : "";
+  return `<section class="setupnotice branchnotice" role="alert">
+<p class="setup-headline">${icon("warn", "escalate")}<strong>${escapeHtml(branch.headline)}</strong></p>
+<ul class="setup-lines">${branch.lines.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul>
+${action}<details class="setup-technical"><summary>Technical details</summary><pre class="engineerror">${escapeHtml(branch.technical)}</pre></details>
+</section>`;
+}
+
 function renderRepositoryContext(model: OverviewModel): string {
-  return renderRepositoryLine(model) + renderSetupNotice(model);
+  return renderRepositoryLine(model) + renderSetupNotice(model) + renderBranchNotice(model);
 }
 
 function renderRepositoryLine(model: OverviewModel): string {
