@@ -848,6 +848,19 @@ export class OperationRegistry implements vscode.Disposable {
     return [...this.operations.values()].map(view);
   }
 
+  /** Every terminal or engine pid an unresolved operation is attributed to: never adopted as an idle shell. */
+  terminalPids(): Set<number> {
+    const pids = new Set<number>();
+    for (const operation of this.operations.values()) {
+      for (const pid of [operation.terminalPid, operation.enginePid, operation.directPid]) {
+        if (pid !== undefined) {
+          pids.add(pid);
+        }
+      }
+    }
+    return pids;
+  }
+
   /** The operation that last ended in `repoRoot` in this window, with its exit code when one was reported. */
   lastSettled(repoRoot: string): SettledOperationRecord | undefined {
     return this.settled.get(path.resolve(repoRoot));

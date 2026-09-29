@@ -47,6 +47,7 @@
  *    execution's own end.
  */
 
+import { basename } from "node:path";
 import { execFile } from "node:child_process";
 import type { CommandOutcome } from "../core/acceptance";
 import { executableWord, planExecutable, type ExecutablePlan } from "../core/cli";
@@ -116,6 +117,15 @@ export class SparringCommandRunner {
       return { ok: false, error: admissionRefusal(blocked), problem: "unconfirmed", submission: outstanding(blocked) ? blocked : undefined };
     }
     const claim = admission.claim;
+    // One reusable terminal per worktree holds only if a second ordinary
+    // engine command there is refused rather than given a second shell.
+    const busy = this.operations.busyWorktree(options.cwd, claim.id);
+    if (busy) {
+      const where = basename(options.cwd);
+      this.operations.release(claim, `${busy.subcommand} is already running in ${where}, so nothing was started`);
+      this.log(`${subcommand} ${where}: not started; ${busy.subcommand} is already running`);
+      return { ok: false, error: `Agent Sparring is already running ${busy.subcommand} in ${where}. Wait for it to finish before starting ${subcommand}.`, problem: "unconfirmed" };
+    }
     const configured = await planExecutable(options.configured, hostEnv(options.cwd), true);
     if (!configured.ok) {
       this.operations.release(claim, "the executable could not be resolved, so nothing was ever submitted");
@@ -129,6 +139,10 @@ export class SparringCommandRunner {
     const shellBound = shellHandoverFor(word, options.args).via !== "no-shell";
     // The project's own terminal, for as long as this command runs — and only
     // when its shell is idle, never one the user is working in.
+    if (shellBound) {
+      // Optional so a test's minimal pool need not implement it.
+      await this.terminals.reconcile?.(options.cwd, this.operations.terminalPids());
+    }
     const lease = shellBound ? this.terminals.acquire(options.cwd) : undefined;
     const integration = lease ? await awaitShellIntegration(lease.terminal) : undefined;
     const handover = integration ? shellHandoverFor(word, options.args) : undefined;
@@ -174,7 +188,8 @@ export class SparringCommandRunner {
       // must not leave a handed-over operation recorded as merely armed.
       const output = collectOutput(request.execution);
       this.operations.submittedToShell(armed.armed, leased, request.execution, output);
-      leased.terminal.show(true);
+      // Not revealed: routine activity belongs in the Overview, and "Show
+      // terminal" is there for when the raw output matters.
       const settled = await this.operations.waitForStart(armed.armed, EXECUTION_START_TIMEOUT_MS);
       if (!settled.established) {
         // The shell has not started it, and may still. Nothing is treated as

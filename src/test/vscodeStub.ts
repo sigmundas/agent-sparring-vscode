@@ -80,6 +80,8 @@ export class FakeTerminal {
   exitStatus: { code: number | undefined } | undefined;
   readonly executions: FakeExecution[] = [];
   shown = 0;
+  /** What it was created with, as `vscode.Terminal.creationOptions` reports it. */
+  creationOptions: { name?: string; cwd?: string; shellPath?: string; shellArgs?: string[] } = {};
   constructor(readonly name: string, readonly pid = 4242) {}
   get processId(): Promise<number> {
     return Promise.resolve(this.pid);
@@ -159,9 +161,10 @@ const stub = {
      * behind one sets its real pid here.
      */
     nextTerminalPid: undefined as number | undefined,
-    createTerminal(options: { name: string; shellPath?: string; shellArgs?: string[] }): FakeTerminal {
+    createTerminal(options: { name: string; cwd?: string; shellPath?: string; shellArgs?: string[] }): FakeTerminal {
       stub.window.created.push(options);
       const terminal = new FakeTerminal(options.name, stub.window.nextTerminalPid);
+      terminal.creationOptions = { ...options };
       stub.window.nextTerminalPid = undefined;
       stub.window.terminals.push(terminal);
       openEmitter.fire(terminal);

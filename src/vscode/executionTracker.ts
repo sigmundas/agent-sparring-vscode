@@ -62,6 +62,8 @@
  * meaning observed executions.
  */
 
+import { basename } from "node:path";
+import { runnerTerminalName } from "./terminalPool";
 import * as vscode from "vscode";
 import { executableWord, planExecutable, wasCommandNotFound, type ExecutablePlan, type ExecutableProblem } from "../core/cli";
 import type { SparringLocation } from "../core/discovery";
@@ -692,6 +694,15 @@ export class ExecutionTracker implements vscode.Disposable {
       return { ok: false, error: admissionRefusal(blocked), problem: "unconfirmed", submission: outstanding(blocked) ? blocked : undefined };
     }
     const claim = admission.claim;
+    // One reusable terminal per worktree holds only if a second ordinary
+    // engine command there is refused rather than given a second shell.
+    const busy = this.operations.busyWorktree(options.cwd, claim.id);
+    if (busy) {
+      const where = basename(options.cwd);
+      this.operations.release(claim, `${busy.subcommand} is already running in ${where}, so nothing was started`);
+      this.log(`${options.kind} ${where}: not started; ${busy.subcommand} is already running`);
+      return { ok: false, error: `Agent Sparring is already running ${busy.subcommand} in ${where}. Wait for it to finish before starting ${options.kind}.`, problem: "unconfirmed" };
+    }
     const configured = await planExecutable(options.configured, hostEnv(options.cwd), true);
     if (!configured.ok) {
       this.log(`refused to launch ${options.name}: ${configured.error}`);
@@ -710,6 +721,10 @@ export class ExecutionTracker implements vscode.Disposable {
     // a plan run is a long series of commands and each one used to leave a
     // dead tab behind, but a terminal someone else is using is never written
     // to (terminalPool.ts).
+    if (shellBound) {
+      // Optional so a test's minimal pool need not implement it.
+      await this.terminals.reconcile?.(options.cwd, this.operations.terminalPids());
+    }
     const lease = shellBound ? this.terminals.acquire(options.cwd) : undefined;
     if (lease && options.reveal) {
       lease.terminal.show(true);
@@ -793,7 +808,7 @@ export class ExecutionTracker implements vscode.Disposable {
     let dedicatedTerminal: vscode.Terminal;
     try {
       dedicatedTerminal = vscode.window.createTerminal({
-        name: `Agent Sparring — ${options.name}`,
+        name: runnerTerminalName(options.cwd),
         shellPath: path,
         shellArgs: options.args,
         cwd: options.cwd,

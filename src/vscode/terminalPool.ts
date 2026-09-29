@@ -30,14 +30,21 @@
  *    recreated on the next command;
  *  - projects never share one, because they never share a cwd.
  *
- * Only terminals created here are ever used, and only while this window has
- * watched them. A window reload empties the pool: terminals VS Code restores
- * are not adopted, because nothing here saw what they have been doing. A
- * command the user typed in their own terminal is observed, never written to.
+ * Only terminals created here are ever used. A window reload empties the
+ * pool, and VS Code restores the old terminals; that used to add one terminal
+ * per worktree per reload, which is how twenty accumulated. A restored
+ * terminal is now adopted only when the process table proves its shell idle
+ * (`reconcile`); otherwise it stays an orphan, untouched and not counted, and
+ * at most one new terminal serves every later command for that worktree. A
+ * second ordinary command in a busy worktree is refused by the launchers, not
+ * given a second terminal. A command the user typed in their own terminal is
+ * observed, never written to.
  */
 
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { descendantsOf, processExists, type ProcessInfo } from "../core/processTree";
+import { listProcesses, processProbeSupported } from "./processProbe";
 import { chooseOwnedTerminal, explainCreation, knownEnded, redundantTerminals, terminalKey, unavailability, type OwnedTerminalState } from "../core/terminalOccupancy";
 
 /** The name prefix of every terminal this extension creates. */
@@ -97,11 +104,29 @@ interface Entry {
 
 export class TerminalPool implements vscode.Disposable {
   private readonly entries: Entry[] = [];
+  /**
+   * Agent Sparring terminals this window is not using: those VS Code restored
+   * after a reload, and those retired from reuse. Executions seen in them
+   * since are tracked, so `reconcile` never mistakes a busy one for idle.
+   */
+  private readonly orphans = new Map<vscode.Terminal, { active: Set<vscode.TerminalShellExecution> }>();
   private readonly disposables: vscode.Disposable[] = [];
 
-  constructor(private readonly log: (message: string) => void) {
+  constructor(
+    private readonly log: (message: string) => void,
+    private readonly processes: () => Promise<ProcessInfo[]> = listProcesses,
+    private readonly probeSupported: boolean = processProbeSupported(),
+  ) {
+    for (const terminal of vscode.window.terminals) {
+      if (terminal.name.startsWith(RUNNER_TERMINAL_PREFIX)) {
+        this.orphans.set(terminal, { active: new Set() });
+      }
+    }
     this.disposables.push(
-      vscode.window.onDidCloseTerminal((terminal) => this.forget(terminal)),
+      vscode.window.onDidCloseTerminal((terminal) => {
+        this.forget(terminal);
+        this.orphans.delete(terminal);
+      }),
       // Occupancy, from the only events that report it. They fire only for
       // terminals with shell integration, which is also the only kind this
       // extension ever writes to.
@@ -130,9 +155,11 @@ export class TerminalPool implements vscode.Disposable {
     if (choice.kind === "reuse") {
       entry = this.entries[choice.index];
       entry.leased = true;
+      this.log(`terminal reused: ${entry.terminal.name}`);
     } else {
-      const sameProject = this.entries.filter((candidate) => candidate.key === key && !candidate.dedicated).length;
-      const name = `${RUNNER_TERMINAL_PREFIX}${path.basename(cwd)}${sameProject > 0 ? ` (${sameProject + 1})` : ""}`;
+      // One stable name per worktree. Numbered or operation-specific names
+      // made every extra terminal look like a separate thing worth keeping.
+      const name = runnerTerminalName(cwd);
       const terminal = vscode.window.createTerminal({ name, cwd, iconPath: new vscode.ThemeIcon("debug-alt") });
       this.log(explainCreation(choice.because, name, cwd));
       entry = { terminal, cwd, key, dedicated: false, leased: true, active: new Set(), observable: terminal.shellIntegration !== undefined };
@@ -140,6 +167,70 @@ export class TerminalPool implements vscode.Disposable {
     }
     this.closeRedundant(key, entry);
     return this.lease(entry);
+  }
+
+  /**
+   * Before `acquire(cwd)`: when this worktree has no terminal in the pool,
+   * adopt one of its orphaned terminals whose shell is *proven* idle, so a
+   * reload does not add one terminal per worktree every time.
+   *
+   * VS Code reports no "is anything running" state for a terminal it
+   * restored, and no execution events for a command started before the
+   * reload. The process table does: a shell with no child process is running
+   * nothing (a foreground or suspended job is a child). So a terminal is
+   * adopted only when all of these hold —
+   *
+   *  - its shell reports integration (so it is a shell, and its executions
+   *    are visible from now on) and it has not exited;
+   *  - it was not created with a process of its own (a dedicated engine
+   *    terminal has no shell to be idle);
+   *  - it was opened for this worktree;
+   *  - no execution has been seen starting in it without ending;
+   *  - its pid is not one the operation registry still attributes an
+   *    operation to (`claimedPids`);
+   *  - `ps` lists its pid with no descendants.
+   *
+   * Anything else stays an orphan: untouched, and not this worktree's
+   * terminal. Unsupported platforms never adopt.
+   */
+  async reconcile(cwd: string, claimedPids: ReadonlySet<number> = new Set()): Promise<void> {
+    const key = terminalKey(cwd);
+    if (!this.probeSupported || this.entries.some((entry) => entry.key === key && !entry.dedicated && entry.terminal.exitStatus === undefined)) {
+      return;
+    }
+    const candidates: { terminal: vscode.Terminal; pid: number }[] = [];
+    for (const [terminal, orphan] of this.orphans) {
+      if (terminal.exitStatus !== undefined || !terminal.shellIntegration || orphan.active.size > 0 || ownProcess(terminal) || !openedHere(terminal, cwd, key)) {
+        continue;
+      }
+      const pid = await terminal.processId;
+      if (pid !== undefined && pid > 0 && !claimedPids.has(pid)) {
+        candidates.push({ terminal, pid });
+      }
+    }
+    if (candidates.length === 0) {
+      return;
+    }
+    let table: ProcessInfo[];
+    try {
+      table = await this.processes();
+    } catch {
+      return;
+    }
+    for (const { terminal, pid } of candidates) {
+      const orphan = this.orphans.get(terminal);
+      // Re-checked after the awaits: anything started meanwhile disqualifies it.
+      if (!orphan || orphan.active.size > 0 || terminal.exitStatus !== undefined || !processExists(table, pid) || descendantsOf(table, pid).length > 0) {
+        continue;
+      }
+      if (this.entries.some((entry) => entry.key === key && !entry.dedicated)) {
+        return;
+      }
+      this.orphans.delete(terminal);
+      this.entries.push({ terminal, cwd, key, dedicated: false, leased: false, active: new Set(), observable: true });
+      this.log(`terminal adopted after reload: ${terminal.name} — its shell (pid ${pid}) has no running child process`);
+      return;
+    }
   }
 
   /**
@@ -245,6 +336,7 @@ export class TerminalPool implements vscode.Disposable {
   }
 
   private onExecutionStarted(event: vscode.TerminalShellExecutionStartEvent): void {
+    this.orphans.get(event.terminal)?.active.add(event.execution);
     const entry = this.entries.find((candidate) => candidate.terminal === event.terminal);
     if (!entry) {
       return;
@@ -259,6 +351,7 @@ export class TerminalPool implements vscode.Disposable {
   }
 
   private onExecutionEnded(event: vscode.TerminalShellExecutionEndEvent): void {
+    this.orphans.get(event.terminal)?.active.delete(event.execution);
     const entry = this.entries.find((candidate) => candidate.terminal === event.terminal);
     if (entry) {
       entry.observable = true;
@@ -299,6 +392,9 @@ export class TerminalPool implements vscode.Disposable {
         done = true;
         entry.leased = false;
         this.forget(entry.terminal);
+        // Still open and still ours: never written to again unless the
+        // process table later proves its shell idle (see `reconcile`).
+        this.orphans.set(entry.terminal, { active: new Set(entry.active) });
       },
     };
   }
@@ -328,6 +424,41 @@ export class TerminalPool implements vscode.Disposable {
       }
     }
   }
+}
+
+/** `Agent Sparring — <worktree>`: the one name a worktree's terminals ever have. */
+export function runnerTerminalName(cwd: string): string {
+  return `${RUNNER_TERMINAL_PREFIX}${path.basename(cwd)}`;
+}
+
+/** The worktree a terminal was opened for, from its creation options. */
+function openedFor(terminal: vscode.Terminal): string | undefined {
+  const options = terminal.creationOptions as vscode.TerminalOptions | undefined;
+  const cwd = options?.cwd;
+  const where = typeof cwd === "string" ? cwd : cwd?.fsPath;
+  return where ? terminalKey(where) : undefined;
+}
+
+/**
+ * Opened for this worktree: by its creation options, or — when a restored
+ * terminal no longer carries them — by its stable name together with the
+ * working directory its shell reports.
+ */
+function openedHere(terminal: vscode.Terminal, cwd: string, key: string): boolean {
+  const opened = openedFor(terminal);
+  return opened !== undefined ? opened === key : terminal.name === runnerTerminalName(cwd) && reportedCwd(terminal) === key;
+}
+
+/** The worktree its shell says it is in, when shell integration reports one. */
+function reportedCwd(terminal: vscode.Terminal): string | undefined {
+  const where = terminal.shellIntegration?.cwd?.fsPath;
+  return where ? terminalKey(where) : undefined;
+}
+
+/** Created with a process of its own (a dedicated engine terminal), not a shell. */
+function ownProcess(terminal: vscode.Terminal): boolean {
+  const options = terminal.creationOptions as vscode.TerminalOptions | undefined;
+  return options?.shellPath !== undefined || (options?.shellArgs !== undefined && options.shellArgs.length > 0);
 }
 
 function describeKept(reason: string | undefined): string {
