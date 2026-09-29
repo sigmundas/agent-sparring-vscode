@@ -391,6 +391,46 @@ export interface StageState {
    * execution, and is read here as that legacy run.
    */
   run: string | null;
+  /**
+   * What each role runs with for this stage's whole life (stage.py
+   * `StageState.agents`), written by the engine before the stage's first
+   * provider turn and reused by every later turn. `null` when absent: the
+   * stage has not pinned anything yet. Data to display only.
+   */
+  agents: Record<string, StageAgentPin> | null;
+}
+
+/** One role's pinned configuration for one stage (stage.py `PinnedAgent`). */
+export interface StageAgentPin {
+  provider: string;
+  model: string | null;
+  modelSource: string | null;
+  effort: string | null;
+  effortSource: string | null;
+}
+
+/**
+ * The `agents` pin, tolerantly: anything that is not an object is no pin,
+ * and an entry without a provider is dropped rather than half-shown.
+ */
+function stageAgents(raw: unknown): Record<string, StageAgentPin> | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const text = (value: unknown): string | null => (typeof value === "string" && value.trim() !== "" ? value : null);
+  const out: Record<string, StageAgentPin> = {};
+  for (const [role, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== "object") {
+      continue;
+    }
+    const entry = value as Record<string, unknown>;
+    const provider = text(entry["provider"]);
+    if (!provider) {
+      continue;
+    }
+    out[role] = { provider, model: text(entry["model"]), modelSource: text(entry["model_source"]), effort: text(entry["effort"]), effortSource: text(entry["effort_source"]) };
+  }
+  return Object.keys(out).length > 0 ? out : null;
 }
 
 const STAGE_STATUSES: ReadonlySet<string> = new Set(["working", "frozen", "accepted"]);
@@ -412,6 +452,7 @@ export function parseStageState(text: string): StageState {
     // older `plan` key recorded a plan key, which named that document's one
     // execution. Reading it as the owning run is what it meant.
     run: optionalString(payload, "run") ?? optionalString(payload, "plan"),
+    agents: stageAgents(payload["agents"]),
   };
 }
 

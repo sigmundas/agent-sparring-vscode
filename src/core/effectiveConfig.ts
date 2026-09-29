@@ -433,6 +433,48 @@ export interface AgentRoleControls {
    * configured model and effort with their sources. Label/value pairs.
    */
   technical: { label: string; value: string }[];
+  /**
+   * What the selected stage was pinned to run with, in words (`This stage:
+   * claude-opus-5-5 · high`), set only when that differs from the current
+   * preference. Displayed only; nothing is switched mid-stage.
+   */
+  stagePin?: string;
+}
+
+/** The role's pin, as the engine recorded it in the stage's state.json. */
+export interface RolePin {
+  provider: string;
+  model: string | null;
+  modelSource: string | null;
+  effort: string | null;
+  effortSource: string | null;
+}
+
+/**
+ * The controls with the selected stage's pin folded in: a Technical details
+ * line whenever there is a pin, and the "This stage:" words only when it
+ * differs from what the controls show as the current preference.
+ */
+export function withStagePin(controls: AgentRoleControls, pin: RolePin | undefined): AgentRoleControls {
+  if (!pin) {
+    return controls;
+  }
+  const technical = [
+    ...controls.technical,
+    {
+      label: "This stage runs with",
+      value: `${pin.provider}, model ${pin.model ?? "none (the provider chooses)"} (source: ${pin.modelSource ?? "not stated"}), effort ${pin.effort ?? "none"} (source: ${pin.effortSource ?? "not stated"})`,
+    },
+  ];
+  const differs =
+    pin.provider !== controls.provider.value ||
+    (pin.model ?? PROVIDER_DEFAULT_VALUE) !== controls.model.value ||
+    (pin.effort ?? PROVIDER_DEFAULT_VALUE) !== (controls.effort?.value ?? PROVIDER_DEFAULT_VALUE);
+  if (!differs) {
+    return { ...controls, technical };
+  }
+  const parts = [...(pin.provider !== controls.provider.value ? [pin.provider] : []), pin.model ?? PROVIDER_DEFAULT_LABEL, ...(pin.effort ? [pin.effort] : [])];
+  return { ...controls, technical, stagePin: `This stage: ${parts.join(" \u00b7 ")}` };
 }
 
 /** Where the model suggestions came from, in words. */
@@ -441,7 +483,30 @@ function choicesPhrase(entry: EngineModelChoices | undefined, provider: string):
     return entry?.error ? `No model suggestions for ${provider}: ${entry.error}` : `No model suggestions for ${provider}.`;
   }
   const from = entry.source === "provider-catalog" ? `${provider}'s own model list` : entry.source === "engine-known" ? "the models Agent Sparring knows" : entry.source;
-  return `Suggestions from ${from}${entry.complete ? "" : "; other exact models may exist"}.`;
+  return `Suggestions from ${from}${entry.complete ? "" : `; ${INCOMPLETE_CHOICES}`}. Any exact model id can be entered.`;
+}
+
+/** Said wherever a suggestion list is not complete: it is never a validation boundary. */
+export const INCOMPLETE_CHOICES = "not a complete list";
+
+/**
+ * The "Other exact model…" input's own check, before the engine is asked:
+ * an empty id is no model, and one beginning with "-" would read as an
+ * option (the engine refuses both too, and its refusal is still shown).
+ * `undefined` means the text may be sent.
+ */
+export function exactModelProblem(text: string): string | undefined {
+  const id = text.trim();
+  if (id.length === 0) {
+    return "Enter an exact model id.";
+  }
+  if (id.startsWith("-")) {
+    return "A model id cannot begin with \"-\".";
+  }
+  if (id.length > 200) {
+    return "That is longer than any model id.";
+  }
+  return undefined;
 }
 
 /**

@@ -26,7 +26,6 @@ import {
   isHumanCheckMessage,
   isHumanFeedbackMessage,
   isAgentConfigMessage,
-  MODEL_MAX_LENGTH,
   isOpenPromptSourceMessage,
   isStopMessage,
   renderOverviewHtml,
@@ -54,6 +53,7 @@ import { gitContext } from "../git";
 import { readHead as readFileHead } from "../fileHead";
 import { configuredExecutable } from "../engineExecutable";
 import { readEffectiveConfig, readModelChoices, writeAgentConfig } from "../configProbe";
+import { exactModelProblem } from "../../core/effectiveConfig";
 import { settingsTarget } from "../../core/settingsTarget";
 import type { EffectiveConfig } from "../../core/effectiveConfig";
 
@@ -278,10 +278,12 @@ export class OverviewPanelManager implements vscode.Disposable {
         prompt: `The exact model id for the ${message.role === "stage" ? "stage agent" : "sparrer"}, saved as your own preference for every project.`,
         placeHolder: "exact model id",
         ignoreFocusOut: true,
-        validateInput: (text) => (text.trim().length === 0 ? "Enter an exact model id." : text.trim().length > MODEL_MAX_LENGTH ? "That is longer than any model id." : undefined),
+        validateInput: exactModelProblem,
       });
       const exact = typed?.trim();
-      if (!exact) {
+      // Checked again here: the input box's own check is a convenience, and
+      // only a well-formed id reaches the engine.
+      if (!exact || exactModelProblem(exact)) {
         await this.forceUpdate();
         return { applied: false, refused: "no model was entered" };
       }
@@ -303,7 +305,7 @@ export class OverviewPanelManager implements vscode.Disposable {
     // change lands, as a fact rather than a warning.
     const note = message.field !== "provider" ? (await this.buildModel()).agentConfig?.activeRunNote : undefined;
     if (note) {
-      void vscode.window.showInformationMessage(`Agent Sparring: saved. ${note}`);
+      void vscode.window.showInformationMessage(`Agent Sparring: saved. ${note} This stage keeps the configuration it started with.`);
     }
     return note ? { applied: true, note } : { applied: true };
   }

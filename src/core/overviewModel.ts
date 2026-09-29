@@ -19,7 +19,7 @@
  */
 
 import { describeRepositoryContext, emptyStateLines, emptyStateTitle, SELECT_RUN_LABEL, type RepositoryContextView } from "./activeRepository";
-import { SETUP_NOT_IGNORED, SETUP_OBSOLETE_AGENT_SETTING, agentConfigView, providerLabel, type AgentConfigView, type ConfigRole, type EffectiveConfig } from "./effectiveConfig";
+import { SETUP_NOT_IGNORED, SETUP_OBSOLETE_AGENT_SETTING, agentConfigView, providerLabel, withStagePin, type AgentConfigView, type ConfigRole, type EffectiveConfig } from "./effectiveConfig";
 import { parseBriefGoal, parseBriefOpening } from "./brief";
 import { currentStageOf, owningRoot, repositoryDisplayName, runLabel, samePath, type DiscoveredIntake, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { intakeContinuation, intakeNextAction, intakeStateLabel, isExecutionGroup, sliceHeading, sliceRoot, sliceStageName, type IntakeContinuation, type IntakeNextAction, type IntakeSliceSnapshot } from "./intake";
@@ -790,9 +790,9 @@ export interface AgentConfigSection extends AgentConfigView {
    */
   scope?: string;
   /**
-   * Said beside the controls while a managed run is executing. Configuration
-   * is read when a turn is launched, so a change reaches the next one and
-   * cannot reconfigure a provider process already running.
+   * Said beside the controls whenever the selected stage is in progress
+   * (running or paused): a stage keeps the configuration it pinned before
+   * its first turn, so a preference change reaches the next stage.
    */
   activeRunNote?: string;
 }
@@ -813,8 +813,7 @@ export interface AgentConfigOutcome {
   note?: string;
 }
 
-export const APPLIES_NEXT_TURN =
-  "A run is in progress. A change here takes effect from the next stage; the agent turn already running is unaffected.";
+export const APPLIES_NEXT_TURN = "Applies from the next stage.";
 
 /**
  * A plan intake with no run yet, shown in place of older finished work.
@@ -913,7 +912,30 @@ export const FIX_CONFIGURATION_LABEL = "Fix configuration";
 export const OBSOLETE_SETTINGS_HEADLINE = "Agent configuration needs updating";
 export const OBSOLETE_SETTINGS_LINE =
   "Model and effort are now your own preferences, shared by every project. This project still has old model/effort settings.";
-export const REMOVE_OBSOLETE_LABEL = "Remove obsolete project settings";
+
+/**
+ * What stops a provider-turn launch before anything starts: obsolete
+ * project model/effort keys, which the engine refuses to run with. Built
+ * only from the freshly read `setup_problems`, never from engine prose.
+ * `undefined` when nothing blocks.
+ */
+export interface LaunchBlocker {
+  headline: string;
+  detail: string;
+  action: string;
+}
+
+export function obsoleteSettingsBlocker(config: EffectiveConfig | undefined): LaunchBlocker | undefined {
+  const problems = config?.kind === "report" ? (config.report.setup_problems ?? []).filter((problem) => problem.kind === SETUP_OBSOLETE_AGENT_SETTING) : [];
+  if (problems.length === 0) {
+    return undefined;
+  }
+  return {
+    headline: `${OBSOLETE_SETTINGS_HEADLINE}, so nothing was started.`,
+    detail: `${OBSOLETE_SETTINGS_LINE}\n\nFix configuration removes them; your own preferences are not changed. Then start again.`,
+    action: FIX_CONFIGURATION_LABEL,
+  };
+}
 
 export function setupNotice(config: EffectiveConfig | undefined): SetupNotice | undefined {
   const problems = config?.kind === "report" ? (config.report.setup_problems ?? []) : [];
@@ -947,7 +969,7 @@ export function setupNotice(config: EffectiveConfig | undefined): SetupNotice | 
     ...(gitignore ? { gitignore } : {}),
     action: onlyObsolete
       ? {
-          label: REMOVE_OBSOLETE_LABEL,
+          label: FIX_CONFIGURATION_LABEL,
           detail: "Remove the old model and effort keys from this project's settings (sparring fix-config). Your own preferences are not changed; commit the file afterwards.",
         }
       : {
@@ -1131,13 +1153,18 @@ const SETTINGS_ACTION = {
 function agentConfigSection(
   config: EffectiveConfig | undefined,
   active = false,
+  stage?: StageSnapshot,
 ): AgentConfigSection | undefined {
   const view = agentConfigView(config);
   if (!view) {
     return undefined;
   }
+  // The selected stage's pin (state.json `agents`): what it runs with until
+  // it ends, whatever the preference says now. Shown, never acted on.
+  const pins = stage?.state?.agents ?? null;
   return {
     ...view,
+    controls: view.controls.map((controls) => withStagePin(controls, pins?.[controls.role] ?? undefined)),
     settings: SETTINGS_ACTION,
     scope: view.configPath,
     // Only said when it is true, and worded as a fact about when the change
@@ -1533,10 +1560,7 @@ function buildScreen(
       matchStage: run.kind === "stage" && plan?.source === "associated" && plan.hasHeadings,
       diff: diffAction(stage),
     },
-    agentConfig: agentConfigSection(
-      artifacts.agentConfig,
-      !halted && (liveness.state === "running" || liveness.turnActive),
-    ),
+    agentConfig: agentConfigSection(artifacts.agentConfig, stageInProgress(stage, halted, liveness), stage),
     facts: facts(run, stage, artifacts.git, presentation, artifacts.associatedPlan, artifacts.siblingRepositories),
     goal: goal(artifacts, plan),
     activity: activityLine(live, halted, nowMs, uncertain),
@@ -2568,6 +2592,23 @@ function blockedDetail(model: OverviewModel): string {
  * "Ready to start" claims; nothing about the stage's readiness in any
  * other sense.
  */
+/**
+ * The selected stage is under way -- running, or paused between turns --
+ * so a preference change reaches the next stage and not this one. Under way
+ * means it has pinned its agents or run a provider session, or a turn is
+ * live now; a stage that has not started yet will pin whatever is current.
+ */
+function stageInProgress(stage: StageSnapshot, halted: boolean, liveness: RunnerLiveness): boolean {
+  if (stage.state?.status === "accepted") {
+    return false;
+  }
+  if (!halted && (liveness.state === "running" || liveness.turnActive)) {
+    return true;
+  }
+  const state = stage.state;
+  return Boolean(state && (state.agents || state.implementationSessionId || state.sparringSessionId));
+}
+
 function isFreshStage(run: RunSnapshot, stage: StageSnapshot, presentation: StagePresentation, liveness: RunnerLiveness): boolean {
   if (run.kind !== "stage" || !stage.exists || presentation.kind !== "working" || run.outcome) {
     return false;

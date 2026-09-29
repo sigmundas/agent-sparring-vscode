@@ -15,7 +15,7 @@ import {
   FIX_CONFIGURATION_LABEL,
   OBSOLETE_SETTINGS_HEADLINE,
   OBSOLETE_SETTINGS_LINE,
-  REMOVE_OBSOLETE_LABEL,
+  obsoleteSettingsBlocker,
   SETUP_HEADLINE,
   buildOverviewModel,
   setupNotice,
@@ -91,7 +91,7 @@ describe("the obsolete project model/effort notice", () => {
     assert.equal(notice.headline, OBSOLETE_SETTINGS_HEADLINE);
     assert.deepEqual(notice.lines, [OBSOLETE_SETTINGS_LINE], "one plain sentence, however many keys");
     assert.match(OBSOLETE_SETTINGS_LINE, /Model and effort are now your own preferences, shared by every project\. This project still has old model\/effort settings\./);
-    assert.equal(notice.action.label, REMOVE_OBSOLETE_LABEL);
+    assert.equal(notice.action.label, FIX_CONFIGURATION_LABEL, "the engine-owned Fix configuration, even for obsolete settings alone");
     assert.match(notice.action.detail, /fix-config/);
     assert.match(notice.action.detail, /preferences are not changed/, "the fix does not choose a preference");
   });
@@ -103,7 +103,7 @@ describe("the obsolete project model/effort notice", () => {
     assert.ok(!notice.lines.join(" ").includes("[agents.stage]"), "engine nouns stay out of the plain text");
     const html = renderOverviewHtml(buildOverviewModel({ ambiguous: [] }, undefined, artifacts(config({ setup_problems: [OBSOLETE] }))), "n", "c");
     assert.match(html, new RegExp(`<strong>${OBSOLETE_SETTINGS_HEADLINE}</strong>`));
-    assert.match(html, new RegExp(`data-action="fixConfiguration"[^>]*>${REMOVE_OBSOLETE_LABEL}</button>`), "the same engine fix, named for what it does");
+    assert.match(html, new RegExp(`data-action="fixConfiguration"[^>]*>${FIX_CONFIGURATION_LABEL}</button>`), "the same engine fix");
     const details = /<details class="setup-technical"><summary>Technical details<\/summary><pre class="engineerror">([\s\S]*?)<\/pre><\/details>/.exec(html);
     assert.ok(details);
     assert.match(details[1], /field: model/);
@@ -128,5 +128,44 @@ describe("the obsolete project model/effort notice", () => {
     const commands = await fs.readFile(path.join(root, "vscode", "commands.ts"), "utf8");
     const fix = commands.slice(commands.indexOf("async function fixConfigurationCommand"), commands.indexOf("async function sliceBranchCommand"));
     assert.doesNotMatch(fix, /writeAgentConfig|set-config/, "removing an old key never picks a new preference");
+  });
+});
+
+describe("the launch guard for obsolete settings", () => {
+  it("blocks a provider-turn launch with the plain problem and Fix configuration", () => {
+    const blocker = obsoleteSettingsBlocker(config({ setup_problems: [OBSOLETE] }));
+    assert.ok(blocker);
+    assert.match(blocker.headline, /^Agent configuration needs updating, so nothing was started\.$/);
+    assert.ok(blocker.detail.startsWith(OBSOLETE_SETTINGS_LINE));
+    assert.equal(blocker.action, FIX_CONFIGURATION_LABEL);
+    assert.ok(!blocker.detail.includes("[agents."), "engine nouns stay out of the plain text");
+  });
+
+  it("does not block for a .gitignore problem, or when nothing is wrong", () => {
+    assert.equal(obsoleteSettingsBlocker(config({ setup_problems: [PROBLEM] })), undefined);
+    assert.equal(obsoleteSettingsBlocker(config({ setup_problems: [] })), undefined);
+    assert.equal(obsoleteSettingsBlocker({ kind: "unavailable", reason: "x" }), undefined, "could not ask: the engine stays the authority");
+  });
+
+  it("runs before every command that starts a provider turn, from a fresh read, never from stderr", async () => {
+    const source = await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "commands.ts"), "utf8");
+    const guard = source.slice(source.indexOf("async function blockedByObsoleteSettings"), source.indexOf("async function blockedByObsoleteSettings") + 1600);
+    assert.match(guard, /readEffectiveConfig\(configuredExecutable\(\), location\.projectDir, location\.sparringDir, true\)/, "a fresh show-config, not a cached one");
+    assert.doesNotMatch(guard, /stderr|output/);
+    const body = (name: string) => {
+      const start = source.indexOf(`async function ${name}(`);
+      assert.ok(start >= 0, name);
+      return source.slice(start, source.indexOf("\n}\n", start));
+    };
+    for (const name of ["launchStageLoop", "askReviewerAgain", "refusedByPreflight"]) {
+      assert.match(body(name), /blockedByObsoleteSettings\(controller/, `${name} is guarded`);
+    }
+    // Every direct resume-plan / run-plan launch through the helper is guarded too.
+    const launches = [...source.matchAll(/await launch\(controller, [^;]*"(resume-plan|run-plan)"/g)].map((match) => match.index ?? 0);
+    assert.ok(launches.length >= 5);
+    for (const at of launches) {
+      const before = source.slice(Math.max(0, source.lastIndexOf("\nasync function ", at)), at);
+      assert.match(before, /blockedByObsoleteSettings\(controller|refusedByPreflight\(controller/, `launch at ${at} is guarded`);
+    }
   });
 });

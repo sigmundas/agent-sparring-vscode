@@ -59,7 +59,7 @@ import { parseHandoffBranch, parsePlanStages, type PlanRunSource } from "../core
 import { appendHumanEvidence, OUTCOME_WORDS, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
 import { blocksLaunch } from "../core/liveness";
 import type { OverviewAction } from "../core/overviewHtml";
-import { UNKNOWN_RUNNER_EXPLANATION, type ActionRequired, type PlanContinuation } from "../core/overviewModel";
+import { UNKNOWN_RUNNER_EXPLANATION, obsoleteSettingsBlocker, type ActionRequired, type PlanContinuation } from "../core/overviewModel";
 import { createStage, proposeNextStage, renderNextStageBrief, type NewStageResult } from "../core/nextStage";
 import { buildStageIndex, locateStage, parsePlanHeadings, sectionSummary, type HeadingRef, type PlanHeading, type StageEntry } from "../core/planAssociation";
 import { stageBelongsToPlan, type PlanScope, type StageOrigin } from "../core/planMembership";
@@ -82,7 +82,7 @@ import { manifestSupport } from "./engineProbe";
 import { openCandidateDiff } from "./overview/gitDiff";
 import { configuredExecutable } from "./engineExecutable";
 import { settingsTarget } from "../core/settingsTarget";
-import { fixSetup, resetModelChoicesCache } from "./configProbe";
+import { fixSetup, readEffectiveConfig, resetModelChoicesCache } from "./configProbe";
 import { OverviewPanelManager } from "./overview/overviewPanel";
 
 export function registerCommands(context: vscode.ExtensionContext, controller: SparringController): void {
@@ -91,6 +91,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     (action) => handleOverviewAction(controller, overview, action),
     (message) => handleIntakeAction(controller, overview, message),
   );
+  launchOverview = overview;
   context.subscriptions.push(
     overview,
     vscode.commands.registerCommand("agentSparring.showLog", () => controller.showLog()),
@@ -352,6 +353,37 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
 
 let lastCommandNotFound: { runId: string; word: string; exitCode: number } | undefined;
 let lastEngineFailure: EngineFailure | undefined;
+/** The Overview, for the launch guard's Fix configuration to refresh. */
+let launchOverview: OverviewPanelManager | undefined;
+
+/**
+ * The launch guard shared by every command that starts a provider turn
+ * (Run Plan, Resume Plan, Continue automatically, Run/Resume stage, a review
+ * turn): obsolete project model/effort keys make the engine refuse, so a
+ * freshly read `show-config` reporting them stops the launch here, with the
+ * plain problem and the engine-owned Fix configuration, rather than in a
+ * failed terminal. Decided from `setup_problems` only, never from prose.
+ * True means nothing was launched.
+ */
+async function blockedByObsoleteSettings(controller: SparringController, location: { projectDir: string; sparringDir: string }): Promise<boolean> {
+  let blocker;
+  try {
+    blocker = obsoleteSettingsBlocker(await readEffectiveConfig(configuredExecutable(), location.projectDir, location.sparringDir, true));
+  } catch {
+    return false; // could not ask: the engine's own refusal stays the authority
+  }
+  if (!blocker) {
+    return false;
+  }
+  controller.log(`Launch refused before starting: obsolete project model/effort settings in ${location.sparringDir}`);
+  const choice = await vscode.window.showWarningMessage(`Agent Sparring: ${blocker.headline}`, { modal: true, detail: blocker.detail }, blocker.action);
+  if (choice === blocker.action && launchOverview) {
+    await fixConfigurationCommand(controller, launchOverview);
+  } else {
+    await launchOverview?.forceRefresh();
+  }
+  return true;
+}
 
 // ---------------------------------------------------------------- select run
 
@@ -628,6 +660,9 @@ async function handleIntakeAction(controller: SparringController, overview: Over
   const invocation = startInvocation(next.slice, locations, canonicalPathOrSelf);
   if (!invocation.ok) {
     void vscode.window.showWarningMessage(`Agent Sparring: ${invocation.problem}`);
+    return;
+  }
+  if (await blockedByObsoleteSettings(controller, invocation.location)) {
     return;
   }
   if (controller.livenessFor(invocation.runId).state === "running") {
@@ -1170,6 +1205,9 @@ async function runStageCommand(controller: SparringController): Promise<void> {
 }
 
 async function launchStageLoop(controller: SparringController, run: StandaloneStageSnapshot, label: string): Promise<void> {
+  if (await blockedByObsoleteSettings(controller, run.location)) {
+    return;
+  }
   const repoRoot = run.location.repoRoot;
   const expectedBranch = await currentBranch(repoRoot);
   if (!expectedBranch) {
@@ -1485,6 +1523,9 @@ async function submitDeferredVerification(
   }
   const args = buildResumePlanArgs({ ...input, repoRoot: run.location.repoRoot, expectedBranch, sparringDir: run.location.sparringDir, deferredResults: answers });
   controller.log(`Submit deferred verification: ${answers.length} result(s) passed to resume-plan --deferred-result`);
+  if (await blockedByObsoleteSettings(controller, run.location)) {
+    return;
+  }
   const result = await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, manifestArgumentOf(input));
   if (result.ok) {
     await controller.beginSubmission({
@@ -1697,6 +1738,9 @@ async function askReviewerAgain(controller: SparringController, run: RunSnapshot
     }
     const args = buildResumePlanArgs({ ...input, repoRoot: run.location.repoRoot, expectedBranch, sparringDir: run.location.sparringDir, evidence: entry });
     controller.log(`${logPrefix} passed to resume-plan --evidence for ${run.currentStage.stageId}`);
+    if (await blockedByObsoleteSettings(controller, run.location)) {
+      return { launched: false };
+    }
     const result = await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, manifestArgumentOf(input));
     return result.ok ? { launched: true, executionId: result.record.id } : { launched: false };
   }
@@ -1705,6 +1749,9 @@ async function askReviewerAgain(controller: SparringController, run: RunSnapshot
     void vscode.window.showErrorMessage(
       `Agent Sparring: no Git branch is checked out in ${run.location.folderName} (detached HEAD or not a repository). Check out the stage's branch, then submit again.`,
     );
+    return { launched: false };
+  }
+  if (await blockedByObsoleteSettings(controller, run.location)) {
     return { launched: false };
   }
   if (!(await recordEvidence(controller, run, entry))) {
@@ -1813,6 +1860,9 @@ async function allowPushCommand(controller: SparringController, overview: Overvi
   controller.log(
     `Allow push: authorizing ${panel.candidateSha} for ${panel.target}${forRun ? ", and this run's later verified candidates" : ""}; the engine performs the push and then its own acceptance gate`,
   );
+  if (await blockedByObsoleteSettings(controller, run.location)) {
+    return { ok: false, reason: "launch", message: "obsolete project model/effort settings" };
+  }
   const result = await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, manifestArgumentOf(input));
   if (!result.ok) {
     await overview.update();
@@ -2510,6 +2560,9 @@ async function runPlanCommand(controller: SparringController, overview: Overview
     return;
   }
   const args = buildRunPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir, runKey });
+  if (await blockedByObsoleteSettings(controller, location)) {
+    return;
+  }
   const result = await launch(controller, location, args, "run-plan", planPath, runId);
   if (result.ok) {
     await controller.showStartedRun(runId);
@@ -2598,6 +2651,9 @@ async function resumePlanCommand(controller: SparringController, preselected?: P
     sparringDir: run.location.sparringDir,
     evidence,
   });
+  if (await blockedByObsoleteSettings(controller, run.location)) {
+    return;
+  }
   await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, manifestArgumentOf(input));
 }
 
@@ -3333,6 +3389,9 @@ async function refusedByPreflight(
   stage: StageSnapshot | undefined,
   context: PreflightContext,
 ): Promise<boolean> {
+  if (await blockedByObsoleteSettings(controller, context.location)) {
+    return true;
+  }
   const blockers = await preflight(stage, context);
   if (blockers.length === 0) {
     return false;

@@ -16,6 +16,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import * as crypto from "node:crypto";
 import * as os from "node:os";
+import { execFile } from "node:child_process";
 import type { DiscoveryDiagnostic } from "../core/diagnose";
 import { discoverRuns, selectRun } from "../core/discovery";
 import { stageScopeKey, stageScopeOf } from "../core/stageScope";
@@ -306,6 +307,7 @@ interface ModelReport {
       model: { value: string; options?: { value: string; label: string; custom?: boolean }[]; fixedText?: string; summary?: string; detail: string };
       effort?: { value: string; options?: { value: string; label: string }[]; summary?: string };
       technical: { label: string; value: string }[];
+      stagePin?: string;
     }[];
     configPath?: string;
     userConfigPath?: string;
@@ -3748,8 +3750,8 @@ async function agentConfigAssertions(report: DiscoveryDiagnostic, reportedRepo: 
   assert.ok(!values(sparrerControl.model.options).some((value) => value.startsWith("claude-")), "and Claude's never for Codex");
   assert.ok(![...(stageControl.model.options ?? []), ...(stageControl.effort?.options ?? [])].some((option) => option.label === "Project setting"), "no Project setting option");
   // Where the suggestions came from is said, and they are not called complete.
-  assert.match(stageControl.model.detail, /Suggestions from the models Agent Sparring knows; other exact models may exist/);
-  assert.match(sparrerControl.model.detail, /Suggestions from Codex's own model list; other exact models may exist/);
+  assert.match(stageControl.model.detail, /Suggestions from the models Agent Sparring knows; not a complete list\. Any exact model id can be entered\./);
+  assert.match(sparrerControl.model.detail, /Suggestions from Codex's own model list; not a complete list\./);
   assert.ok(stageControl.technical.some((entry) => entry.label === "Model suggestions" && /^engine-known, not complete/.test(entry.value)));
   assert.ok(sparrerControl.technical.some((entry) => entry.label === "Model suggestions" && /^provider-catalog, not complete/.test(entry.value)));
   // Nothing configured is the words for that, never a model name.
@@ -3892,6 +3894,34 @@ async function agentConfigAssertions(report: DiscoveryDiagnostic, reportedRepo: 
   assert.equal(settled.agentConfig?.controls[0].effort?.value, "max");
   assert.equal(await exists(configPath), false, "after every change, the repository still has no configuration written by them");
 
+  // A stage keeps the configuration it pinned before its first turn: the
+  // card says what this stage runs with when that differs from the
+  // preference, and that a change applies from the next stage.
+  const pinnedState = path.join(reportedRepo, ".sparring", "stages", "stage-review-complete", "state.json");
+  const unpinned = await fs.readFile(pinnedState, "utf8");
+  await fs.writeFile(
+    pinnedState,
+    JSON.stringify({
+      ...JSON.parse(unpinned),
+      // Under way, whatever an earlier section left it as: the note is about
+      // a stage in progress, and an accepted one is not.
+      status: "working",
+      agents: {
+        stage: { provider: "claude-cli", model: "claude-haiku-4-5-20251001", model_source: "user", effort: "low", effort_source: "user" },
+        sparring: { provider: "codex-cli", model: null, model_source: "provider-default", effort: "ultra", effort_source: "user" },
+      },
+    }),
+  );
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  const pinned = await model();
+  assert.equal(pinned.agentConfig?.controls[0].stagePin, "This stage: claude-haiku-4-5-20251001 · low", "what this stage runs with, beside the preference");
+  assert.equal(pinned.agentConfig?.controls[0].model.value, "claude-fable-5-1", "the preference itself is unchanged");
+  assert.equal(pinned.agentConfig?.controls[1].stagePin, undefined, "the sparrer's pin equals its preference, so nothing extra is said");
+  assert.equal(pinned.agentConfig?.activeRunNote, "Applies from the next stage.");
+  assert.ok(pinned.agentConfig?.controls[0].technical.some((entry) => entry.label === "This stage runs with" && entry.value.includes("claude-haiku-4-5-20251001")));
+  await fs.writeFile(pinnedState, unpinned);
+  await vscode.commands.executeCommand("agentSparring.refresh");
+
   // A message that is not a well-formed change never reaches the engine.
   await fs.rm(callsLog, { force: true });
   for (const bad of [
@@ -3914,9 +3944,43 @@ async function agentConfigAssertions(report: DiscoveryDiagnostic, reportedRepo: 
   const obsolete = await model();
   assert.equal(obsolete.setup?.headline, "Agent configuration needs updating");
   assert.deepEqual(obsolete.setup?.lines, ["Model and effort are now your own preferences, shared by every project. This project still has old model/effort settings."]);
-  assert.equal(obsolete.setup?.action.label, "Remove obsolete project settings");
   assert.match(obsolete.setup?.technical ?? "", /role: stage\nfield: model\nvalue: claude-haiku-4-5-20251001\nconfig: \.sparring\/project\.toml/);
   assert.equal(obsolete.agentConfig?.controls[0].model.value, "claude-fable-5-1", "the old key is not what runs: the preference is");
+  assert.equal(obsolete.setup?.action.label, "Fix configuration", "the engine-owned fix, whatever it fixes");
+
+  // The fake engine refuses a provider turn with obsolete keys, as the real one does.
+  const fake = vscode.workspace.getConfiguration("agentSparring").get<string>("executable") as string;
+  const refusedRun = await new Promise<{ code: number | null; stderr: string }>((resolve) =>
+    execFile(fake, ["run-loop", "stage-review-complete", "--repo-root", reportedRepo], { cwd: reportedRepo }, (error, _stdout, stderr) =>
+      resolve({ code: error ? ((error as { code?: number }).code ?? 1) : 0, stderr }),
+    ),
+  );
+  assert.equal(refusedRun.code, 1);
+  assert.match(refusedRun.stderr, /project\.toml still sets .*fix-config/);
+  // And the extension does not even launch it: Run stage stops before any
+  // terminal, with the plain problem and Fix configuration.
+  const runLoopArgv = path.join(fixtureRoot, "fake-argv-run-loop.log");
+  await fs.rm(runLoopArgv, { force: true });
+  const typed = runIdOf(report, reportedRepo, "stage-reported-statistics-typed-parser");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", typed), typed);
+  const warnings: { message: string; items: unknown[] }[] = [];
+  const warning = window["showWarningMessage"];
+  window["showWarningMessage"] = async (message: string, ...rest: unknown[]) => {
+    const items = rest.filter((item) => typeof item === "string");
+    warnings.push({ message, items });
+    return items.includes("Run anyway") ? "Run anyway" : undefined;
+  };
+  try {
+    await vscode.commands.executeCommand("agentSparring.runStage");
+  } finally {
+    window["showWarningMessage"] = warning;
+  }
+  const blocked = warnings.find((entry) => /Agent configuration needs updating, so nothing was started\./.test(entry.message));
+  assert.ok(blocked, `the launch was refused in plain words: ${JSON.stringify(warnings)}`);
+  assert.deepEqual(blocked.items, ["Fix configuration"]);
+  assert.equal(await exists(runLoopArgv), false, "no run-loop was launched");
+  assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
+
   const prefsBeforeFix = await prefs();
   await fs.rm(callsLog, { force: true });
   await vscode.commands.executeCommand("agentSparring._test.overviewAction", "fixConfiguration");
@@ -3929,5 +3993,5 @@ async function agentConfigAssertions(report: DiscoveryDiagnostic, reportedRepo: 
   await fs.rm(configPath, { force: true });
   await fs.rm(prefsPath, { force: true });
   await vscode.commands.executeCommand("agentSparring.refresh");
-  console.log("integration: the Agents controls offered the engine's model suggestions per role and provider plus an exact custom id, every change ran set-config for the global preference and left the repository clean, a repository switch showed the same preference, a stale or refused change was never applied, and obsolete project keys were removed by fix-config");
+  console.log("integration: the Agents controls offered the engine's model suggestions per role and provider plus an exact custom id, every change ran set-config for the global preference and left the repository clean, a repository switch showed the same preference, a stale or refused change was never applied, a pinned stage said what it runs with and that changes apply from the next stage, and obsolete project keys blocked Run stage before any launch and were removed by fix-config");
 }

@@ -1829,6 +1829,7 @@ function renderRoleControls(role: AgentRoleControls, scope: string, dials = "", 
       const quiet = item.summary === PROVIDER_DEFAULT_LABEL ? " novalue" : "";
       return `<div class="agentconfig-effective${quiet}" data-effective="${escapeHtml(item.field)}">${escapeHtml(item.label)}: ${escapeHtml(item.summary ?? "")}</div>`;
     });
+  const pin = role.stagePin ? `<div class="agentconfig-pin" data-stage-pin="${escapeHtml(role.role)}">${escapeHtml(role.stagePin)}</div>` : "";
   const runtime = runtimeModel
     ? `<div class="agentconfig-runtime muted" data-runtime-model="${escapeHtml(runtimeModel)}">Provider reported running ${escapeHtml(runtimeModel)}</div>`
     : "";
@@ -1839,7 +1840,7 @@ function renderRoleControls(role: AgentRoleControls, scope: string, dials = "", 
   // Fields left, dials right. The fields column is what gives way when the
   // card is narrow, because a truncated dropdown is still usable and a
   // squashed dial is not readable at all.
-  return `<div class="agentconfig-block"><div class="agentconfig-fields">${summaries.join("")}${runtime}${rows}${details}</div>${dials}</div>`;
+  return `<div class="agentconfig-block"><div class="agentconfig-fields">${summaries.join("")}${pin}${runtime}${rows}${details}</div>${dials}</div>`;
 }
 
 /**
@@ -2128,6 +2129,7 @@ pre.engineerror { margin: 6px 0 0; padding: 6px 8px; max-height: 9em; overflow: 
    weight. */
 .agentconfig-effective { font-size: 0.95em; font-weight: 600; margin-top: 2px; overflow-wrap: anywhere; }
 .agentconfig-effective.novalue { font-weight: 400; font-style: italic; color: var(--vscode-descriptionForeground); }
+.agentconfig-pin { font-size: 0.9em; margin-top: 2px; overflow-wrap: anywhere; }
 .agentconfig-runtime { font-size: 0.9em; margin-top: 2px; overflow-wrap: anywhere; }
 .agentconfig-technical { margin-top: 6px; font-size: 0.9em; }
 .agentconfig-fixed.novalue { font-weight: 400; font-style: italic; color: var(--vscode-descriptionForeground); }

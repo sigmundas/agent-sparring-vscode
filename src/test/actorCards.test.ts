@@ -365,7 +365,7 @@ describe("each actor card is its own configuration surface", () => {
     const model = buildOverviewModel(await planSelection(), live, artifacts(parsed()), Date.parse(live.lastEventTs!) + 1000);
     assert.equal(model.agentConfig?.activeRunNote, APPLIES_NEXT_TURN, "said as a fact about when it lands");
     const html = renderOverviewHtml(model, "n", "c");
-    assert.match(html, /takes effect from the next stage/);
+    assert.match(html, /Applies from the next stage\./);
 
     const effort = elementFrom(html, "select", /<select data-role="stage"[^>]*data-field="effort"[^>]*>/, "the stage effort dropdown");
     effort.value = "brisk";

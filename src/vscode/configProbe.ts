@@ -34,7 +34,7 @@ const cache = new Map<string, { stamp: string; value: EffectiveConfig }>();
  * is global and the cockpit already knows where the project's one is; it
  * must not depend on the process's working directory matching.
  */
-export async function readEffectiveConfig(configured: string | undefined, projectDir: string, sparringDir: string): Promise<EffectiveConfig> {
+export async function readEffectiveConfig(configured: string | undefined, projectDir: string, sparringDir: string, fresh = false): Promise<EffectiveConfig> {
   const planned = await planExecutable(configured, hostEnv(projectDir), false);
   if (!planned.ok || planned.plan.kind === "shell") {
     // Nothing here can run it; the engine's own refusals remain the
@@ -51,7 +51,8 @@ export async function readEffectiveConfig(configured: string | undefined, projec
   // So is setup, which the repository's .gitignore decides: fixing it by
   // hand must clear the notice without waiting for project.toml to change.
   const stamp = `${file}\u0000${sparringDir}\u0000${await configStamp(sparringDir)}\u0000${userPath ? await fileStamp(userPath) : ""}\u0000${await fileStamp(path.join(projectDir, ".gitignore"))}`;
-  if (known && known.stamp === stamp) {
+  // `fresh`: a launch decision reads the engine now, never a cached answer.
+  if (known && known.stamp === stamp && !fresh) {
     return known.value;
   }
   const value = await probe(file, projectDir, sparringDir);

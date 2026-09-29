@@ -182,6 +182,8 @@ export class Workspace {
        * check that it still reads back as that plan's legacy run's stage.
        */
       plan: string | null;
+      /** The engine's per-stage agent pin (stage.py `StageState.agents`), verbatim. */
+      agents: unknown;
     }> = {},
     files: Partial<Record<"brief.md" | "notes.md" | "handoff.md" | "sparring.md", string>> = {},
   ): Promise<string> {

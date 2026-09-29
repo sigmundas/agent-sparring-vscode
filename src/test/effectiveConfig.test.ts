@@ -15,6 +15,9 @@ import { describe, it } from "node:test";
 import {
   CUSTOM_MODEL_LABEL,
   CUSTOM_MODEL_VALUE,
+  INCOMPLETE_CHOICES,
+  exactModelProblem,
+  withStagePin,
   PROVIDER_DEFAULT_LABEL,
   PROVIDER_DEFAULT_VALUE,
   agentConfigView,
@@ -600,7 +603,7 @@ describe("the rendered controls are self-describing", () => {
     assert.doesNotMatch(html, /data-custom="1" selected/);
   });
 
-  it("says a change lands on the next turn only while a run is actually active", async () => {
+  it("says Applies from the next stage only while the selected stage is in progress", async () => {
     const ws = await Workspace.create();
     await ws.writePlan();
     await ws.writePlanRun(FOO_PLAN_KEY, { plan: FOO_PLAN_LABEL, status: "running", current_stage_index: 0, current_stage: FOO_STAGE_IDS[0] });
@@ -609,17 +612,27 @@ describe("the rendered controls are self-describing", () => {
     const artifacts = { handoff: false, sparring: false, brief: false, plan: false, agentConfig: parsed() };
 
     const quiet = buildOverviewModel(selection, undefined, artifacts, NOW);
-    assert.equal(quiet.agentConfig?.activeRunNote, undefined, "nothing is running, so nothing is said");
+    assert.equal(quiet.agentConfig?.activeRunNote, undefined, "a stage that has not started will pin what is current, so nothing is said");
+    assert.doesNotMatch(renderOverviewHtml(quiet, "nonce", "csp:"), /Applies from the next stage/);
 
     const live = foldEvents([event("stage", "turn.started", { provider: "claude-cli" })]);
     const busy = buildOverviewModel(selection, live, artifacts, Date.parse(live.lastEventTs!) + 1000);
     assert.equal(busy.agentConfig?.activeRunNote, APPLIES_NEXT_TURN);
-    // A statement about when it lands, never a claim that the running agent
-    // changed model part-way through its own call.
-    assert.match(APPLIES_NEXT_TURN, /takes effect from the next stage/);
-    assert.match(APPLIES_NEXT_TURN, /already running is unaffected/);
-    assert.doesNotMatch(APPLIES_NEXT_TURN, /cannot|blocked|not allowed/i);
-    assert.match(renderOverviewHtml(busy, "nonce", "csp:"), /takes effect from the next stage/);
+    // A statement about when it lands, exactly these words.
+    assert.equal(APPLIES_NEXT_TURN, "Applies from the next stage.");
+    assert.match(renderOverviewHtml(busy, "nonce", "csp:"), /<p class="muted note">Applies from the next stage\.<\/p>/);
+
+    // Paused between turns: no runner, but the stage has pinned its agents
+    // (or run a session), so it is still in progress and the note stays.
+    await ws.writeStage(FOO_STAGE_IDS[0], { status: "working", implementation_session_id: "impl-1" });
+    const paused = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, artifacts, NOW);
+    assert.equal(paused.agentConfig?.activeRunNote, APPLIES_NEXT_TURN, "a paused stage keeps its configuration too");
+    await ws.writeStage(FOO_STAGE_IDS[0], { status: "working", agents: { stage: { provider: "claude-cli", model: null, model_source: "provider-default", effort: null, effort_source: "provider-default" } } });
+    const pinned = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, artifacts, NOW);
+    assert.equal(pinned.agentConfig?.activeRunNote, APPLIES_NEXT_TURN);
+    await ws.writeStage(FOO_STAGE_IDS[0], { status: "accepted", implementation_session_id: "impl-1" });
+    const done = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, artifacts, NOW);
+    assert.equal(done.agentConfig?.activeRunNote, undefined, "an accepted stage is not in progress");
     // And it is a note, not a lock: the controls are still there.
     assert.match(renderOverviewHtml(busy, "nonce", "csp:"), /data-field="effort"/);
   });
@@ -680,7 +693,7 @@ describe("choosing the model from the engine's suggestions", () => {
     assert.equal(stage.model.options?.[1]?.label, "claude-opus-5-5 · Claude Opus 5.5", "the exact id first, then the provider's name for it");
     assert.equal(stage.model.options?.at(-1)?.label, CUSTOM_MODEL_LABEL);
     assert.equal(stage.model.options?.at(-1)?.custom, true);
-    assert.match(stage.model.detail, /Suggestions from the models Agent Sparring knows; other exact models may exist/);
+    assert.match(stage.model.detail, /Suggestions from the models Agent Sparring knows; not a complete list\. Any exact model id can be entered\./, "an incomplete list is marked as such and is not validation");
     const sparring = controls(withChoices(), "sparring")!;
     assert.match(sparring.model.detail, /Suggestions from Codex's own model list/);
   });
@@ -727,5 +740,90 @@ describe("choosing the model from the engine's suggestions", () => {
     assert.deepEqual(offenders, []);
     const manifest = JSON.parse(await fs.readFile(path.join(__dirname, "..", "..", "package.json"), "utf8"));
     assert.equal(manifest.contributes.configuration.properties["agentSparring.modelChoices"], undefined);
+  });
+});
+
+describe("the Other exact model… input", () => {
+  it("refuses an empty id and one beginning with a dash before the engine is asked", () => {
+    assert.match(exactModelProblem("") ?? "", /Enter an exact model id/);
+    assert.match(exactModelProblem("   ") ?? "", /Enter an exact model id/);
+    assert.match(exactModelProblem("-m") ?? "", /cannot begin with "-"/);
+    assert.match(exactModelProblem("  --model") ?? "", /cannot begin with "-"/, "checked on the trimmed id");
+    assert.equal(exactModelProblem("claude-opus-5-5-20260901"), undefined);
+    assert.equal(exactModelProblem("a-b"), undefined, "a dash inside an id is fine");
+  });
+
+  it("is the input box's validateInput, and is checked again before the write", async () => {
+    const panel = stripComments(await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "overview", "overviewPanel.ts"), "utf8"));
+    assert.match(panel, /validateInput: exactModelProblem/);
+    assert.match(panel, /if \(!exact \|\| exactModelProblem\(exact\)\)/);
+  });
+});
+
+describe("the incomplete suggestion list", () => {
+  it("is marked visibly wherever the engine says it is not complete, and never when it is", () => {
+    const choices = (complete: boolean): EngineModelChoices[] => [{ role: "stage", provider: "claude-cli", source: "engine-known", complete, custom_allowed: true, choices: [{ model: "m-1" }], error: null }];
+    const view = (complete: boolean) => {
+      const base = parsed();
+      return agentConfigView(base.kind === "report" ? { ...base, modelChoices: choices(complete) } : base)!.controls[0];
+    };
+    assert.ok(view(false).model.detail.includes(INCOMPLETE_CHOICES));
+    assert.ok(!view(true).model.detail.includes(INCOMPLETE_CHOICES));
+    assert.ok(view(false).technical.some((entry) => entry.label === "Model suggestions" && entry.value === "engine-known, not complete"));
+    assert.equal(view(false).model.options?.at(-1)?.custom, true, "an exact custom id is always offered");
+  });
+});
+
+describe("the stage's pinned configuration", () => {
+  const stage = () => agentConfigView(parsed())!.controls[0];
+  const pin = (overrides: Partial<{ provider: string; model: string | null; effort: string | null }> = {}) => ({
+    provider: "claude-cli",
+    model: "claude-opus-5-5",
+    modelSource: "user",
+    effort: "high",
+    effortSource: "user",
+    ...overrides,
+  });
+
+  it("says nothing extra when the stage runs with the current preference", () => {
+    const same = withStagePin(stage(), pin());
+    assert.equal(same.stagePin, undefined);
+    assert.ok(same.technical.some((entry) => entry.label === "This stage runs with" && /claude-opus-5-5 \(source: user\)/.test(entry.value)), "but the pin is in Technical details");
+    const controls = stage();
+    assert.equal(withStagePin(controls, undefined), controls, "no pin, no change");
+  });
+
+  it("shows what this stage runs with when it differs from the preference", () => {
+    assert.equal(withStagePin(stage(), pin({ model: "claude-fable-5-1" })).stagePin, "This stage: claude-fable-5-1 · high");
+    assert.equal(withStagePin(stage(), pin({ effort: "low" })).stagePin, "This stage: claude-opus-5-5 · low");
+    assert.equal(withStagePin(stage(), pin({ model: null, effort: null })).stagePin, "This stage: Provider default");
+    assert.equal(withStagePin(stage(), pin({ provider: "acme-cli" })).stagePin, "This stage: acme-cli · claude-opus-5-5 · high");
+  });
+
+  it("is read tolerantly from state.json and shown on the card", async () => {
+    const ws = await Workspace.create();
+    await ws.writePlan();
+    await ws.writePlanRun(FOO_PLAN_KEY, { plan: FOO_PLAN_LABEL, status: "running", current_stage_index: 0, current_stage: FOO_STAGE_IDS[0] });
+    await ws.writeStage(FOO_STAGE_IDS[0], {
+      status: "working",
+      agents: {
+        stage: { provider: "claude-cli", model: "claude-fable-5-1", model_source: "user", effort: "high", effort_source: "user" },
+        sparring: { provider: "codex-cli", model: "gpt-5.6-terra", model_source: "user", effort: null, effort_source: "provider-default" },
+        reviewer: "not an object",
+      },
+    });
+    const selection = selectRun((await discoverRuns([ws.location])).runs);
+    const model = buildOverviewModel(selection, undefined, { handoff: false, sparring: false, brief: false, plan: false, agentConfig: parsed() }, NOW);
+    assert.equal(model.agentConfig?.controls[0].stagePin, "This stage: claude-fable-5-1 · high");
+    assert.equal(model.agentConfig?.controls[1].stagePin, undefined, "the sparrer's pin matches its preference");
+    const html = renderOverviewHtml(model, "nonce", "csp:");
+    assert.match(html, /<div class="agentconfig-pin" data-stage-pin="stage">This stage: claude-fable-5-1 · high<\/div>/);
+    assert.equal((html.match(/data-stage-pin=/g) ?? []).length, 1);
+
+    for (const junk of [null, "x", [1], { stage: { model: "no provider" } }]) {
+      await ws.writeStage(FOO_STAGE_IDS[0], { status: "working", agents: junk });
+      const again = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, { handoff: false, sparring: false, brief: false, plan: false, agentConfig: parsed() }, NOW);
+      assert.equal(again.agentConfig?.controls[0].stagePin, undefined, `no pin from ${JSON.stringify(junk)}`);
+    }
   });
 });

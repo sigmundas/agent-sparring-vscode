@@ -105,10 +105,13 @@ Each role's **Model** and **Effort** are dropdowns on its card.
 the model currently configured, even when no suggestion names it; the
 engine's suggestions for exactly that role and provider; and **Other exact
 model…**, which asks for an exact model id and sends it to the engine as one
-argument, never through a shell. The suggestions come from
+argument, never through a shell; the input refuses an empty id and one
+beginning with `-` before the engine is asked, and any refusal the engine
+returns is still shown in its own words. The suggestions come from
 `sparring model-choices --json` — for Codex the provider's own catalog, for
 Claude the models the engine knows — and are only suggestions: they are
-never a validation boundary and are not called complete. A list for one
+never a validation boundary; a list the engine does not call complete says
+"not a complete list" in the dropdown's tooltip. A list for one
 provider is never offered for another. They are read once per session per
 role and provider (the Codex catalog spawns `codex`) and read again on an
 explicit **Refresh**. The engine refuses a Claude alias such as `opus` as a
@@ -133,9 +136,16 @@ leaves the engine's diagnostic on screen and its value in the control.
 Switching repositories re-reads `show-config` for the new repository, which
 reports the same preference while the role and provider are the same.
 
-While a run is in progress, the card says — and a saved change repeats —
-that the change takes effect from the next stage; the provider turn already
-running is unaffected.
+**A stage keeps one configuration for its whole life.** Before a stage's
+first provider turn the engine records what each role runs with in the
+stage's `state.json` (`agents`), and every later turn of that stage —
+SEND_BACK, a resume in a new process, finalization — reuses it. Editing your
+preference stays allowed at any time, and whenever the selected stage is in
+progress (running or paused) the Agents area says **Applies from the next
+stage.** When the stage's pin differs from your current preference, the card
+also says what this stage runs with ("This stage: claude-opus-5-5 · high"),
+and the pin is in the role's Technical details. The pin is shown, never acted
+on: nothing is rebuilt or switched mid-stage.
 
 A change carries the `project.toml` its control was drawn from, and is
 applied only if that is still the repository this window is looking at, so
@@ -149,11 +159,19 @@ Older projects may still set `model` or `effort` in `project.toml`. The
 engine no longer reads them and reports each as a setup problem; the
 Overview shows **Agent configuration needs updating** — "Model and effort
 are now your own preferences, shared by every project. This project still
-has old model/effort settings." — with a **Remove obsolete project
-settings** button. It runs `sparring fix-config --json`, which removes the
+has old model/effort settings." — with the engine-owned **Fix
+configuration** button. It runs `sparring fix-config --json`, which removes the
 keys and chooses no preference in their place; commit the file afterwards.
 Role, field, value, config path and the engine's own message are under
 Technical details.
+
+While they are there the engine refuses every command that starts a provider
+turn (`run-plan`, `resume-plan`, `run-loop`, `run-sparring`, …). So Run Plan,
+Resume Plan, Continue automatically, Run/Resume stage and a review turn first
+read `show-config` afresh and, when it reports an obsolete setting, launch
+nothing: they say so in plain words with the same **Fix configuration**
+action, instead of opening a terminal that would fail. This is decided from
+the engine's `setup_problems`, never from its error text.
 
 **Settings**, beside the cards, still opens `project.toml`, where the
 provider is set.
