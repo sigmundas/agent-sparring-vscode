@@ -98,6 +98,8 @@ export interface ApprovePlanInvocation {
   repoRoot: string;
   repositoryName: string;
   sparringDir?: string;
+  /** Sibling repositories the slice declares: `--repository NAME=PATH --repository-branch NAME=BRANCH`. */
+  siblings?: Record<string, { path: string; branch: string }>;
 }
 
 export function buildApprovePlanArgs(invocation: ApprovePlanInvocation): string[] {
@@ -111,6 +113,9 @@ export function buildApprovePlanArgs(invocation: ApprovePlanInvocation): string[
     invocation.repoRoot,
     "--repository-name",
     invocation.repositoryName,
+    ...Object.keys(invocation.siblings ?? {})
+      .sort()
+      .flatMap((name) => ["--repository", `${name}=${invocation.siblings![name].path}`, "--repository-branch", `${name}=${invocation.siblings![name].branch}`]),
   ];
 }
 

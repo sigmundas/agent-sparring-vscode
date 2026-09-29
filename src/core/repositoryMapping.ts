@@ -49,3 +49,13 @@ export async function checkRepositoryMapping(_name: string, repoPath: string, re
   }
   return { valid: true };
 }
+
+/** The branch checked out at `repoPath`, or undefined when detached or unreadable. */
+export async function checkedOutBranch(repoPath: string): Promise<string | undefined> {
+  try {
+    const branch = await git(repoPath, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    return branch || undefined;
+  } catch {
+    return undefined;
+  }
+}

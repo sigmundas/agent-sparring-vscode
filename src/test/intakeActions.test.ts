@@ -10,7 +10,8 @@
  *    when blocking findings are recorded, Approve for the next unapproved
  *    slice otherwise, Start for an approved slice with no run;
  *  - approve-plan is invoked for the right slice from its primary repository,
- *    with no gate, sibling or amendment flag supplied on the person's behalf;
+ *    with no gate or amendment flag supplied on the person's behalf, and sibling
+ *    repositories only as the person confirmed them;
  *  - Start runs the exact sealed manifest with the approval's own values;
  *  - an engine refusal is shown verbatim and nothing else is attempted;
  *  - once the run's state exists the managed run takes over;
@@ -176,7 +177,7 @@ describe("the engine commands, built from the engine's own records", () => {
     assert.equal(invocation.cwd, path.join(base, "web"));
   });
 
-  it("no gate, sibling or amendment flag is ever supplied on the person's behalf", () => {
+  it("with nothing confirmed, no gate, sibling or amendment flag is supplied on the person's behalf", () => {
     const args = buildApprovePlanArgs({ intakeDir: "/i", runId: "web", repoRoot: "/r", repositoryName: "web" });
     for (const flag of ["--confirm-prerequisite", "--repository", "--repository-branch", "--without-amendment", "--expected-branch"]) {
       assert.ok(!args.includes(flag), flag);

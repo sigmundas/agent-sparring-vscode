@@ -48,10 +48,10 @@ import {
   type StandaloneStageSnapshot,
   type DiscoveredIntake,
 } from "../core/discovery";
-import { intakeContinuation, intakeNextAction, intakeStateLabel, sliceRoot, sliceStageName, sourcePlanDigest } from "../core/intake";
+import { intakeContinuation, intakeNextAction, intakeStateLabel, sliceRoot, sliceStageName, sourcePlanDigest, type IntakeSliceSnapshot } from "../core/intake";
 import type { IntakeActionMessage } from "../core/overviewHtml";
-import { approveInvocation, preparedFromCurrentPlan, prepareInvocation, staleContextRepositories, startInvocation } from "../core/intakeActions";
-import { checkRepositoryMapping } from "../core/repositoryMapping";
+import { approveInvocation, preparedFromCurrentPlan, prepareInvocation, proposeSiblingMappings, staleContextRepositories, startInvocation } from "../core/intakeActions";
+import { checkedOutBranch, checkRepositoryMapping } from "../core/repositoryMapping";
 import { stageScopeOf } from "../core/stageScope";
 import { CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
@@ -570,7 +570,19 @@ async function handleIntakeAction(controller: SparringController, overview: Over
       // A second click before the page redrew: the first approve-plan is still running.
       return;
     }
-    const invocation = approveInvocation(intake, next.slice, locations);
+    const siblings = await confirmSiblings(intake, next.slice);
+    if (siblings === undefined) {
+      return;
+    }
+    // The confirmation may have been open a while: approve only the slice drawn.
+    const still = (controller.currentDiscovery.intakes ?? []).find((candidate) => samePath(candidate.dir, message.intakeDir));
+    const nextNow = still ? intakeNextAction(still) : undefined;
+    if (!nextNow || nextNow.kind !== "approve" || nextNow.slice.runId !== message.runId) {
+      void vscode.window.showInformationMessage(`Agent Sparring: the intake changed while the confirmation was open, so ${sliceStageName(next.slice)} was not approved. Check the updated screen.`);
+      await overview.update();
+      return;
+    }
+    const invocation = approveInvocation(intake, next.slice, locations, siblings);
     if (!invocation.ok) {
       void vscode.window.showWarningMessage(`Agent Sparring: ${invocation.problem}`);
       return;
@@ -670,6 +682,75 @@ async function handleIntakeAction(controller: SparringController, overview: Over
     await controller.showStartedRun(invocation.runId);
   }
   await overview.update();
+}
+
+/**
+ * The sibling repositories approve-plan needs for `slice`, confirmed by the
+ * person: `{}` when it declares none, undefined when they cancelled.
+ *
+ * Each is proposed at the path intake inspected and the branch checked out
+ * there now. Valid proposals are confirmed in one step ("Use these"); only a
+ * mapping that no longer checks out, or one the person chooses to change, is
+ * asked for. The engine still re-checks the repository identity.
+ */
+async function confirmSiblings(intake: DiscoveredIntake, slice: IntakeSliceSnapshot): Promise<Record<string, { path: string; branch: string }> | undefined> {
+  const proposals = await proposeSiblingMappings(intake, slice, checkRepositoryMapping, checkedOutBranch);
+  if (proposals.length === 0) {
+    return {};
+  }
+  const chosen: Record<string, { path: string; branch: string }> = {};
+  const pending: string[] = [];
+  for (const proposal of proposals) {
+    if (proposal.path && proposal.branch && !proposal.problem) {
+      chosen[proposal.name] = { path: proposal.path, branch: proposal.branch };
+    } else {
+      pending.push(proposal.name);
+    }
+  }
+  const pick = async (name: string, reason?: string): Promise<boolean> => {
+    const picked = await vscode.window.showOpenDialog({ canSelectFolders: true, canSelectFiles: false, canSelectMany: false, openLabel: `Use for ${name}`, title: reason ? `${name}: ${reason}` : name });
+    const folder = picked?.[0]?.fsPath;
+    if (!folder) {
+      return false;
+    }
+    const check = await checkRepositoryMapping(name, folder, undefined);
+    if (!check.valid) {
+      void vscode.window.showWarningMessage(`Agent Sparring: ${folder} cannot be used for ${name}: ${check.reason}. Nothing was approved.`);
+      return false;
+    }
+    const branch = await vscode.window.showInputBox({ title: `Branch of ${name}`, prompt: `The branch ${sliceStageName(slice)}'s work in ${name} is on`, value: (await checkedOutBranch(folder)) ?? "", ignoreFocusOut: true });
+    if (!branch?.trim()) {
+      return false;
+    }
+    chosen[name] = { path: folder, branch: branch.trim() };
+    return true;
+  };
+  for (const name of pending) {
+    const proposal = proposals.find((entry) => entry.name === name);
+    if (!(await pick(name, proposal?.problem))) {
+      return undefined;
+    }
+  }
+  const use = "Use these";
+  const change = "Choose another…";
+  for (;;) {
+    const detail = Object.keys(chosen)
+      .sort()
+      .map((name) => `${name}\nPath:   ${chosen[name].path}\nBranch: ${chosen[name].branch}`)
+      .join("\n\n");
+    const answer = await vscode.window.showInformationMessage(`Sibling repositories for ${sliceStageName(slice)}`, { modal: true, detail }, use, change);
+    if (answer === use) {
+      return chosen;
+    }
+    if (answer !== change) {
+      return undefined;
+    }
+    const names = Object.keys(chosen).sort();
+    const name = names.length === 1 ? names[0] : await vscode.window.showQuickPick(names, { title: "Which repository?" });
+    if (!name || !(await pick(name))) {
+      return undefined;
+    }
+  }
 }
 
 /**

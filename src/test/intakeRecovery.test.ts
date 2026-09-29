@@ -13,7 +13,9 @@
  *    active one — and a person's resolution replaces only the stale one;
  *  - a recorded mapping is reused only while it is still the root of the
  *    same git repository;
- *  - a failed prepare is shown on the intake that is still selected.
+ *  - a failed prepare is shown on the intake that is still selected;
+ *  - approve-plan gets each sibling repository a slice declares, proposed from
+ *    what intake inspected and confirmed by the person.
  */
 
 import assert from "node:assert/strict";
@@ -25,10 +27,10 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import { discoverRuns, type DiscoveredIntake, type SparringLocation } from "../core/discovery";
 import { intakeSourceChanged, sourcePlanDigest } from "../core/intake";
-import { preparedFromCurrentPlan, prepareInvocation, staleContextRepositories } from "../core/intakeActions";
+import { approveInvocation, preparedFromCurrentPlan, prepareInvocation, proposeSiblingMappings, staleContextRepositories } from "../core/intakeActions";
 import { isIntakeActionMessage, renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel, intakeView } from "../core/overviewModel";
-import { checkRepositoryMapping } from "../core/repositoryMapping";
+import { checkedOutBranch, checkRepositoryMapping } from "../core/repositoryMapping";
 
 const FIXTURES = path.join(__dirname, "..", "..", "src", "test", "fixtures", "plan-intake");
 const INTAKE_ID = "plan-61bf2008-20260927T204930Z-faithful-fb55";
@@ -201,5 +203,40 @@ describe("reusing a recorded repository mapping", () => {
     gitInit(repo);
     await fs.mkdir(path.join(repo, "sub"));
     assert.deepEqual(await checkRepositoryMapping("x", path.join(repo, "sub"), undefined), { valid: false, reason: "it is not the root of a git repository" });
+  });
+});
+
+describe("approve-plan's sibling repositories", () => {
+  it("each declared sibling is proposed at the path intake inspected and the branch checked out there now", async () => {
+    const { base, intake } = await prepared();
+    const web = path.join(base, "web");
+    gitInit(web);
+    execFileSync("git", ["-C", web, "checkout", "-q", "-b", "feature/web-3w"]);
+    const slice = { ...intake.slices[0], requirements: { ...intake.slices[0].requirements!, siblings: ["web"] } };
+    assert.deepEqual(await proposeSiblingMappings(intake, slice, checkRepositoryMapping, checkedOutBranch), [{ name: "web", path: web, branch: "feature/web-3w" }]);
+  });
+
+  it("a stale or uninspected sibling is proposed with its problem, so only it is asked for", async () => {
+    const { intake } = await prepared();
+    const slice = { ...intake.slices[0], requirements: { ...intake.slices[0].requirements!, siblings: ["landing", "web"] } };
+    const proposals = await proposeSiblingMappings(intake, slice, checkRepositoryMapping, async () => "main");
+    assert.equal(proposals.length, 2);
+    assert.match(proposals[0].problem ?? "", /did not inspect/);
+    assert.match(proposals[1].problem ?? "", /no longer exists/);
+  });
+
+  it("confirmed siblings reach approve-plan as --repository / --repository-branch pairs, for every one", async () => {
+    const { intake } = await prepared();
+    const slice = intake.slices[0];
+    const invocation = approveInvocation(intake, slice, [], { web: { path: "/code/web", branch: "feature/w" }, api: { path: "/code/api", branch: "main" } });
+    assert.ok(invocation.ok);
+    const tail = invocation.args.slice(invocation.args.indexOf("--repository-name") + 2);
+    assert.deepEqual(tail, ["--repository", "api=/code/api", "--repository-branch", "api=main", "--repository", "web=/code/web", "--repository-branch", "web=feature/w"]);
+  });
+
+  it("a slice with no siblings proposes none", async () => {
+    const { intake } = await prepared();
+    const slice = { ...intake.slices[0], requirements: { ...intake.slices[0].requirements!, siblings: [] } };
+    assert.deepEqual(await proposeSiblingMappings(intake, slice, checkRepositoryMapping, async () => "main"), []);
   });
 });

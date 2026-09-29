@@ -32,7 +32,13 @@ function sparringDirFor(repoRoot: string, locations: readonly SparringLocation[]
   return locations.find((location) => samePath(location.repoRoot, repoRoot))?.sparringDir ?? path.join(repoRoot, ".sparring");
 }
 
-export function approveInvocation(intake: IntakeSnapshot, slice: IntakeSliceSnapshot, locations: readonly SparringLocation[]): IntakeInvocation {
+export function approveInvocation(
+  intake: IntakeSnapshot,
+  slice: IntakeSliceSnapshot,
+  locations: readonly SparringLocation[],
+  /** The slice's sibling repositories as a person confirmed them; see {@link proposeSiblingMappings}. */
+  siblings?: Record<string, { path: string; branch: string }>,
+): IntakeInvocation {
   if (!slice.primaryRepository) {
     return { ok: false, problem: `the intake does not record which repository ${sliceStageName(slice)} (run slice ${slice.runId}) is approved from. Open the intake report.` };
   }
@@ -41,7 +47,7 @@ export function approveInvocation(intake: IntakeSnapshot, slice: IntakeSliceSnap
   }
   const repoRoot = slice.primaryPath;
   const sparringDir = sparringDirFor(repoRoot, locations);
-  const args = buildApprovePlanArgs({ intakeDir: intake.dir, runId: slice.runId, repoRoot, repositoryName: slice.primaryRepository, sparringDir });
+  const args = buildApprovePlanArgs({ intakeDir: intake.dir, runId: slice.runId, repoRoot, repositoryName: slice.primaryRepository, sparringDir, ...(siblings ? { siblings } : {}) });
   return { ok: true, args, cwd: repoRoot, repoRoot, sparringDir, describe: `approve-plan ${intake.dir} --run ${slice.runId} (from ${slice.primaryRepository})` };
 }
 
@@ -169,4 +175,46 @@ export function preparedFromCurrentPlan<T extends IntakeSnapshot & { location: S
         (intake.record.createdAtMs === undefined || candidate.record.createdAtMs > intake.record.createdAtMs),
     )
     .sort((a, b) => (b.record.createdAtMs ?? 0) - (a.record.createdAtMs ?? 0))[0];
+}
+
+/** A sibling repository approve-plan needs for a slice, as proposed from what intake recorded. */
+export interface SiblingProposal {
+  name: string;
+  /** The path intake recorded for it, when it recorded one. */
+  path?: string;
+  /** The branch checked out there now, when it is on one. */
+  branch?: string;
+  /** Why the recorded mapping cannot be proposed as it is; absent when it can. */
+  problem?: string;
+}
+
+/**
+ * The sibling repositories `slice` declares (the engine's recorded
+ * `approval_requirements`), each proposed at the path intake inspected and
+ * the branch checked out there now. A person confirms or replaces them:
+ * the branch is sealed into the manifest, and approve-plan re-checks the
+ * repository identity itself.
+ */
+export async function proposeSiblingMappings(
+  intake: IntakeSnapshot,
+  slice: IntakeSliceSnapshot,
+  validate: RepositoryMappingValidator,
+  branchOf: (repoPath: string) => Promise<string | undefined>,
+): Promise<SiblingProposal[]> {
+  const out: SiblingProposal[] = [];
+  for (const name of slice.requirements?.siblings ?? []) {
+    const recorded = intake.record.repositories[name];
+    if (!recorded) {
+      out.push({ name, problem: "this intake did not inspect it" });
+      continue;
+    }
+    const check = await validate(name, recorded, intake.record.repositoryGitDirs?.[name]);
+    if (!check.valid) {
+      out.push({ name, path: recorded, problem: check.reason });
+      continue;
+    }
+    const branch = await branchOf(recorded);
+    out.push(branch ? { name, path: recorded, branch } : { name, path: recorded, problem: "it has no branch checked out" });
+  }
+  return out;
 }
