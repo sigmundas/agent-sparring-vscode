@@ -2069,14 +2069,14 @@ pre.engineerror { margin: 6px 0 0; padding: 6px 8px; max-height: 9em; overflow: 
 .agentconfig-block { margin: 6px 0 2px; display: flex; align-items: flex-start; gap: 12px; }
 .agentconfig-fields { flex: 1; min-width: 0; }
 .agentconfig-field { display: flex; align-items: center; gap: 8px; margin-top: 3px; font-size: 0.9em; }
-.agentconfig-field > .muted { min-width: 5.5em; }
+.agentconfig-field > .muted { min-width: 4.5em; }
 /* Only a chooser is drawn as a control. It is the platform's own select,
    filled and with its own chevron, so the one thing on the card that can be
    changed here looks like the one thing that can be changed here. */
 .agentconfig-field select {
-  /* Narrower than the row now that the dials share it: the levels are one
-     short word each, so the box never needed the card's full width. */
-  flex: 0 1 9.5em; min-width: 0; padding: 2px 4px; font: inherit; font-size: 0.95em;
+  /* Narrower than the row now that the dials share it, but wide enough for
+     a full model id; it still shrinks on a narrow card. */
+  flex: 0 1 12.5em; min-width: 0; padding: 2px 4px; font: inherit; font-size: 0.95em;
   color: var(--vscode-input-foreground); background: var(--vscode-input-background);
   border: 1px solid var(--vscode-input-border, var(--line)); border-radius: 3px;
 }
