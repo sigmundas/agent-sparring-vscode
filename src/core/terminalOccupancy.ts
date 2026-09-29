@@ -148,7 +148,7 @@ export function knownEnded(state: OwnedTerminalState): boolean {
  * The terminals for `cwd` that may be closed without being asked, once the
  * next command has chosen (`keep`) or opened its one terminal there: known to
  * have ended, not the one kept, and whose last command did not fail — a failed
- * command's raw output stays until Clean Up Runner Terminals closes it.
+ * command's raw output stays until Clean Up Terminals closes it.
  */
 export function redundantTerminals(states: readonly OwnedTerminalState[], cwd: string, keep?: number): number[] {
   return states

@@ -45,15 +45,17 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { descendantsOf, processExists, type ProcessInfo } from "../core/processTree";
 import { listProcesses, processProbeSupported } from "./processProbe";
-import { chooseOwnedTerminal, explainCreation, knownEnded, redundantTerminals, terminalKey, unavailability, type OwnedTerminalState } from "../core/terminalOccupancy";
+import { chooseOwnedTerminal, explainCreation, redundantTerminals, terminalKey, unavailability, type OwnedTerminalState } from "../core/terminalOccupancy";
 
 /** The name prefix of every terminal this extension creates. */
 export const RUNNER_TERMINAL_PREFIX = "Agent Sparring — ";
 
-/** What Clean Up Runner Terminals did: the terminals closed, and those it left open and why. */
+/** What Clean Up Terminals did: closed and kept, each with why, and those whose liveness is unknown. */
 export interface CleanupResult {
-  closed: string[];
+  closed: { name: string; reason: string }[];
   kept: { name: string; reason: string }[];
+  /** Left open and not closed without asking: liveness cannot be established. */
+  unknown: vscode.Terminal[];
 }
 
 export interface TerminalLease {
@@ -242,38 +244,84 @@ export class TerminalPool implements vscode.Disposable {
   }
 
   /**
-   * Close every Agent Sparring terminal known to be running nothing: those in
-   * the pool that are idle or whose process has exited, and any other
-   * terminal of ours (one VS Code restored after a reload) whose process has
-   * exited. Everything else is left open and reported — a running, leased or
-   * occupied terminal, and every terminal whose liveness this window cannot
-   * establish. Normal terminals are never looked at.
+   * Agent Sparring: Clean Up Terminals. Every terminal with our name prefix
+   * is classified, and only those proven to be running nothing are closed:
+   *
+   *  - Active — leased, occupied, a dedicated engine still running, or an
+   *    orphan whose shell `ps` shows with a child process: kept;
+   *  - Current reusable — the one idle pooled terminal per worktree: kept;
+   *  - Idle redundant — another idle pooled terminal, or an orphan whose
+   *    shell `ps` proves idle and no operation claims: closed;
+   *  - Ended — its process has exited: closed;
+   *  - Unknown — liveness cannot be established (no process table on this
+   *    platform, no shell integration, a pid an operation still claims):
+   *    never closed here, returned in `unknown` for the caller to ask about.
+   *
+   * A person's own terminals are never looked at.
    */
-  cleanUp(): CleanupResult {
-    const result: CleanupResult = { closed: [], kept: [] };
+  async cleanUp(claimedPids: ReadonlySet<number> = new Set()): Promise<CleanupResult> {
+    const result: CleanupResult = { closed: [], kept: [], unknown: [] };
+    const close = (terminal: vscode.Terminal, why: string) => {
+      result.closed.push({ name: terminal.name, reason: why });
+      this.forget(terminal);
+      this.orphans.delete(terminal);
+      terminal.dispose();
+    };
+    const current = new Set<string>();
     for (const entry of [...this.entries]) {
       const state = this.stateOf(entry);
-      if (knownEnded(state)) {
-        result.closed.push(entry.terminal.name);
-        this.forget(entry.terminal);
-        entry.terminal.dispose();
+      const reason = unavailability(state);
+      if (reason === "exited") {
+        close(entry.terminal, "ended");
+      } else if (reason === undefined && !current.has(entry.key)) {
+        current.add(entry.key);
+        result.kept.push({ name: entry.terminal.name, reason: "current reusable terminal for its worktree" });
+      } else if (reason === undefined) {
+        close(entry.terminal, "idle and redundant");
       } else {
-        result.kept.push({ name: entry.terminal.name, reason: describeKept(unavailability(state)) });
+        result.kept.push({ name: entry.terminal.name, reason: describeKept(reason) });
       }
     }
     const pooled = new Set(this.entries.map((entry) => entry.terminal));
-    for (const terminal of vscode.window.terminals) {
-      if (pooled.has(terminal) || !terminal.name.startsWith(RUNNER_TERMINAL_PREFIX)) {
+    const others = vscode.window.terminals.filter((terminal) => !pooled.has(terminal) && terminal.name.startsWith(RUNNER_TERMINAL_PREFIX));
+    let table: ProcessInfo[] | undefined;
+    if (this.probeSupported && others.some((terminal) => terminal.exitStatus === undefined)) {
+      table = await this.processes().catch(() => undefined);
+    }
+    for (const terminal of others) {
+      if (terminal.exitStatus !== undefined) {
+        close(terminal, "ended");
         continue;
       }
-      if (terminal.exitStatus !== undefined) {
-        result.closed.push(terminal.name);
-        terminal.dispose();
-      } else {
-        result.kept.push({ name: terminal.name, reason: "whether it is still running cannot be established (it was not opened in this window session)" });
+      const pid = await terminal.processId;
+      const seen = this.orphans.get(terminal)?.active.size ?? 0;
+      if (table && pid !== undefined && pid > 0 && !claimedPids.has(pid) && processExists(table, pid)) {
+        if (descendantsOf(table, pid).length > 0 || seen > 0) {
+          result.kept.push({ name: terminal.name, reason: "a process is running in it" });
+          continue;
+        }
+        if (terminal.shellIntegration && !ownProcess(terminal)) {
+          close(terminal, "idle and redundant (its shell has no running child process)");
+          continue;
+        }
       }
+      result.unknown.push(terminal);
     }
     return result;
+  }
+
+  /** Close terminals a person confirmed closing from `cleanUp().unknown`. */
+  closeConfirmed(terminals: readonly vscode.Terminal[]): string[] {
+    const names: string[] = [];
+    for (const terminal of terminals) {
+      if (vscode.window.terminals.includes(terminal)) {
+        names.push(terminal.name);
+        this.orphans.delete(terminal);
+        this.forget(terminal);
+        terminal.dispose();
+      }
+    }
+    return names;
   }
 
   /**
@@ -409,7 +457,7 @@ export class TerminalPool implements vscode.Disposable {
   /**
    * Terminals whose process has exited are never reused. One whose last
    * command ended cleanly is closed; one that failed keeps its tab, and its
-   * output, until Clean Up Runner Terminals.
+   * output, until Clean Up Terminals.
    */
   private prune(): void {
     for (const entry of [...this.entries]) {

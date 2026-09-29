@@ -62,13 +62,15 @@ function host(table: () => ProcessInfo[] = () => []): Host {
   return { runner, pool, registry, logged, dispose: () => (runner.dispose(), pool.dispose(), registry.dispose()) };
 }
 
+/** Terminals a previous window left; their shells are the test's to describe, never integrated here. */
+const restoredTerminals = new WeakSet<FakeTerminal>();
 const handled = new Map<FakeTerminal, number>();
 
 /** Play the shell's part for one command: integrate a new terminal, report the start and the end. */
 async function complete(result: Promise<unknown>, exitCode = 0): Promise<{ terminal: FakeTerminal; result: Awaited<typeof result> }> {
   const terminal = await until(() => {
     for (const candidate of stub.window.terminals) {
-      if (!candidate.shellIntegration && candidate.exitStatus === undefined) {
+      if (!candidate.shellIntegration && candidate.exitStatus === undefined && !restoredTerminals.has(candidate)) {
         candidate.integrate();
       }
     }
@@ -93,6 +95,7 @@ function restored(cwd: string, pid: number): FakeTerminal {
   terminal.creationOptions = { name: terminal.name, cwd };
   terminal.shellIntegration = new FakeShellIntegration(terminal);
   stub.window.terminals.push(terminal);
+  restoredTerminals.add(terminal);
   return terminal;
 }
 
@@ -253,6 +256,61 @@ describe("one reusable terminal per worktree", () => {
       assert.equal(a.terminal.shown, 0);
     } finally {
       h.dispose();
+    }
+  });
+
+  it("Clean Up Terminals: ended and idle redundant are closed, active and current are kept, unknown is only listed", async () => {
+    const ended = restored(py, 7001);
+    ended.exitStatus = { code: 0 };
+    // Another worktree's: in sporely-py it would be adopted as the current one.
+    const idleOrphan = restored(web, 7002);
+    const busyOrphan = restored(web, 7003);
+    const claimed = restored(web, 7005);
+    const noIntegration = restored(web, 7006);
+    noIntegration.shellIntegration = undefined;
+    const table = [
+      { pid: 7002, ppid: 1, command: "-zsh" },
+      { pid: 7003, ppid: 1, command: "-zsh" },
+      { pid: 7004, ppid: 7003, command: "python sparring run-plan" },
+      { pid: 7005, ppid: 1, command: "-zsh" },
+      { pid: 7006, ppid: 1, command: "-zsh" },
+    ];
+    const h = host(() => table);
+    try {
+      // The current reusable terminal for sporely-py, opened in this window.
+      const current = await complete(run(h, py, "approve-plan"));
+      const result = await h.pool.cleanUp(new Set([7005]));
+      assert.deepEqual(result.closed.map((entry) => entry.reason).sort(), ["ended", "idle and redundant (its shell has no running child process)"]);
+      assert.equal(current.terminal.creationOptions.cwd, py);
+      assert.equal(idleOrphan.exitStatus?.code, 0, "idle redundant (ps proves its shell idle): closed");
+      assert.equal(busyOrphan.exitStatus, undefined, "a process is running in it: never closed");
+      assert.equal(current.terminal.exitStatus, undefined, "the current reusable terminal is kept");
+      assert.ok(result.kept.some((entry) => entry.reason === "current reusable terminal for its worktree"));
+      assert.deepEqual(new Set(result.unknown), new Set([claimed, noIntegration]), "unknown liveness is listed, not closed");
+      assert.equal(claimed.exitStatus, undefined);
+      assert.equal(noIntegration.exitStatus, undefined);
+      assert.deepEqual(h.pool.closeConfirmed(result.unknown).length, 2, "closed only once a person confirms");
+      assert.equal((claimed.exitStatus as { code?: number } | undefined)?.code, 0);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it("without a process table every old terminal is unknown, and nothing is closed silently", async () => {
+    const a = restored(py, 8001);
+    const b = restored(web, 8002);
+    const logged: string[] = [];
+    const registry = new OperationRegistry({ workspaceState: memento() } as never, (m: string) => logged.push(m), () => false, async () => []);
+    const pool = new TerminalPool((m) => logged.push(m), async () => [], false);
+    try {
+      const result = await pool.cleanUp();
+      assert.deepEqual(result.closed, []);
+      assert.deepEqual(new Set(result.unknown), new Set([a, b]));
+      await pool.reconcile(py);
+      assert.deepEqual(pool.owned(), [], "and none is adopted either");
+    } finally {
+      pool.dispose();
+      registry.dispose();
     }
   });
 });

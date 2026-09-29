@@ -196,7 +196,7 @@ describe("Stop interrupts one exact operation", () => {
       assert.deepEqual(signalled, [], "no process was signalled directly: the terminal is the more exact route");
       // 5: nothing anywhere in this path names a process by name.
       assert.deepEqual(
-        logged.filter((line) => /pkill|killall|SIGKILL|-9/.test(line)),
+        logged.filter((line) => /pkill|killall|SIGKILL|(^|\s)-9(\s|$)/.test(line)),
         [],
       );
     } finally {

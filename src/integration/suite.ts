@@ -1606,12 +1606,12 @@ async function terminalReuseAssertions(report: DiscoveryDiagnostic, reportedRepo
   assert.notEqual(reopened[0], opened[0], "a fresh one, because the old one is gone");
   await waitFor(runId, (liveness) => liveness.state === "stopped", 20_000, "and it ends");
 
-  // Clean Up Runner Terminals closes the runner known to be idle and never
-  // looks at a person's own terminal.
+  // Clean Up Terminals keeps the worktree's current reusable terminal and
+  // never looks at a person's own terminal.
   const userTerminal = vscode.window.createTerminal({ name: "user zsh", cwd: reportedRepo });
   await vscode.commands.executeCommand("agentSparring.cleanUpRunnerTerminals");
   await new Promise((resolve) => setTimeout(resolve, 500));
-  assert.deepEqual(ownTerminals(), [], "the idle runner terminal was closed");
+  assert.equal(ownTerminals().length, 1, "the current reusable terminal is kept");
   assert.ok(vscode.window.terminals.includes(userTerminal), "the user's terminal is untouched");
   userTerminal.dispose();
   console.log("integration: four engine commands, one reusable terminal per project, each execution tracked on its own; cleanup closed only the idle runner");

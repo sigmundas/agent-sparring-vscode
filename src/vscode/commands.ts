@@ -4039,15 +4039,36 @@ async function chooseRepositoryCommand(controller: SparringController): Promise<
  * and the Agent Sparring output keep the history.
  */
 async function cleanUpRunnerTerminalsCommand(controller: SparringController): Promise<void> {
-  const result = controller.cleanUpRunnerTerminals();
-  for (const name of result.closed) {
-    controller.log(`Clean up runner terminals: closed ${name}`);
+  const result = await controller.cleanUpRunnerTerminals();
+  for (const closed of result.closed) {
+    controller.log(`Clean up terminals: closed ${closed.name} — ${closed.reason}`);
   }
   for (const kept of result.kept) {
-    controller.log(`Clean up runner terminals: left ${kept.name} open — ${kept.reason}`);
+    controller.log(`Clean up terminals: kept ${kept.name} — ${kept.reason}`);
   }
-  const closed = result.closed.length === 0 ? "No runner terminal could be closed" : `Closed ${result.closed.length} runner terminal${result.closed.length === 1 ? "" : "s"}`;
-  const kept = result.kept.length === 0 ? "." : `; left ${result.kept.length} open that ${result.kept.length === 1 ? "is" : "are"} running or whose state cannot be established (see the log).`;
+  for (const terminal of result.unknown) {
+    controller.log(`Clean up terminals: ${terminal.name} — whether anything is running in it cannot be established`);
+  }
+  let closedCount = result.closed.length;
+  if (result.unknown.length > 0) {
+    const count = result.unknown.length;
+    // VS Code offers no way to ask a restored terminal whether it is running
+    // anything, so only a person can decide these.
+    const answer = await vscode.window.showWarningMessage(
+      `${count} old Agent Sparring terminal${count === 1 ? " has" : "s have"} unknown liveness after reload. Close ${count === 1 ? "it" : "them"}?`,
+      { modal: true, detail: "Agent Sparring cannot tell whether anything is still running in them. Closing a terminal ends what runs in its shell." },
+      "Close",
+    );
+    if (answer === "Close") {
+      const names = controller.closeConfirmedTerminals(result.unknown);
+      for (const name of names) {
+        controller.log(`Clean up terminals: closed ${name} — confirmed by you`);
+      }
+      closedCount += names.length;
+    }
+  }
+  const closed = closedCount === 0 ? "No terminal was closed" : `Closed ${closedCount} terminal${closedCount === 1 ? "" : "s"}`;
+  const kept = result.kept.length === 0 ? "." : `; kept ${result.kept.length} (active or current — see the log).`;
   void vscode.window.showInformationMessage(`Agent Sparring: ${closed}${kept}`);
 }
 

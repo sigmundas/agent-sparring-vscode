@@ -582,8 +582,13 @@ export class SparringController implements vscode.Disposable {
   }
 
   /** See TerminalPool.cleanUp. */
-  cleanUpRunnerTerminals(): CleanupResult {
-    return this.terminals.cleanUp();
+  cleanUpRunnerTerminals(): Promise<CleanupResult> {
+    return this.terminals.cleanUp(this.submissions.terminalPids());
+  }
+
+  /** Close the unknown-liveness terminals a person confirmed. */
+  closeConfirmedTerminals(terminals: readonly vscode.Terminal[]): string[] {
+    return this.terminals.closeConfirmed(terminals);
   }
 
   get currentSelection(): RunSelection {
