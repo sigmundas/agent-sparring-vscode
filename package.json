@@ -6,6 +6,7 @@
   "publisher": "sintef",
   "private": true,
   "license": "MIT",
+  "icon": "icons/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/sigmundas/agent-sparring-vscode.git"
@@ -202,7 +203,7 @@
     "test": "npm run compile-tests && node --test \"out/test/**/*.test.js\"",
     "test:parity": "npm run compile-tests && node --test out/test/manifestParity.test.js",
     "compile-integration": "tsc -p tsconfig.integration.json",
-    "test:integration": "npm run bundle && npm run compile-integration && node out/integration/runTests.js",
+    "test:integration": "npm run bundle && npm run compile-integration && node out/integration/runTests.js && node out/integration/runFreshWorkspace.js",
     "lint": "eslint src",
     "vscode:prepublish": "npm run build",
     "package:vsix": "vsce package --no-dependencies"

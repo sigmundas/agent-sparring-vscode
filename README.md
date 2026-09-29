@@ -4,6 +4,24 @@ A thin desktop cockpit for the `agent-sparring` engine (the sibling Python proje
 The engine stays the authority; this extension only observes, launches and
 navigates.
 
+## First run
+
+1. Install the engine and set up your repository as its
+   [QUICKSTART](https://github.com/sigmundas/agent-sparring/blob/main/QUICKSTART.md)
+   describes: `sparring` on your shell's `PATH`, with the `claude` and `codex`
+   CLIs signed in.
+2. Install this extension (see [Install locally](#install-locally)).
+3. Open the repository and run **Agent Sparring: Run Plan**. A repository
+   without any `.sparring` state yet is fine. Running any Agent Sparring
+   command activates the extension, and **Open Project Settings** →
+   **Create project settings** runs the engine's `init-config`.
+4. After that, the **Overview** is where you continue a paused run, answer
+   checks, accept stages and apply setup fixes. Every one of those is an
+   engine command.
+
+If the integrated terminal can't find `sparring`, run **Agent Sparring:
+Choose sparring Executable…** (see "Executable resolution").
+
 ## What it does (V1 shell)
 
 - Detects every `.sparring/` directory in the workspace: directly under each
@@ -1064,8 +1082,15 @@ npm install
 npm run build      # typecheck + esbuild bundle to dist/
 npm test           # node:test unit tests against fake .sparring fixtures
 npm run lint
-npm run test:integration   # downloads VS Code once, opens a generated multi-root workspace, asserts discovery, runner lifecycle, bare-`sparring` resolution by the shell, command-not-found, Accept stage and plan association with a fake `sparring`
+npm run test:integration   # downloads VS Code once, opens a generated multi-root workspace, asserts discovery, runner lifecycle, bare-`sparring` resolution by the shell, command-not-found, Accept stage and plan association with a fake `sparring`; then opens an empty repository and asserts that invoking a command activates the extension
 ```
+
+**Activation.** `activationEvents` lists only `workspaceContains:` patterns,
+so a window that already has Agent Sparring state activates the extension on
+open. A brand-new repository has none, and relies on VS Code (1.74 and later;
+`engines.vscode` requires 1.90) activating an extension when one of its
+`contributes.commands` is invoked. `src/integration/freshWorkspaceSuite.ts`
+checks exactly that, so no redundant `onCommand:` events are declared.
 
 Press F5 in VS Code to launch an Extension Development Host.
 
