@@ -992,6 +992,9 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
     case "showLog":
       controller.showLog();
       return;
+    case "showTerminal":
+      controller.showOperationTerminal();
+      return;
     case "selectRun":
       await selectRunCommand(controller);
       await overview.update();

@@ -18,6 +18,7 @@
  * tooltips and the footer.
  */
 
+import type { ActiveOperationView, OperationLiveness } from "./activeOperation";
 import { describeRepositoryContext, emptyStateLines, emptyStateTitle, SELECT_RUN_LABEL, type RepositoryContextView } from "./activeRepository";
 import { SETUP_NOT_IGNORED, SETUP_OBSOLETE_AGENT_SETTING, agentConfigView, providerLabel, withStagePin, type AgentConfigView, type ConfigRole, type EffectiveConfig } from "./effectiveConfig";
 import { parseBriefGoal, parseBriefOpening } from "./brief";
@@ -271,6 +272,14 @@ export interface OverviewArtifacts {
   intakeApproval?: IntakeApprovalAttempt;
   /** For the intake screen: the engine command its action runs, shown in the details layer. */
   intakeCommand?: string;
+  /**
+   * The operation active in the repository on screen, from the operation
+   * registry and nothing else (core/activeOperation.ts). While it is set the
+   * intake's next-action command is not shown as "Engine command".
+   */
+  activeOperation?: ActiveOperationView;
+  /** The last operation that ended there in this window, when its exit code is known. */
+  lastOperation?: { liveness: OperationLiveness; text: string };
   /** For the intake screen: the source plan changed since this intake read it. */
   intakeRecovery?: IntakeRecovery;
   handoff: boolean;
@@ -860,6 +869,12 @@ export interface IntakeView {
   unconfirmed?: { text: string };
   /** The engine command the action runs, for the details layer. */
   command?: string;
+  /**
+   * The same command while another operation is active: kept inspectable
+   * under Technical details, and never labelled as the engine command,
+   * because it is not what is running.
+   */
+  nextActionCommand?: string;
   hasSource: boolean;
   intakeId: string;
   /** Explicitly chosen although the plan has a newer intake, which is this one. */
@@ -980,6 +995,9 @@ export function setupNotice(config: EffectiveConfig | undefined): SetupNotice | 
 }
 
 export interface OverviewModel {
+  /** What Agent Sparring is running in this repository right now; see {@link OverviewArtifacts.activeOperation}. */
+  activeOperation?: ActiveOperationView;
+  lastOperation?: { liveness: OperationLiveness; text: string };
   /** A fixable setup problem of this repository; see {@link SetupNotice}. */
   setup?: SetupNotice;
   /** The slice on screen needs a feature branch; see {@link BranchNotice}. */
@@ -1489,7 +1507,17 @@ export function buildOverviewModel(
   const model = buildScreen(selection, rawLive, artifacts, nowMs, execution);
   const setup = setupNotice(artifacts.agentConfig);
   const branch = branchNotice(artifacts.sliceBranch);
-  return { ...model, ...(setup ? { setup } : {}), ...(branch ? { branch } : {}) };
+  const active = artifacts.activeOperation;
+  if (active && model.intake?.command) {
+    const { command, ...intake } = model.intake;
+    model.intake = { ...intake, nextActionCommand: command };
+  }
+  return {
+    ...model,
+    ...(setup ? { setup } : {}),
+    ...(branch ? { branch } : {}),
+    ...(active ? { activeOperation: active } : artifacts.lastOperation ? { lastOperation: artifacts.lastOperation } : {}),
+  };
 }
 
 function buildScreen(

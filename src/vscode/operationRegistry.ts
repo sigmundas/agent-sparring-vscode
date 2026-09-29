@@ -320,6 +320,8 @@ import { commandLineIsInvocation, type RecordedInvocation } from "../core/proces
 import { descendantsOf, findSelfOrDescendant, processExists, processGenerationVerdict, type ProcessInfo } from "../core/processTree";
 import { commandLineIsOperation, targetIsAttributable, type OperationTarget, type SparringSubcommand } from "../core/sparringCommand";
 import { listProcesses, processProbeSupported } from "./processProbe";
+import type { SettledOperationRecord } from "../core/activeOperation";
+import { terminalKey } from "../core/terminalOccupancy";
 import type { TerminalLease } from "./terminalPool";
 
 /**
@@ -529,6 +531,9 @@ export interface OperationView {
   observationLost?: boolean;
   /** The engine process positively attributed to it, when one was found. */
   enginePid?: number;
+  /** The stage, plan or intake it acts on, for presentation. */
+  target?: string;
+  stageId?: string;
 }
 
 /** Everything the runner launcher needs to promote a started operation into a tracked execution. */
@@ -748,6 +753,8 @@ export class OperationRegistry implements vscode.Disposable {
   private readonly operations = new Map<string, Operation>();
   /** Operation key → the one record that holds it. The whole invariant, in one map. */
   private readonly byKey = new Map<string, string>();
+  /** Repository root → the operation that last ended there, for the Overview. Never persisted, never an admission input. */
+  private readonly settled = new Map<string, SettledOperationRecord>();
   private readonly disposables: vscode.Disposable[] = [];
   private readonly establishedEmitter = new vscode.EventEmitter<Establishment>();
   /** A submitted command was reported by its shell as started (or as finished). */
@@ -830,6 +837,36 @@ export class OperationRegistry implements vscode.Disposable {
    */
   unresolved(): OperationView[] {
     return [...this.operations.values()].map(view).filter(outstanding);
+  }
+
+  /**
+   * Every operation held right now, whatever its state: what the Overview's
+   * active-operation banner is drawn from, and the only thing it is drawn
+   * from (core/activeOperation.ts).
+   */
+  active(): OperationView[] {
+    return [...this.operations.values()].map(view);
+  }
+
+  /** The operation that last ended in `repoRoot` in this window, with its exit code when one was reported. */
+  lastSettled(repoRoot: string): SettledOperationRecord | undefined {
+    return this.settled.get(path.resolve(repoRoot));
+  }
+
+  /**
+   * Another operation held for the same repository or worktree as `cwd`,
+   * other than `except`. One reusable terminal per worktree only works if a
+   * second ordinary engine command there is refused rather than given a
+   * second shell; this is how the launchers ask.
+   */
+  busyWorktree(cwd: string, except: string): OperationView | undefined {
+    const key = terminalKey(cwd);
+    for (const operation of this.operations.values()) {
+      if (operation.id !== except && (terminalKey(operation.cwd) === key || terminalKey(operation.repoRoot) === key)) {
+        return view(operation);
+      }
+    }
+    return undefined;
   }
 
   // ---------------------------------------------------------------- admission
@@ -925,6 +962,7 @@ export class OperationRegistry implements vscode.Disposable {
       this.log(`${operation.label}: the durable record of the intent to run it could not be written (${message}); nothing was started`);
       return { ok: false, error: `Agent Sparring could not record that it is about to run ${operation.label}, so it did not start it: ${message}` };
     }
+    this.brief(operation, "starting");
     this.log(`${operation.label}: recorded as about to run over ${transport}; the transport is invoked only now that this is durable`);
     this.changeEmitter.fire();
     return { ok: true, armed: { id: operation.id, key: operation.key, transport } };
@@ -956,6 +994,7 @@ export class OperationRegistry implements vscode.Disposable {
     const operation = this.held(armed, "armed");
     operation.state = "running-direct";
     operation.directPid = process.pid;
+    this.brief(operation, "engine running");
     // The actual invocation, verbatim: the executable word, the argument
     // array as passed, and the working directory it was spawned in. Nothing
     // semantic is derived from it, because several subcommands carry no
@@ -999,6 +1038,7 @@ export class OperationRegistry implements vscode.Disposable {
     operation.state = "running-dedicated";
     operation.terminal = terminal;
     operation.terminalName = terminal.name;
+    this.brief(operation, "engine running");
     this.log(`${operation.label}: ${detail}; a second copy of this operation is refused until that process is gone`);
     void this.remember(operation)
       .then(() => {
@@ -1173,8 +1213,25 @@ export class OperationRegistry implements vscode.Disposable {
     return { overridden: true, view: resolved };
   }
 
-  private resolve(operation: Operation, evidence: OperationEvidence, detail: string): void {
+  /** One concise, durable host event: `prepare-plan sporely-py: starting`. */
+  private brief(operation: Operation, text: string): void {
+    this.log(`${operation.subcommand} ${path.basename(operation.cwd)}: ${text}`);
+  }
+
+  private resolve(operation: Operation, evidence: OperationEvidence, detail: string, exitCode?: number): void {
     this.operations.delete(operation.id);
+    if (OUTCOME_OF[evidence] === "completed") {
+      this.settled.set(operation.repoRoot, {
+        label: operation.label,
+        subcommand: operation.subcommand,
+        repoRoot: operation.repoRoot,
+        cwd: operation.cwd,
+        target: operation.stageId ?? operation.planPath ?? operation.manifest,
+        submittedAtMs: operation.armedAtMs ?? operation.claimedAtMs,
+        endedAtMs: Date.now(),
+        ...(exitCode !== undefined ? { exitCode } : {}),
+      });
+    }
     if (this.byKey.get(operation.key) === operation.id) {
       this.byKey.delete(operation.key);
     }
@@ -1182,6 +1239,9 @@ export class OperationRegistry implements vscode.Disposable {
     clearInterval(operation.probeTimer);
     operation.waitTimer = undefined;
     operation.probeTimer = undefined;
+    if (OUTCOME_OF[evidence] === "completed") {
+      this.brief(operation, exitCode === undefined ? "ended" : exitCode === 0 ? "succeeded" : `failed (exit ${exitCode})`);
+    }
     this.log(`${operation.label}: resolved as ${OUTCOME_OF[evidence]} (${evidence}) — ${detail}`);
     // A caller may still be waiting for the shell to report this one (an
     // override or a closed terminal can settle it mid-wait). It is settled,
@@ -1227,7 +1287,7 @@ export class OperationRegistry implements vscode.Disposable {
         continue;
       }
       if (operation.state === "running-shell") {
-        this.resolve(operation, "shell-execution-ended", `the shell in "${event.terminal.name}" reported that exact execution finishing${event.exitCode === undefined ? "" : ` (exit ${event.exitCode})`}`);
+        this.resolve(operation, "shell-execution-ended", `the shell in "${event.terminal.name}" reported that exact execution finishing${event.exitCode === undefined ? "" : ` (exit ${event.exitCode})`}`, event.exitCode);
         return;
       }
       if (operation.state === "submitted-shell") {
@@ -1261,7 +1321,7 @@ export class OperationRegistry implements vscode.Disposable {
         // The pty host reported an exit *status* for the process that is the
         // engine. That is not "the terminal went away": it is the process's
         // own exit code, which is as positive as evidence gets.
-        this.resolve(operation, "terminal-process-exited", `the process of the dedicated terminal "${terminal.name}" — which is the engine itself — exited with code ${terminal.exitStatus.code}`);
+        this.resolve(operation, "terminal-process-exited", `the process of the dedicated terminal "${terminal.name}" — which is the engine itself — exited with code ${terminal.exitStatus.code}`, terminal.exitStatus.code);
       } else if (operation.state === "running-shell" || operation.state === "running-dedicated") {
         // An operation that is already running is a process, and closing a
         // terminal does not end a process that survives the hangup. Real
@@ -1363,6 +1423,7 @@ export class OperationRegistry implements vscode.Disposable {
     operation.observation = operation.observation ?? "launched";
     clearInterval(operation.probeTimer);
     operation.probeTimer = undefined;
+    this.brief(operation, "engine running");
     this.log(
       `${operation.label}: the shell in "${terminal.name}" ${ended ? "reported it finished" : "started it"}${
         late ? ` ${Math.round((Date.now() - (operation.armedAtMs ?? operation.claimedAtMs)) / 1000)} s after it was submitted, long after the wait had expired` : ""
@@ -1389,7 +1450,7 @@ export class OperationRegistry implements vscode.Disposable {
       // history is honest and there is no instant in which it is unguarded.
       const current = this.operations.get(operation.id);
       if (current && current.state === "running-shell") {
-        this.resolve(current, "shell-execution-ended", `the shell in "${terminal.name}" reported that exact execution finishing${ended.exitCode === undefined ? "" : ` (exit ${ended.exitCode})`}`);
+        this.resolve(current, "shell-execution-ended", `the shell in "${terminal.name}" reported that exact execution finishing${ended.exitCode === undefined ? "" : ` (exit ${ended.exitCode})`}`, ended.exitCode);
       }
     }
   }
@@ -2253,6 +2314,8 @@ function view(operation: Operation): OperationView {
     directPid: operation.directPid,
     observationLost: operation.observationLost,
     enginePid: operation.enginePid,
+    target: operation.stageId ?? operation.planPath ?? operation.manifest,
+    stageId: operation.stageId,
   };
 }
 

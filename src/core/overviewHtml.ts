@@ -14,6 +14,7 @@
  * meaningful event on the right); provider cards; recent events; metadata.
  */
 
+import { workingFor } from "./activeOperation";
 import { ACTIVE_CONTEXT_HEADLINE, CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, SELECT_RUN_LABEL } from "./activeRepository";
 import {
   CONFIG_FIELDS,
@@ -41,6 +42,7 @@ export type OverviewAction =
   | "openNextStage"
   | "openDiff"
   | "showLog"
+  | "showTerminal"
   | "selectRun"
   | "followActiveRepository"
   | "showNextWork"
@@ -353,6 +355,7 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "openNextStage",
   "openDiff",
   "showLog",
+  "showTerminal",
   "selectRun",
   "followActiveRepository",
   "showNextWork",
@@ -449,6 +452,7 @@ export function renderOverviewHtml(model: OverviewModel, nonce: string, cspSourc
 ${renderBody(model)}
 </main>
 <script nonce="${nonce}">${SCRIPT}</script>
+${model.activeOperation?.startedAtMs !== undefined ? `<script nonce="${nonce}">${ELAPSED_TICKER}</script>` : ""}
 </body>
 </html>`;
 }
@@ -508,7 +512,7 @@ function renderBody(model: OverviewModel): string {
   if (model.kind === "empty") {
     // The title names the repository, so an empty screen cannot be mistaken
     // for the cockpit still looking at the repository just left behind.
-    return `${renderRepositoryContext(model)}
+    return `${renderRepositoryContext(model)}${renderOperation(model)}
 <header class="top"><div><h1>Agent Sparring</h1><div class="run muted">${escapeHtml(model.title)}</div></div></header>
 ${(model.emptyLines ?? []).map((line) => `<p class="muted">${escapeHtml(line)}</p>`).join("\n")}
 ${renderActors(model, discloseScope(model))}
@@ -524,7 +528,7 @@ ${renderActors(model, discloseScope(model))}
           }</li>`,
       )
       .join("");
-    return `${renderRepositoryContext(model)}
+    return `${renderRepositoryContext(model)}${renderOperation(model)}
 <header class="top"><div><h1>${escapeHtml(intake.planName)}</h1><div class="run muted">Plan intake · ${escapeHtml(intake.stateLabel)}</div></div></header>
 ${intake.blocked ? `<p class="intake-blocked"><strong>${escapeHtml(intake.blocked)}</strong></p>` : ""}
 ${intake.historical ? `<p class="preserved">${icon("warn", "escalate")}Historical intake · Source plan has newer intake <code>${escapeHtml(intake.historical.currentIntakeId)}</code></p>` : ""}
@@ -540,7 +544,11 @@ ${intake.unconfirmed ? `<div class="subfail"><p class="preserved">${icon("warn",
 <ul class="intake-slices">${slices}</ul>
 <div class="actions">${intake.action ? intakeButton(intake.action) : ""}${button("openIntakeReport", "Open intake report", true, undefined, intake.action ? "" : "primary")}${intake.hasSource ? button("openIntakeSource", "Open plan") : ""}${button("showLog", "Show log")}</div>
 ${intake.command ? `<details class="intake-command"><summary>Engine command</summary><pre class="command">${escapeHtml(intake.command)}</pre></details>` : ""}
-<details class="intake-technical"><summary>Technical details</summary><ul class="intake-technical-list">${intake.slices
+<details class="intake-technical"><summary>Technical details</summary>${
+  intake.nextActionCommand
+    ? `<p class="muted small">Command this intake's next action would run (not what is running now):</p><pre class="command">${escapeHtml(intake.nextActionCommand)}</pre>`
+    : ""
+}<ul class="intake-technical-list">${intake.slices
   .map(
     (slice) =>
       `<li><strong>${escapeHtml(slice.heading)}</strong>: run slice <code>${escapeHtml(slice.technical.runId)}</code> · run key <code>${escapeHtml(slice.technical.runKey)}</code>${
@@ -551,7 +559,7 @@ ${intake.command ? `<details class="intake-command"><summary>Engine command</sum
 <p class="muted small">Intake ${escapeHtml(intake.intakeId)} · ${escapeHtml(intake.planLabel)}</p>`;
   }
   if (model.kind === "ambiguous") {
-    return `${renderRepositoryContext(model)}
+    return `${renderRepositoryContext(model)}${renderOperation(model)}
 <header class="top"><h1>Agent Sparring</h1></header>
 <p>${escapeHtml(model.title)}:</p>
 <ul>${(model.choices ?? []).map((choice) => `<li>${escapeHtml(choice)}</li>`).join("")}</ul>
@@ -562,6 +570,7 @@ ${intake.command ? `<details class="intake-command"><summary>Engine command</sum
   const scope = discloseScope(model);
   const parts: string[] = [];
   parts.push(renderRepositoryContext(model));
+  parts.push(renderOperation(model));
   parts.push(renderHeader(model));
   if (model.branchGuard) {
     parts.push(renderBranchGuard(model.branchGuard));
@@ -1934,6 +1943,29 @@ function options(items: readonly { value: string; label: string; custom?: boolea
     .join("");
 }
 
+/**
+ * What Agent Sparring is running in this repository right now, from the
+ * operation registry (core/activeOperation.ts); otherwise, quietly, the last
+ * operation that ended here. Nothing when idle.
+ */
+function renderOperation(model: OverviewModel): string {
+  const active = model.activeOperation;
+  if (!active) {
+    const last = model.lastOperation;
+    return last ? `<p class="muted small last-operation">${icon(last.liveness === "failed" ? "warn" : "check", last.liveness === "failed" ? "escalate" : "")}Last operation: ${escapeHtml(last.text)}</p>` : "";
+  }
+  const elapsed = workingFor(active, Date.now());
+  const meta = [...active.meta.map(escapeHtml), ...(elapsed ? [`<span data-started-ms="${active.startedAtMs}">${escapeHtml(elapsed)}</span>`] : [])];
+  return `<section class="active-operation" data-liveness="${active.liveness}">
+<div class="op-title">${icon(active.liveness === "liveness_unknown" ? "warn" : "pulse", active.liveness === "liveness_unknown" ? "escalate" : "")}<strong>${escapeHtml(active.title)}</strong></div>
+${meta.length > 0 ? `<div class="muted small">${meta.join(" · ")}</div>` : ""}
+${active.note ? `<div class="muted small">${escapeHtml(active.note)}</div>` : ""}
+<pre class="command">${active.command.map(escapeHtml).join("\n")}</pre>
+${active.activity.length > 0 ? `<div class="small">Activity:<ul class="op-activity">${active.activity.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul></div>` : ""}
+<div class="actions">${button("showLog", "Show activity")}${active.terminalName ? button("showTerminal", "Show terminal") : ""}</div>
+</section>`;
+}
+
 function button(action: OverviewAction, label: string, enabled = true, title?: string, cls = ""): string {
   const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
   const classAttr = cls ? ` class="${cls}"` : "";
@@ -2081,6 +2113,12 @@ textarea.note:focus { outline: 1px solid var(--vscode-focusBorder); }
 
 /* A submission in flight, and one that failed with everything preserved. */
 .submitting { display: flex; align-items: center; margin: 8px 0 0; font-weight: 600; color: var(--info); }
+.active-operation { margin: 8px 0 12px; padding: 8px 10px; border-left: 3px solid var(--vscode-focusBorder); background: var(--vscode-textBlockQuote-background); }
+.active-operation[data-liveness="liveness_unknown"] { border-left-color: var(--bad); }
+.active-operation .op-title { display: flex; align-items: center; gap: 6px; }
+.active-operation .op-activity { margin: 2px 0 0; padding-left: 18px; }
+.active-operation .actions { margin-top: 6px; }
+.last-operation { display: flex; align-items: center; gap: 4px; }
 .subfail { margin: 10px 0 0; padding: 8px 10px; border-left: 3px solid var(--bad); background: var(--vscode-textBlockQuote-background); }
 .subfail .preserved { display: flex; align-items: flex-start; margin: 0; font-weight: 600; }
 .subfail p.muted { margin: 4px 0 0; }
@@ -2562,6 +2600,25 @@ const DISCLOSURE_SCRIPT = `
     }, 100);
   });
   restore();
+`;
+
+/**
+ * The active operation's elapsed counter, ticked in the page from its recorded
+ * start so the host does not re-render every second. Emitted only when there
+ * is a counter, so an idle page schedules nothing.
+ */
+const ELAPSED_TICKER = `
+(function () {
+  function tick() {
+    var nodes = document.querySelectorAll('[data-started-ms]');
+    for (var i = 0; i < nodes.length; i++) {
+      var s = Math.max(0, Math.floor((Date.now() - Number(nodes[i].getAttribute('data-started-ms'))) / 1000));
+      var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+      nodes[i].textContent = 'working for ' + (h > 0 ? h + 'h ' + (m < 10 ? '0' : '') + m + 'm' : m > 0 ? m + 'm ' + r + 's' : r + 's');
+    }
+  }
+  setInterval(tick, 1000);
+})();
 `;
 
 const SCRIPT = `

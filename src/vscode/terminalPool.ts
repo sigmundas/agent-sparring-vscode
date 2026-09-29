@@ -212,6 +212,26 @@ export class TerminalPool implements vscode.Disposable {
     return this.entries.map((entry) => ({ name: entry.terminal.name, cwd: entry.cwd, unavailable: unavailability(this.stateOf(entry)) }));
   }
 
+  /**
+   * Reveal the terminal an explicit "Show terminal" asks for: the one named
+   * `name` when it is one of ours, otherwise this repository's pooled
+   * terminal. Nothing else ever calls `show()` for a routine command.
+   */
+  reveal(cwd: string | undefined, name?: string): boolean {
+    const byName = name ? vscode.window.terminals.find((terminal) => terminal.name === name && terminal.name.startsWith(RUNNER_TERMINAL_PREFIX)) : undefined;
+    const key = cwd ? terminalKey(cwd) : undefined;
+    // The pool's own terminal first: names are per repository, so a name can
+    // also match a terminal an earlier window left behind.
+    const leased = key ? this.entries.find((entry) => entry.key === key && entry.leased) : undefined;
+    const any = key ? this.entries.find((entry) => entry.key === key) : undefined;
+    const terminal = leased?.terminal ?? byName ?? any?.terminal;
+    if (!terminal) {
+      return false;
+    }
+    terminal.show(false);
+    return true;
+  }
+
   private stateOf(entry: Entry): OwnedTerminalState {
     return {
       cwd: entry.key,

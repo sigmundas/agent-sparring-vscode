@@ -96,6 +96,7 @@ import type { IntakeApprovalAttempt } from "../core/overviewModel";
 import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
 import { TerminalPool, type CleanupResult } from "./terminalPool";
 import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult, type StopOutcome, type StopTarget } from "./executionTracker";
+import type { SettledOperationRecord } from "../core/activeOperation";
 import { OperationRegistry, runnerKey, type OperationView, type OverrideResult } from "./operationRegistry";
 import { ManifestReader, type BoundManifest } from "./manifestReader";
 import { ActiveRepositoryTracker, RealPaths } from "./activeRepository";
@@ -1203,6 +1204,16 @@ export class SparringController implements vscode.Disposable {
     return this.submissions.unresolved();
   }
 
+  /** Every operation held right now: the one source of what the Overview calls active. */
+  activeOperations(): OperationView[] {
+    return this.submissions.active();
+  }
+
+  /** The operation that last ended in `repoRoot` in this window. */
+  lastSettledOperation(repoRoot: string): SettledOperationRecord | undefined {
+    return this.submissions.lastSettled(repoRoot);
+  }
+
   /**
    * The operation holding this run's duplicate guard right now, in whatever
    * state. Read once while a surface is built, so what that surface offers
@@ -1686,6 +1697,19 @@ export class SparringController implements vscode.Disposable {
 
   showLog(): void {
     this.output.show(true);
+  }
+
+  /**
+   * The Overview's "Show terminal": reveal the terminal of the operation on
+   * screen, and only on this explicit request — routine launches never do.
+   */
+  showOperationTerminal(): void {
+    const selection = this.selection;
+    const root = selection.selected?.location.repoRoot ?? selection.intake?.location.repoRoot ?? selection.scope?.repoRoot;
+    const named = this.activeOperations().find((operation) => operation.terminalName && root && (samePath(operation.repoRoot, root) || samePath(operation.cwd, root)))?.terminalName;
+    if (!this.terminals.reveal(root, named)) {
+      void vscode.window.showInformationMessage("Agent Sparring: there is no Agent Sparring terminal for this repository in this window.");
+    }
   }
 }
 

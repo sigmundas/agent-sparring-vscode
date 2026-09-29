@@ -11,7 +11,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, intakeOfRun, type DiscoveredIntake, type PlanRunSnapshot, type RunSnapshot } from "../../core/discovery";
+import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, intakeOfRun, samePath, type DiscoveredIntake, type PlanRunSnapshot, type RunSnapshot } from "../../core/discovery";
 import { stageScopeOf } from "../../core/stageScope";
 import { intakeNextAction, sourcePlanDigest } from "../../core/intake";
 import { approveInvocation, preparedFromCurrentPlan, startInvocation } from "../../core/intakeActions";
@@ -49,6 +49,7 @@ import { planKey, planLabel } from "../../core/sparringCommand";
 import type { DeclaredRepository } from "../../core/stageRepositories";
 import { documentViewColumn } from "../../core/viewColumn";
 import type { SparringController } from "../controller";
+import { activeOperationView, relevantTo, settledOperationLine, type OperationScope } from "../../core/activeOperation";
 import { gitContext } from "../git";
 import { readHead as readFileHead } from "../fileHead";
 import { configuredExecutable } from "../engineExecutable";
@@ -458,8 +459,29 @@ export class OverviewPanelManager implements vscode.Disposable {
     if (sliceBranch) {
       artifacts = { ...artifacts, sliceBranch };
     }
+    artifacts = { ...artifacts, ...this.operationOnScreen() };
     const model = buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.executionFor(selection.selected?.id));
     return { model, source: { model, artifacts, sparringText, repository } };
+  }
+
+  /**
+   * The operation active for what is on screen, from the operation registry
+   * alone — never from the intake's next action, the selected run or a
+   * button — and otherwise the last one that ended there.
+   */
+  private operationOnScreen(): Pick<OverviewArtifacts, "activeOperation" | "lastOperation"> {
+    const selection = this.controller.currentSelection;
+    const scope: OperationScope = {
+      repoRoot: selection.selected?.location.repoRoot ?? selection.intake?.location.repoRoot ?? selection.scope?.repoRoot,
+      intakeDir: selection.selected ? undefined : selection.intake?.dir,
+      runId: selection.selected?.id,
+    };
+    const active = activeOperationView(this.controller.activeOperations().filter((record) => relevantTo(record, scope, samePath)));
+    if (active) {
+      return { activeOperation: active };
+    }
+    const last = scope.repoRoot ? settledOperationLine(this.controller.lastSettledOperation(scope.repoRoot)) : undefined;
+    return last ? { lastOperation: last } : {};
   }
 
   /**
