@@ -66,7 +66,8 @@ export type OverviewAction =
   | "doNotAllowPush"
   | "openSettings"
   | "openIntakeSource"
-  | "openIntakeReport";
+  | "openIntakeReport"
+  | "switchToNextRepository";
 
 /** A Pass / Fail / Can't test click or a note edit on one manual check, posted by the webview as it happens. */
 export interface HumanCheckMessage {
@@ -358,6 +359,7 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "openSettings",
   "openIntakeSource",
   "openIntakeReport",
+  "switchToNextRepository",
 ];
 
 const ACTIONS: ReadonlySet<string> = new Set<string>(OVERVIEW_ACTIONS);
@@ -1422,6 +1424,29 @@ function renderCurrentPlanStage(current: string, matched: MatchSource | undefine
  * managed run; everything for an associated file opens or matches a
  * document and never claims to start a stage.
  */
+/**
+ * What's next for an intake-backed run, from the whole intake. Switching
+ * repository only changes what this screen follows; the next work's own
+ * screen then offers its approval or start.
+ */
+function renderIntakeWhatsNext(model: OverviewModel, next: WhatsNext, heading: string, text: string): string {
+  const repository = next.repository ? `<p class="muted">Repository: ${escapeHtml(next.repository.name)}</p>` : "";
+  const stages = next.stages && next.stages.length > 0 ? `<ul class="muted">${next.stages.map((stage) => `<li>${escapeHtml(stage)}</li>`).join("")}</ul>` : "";
+  const buttons: string[] = [];
+  if (model.planAction) {
+    buttons.push(button("resumePlan", model.planAction.label, true, model.planAction.detail, "primary"));
+  }
+  if (next.repository?.action === "switch") {
+    buttons.push(button("switchToNextRepository", `Switch to ${next.repository.name}`, true, `Follow ${next.repository.name}'s current work. Nothing is approved or started.`, model.planAction ? "" : "primary"));
+  } else if (next.repository?.action === "show") {
+    buttons.push(button("followActiveRepository", "Show next stage", true, "Release this pin and show this repository's current work. Nothing is approved or started.", model.planAction ? "" : "primary"));
+  }
+  if (model.actions?.plan) {
+    buttons.push(button("openPlan", "Open plan document", true, `Open the document ${model.plan?.name ?? "the plan"}`));
+  }
+  return `<div class="block whatsnext"><h3>${icon("arrow", "accent")}What's next</h3>${heading}${repository}${stages}${text}<div class="actions">${buttons.join("")}</div></div>`;
+}
+
 function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
   const plan = model.plan;
   const heading = next.heading ? `<p class="nextstage">${escapeHtml(next.heading)}</p>` : "";
@@ -1492,6 +1517,9 @@ function renderWhatsNext(model: OverviewModel, next: WhatsNext): string {
     case "choose":
       buttons.push(button("associatePlan", "Choose plan…", true, CHOOSE_PLAN_TITLE, "primary"));
       break;
+  }
+  if (next.kind === "intake-next" || next.kind === "intake-waiting" || next.kind === "plan-complete") {
+    return renderIntakeWhatsNext(model, next, heading, text);
   }
   const matchedKinds: WhatsNext["kind"][] = ["next-stage", "next-unclear", "last-stage", "no-labels"];
   const current =

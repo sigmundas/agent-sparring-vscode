@@ -26,7 +26,7 @@ import {
   type SparringOutcome,
   type StageState,
 } from "./engineFormats";
-import { discoverIntakes, isPreRunIntake, nextIntakeSlice, resolveIntakeRun, type IntakeRunBinding, type IntakeSnapshot } from "./intake";
+import { discoverIntakes, isPreRunIntake, nextIntakeSlice, resolveIntakeRun, sliceEligible, sliceRoot, type IntakeRunBinding, type IntakeSnapshot } from "./intake";
 import { planTitle } from "./planAssociation";
 
 export const SPARRING_DIRNAME = ".sparring";
@@ -1036,7 +1036,28 @@ function newestIntakePerPlan(intakes: readonly DiscoveredIntake[]): DiscoveredIn
  */
 export function nextIntakeSliceRoot(intake: IntakeSnapshot): string | undefined {
   const next = nextIntakeSlice(intake);
-  return next?.approval?.repoRoot ?? next?.primaryPath;
+  return next ? sliceRoot(next) : undefined;
+}
+
+/**
+ * The intake an `intake-manifest` run executes a slice of, among the
+ * discovered ones: the directory its binding names, never a newer proposal of
+ * the same plan. Undefined for a standalone run.
+ */
+export function intakeOfRun(run: RunSnapshot, intakes: readonly DiscoveredIntake[] | undefined): DiscoveredIntake | undefined {
+  if (run.kind !== "plan" || !run.intake) {
+    return undefined;
+  }
+  const binding = run.intake;
+  return (intakes ?? []).find((intake) => samePath(intake.dir, binding.intakeDir) && intake.slices.some((slice) => slice.runId === binding.runId));
+}
+
+/**
+ * The repository among `roots` that owns `root` — the canonical identity
+ * current-work selection uses — or undefined when none does.
+ */
+export function owningRoot(root: string, roots: readonly string[]): string | undefined {
+  return repositoryOwning({ repoRoot: root, projectDir: root }, [...new Set(roots.map((entry) => path.resolve(entry)))]);
 }
 
 /**
@@ -1067,15 +1088,13 @@ export function continuingIntake(intakes: readonly DiscoveredIntake[], scope?: R
     if (!next || !root) {
       return false;
     }
-    const complete = new Set(intake.slices.filter((slice) => slice.state === "complete").map((slice) => slice.runId));
-    if (!(next.requirements?.earlierSlices ?? []).every((runId) => complete.has(runId))) {
+    if (!sliceEligible(intake, next)) {
       return false;
     }
     if (!scope) {
       return true;
     }
-    const roots = [...new Set([scope.repoRoot, ...(scope.knownRoots ?? [])].map((entry) => path.resolve(entry)))];
-    const owner = repositoryOwning({ repoRoot: root, projectDir: root }, roots);
+    const owner = owningRoot(root, [scope.repoRoot, ...(scope.knownRoots ?? [])]);
     return owner !== undefined && samePath(owner, scope.repoRoot);
   });
   return candidates.sort((a, b) => (b.activityMs ?? 0) - (a.activityMs ?? 0))[0];

@@ -96,7 +96,8 @@ function deriveUnpinnedStatus(selection: RunSelection, live: LiveState | undefin
     const { status } = run.state;
     const position = stagePosition(run);
     if (status === "complete") {
-      return finish(`$(check) ${PREFIX}: Plan complete`, tooltipLines, "none");
+      // An intake-backed run executes one part of a plan; its end is not the plan's.
+      return finish(`$(check) ${PREFIX}: ${run.intake ? "Execution complete" : "Plan complete"}`, tooltipLines, "none");
     }
     if (status === "paused") {
       const outcome = run.currentOutcome;

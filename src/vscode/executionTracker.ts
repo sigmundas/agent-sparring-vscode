@@ -825,6 +825,14 @@ export class ExecutionTracker implements vscode.Disposable {
     // with the terminal because that is all liveness can honestly say about a
     // runner it can no longer see; it is not an admission authority.
     this.operations.runningDedicated(armed.armed, dedicatedTerminal, `it runs as the process of a dedicated terminal "${dedicatedTerminal.name}"`);
+    // Known to the pool for cleanup only — closed once its process has ended,
+    // never reused. After the bookkeeping above, and unable to fail it: the
+    // terminal already exists, and losing track of it is the worse outcome.
+    try {
+      this.terminals.adoptDedicated(dedicatedTerminal, options.cwd);
+    } catch (error) {
+      this.log(`could not register ${dedicatedTerminal.name} for cleanup: ${(error as Error).message}`);
+    }
     this.log(`launched ${options.name} in a dedicated terminal (shell integration unavailable; ${path}, ${options.args.length} args, cwd ${options.cwd})`);
     void this.persistWithPid(item, dedicatedTerminal);
     this.changeEmitter.fire("started");

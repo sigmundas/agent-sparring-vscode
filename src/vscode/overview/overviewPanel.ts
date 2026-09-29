@@ -11,7 +11,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, type PlanRunSnapshot, type RunSnapshot } from "../../core/discovery";
+import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, intakeOfRun, type PlanRunSnapshot, type RunSnapshot } from "../../core/discovery";
 import { stageScopeOf } from "../../core/stageScope";
 import { intakeNextAction } from "../../core/intake";
 import { approveInvocation, startInvocation } from "../../core/intakeActions";
@@ -378,6 +378,7 @@ export class OverviewPanelManager implements vscode.Disposable {
         association ? readHead(association.path, PLAN_READ_LIMIT) : Promise.resolve(undefined),
       ]);
       sparringText = sparring;
+      const owningIntake = intakeOfRun(run, this.controller.currentDiscovery.intakes);
       artifacts = {
         handoff: handoffText !== undefined,
         handoffText,
@@ -410,6 +411,8 @@ export class OverviewPanelManager implements vscode.Disposable {
         stopTarget: this.controller.stopTargetFor(run.id),
         autoPushDraft: this.controller.autoPushDraft(run.id),
         agentConfig,
+        intake: owningIntake,
+        knownRoots: owningIntake ? (await this.controller.repositoryChoices()).map((choice) => choice.root) : undefined,
       };
     }
     if (!selection.selected && selection.intake) {

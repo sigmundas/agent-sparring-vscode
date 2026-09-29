@@ -76,6 +76,11 @@
         "category": "Agent Sparring"
       },
       {
+        "command": "agentSparring.cleanUpRunnerTerminals",
+        "title": "Clean Up Runner Terminals",
+        "category": "Agent Sparring"
+      },
+      {
         "command": "agentSparring.followActiveEditor",
         "title": "Follow Active Editor",
         "category": "Agent Sparring"

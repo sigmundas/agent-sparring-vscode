@@ -31,6 +31,23 @@
  * long series of engine commands does not leave a row of dead tabs.
  */
 
+import * as fs from "node:fs";
+import { canonicalPath } from "./discovery";
+
+/**
+ * The repository/worktree identity a terminal is kept for: the resolved real
+ * path in the same canonical form repository selection compares, so
+ * `/tmp/x` and `/private/tmp/x`, or two spellings differing in case on
+ * macOS, share one terminal, while two worktrees never do.
+ */
+export function terminalKey(cwd: string): string {
+  try {
+    return canonicalPath(fs.realpathSync.native(cwd));
+  } catch {
+    return canonicalPath(cwd);
+  }
+}
+
 export interface OwnedTerminalState {
   /** The project directory this terminal was opened for; projects never share one. */
   cwd: string;
@@ -42,14 +59,24 @@ export interface OwnedTerminalState {
   activeExecutions: number;
   /** This window has watched its shell executions since it created it. */
   observable: boolean;
+  /**
+   * The terminal's own process *is* an engine command (no shell): never sent
+   * anything, and running for as long as it has not exited.
+   */
+  dedicated?: boolean;
+  /** The exit code of the last command that ended in it, when the shell reported one. */
+  lastExitCode?: number;
 }
 
-export type Unavailability = "exited" | "leased" | "occupied" | "unobservable";
+export type Unavailability = "exited" | "leased" | "occupied" | "unobservable" | "dedicated";
 
 /** Why this terminal may not be sent a command, or undefined when it may. */
 export function unavailability(state: OwnedTerminalState): Unavailability | undefined {
   if (state.exited) {
     return "exited";
+  }
+  if (state.dedicated) {
+    return "dedicated";
   }
   if (!state.observable) {
     return "unobservable";
@@ -82,7 +109,7 @@ export function chooseOwnedTerminal(states: readonly OwnedTerminalState[], cwd: 
   }
   // "exited" is about a terminal that is already being dropped and explains
   // nothing about occupancy, so it is the least informative reason.
-  const order: Unavailability[] = ["occupied", "unobservable", "leased", "exited"];
+  const order: Unavailability[] = ["occupied", "unobservable", "leased", "dedicated", "exited"];
   const reasons = mine.map(({ state }) => unavailability(state) as Unavailability);
   const because = order.find((reason) => reasons.includes(reason));
   return { kind: "create", because };
@@ -99,7 +126,33 @@ export function explainCreation(because: Unavailability | undefined, name: strin
       return `opened ${name}: whether this project's existing terminal is idle cannot be established, so it is left alone`;
     case "exited":
       return `opened ${name}: this project's previous terminal's shell had exited`;
+    case "dedicated":
+      return `opened ${name}: this project's other terminal runs an engine command as its own process`;
     default:
       return `opened the terminal ${name} for ${cwd}`;
   }
+}
+
+/**
+ * Whether this terminal is *known* to be running nothing, and may therefore be
+ * closed: its process has exited, or its shell has been watched from creation
+ * and is idle with no lease. Running, leased, occupied and unobservable
+ * terminals — including every terminal restored after a reload — are not.
+ */
+export function knownEnded(state: OwnedTerminalState): boolean {
+  const reason = unavailability(state);
+  return reason === undefined || reason === "exited";
+}
+
+/**
+ * The terminals for `cwd` that may be closed without being asked, once the
+ * next command has chosen (`keep`) or opened its one terminal there: known to
+ * have ended, not the one kept, and whose last command did not fail — a failed
+ * command's raw output stays until Clean Up Runner Terminals closes it.
+ */
+export function redundantTerminals(states: readonly OwnedTerminalState[], cwd: string, keep?: number): number[] {
+  return states
+    .map((state, index) => ({ state, index }))
+    .filter(({ state, index }) => state.cwd === cwd && index !== keep && knownEnded(state) && (state.lastExitCode === undefined || state.lastExitCode === 0))
+    .map(({ index }) => index);
 }

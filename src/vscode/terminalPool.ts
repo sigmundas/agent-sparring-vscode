@@ -38,7 +38,16 @@
 
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { chooseOwnedTerminal, explainCreation, unavailability, type OwnedTerminalState } from "../core/terminalOccupancy";
+import { chooseOwnedTerminal, explainCreation, knownEnded, redundantTerminals, terminalKey, unavailability, type OwnedTerminalState } from "../core/terminalOccupancy";
+
+/** The name prefix of every terminal this extension creates. */
+export const RUNNER_TERMINAL_PREFIX = "Agent Sparring — ";
+
+/** What Clean Up Runner Terminals did: the terminals closed, and those it left open and why. */
+export interface CleanupResult {
+  closed: string[];
+  kept: { name: string; reason: string }[];
+}
 
 export interface TerminalLease {
   terminal: vscode.Terminal;
@@ -72,6 +81,12 @@ export interface TerminalLease {
 interface Entry {
   terminal: vscode.Terminal;
   cwd: string;
+  /** {@link terminalKey} of `cwd`: what "this repository's terminal" is matched by. */
+  key: string;
+  /** A terminal whose process is the engine command itself: tracked for cleanup, never reused. */
+  dedicated: boolean;
+  /** The exit code of the last command that ended in it. */
+  lastExitCode?: number;
   /** Held by an Agent Sparring command. */
   leased: boolean;
   /** Shell executions running in it right now, ours and the user's alike. */
@@ -109,19 +124,79 @@ export class TerminalPool implements vscode.Disposable {
    */
   acquire(cwd: string): TerminalLease {
     this.prune();
-    const choice = chooseOwnedTerminal(this.entries.map((entry) => this.stateOf(entry)), cwd);
+    const key = terminalKey(cwd);
+    const choice = chooseOwnedTerminal(this.entries.map((entry) => this.stateOf(entry)), key);
+    let entry: Entry;
     if (choice.kind === "reuse") {
-      const known = this.entries[choice.index];
-      known.leased = true;
-      return this.lease(known);
+      entry = this.entries[choice.index];
+      entry.leased = true;
+    } else {
+      const sameProject = this.entries.filter((candidate) => candidate.key === key && !candidate.dedicated).length;
+      const name = `${RUNNER_TERMINAL_PREFIX}${path.basename(cwd)}${sameProject > 0 ? ` (${sameProject + 1})` : ""}`;
+      const terminal = vscode.window.createTerminal({ name, cwd, iconPath: new vscode.ThemeIcon("debug-alt") });
+      this.log(explainCreation(choice.because, name, cwd));
+      entry = { terminal, cwd, key, dedicated: false, leased: true, active: new Set(), observable: terminal.shellIntegration !== undefined };
+      this.entries.push(entry);
     }
-    const sameProject = this.entries.filter((entry) => entry.cwd === cwd).length;
-    const name = `Agent Sparring — ${path.basename(cwd)}${sameProject > 0 ? ` (${sameProject + 1})` : ""}`;
-    const terminal = vscode.window.createTerminal({ name, cwd, iconPath: new vscode.ThemeIcon("debug-alt") });
-    this.log(explainCreation(choice.because, name, cwd));
-    const entry: Entry = { terminal, cwd, leased: true, active: new Set(), observable: terminal.shellIntegration !== undefined };
-    this.entries.push(entry);
+    this.closeRedundant(key, entry);
     return this.lease(entry);
+  }
+
+  /**
+   * Track a terminal whose own process is an engine command, so it can be
+   * closed once that process has ended. It is never leased or written to.
+   */
+  adoptDedicated(terminal: vscode.Terminal, cwd: string): void {
+    this.entries.push({ terminal, cwd, key: terminalKey(cwd), dedicated: true, leased: false, active: new Set(), observable: false });
+  }
+
+  /**
+   * Close every Agent Sparring terminal known to be running nothing: those in
+   * the pool that are idle or whose process has exited, and any other
+   * terminal of ours (one VS Code restored after a reload) whose process has
+   * exited. Everything else is left open and reported — a running, leased or
+   * occupied terminal, and every terminal whose liveness this window cannot
+   * establish. Normal terminals are never looked at.
+   */
+  cleanUp(): CleanupResult {
+    const result: CleanupResult = { closed: [], kept: [] };
+    for (const entry of [...this.entries]) {
+      const state = this.stateOf(entry);
+      if (knownEnded(state)) {
+        result.closed.push(entry.terminal.name);
+        this.forget(entry.terminal);
+        entry.terminal.dispose();
+      } else {
+        result.kept.push({ name: entry.terminal.name, reason: describeKept(unavailability(state)) });
+      }
+    }
+    const pooled = new Set(this.entries.map((entry) => entry.terminal));
+    for (const terminal of vscode.window.terminals) {
+      if (pooled.has(terminal) || !terminal.name.startsWith(RUNNER_TERMINAL_PREFIX)) {
+        continue;
+      }
+      if (terminal.exitStatus !== undefined) {
+        result.closed.push(terminal.name);
+        terminal.dispose();
+      } else {
+        result.kept.push({ name: terminal.name, reason: "whether it is still running cannot be established (it was not opened in this window session)" });
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Once `keep` is this repository's terminal, close its other terminals that
+   * are known to have ended cleanly, so one per repository is what remains.
+   */
+  private closeRedundant(key: string, keep: Entry): void {
+    const states = this.entries.map((entry) => this.stateOf(entry));
+    for (const index of redundantTerminals(states, key, this.entries.indexOf(keep)).reverse()) {
+      const entry = this.entries[index];
+      this.log(`closed ${entry.terminal.name}: its command had ended, and ${keep.terminal.name} is this repository's runner terminal`);
+      this.entries.splice(index, 1);
+      entry.terminal.dispose();
+    }
   }
 
   /**
@@ -139,7 +214,9 @@ export class TerminalPool implements vscode.Disposable {
 
   private stateOf(entry: Entry): OwnedTerminalState {
     return {
-      cwd: entry.cwd,
+      cwd: entry.key,
+      dedicated: entry.dedicated,
+      ...(entry.lastExitCode !== undefined ? { lastExitCode: entry.lastExitCode } : {}),
       exited: entry.terminal.exitStatus !== undefined,
       leased: entry.leased,
       activeExecutions: entry.active.size,
@@ -166,6 +243,7 @@ export class TerminalPool implements vscode.Disposable {
     if (entry) {
       entry.observable = true;
       entry.active.delete(event.execution);
+      entry.lastExitCode = event.exitCode;
     }
   }
 
@@ -212,12 +290,37 @@ export class TerminalPool implements vscode.Disposable {
     }
   }
 
-  /** Drop terminals whose shell has exited; VS Code keeps the tab until the user closes it. */
+  /**
+   * Terminals whose process has exited are never reused. One whose last
+   * command ended cleanly is closed; one that failed keeps its tab, and its
+   * output, until Clean Up Runner Terminals.
+   */
   private prune(): void {
     for (const entry of [...this.entries]) {
-      if (entry.terminal.exitStatus !== undefined) {
+      const exit = entry.terminal.exitStatus;
+      if (exit === undefined) {
+        continue;
+      }
+      const code = entry.dedicated ? exit.code : entry.lastExitCode;
+      if (code === undefined || code === 0) {
         this.forget(entry.terminal);
+        entry.terminal.dispose();
       }
     }
+  }
+}
+
+function describeKept(reason: string | undefined): string {
+  switch (reason) {
+    case "leased":
+      return "an Agent Sparring command is running in it";
+    case "occupied":
+      return "a command is running in it";
+    case "dedicated":
+      return "its engine command is still running";
+    case "unobservable":
+      return "whether it is still running cannot be established";
+    default:
+      return "it may still be in use";
   }
 }

@@ -21,8 +21,8 @@
 import { describeRepositoryContext, emptyStateLines, emptyStateTitle, SELECT_RUN_LABEL, type RepositoryContextView } from "./activeRepository";
 import { agentConfigView, providerLabel, type AgentConfigView, type ConfigRole, type EffectiveConfig } from "./effectiveConfig";
 import { parseBriefGoal, parseBriefOpening } from "./brief";
-import { currentStageOf, runLabel, type DiscoveredIntake, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
-import { intakeNextAction, intakeStateLabel, isExecutionGroup, sliceHeading, sliceStageName, type IntakeNextAction, type IntakeSliceSnapshot } from "./intake";
+import { currentStageOf, owningRoot, repositoryDisplayName, runLabel, samePath, type DiscoveredIntake, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
+import { intakeContinuation, intakeNextAction, intakeStateLabel, isExecutionGroup, sliceHeading, sliceRoot, sliceStageName, type IntakeContinuation, type IntakeNextAction, type IntakeSliceSnapshot } from "./intake";
 import { activeDurationMs, formatDuration, providerDisplayName, type ActorBudget, type LiveState, type MeaningfulEvent } from "./liveState";
 import { DEFERRED_VERIFICATION_REQUIRED, PUSH_AUTHORIZATION_REQUIRED, obligationFailed, obligationResolved, parseHandoffBranch, type DeferredObligation, type PlanRunState, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
 import type { DeclaredRepository } from "./stageRepositories";
@@ -250,6 +250,17 @@ export interface AssociatedPlan {
 }
 
 export interface OverviewArtifacts {
+  /**
+   * For an `intake-manifest` run: the discovered intake whose slice it
+   * executes (discovery.intakeOfRun). What's next reads the whole intake from
+   * it, because the run's own stage list ends where its slice does.
+   */
+  intake?: DiscoveredIntake;
+  /**
+   * The repositories this window knows (aligned spellings), so a slice's
+   * repository is compared by the canonical identity current-work uses.
+   */
+  knownRoots?: string[];
   /** For the intake screen: this window's last approval of the slice it offers. */
   intakeApproval?: IntakeApprovalAttempt;
   /** For the intake screen: the engine command its action runs, shown in the details layer. */
@@ -473,7 +484,10 @@ export interface WhatsNext {
     | "no-labels" // associated plan, matched to a plain heading: the plan has no stage labels to order by
     | "match" // associated plan, unmatched: ask the user where this stage belongs
     | "missing-plan" // associated file is gone
-    | "choose"; // no plan at all
+    | "choose" // no plan at all
+    | "intake-next" // intake-backed run: the next eligible work of the whole intake (maybe in another repository)
+    | "intake-waiting" // intake-backed run: later work remains, none of it may begin yet
+    | "plan-complete"; // intake-backed run: nothing in the intake follows this execution
   /** The heading to show, e.g. `Stage 3C — Cloud schema and synchronization`. */
   heading?: string;
   /** Its opening paragraph, when the document has one. */
@@ -484,6 +498,18 @@ export interface WhatsNext {
   hints?: string[];
   /** For `next-stage`: what Start next stage would create (`sparring new-stage <stageId>`). */
   start?: NextStageProposal;
+  /**
+   * For `intake-next`: the stages of the next execution, when it runs more
+   * than one (`Stage 2 — …`, `Stage 3P — …`).
+   */
+  stages?: string[];
+  /**
+   * For `intake-next`: the repository the next work belongs to. `switch` when
+   * it is not the one this screen follows, and the current execution is
+   * closed, so switching shows it as current work; `show` when it is this
+   * repository and a run pin is keeping the screen on this execution.
+   */
+  repository?: { name: string; root: string; action?: "switch" | "show" };
 }
 
 /**
@@ -1554,8 +1580,13 @@ function buildScreen(
     model.lastSparring = { action: outcome.action, word: actionWord(outcome.action), summary: outcome.summary, reason: outcome.needsYouReason };
   }
   Object.assign(model, currentLine(run, stage, live, presentation, liveness, Boolean(artifacts.accepting), model.planAction, fresh));
-  if (stage.state?.status === "accepted" && !(run.kind === "plan" && run.state.status === "complete")) {
-    model.whatsNext = whatsNext(run, plan, artifacts, model.planAction);
+  const continuation = run.kind === "plan" && !plan?.next && artifacts.intake ? intakeContinuation(artifacts.intake, run.intake?.runId ?? "") : undefined;
+  if (stage.state?.status === "accepted" && (continuation || !(run.kind === "plan" && run.state.status === "complete"))) {
+    model.whatsNext = continuation && artifacts.intake ? intakeWhatsNext(artifacts.intake, continuation, run, selection, artifacts, model.planAction) : whatsNext(run, plan, artifacts, model.planAction);
+  }
+  if (continuation && continuation.kind !== "complete" && model.banner?.kind === "done") {
+    // The run is complete; the plan is not. Its banner says only what ended.
+    model.banner = { ...model.banner, text: model.banner.text.replace(/^Plan complete/, "Execution complete") };
   }
   model.planName = plan?.name;
   model.continueAutomatically = continueAutomatically(run, plan, artifacts, model, liveness);
@@ -2824,6 +2855,50 @@ function planContext(run: RunSnapshot, stage: StageSnapshot, artifacts: Overview
     hasStageLabels: headings.some((heading) => heading.label !== undefined),
     note,
   };
+}
+
+/**
+ * What's next for an accepted stage of an intake-backed run whose own stage
+ * list has nothing after it: the continuation of the whole intake
+ * (intake.intakeContinuation), which is the same "next" current-work
+ * selection uses. Nothing here approves, starts or pins anything.
+ */
+function intakeWhatsNext(intake: DiscoveredIntake, continuation: IntakeContinuation, run: RunSnapshot, selection: RunSelection, artifacts: OverviewArtifacts, planAction: PlanAction | undefined): WhatsNext {
+  const close = continuation.afterCurrent ? (planAction?.kind === "continue" ? "Continue plan closes this execution. " : "This execution closes when the engine finishes it. ") : "This execution is complete. ";
+  const name = (runId: string) => {
+    const slice = intake.slices.find((entry) => entry.runId === runId);
+    return slice ? sliceStageName(slice) : runId;
+  };
+  if (continuation.kind === "complete") {
+    return { kind: "plan-complete", text: `${continuation.afterCurrent ? close : ""}No further stages in this plan.` };
+  }
+  if (continuation.kind === "waiting") {
+    const why = continuation.slice && continuation.waitingOn.length > 0
+      ? ` ${sliceStageName(continuation.slice)} waits on ${continuation.waitingOn.map(name).join(" and ")}.`
+      : continuation.running.length > 0
+        ? ` ${continuation.running.map((slice) => sliceStageName(slice)).join(" and ")} ${continuation.running.length === 1 ? "is" : "are"} still running.`
+        : "";
+    return { kind: "intake-waiting", text: `${close}Later stages remain in this plan, but none can begin yet.${why}` };
+  }
+  const slice = continuation.slice;
+  const heading = isExecutionGroup(slice) ? `Next execution: ${sliceStageName(slice)}` : sliceHeading(slice);
+  const stages = isExecutionGroup(slice) ? slice.stages.map((stage) => `${stage.label} — ${stage.title}`) : undefined;
+  const root = sliceRoot(slice);
+  const roots = [run.location.repoRoot, ...(selection.scope ? [selection.scope.repoRoot] : []), ...(artifacts.knownRoots ?? []), ...(root ? [root] : [])];
+  const owner = root ? owningRoot(root, roots) ?? root : undefined;
+  const repoName = owner ? repositoryDisplayName(owner, roots) : slice.primaryRepository;
+  const followed = selection.scope?.repoRoot ?? run.location.repoRoot;
+  const elsewhere = owner !== undefined && !samePath(owner, followed);
+  const repository = owner && repoName
+    ? { name: repoName, root: owner, ...(continuation.afterCurrent ? {} : { action: elsewhere ? ("switch" as const) : ("show" as const) }) }
+    : undefined;
+  const where = repoName ? ` in ${repoName}` : "";
+  const text = continuation.afterCurrent
+    ? `${close}${sliceStageName(slice)} follows${where}${elsewhere ? `; switch to ${repoName} once this execution is closed` : ""}.`
+    : elsewhere
+      ? `${close}The plan continues${where}. Switching shows it there as current work; nothing is approved or started by switching.`
+      : `${close}The plan continues here.`;
+  return { kind: "intake-next", heading, text, ...(stages ? { stages } : {}), ...(repository ? { repository } : {}) };
 }
 
 /** See WhatsNext. Only called for an accepted current stage of a run that is not complete. */

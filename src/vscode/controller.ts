@@ -92,7 +92,7 @@ import { migrateToStageScope, stageScopeKey, type StageScope } from "../core/sta
 import { deriveStatus } from "../core/status";
 import type { IntakeApprovalAttempt } from "../core/overviewModel";
 import { SparringCommandRunner, type RunCommandOptions, type RunCommandResult } from "./commandRunner";
-import { TerminalPool } from "./terminalPool";
+import { TerminalPool, type CleanupResult } from "./terminalPool";
 import { ExecutionTracker, type CommandNotFound, type EngineFailure, type LaunchOptions, type LaunchResult, type StopOutcome, type StopTarget } from "./executionTracker";
 import { OperationRegistry, runnerKey, type OperationView, type OverrideResult } from "./operationRegistry";
 import { ManifestReader, type BoundManifest } from "./manifestReader";
@@ -576,6 +576,11 @@ export class SparringController implements vscode.Disposable {
       }
     }
     return out;
+  }
+
+  /** See TerminalPool.cleanUp. */
+  cleanUpRunnerTerminals(): CleanupResult {
+    return this.terminals.cleanUp();
   }
 
   get currentSelection(): RunSelection {

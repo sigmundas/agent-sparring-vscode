@@ -616,9 +616,78 @@ export function isPreRunIntake(intake: IntakeSnapshot): boolean {
   return intake.state === "prepared" || intake.state === "approved";
 }
 
-/** The slice an intake is waiting on: the first approved-but-not-run one, else the first prepared one. */
-export function nextIntakeSlice(intake: IntakeSnapshot): IntakeSliceSnapshot | undefined {
-  return intake.slices.find((slice) => slice.state === "approved") ?? intake.slices.find((slice) => slice.state === "prepared");
+/**
+ * The slice an intake is waiting on: the first approved-but-not-run one, else
+ * the first prepared one — preferring, in each, a slice whose earlier slices
+ * (as the engine recorded them) are all complete, so work that is still
+ * dependency-blocked is not named next while eligible work exists.
+ *
+ * `finishing` is the run id of a slice whose run is still open but whose last
+ * stage is accepted: it is counted as complete and never offered itself. This
+ * is the one definition of "next" — current-work selection and the Overview's
+ * What's next both ask it — and it decides only what is shown; approve-plan
+ * and run-plan enforce the order themselves.
+ */
+export function nextIntakeSlice(intake: IntakeSnapshot, finishing?: string): IntakeSliceSnapshot | undefined {
+  const open = intake.slices.filter((slice) => slice.runId !== finishing);
+  const eligible = (slice: IntakeSliceSnapshot) => sliceEligible(intake, slice, finishing);
+  return (
+    open.find((slice) => slice.state === "approved" && eligible(slice)) ??
+    open.find((slice) => slice.state === "prepared" && eligible(slice)) ??
+    open.find((slice) => slice.state === "approved") ??
+    open.find((slice) => slice.state === "prepared")
+  );
+}
+
+/** Whether every earlier slice the engine recorded for `slice` is complete (`finishing` counted as complete). */
+export function sliceEligible(intake: IntakeSnapshot, slice: IntakeSliceSnapshot, finishing?: string): boolean {
+  return earlierSlicesPending(intake, slice, finishing).length === 0;
+}
+
+/** The earlier slices `slice` still waits on, by run id; `finishing` counted as complete. */
+export function earlierSlicesPending(intake: IntakeSnapshot, slice: IntakeSliceSnapshot, finishing?: string): string[] {
+  const complete = new Set(intake.slices.filter((entry) => entry.state === "complete").map((entry) => entry.runId));
+  if (finishing) {
+    complete.add(finishing);
+  }
+  return (slice.requirements?.earlierSlices ?? []).filter((runId) => !complete.has(runId));
+}
+
+/**
+ * What follows the execution of slice `currentRunId` in the whole intake — not
+ * in that slice's own run, whose stage list ends where the slice does.
+ *
+ *  - `next`: `slice` is the next work the recorded order permits. `afterCurrent`
+ *    when the current slice's run is still open, so it must be closed first.
+ *  - `waiting`: later slices remain but none may begin yet — each waits on an
+ *    earlier slice that is not complete (`slice` is the first such, `waitingOn`
+ *    its unmet earlier slices), or another slice is running.
+ *  - `complete`: no slice other than the current one is left: the plan ends
+ *    with this execution.
+ */
+export type IntakeContinuation =
+  | { kind: "next"; slice: IntakeSliceSnapshot; afterCurrent: boolean }
+  | { kind: "waiting"; slice?: IntakeSliceSnapshot; waitingOn: string[]; running: IntakeSliceSnapshot[]; afterCurrent: boolean }
+  | { kind: "complete"; afterCurrent: boolean };
+
+export function intakeContinuation(intake: IntakeSnapshot, currentRunId: string): IntakeContinuation {
+  const current = intake.slices.find((slice) => slice.runId === currentRunId);
+  const afterCurrent = current !== undefined && current.state !== "complete";
+  const remaining = intake.slices.filter((slice) => slice.runId !== currentRunId && slice.state !== "complete");
+  if (remaining.length === 0) {
+    return { kind: "complete", afterCurrent };
+  }
+  const next = nextIntakeSlice(intake, currentRunId);
+  if (next && sliceEligible(intake, next, currentRunId)) {
+    return { kind: "next", slice: next, afterCurrent };
+  }
+  const running = remaining.filter((slice) => slice.state === "running");
+  return { kind: "waiting", slice: next, waitingOn: next ? earlierSlicesPending(intake, next, currentRunId) : [], running, afterCurrent };
+}
+
+/** The repository a slice is approved in and run from: its approval's worktree, else intake's recorded path for its primary. */
+export function sliceRoot(slice: Pick<IntakeSliceSnapshot, "approval" | "primaryPath">): string | undefined {
+  return slice.approval?.repoRoot ?? slice.primaryPath;
 }
 
 /**

@@ -36,6 +36,8 @@ import {
   NOTES_FILENAME,
   SPARRING_FILENAME,
   currentStageOf,
+  intakeOfRun,
+  owningRoot,
   isInsidePath,
   runIdFor,
   samePath,
@@ -46,7 +48,7 @@ import {
   type StandaloneStageSnapshot,
   type DiscoveredIntake,
 } from "../core/discovery";
-import { intakeNextAction, intakeStateLabel, sliceStageName } from "../core/intake";
+import { intakeContinuation, intakeNextAction, intakeStateLabel, sliceRoot, sliceStageName } from "../core/intake";
 import type { IntakeActionMessage } from "../core/overviewHtml";
 import { approveInvocation, startInvocation } from "../core/intakeActions";
 import { stageScopeOf } from "../core/stageScope";
@@ -96,6 +98,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.selectRun", () => selectRunCommand(controller)),
     vscode.commands.registerCommand("agentSparring.followActiveRepository", () => controller.followActiveRepository()),
     vscode.commands.registerCommand("agentSparring.chooseRepository", () => chooseRepositoryCommand(controller)),
+    vscode.commands.registerCommand("agentSparring.cleanUpRunnerTerminals", () => cleanUpRunnerTerminalsCommand(controller)),
     vscode.commands.registerCommand("agentSparring.followActiveEditor", () => controller.followActiveEditor()),
     vscode.commands.registerCommand("agentSparring.diagnoseDiscovery", () => controller.diagnoseDiscovery()),
     vscode.commands.registerCommand("agentSparring.openOverview", () => openOverviewCommand(controller, overview)),
@@ -653,7 +656,7 @@ async function handleIntakeAction(controller: SparringController, overview: Over
     kind: "run-plan",
     planPath: intake.record.sourcePath ?? invocation.manifestPath,
     manifest: invocation.manifestPath,
-    reveal: true,
+    reveal: false,
   });
   await explainLaunch(controller, result);
   if (result.ok) {
@@ -766,6 +769,10 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       return;
     case "followActiveEditor":
       await controller.followActiveEditor();
+      await overview.update();
+      return;
+    case "switchToNextRepository":
+      await switchToNextRepository(controller);
       await overview.update();
       return;
     case "runPlan":
@@ -2215,7 +2222,7 @@ async function launch(controller: SparringController, location: SparringLocation
   // here builds a command line or starts a process of its own.
   // `runId` is passed in rather than derived from the plan path: a plan run
   // is identified by its run *instance*, and a document may have several.
-  const result = await controller.launch({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: kind, runId, kind, planPath, manifest, reveal: true });
+  const result = await controller.launch({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: kind, runId, kind, planPath, manifest, reveal: false });
   await explainLaunch(controller, result);
   return result;
 }
@@ -3006,7 +3013,7 @@ async function startManagedRun(controller: SparringController, overview: Overvie
     kind: "run-plan",
     planPath,
     manifest: manifestPath,
-    reveal: true,
+    reveal: false,
   });
   await explainLaunch(controller, result);
   if (result.ok) {
@@ -3752,6 +3759,51 @@ async function chooseRepositoryCommand(controller: SparringController): Promise<
   } else if (picked.root) {
     await controller.chooseRepository(picked.root);
   }
+}
+
+/**
+ * Close the Agent Sparring terminals known to be running nothing. Running,
+ * occupied and unknown-liveness terminals stay, and the log says why. Their
+ * scrollback is not workflow state: the engine's records, the activity logs
+ * and the Agent Sparring output keep the history.
+ */
+async function cleanUpRunnerTerminalsCommand(controller: SparringController): Promise<void> {
+  const result = controller.cleanUpRunnerTerminals();
+  for (const name of result.closed) {
+    controller.log(`Clean up runner terminals: closed ${name}`);
+  }
+  for (const kept of result.kept) {
+    controller.log(`Clean up runner terminals: left ${kept.name} open — ${kept.reason}`);
+  }
+  const closed = result.closed.length === 0 ? "No runner terminal could be closed" : `Closed ${result.closed.length} runner terminal${result.closed.length === 1 ? "" : "s"}`;
+  const kept = result.kept.length === 0 ? "." : `; left ${result.kept.length} open that ${result.kept.length === 1 ? "is" : "are"} running or whose state cannot be established (see the log).`;
+  void vscode.window.showInformationMessage(`Agent Sparring: ${closed}${kept}`);
+}
+
+/**
+ * What's next's "Switch to <repository>": follow the repository that owns the
+ * intake's next work, recomputed here from the same continuation the screen
+ * was drawn from — never a path the webview sent. Only the followed
+ * repository changes (which releases a run pin); nothing is approved,
+ * started, pinned or opened, and that repository's current-work selection
+ * then shows the next stage.
+ */
+async function switchToNextRepository(controller: SparringController): Promise<void> {
+  const run = controller.currentSelection.selected;
+  const intake = run ? intakeOfRun(run, controller.currentDiscovery.intakes) : undefined;
+  const continuation = run?.kind === "plan" && run.intake && intake ? intakeContinuation(intake, run.intake.runId) : undefined;
+  const root = continuation?.kind === "next" && !continuation.afterCurrent ? sliceRoot(continuation.slice) : undefined;
+  if (!root) {
+    void vscode.window.showInformationMessage("Agent Sparring: what comes next changed since this screen was drawn, so the repository was not switched. Check the updated screen.");
+    return;
+  }
+  const choices = await controller.repositoryChoices();
+  const owner = owningRoot(root, choices.map((choice) => choice.root));
+  if (!owner) {
+    void vscode.window.showInformationMessage(`Agent Sparring: the next stage belongs to ${root}, which is not open in this window. Add it to the workspace to follow it.`);
+    return;
+  }
+  await controller.chooseRepository(owner);
 }
 
 /**
