@@ -25,7 +25,7 @@ import { planKey } from "../core/sparringCommand";
 import { BINDING_VERSION, bindingFileName, manifestFileName, parseExecutionManifest, renderBindingRecord } from "../core/manifest";
 import { isActionMessage, isAgentConfigMessage, isAutoPushMessage, isCopyPromptMessage, isHumanCheckMessage, isHumanFeedbackMessage, isOpenPromptSourceMessage, renderOverviewHtml } from "../core/overviewHtml";
 import { appendHumanEvidence, draftKeyFor, renderHumanEvidence, submittableChecks, withHumanCheck, type HumanCheckDrafts } from "../core/humanChecks";
-import { PROVIDER_DEFAULT_LABEL, parseEngineConfig } from "../core/effectiveConfig";
+import { CUSTOM_MODEL_VALUE, PROVIDER_DEFAULT_LABEL, PROVIDER_DEFAULT_VALUE, parseEngineConfig } from "../core/effectiveConfig";
 import type { ExecutionRecord, LivenessState, RunnerLiveness } from "../core/liveness";
 import { buildOverviewModel, type CapturedPrompt, type ManifestStageView, type OverviewArtifacts } from "../core/overviewModel";
 import { ExecutionTracker } from "../vscode/executionTracker";
@@ -303,16 +303,20 @@ interface ModelReport {
       role: string;
       label: string;
       provider: { value: string; fixedText?: string; options?: { value: string; label: string }[] };
-      model: { value: string; options?: { value: string }[]; fixedText?: string };
-      effort?: { value: string; options?: { value: string; label: string }[] };
+      model: { value: string; options?: { value: string; label: string; custom?: boolean }[]; fixedText?: string; summary?: string; detail: string };
+      effort?: { value: string; options?: { value: string; label: string }[]; summary?: string };
+      technical: { label: string; value: string }[];
     }[];
     configPath?: string;
+    userConfigPath?: string;
     configExists?: boolean;
     scope?: string;
     activeRunNote?: string;
     note?: string;
     settings: { label: string; detail: string };
   };
+  /** A fixable setup problem of this repository, with its one engine action. */
+  setup?: { headline: string; lines: string[]; technical: string; action: { label: string; detail: string } };
   /** The live-run pill: Working / Stop requested… / Run status unknown. */
   busyState?: { label: string; detail: string; state: string };
   /** The Stop control, present only when an exact operation can be interrupted. */
@@ -1194,7 +1198,8 @@ async function actorCardControlAssertions(): Promise<void> {
       config_exists: true,
       project: "demo",
       error: null,
-      stage: { role: "stage", provider: "claude-cli", provider_display_name: "Claude", provider_source: "project", model: "a-model", model_source: "project", effort: null, effort_source: "provider-default", effort_supported: true, effort_levels: ["brisk", "glacial"] },
+      user_config_path: path.join(root, "preferences.toml"),
+      stage: { role: "stage", provider: "claude-cli", provider_display_name: "Claude", provider_source: "project", model: "a-model", model_source: "user", effort: null, effort_source: "provider-default", effort_supported: true, effort_levels: ["brisk", "glacial"] },
       sparring: { role: "sparring", provider: "codex-cli", provider_display_name: "Codex", provider_source: "project", model: null, model_source: "provider-default", effort: null, effort_source: "provider-default", effort_supported: true, effort_levels: ["minimal"] },
     }),
   );
@@ -1264,10 +1269,11 @@ async function actorCardControlAssertions(): Promise<void> {
         var providerLine = card.querySelector('.provider');
         var cardBox = card.getBoundingClientRect();
         var effortBox = effort.getBoundingClientRect();
-        // The model as the page actually renders it: read-only text, with
-        // nothing focusable or typable behind it.
-        var modelText = card.querySelector('.agentconfig-fixed');
-        var modelBox = modelText.getBoundingClientRect();
+        // The model as the page actually renders it: the configured value in
+        // words, and a dropdown (not a text box) to change the preference.
+        var modelSelect = card.querySelector('select[data-field="model"]');
+        var modelEffective = card.querySelector('.agentconfig-effective[data-effective="model"]');
+        var modelBox = modelSelect.getBoundingClientRect();
         var size = function (node) { return parseFloat(getComputedStyle(node).fontSize); };
         __api.postMessage({
           type: 'cardProbe',
@@ -1284,11 +1290,12 @@ async function actorCardControlAssertions(): Promise<void> {
           providerColor: getComputedStyle(providerLine).color,
           roleAbove: rolename.getBoundingClientRect().top < providerLine.getBoundingClientRect().top,
           effortInsideCard: effortBox.top >= cardBox.top && effortBox.bottom <= cardBox.bottom && effortBox.left >= cardBox.left && effortBox.right <= cardBox.right,
-          modelTag: modelText.tagName,
-          modelValue: modelText.textContent,
+          modelTag: modelSelect.tagName,
+          modelValue: modelSelect.value,
+          modelOptions: Array.prototype.map.call(modelSelect.options, function (option) { return [option.value, option.hasAttribute('data-custom')]; }),
+          modelEffective: modelEffective ? modelEffective.textContent : null,
           modelEditable: card.querySelectorAll('input[data-field], [contenteditable]').length,
-          // Both start on the same column, which is the alignment the
-          // read-only value's padding exists to preserve.
+          // Both dropdowns start on the same column.
           modelAlignsWithEffort: Math.abs(modelBox.left - effortBox.left) < 1,
           labelWhenOpen: labelWhenOpen,
           labelWhenClosed: labelWhenClosed,
@@ -1319,10 +1326,16 @@ async function actorCardControlAssertions(): Promise<void> {
     assert.ok((seen["roleSize"] as number) > (seen["providerSize"] as number), `the role is the larger text (${String(seen["roleSize"])} vs ${String(seen["providerSize"])})`);
     assert.notEqual(seen["roleColor"], seen["providerColor"], "the role carries the actor's colour; the provider is subdued");
     assert.equal(seen["effortInsideCard"], true, "the effort control is laid out inside its own role's card");
-    assert.equal(seen["modelTag"], "SPAN", "the model is text on the card, not a control");
-    assert.equal(seen["modelValue"], "a-model", "showing exactly what the engine resolved");
+    assert.equal(seen["modelTag"], "SELECT", "the model preference is a dropdown on the card");
+    assert.equal(seen["modelValue"], "a-model", "selecting exactly what the engine resolved");
+    assert.deepEqual(
+      seen["modelOptions"],
+      [["", false], ["a-model", false], [CUSTOM_MODEL_VALUE, true]],
+      "Provider default, the configured model although nothing suggested it, and Other exact model…",
+    );
+    assert.equal(seen["modelEffective"], "Model: a-model · Your preference", "the exact configured model and where it came from, in words");
     assert.equal(seen["modelEditable"], 0, "and nothing on the card can be typed into");
-    assert.equal(seen["modelAlignsWithEffort"], true, "the read value starts on the same column as the dropdown");
+    assert.equal(seen["modelAlignsWithEffort"], true, "the two dropdowns start on the same column");
     // The reported bug: opening one actor's instructions moved the other
     // actor's card. Both cards' boxes are measured either side of the click.
     assert.deepEqual(seen["cardsAfter"], seen["cardsBefore"], "opening the instructions moved neither card");
@@ -1341,13 +1354,13 @@ async function actorCardControlAssertions(): Promise<void> {
     const changes = posted.filter((message) => message["type"] === "agentConfig");
     assert.deepEqual(
       changes,
-      [{ type: "agentConfig", role: "stage", field: "effort", value: "glacial", scope: configPath }],
-      "the one change went out on the existing wire, carrying the project.toml the card was drawn from",
+      [{ type: "agentConfig", role: "stage", field: "effort", value: "glacial", scope: configPath, provider: "claude-cli" }],
+      "the one change went out on the existing wire, carrying the project.toml and the provider the card was drawn from",
     );
     for (const change of changes) {
       assert.ok(isAgentConfigMessage(change), "and the host accepts each one");
     }
-    console.log("integration: the actor cards state their own model and carry their own effort control, built from the engine's levels, and using it leaves the card and its instructions exactly as the person left them");
+    console.log("integration: the actor cards state their own model and carry their own model and effort controls, built from the engine's levels, and using it leaves the card and its instructions exactly as the person left them");
   } finally {
     panel.dispose();
     await fs.rm(root, { recursive: true, force: true });
@@ -3135,12 +3148,15 @@ async function evidenceLaunchAssertions(reportedRepo: string, fixtureRoot: strin
     const args = [...argv.matchAll(/<([^]*?)>\n/g)].map((match) => match[1]);
 
     assert.equal(executable, vscode.workspace.getConfiguration("agentSparring").get<string>("executable"), "the exact configured absolute executable ran");
-    assert.equal(args.length, 8, `resume-plan carries eight arguments, not a sentence split into words: ${JSON.stringify(args)}`);
+    // The run key names the one managed run being resumed, so the engine
+    // resumes that run and not whichever one it would pick by itself.
+    assert.equal(args.length, 10, `resume-plan carries ten arguments, not a sentence split into words: ${JSON.stringify(args)}`);
     assert.equal(args[0], "resume-plan");
-    assert.deepEqual([args[2], args[4], args[6]], ["--repo-root", "--expected-branch", "--evidence"], "each flag with its own value");
+    assert.deepEqual([args[2], args[4], args[6], args[8]], ["--repo-root", "--expected-branch", "--run-key", "--evidence"], "each flag with its own value");
     assert.equal(args[3], reportedRepo);
     assert.equal(args[5], "feature/reported-statistics");
-    const evidence = args[7];
+    assert.equal(args[7], GATE_PLAN_KEY, "the run key of the plan run on screen");
+    const evidence = args[9];
     assert.match(evidence, new RegExp(`check \\\`${GATE_CHECK_ID}\\\``), "the backticked gate id arrives as text, not as command substitution");
     assert.match(evidence, /Checked on the reviewer's build; the placeholder doesn't flash\./, "apostrophes and the semicolon survive");
     assert.ok(evidence.includes("\n"), "and it is still one multi-line entry");
@@ -3164,7 +3180,7 @@ async function evidenceLaunchAssertions(reportedRepo: string, fixtureRoot: strin
       beforeNotFound,
       "and nothing claims the shell could not find an executable it just ran",
     );
-    console.log("integration: resume-plan --evidence reached the configured executable as 8 arguments with no shell in between; its 127 was reported as an engine failure");
+    console.log("integration: resume-plan --evidence reached the configured executable as 10 arguments with no shell in between; its 127 was reported as an engine failure");
   } finally {
     restore();
     await fs.writeFile(path.join(sparring, "fake-runner.conf"), "sleep_for=3\nexit_with=0\n");
@@ -3662,24 +3678,44 @@ function built(result: unknown, projectDir: string): BuiltManifest {
 /**
  * Changing the model and the effort from the Overview, for real.
  *
- * What this proves end to end: the controls are built from what the engine
- * reported, not from anything the extension knows; a change runs the
- * engine's own `set-config` (it shows up in the engine call log, and the
- * file it wrote is on disk) rather than the extension writing TOML; the
- * value shown afterwards is re-read from the engine rather than assumed;
- * a change the engine refuses leaves the engine's value on screen and the
- * file untouched; and a change carrying a repository this window has moved
- * on from is refused instead of being applied to the one now on screen.
+ * Model and effort are the person's own preferences, keyed by role and
+ * provider and kept by the engine in one file outside every repository;
+ * the provider stays a project setting. What this proves end to end:
+ *
+ * - the model choices are the engine's `model-choices` suggestions, for
+ *   exactly that role and provider, with where they came from, read once and
+ *   cached until an explicit Refresh; they are never a closed list: the
+ *   configured model is always kept, and Other exact model… sends any exact
+ *   id as one argument;
+ * - a change runs the engine's own `set-config … --for-provider <p> --json`
+ *   (no per-worktree flag), the engine writes its preferences file, the
+ *   repository is left untouched, and what is shown afterwards is re-read
+ *   from the engine;
+ * - a refused change (an alias, an unsupported level) keeps the engine's
+ *   value on screen and writes nothing;
+ * - switching repositories shows the same preference, because it is one;
+ * - a change carrying a repository this window has moved on from is refused;
+ * - obsolete project model/effort keys are diagnosed, not used, and removed
+ *   by the engine's fix-config without choosing a preference.
  */
 async function agentConfigAssertions(report: DiscoveryDiagnostic, reportedRepo: string, fixtureRoot: string): Promise<void> {
   const model = async () => (await vscode.commands.executeCommand("agentSparring._test.overviewModel")) as ModelReport;
   const change = async (message: unknown) => (await vscode.commands.executeCommand("agentSparring._test.agentConfig", message)) as AgentConfigOutcome;
   const configPath = path.join(reportedRepo, ".sparring", "project.toml");
   const callsLog = path.join(reportedRepo, ".sparring", "fake-calls.log");
+  const prefsPath = path.join(fixtureRoot, "user-preferences.conf");
+  const choicesCount = path.join(fixtureRoot, "fake-model-choices.count");
+  const setArgv = path.join(fixtureRoot, "fake-argv-set-config.log");
   const read = () => fs.readFile(configPath, "utf8").catch(() => "");
+  const prefs = () => fs.readFile(prefsPath, "utf8").catch(() => "");
   const calls = async () => (await fs.readFile(callsLog, "utf8").catch(() => "")).trim().split("\n").filter(Boolean);
+  const choiceReads = async () => (await fs.readFile(choicesCount, "utf8").catch(() => "")).split("\n").filter(Boolean).length;
+  const lastSetArgs = async () => [...(await fs.readFile(setArgv, "utf8")).matchAll(/<([^]*?)>\n/g)].map((match) => match[1]);
+  const values = (options: { value: string }[] | undefined) => (options ?? []).map((option) => option.value);
+  const exists = (file: string) => fs.access(file).then(() => true, () => false);
 
   await fs.rm(configPath, { force: true });
+  await fs.rm(prefsPath, { force: true });
   const runId = runIdOf(report, reportedRepo, "stage-review-complete");
   assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", runId), runId);
   // The panel has to be open: a control can only post a change after it has
@@ -3692,6 +3728,8 @@ async function agentConfigAssertions(report: DiscoveryDiagnostic, reportedRepo: 
   const initial = await model();
   const scope = initial.agentConfig?.scope;
   assert.equal(scope, configPath, "the controls are scoped to this repository's config");
+  assert.equal(initial.agentConfig?.userConfigPath, prefsPath, "the preferences file is the engine's, outside the repository");
+  assert.ok(path.relative(reportedRepo, prefsPath).startsWith(".."), "and it is not inside any repository");
   assert.deepEqual(
     initial.agentConfig?.controls.map((control) => control.role),
     ["stage", "sparring"],
@@ -3700,85 +3738,144 @@ async function agentConfigAssertions(report: DiscoveryDiagnostic, reportedRepo: 
   const sparrerControl = initial.agentConfig!.controls[1];
   assert.equal(stageControl.provider.fixedText, "Claude", "one provider for the role, so it is shown and not chosen");
   assert.equal(stageControl.provider.options, undefined);
-  assert.equal(stageControl.model.options, undefined, "a model is never a closed list: nothing enumerates them");
-  assert.equal(stageControl.model.fixedText, PROVIDER_DEFAULT_LABEL, "and with none configured it is read, not offered");
+
+  // The model choices are the engine's suggestions for exactly this role and
+  // provider, with the default first and an exact custom value last.
+  assert.deepEqual(values(stageControl.model.options), [PROVIDER_DEFAULT_VALUE, "claude-opus-5-5", "claude-fable-5-1", CUSTOM_MODEL_VALUE]);
+  assert.deepEqual(values(sparrerControl.model.options), [PROVIDER_DEFAULT_VALUE, "gpt-6-astra", "gpt-5.6-terra", CUSTOM_MODEL_VALUE]);
+  assert.equal(stageControl.model.options?.at(-1)?.custom, true, "Other exact model… is a request for a value, not a value");
+  assert.ok(!values(stageControl.model.options).some((value) => value.startsWith("gpt-")), "Codex's suggestions are never offered for Claude");
+  assert.ok(!values(sparrerControl.model.options).some((value) => value.startsWith("claude-")), "and Claude's never for Codex");
+  assert.ok(![...(stageControl.model.options ?? []), ...(stageControl.effort?.options ?? [])].some((option) => option.label === "Project setting"), "no Project setting option");
+  // Where the suggestions came from is said, and they are not called complete.
+  assert.match(stageControl.model.detail, /Suggestions from the models Agent Sparring knows; other exact models may exist/);
+  assert.match(sparrerControl.model.detail, /Suggestions from Codex's own model list; other exact models may exist/);
+  assert.ok(stageControl.technical.some((entry) => entry.label === "Model suggestions" && /^engine-known, not complete/.test(entry.value)));
+  assert.ok(sparrerControl.technical.some((entry) => entry.label === "Model suggestions" && /^provider-catalog, not complete/.test(entry.value)));
+  // Nothing configured is the words for that, never a model name.
+  assert.equal(stageControl.model.value, PROVIDER_DEFAULT_VALUE);
+  assert.equal(stageControl.model.summary, PROVIDER_DEFAULT_LABEL);
   // The dropdown's entries are the engine's levels: the two providers'
   // vocabularies differ, and the difference arrives from the engine.
-  assert.deepEqual(
-    stageControl.effort?.options?.map((option) => option.value),
-    ["", "low", "medium", "high", "xhigh", "max"],
-  );
-  assert.deepEqual(
-    sparrerControl.effort?.options?.map((option) => option.value),
-    ["", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
-  );
+  assert.deepEqual(values(stageControl.effort?.options), ["", "low", "medium", "high", "xhigh", "max"]);
+  assert.deepEqual(values(sparrerControl.effort?.options), ["", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
   assert.equal(stageControl.effort?.options?.[0].label, "Provider default");
+  const readsAfterRefresh = await choiceReads();
+  assert.ok(readsAfterRefresh >= 1, "model-choices was asked");
 
-  // A model change goes through the engine, and the engine writes the file.
-  // Driven here as a message rather than from a control: the cockpit shows
-  // the model and does not edit it, but `set-config --model` is still the
-  // engine's own mutation and the host still has to honour it correctly.
+  // A model change goes through the engine, which writes the user's own
+  // preferences file -- for the provider on the card, and never a repository.
   await fs.rm(callsLog, { force: true });
-  const set = await change({ type: "agentConfig", role: "stage", field: "model", value: "opus", scope });
+  const set = await change({ type: "agentConfig", role: "stage", field: "model", value: "claude-fable-5-1", scope, provider: "claude-cli" });
   assert.deepEqual([set.applied, set.error], [true, undefined], `set model: ${JSON.stringify(set)}`);
   assert.deepEqual(await calls(), ["set-config stage"], "exactly one engine command, and it is the engine's own mutation");
-  assert.match(await read(), /^model = "opus"$/m, "the engine wrote the file; the extension never touched it");
-  assert.equal((await model()).agentConfig?.controls[0].model.value, "opus", "and the value shown is re-read from the engine");
+  const args = await lastSetArgs();
+  assert.deepEqual(args.slice(args.indexOf("set-config")), ["set-config", "stage", "--model", "claude-fable-5-1", "--for-provider", "claude-cli", "--json"], "the global preference, for the provider on screen");
+  assert.ok(!args.includes("--local"), "there is no per-worktree override any more");
+  assert.match(await prefs(), /^stage\.claude-cli\.model=claude-fable-5-1$/m, "the engine wrote its preferences file; the extension never touched it");
+  assert.equal(await exists(configPath), false, "and the repository was not written to");
+  const afterSet = await model();
+  assert.equal(afterSet.agentConfig?.controls[0].model.value, "claude-fable-5-1", "the value shown is re-read from the engine");
+  assert.equal(afterSet.agentConfig?.controls[0].model.summary, "claude-fable-5-1 · Your preference", "the exact model and where it came from");
+  assert.equal(await choiceReads(), readsAfterRefresh, "suggestions are cached, not re-read behind every render");
+
+  // A Claude alias is not an exact model; the engine refuses it and nothing changes.
+  const alias = await change({ type: "agentConfig", role: "stage", field: "model", value: "opus", scope, provider: "claude-cli" });
+  assert.equal(alias.applied, false);
+  assert.match(alias.error ?? "", /alias/, "the engine's own diagnostic");
+  assert.equal((await model()).agentConfig?.controls[0].model.value, "claude-fable-5-1");
+
+  // Other exact model…: the id typed is sent as one exact argument, shell
+  // syntax and all, and the configured model is then kept in the dropdown
+  // although no suggestion names it.
+  const exact = "claude-opus-5-5-20260901 $(touch pwned); 'x'";
+  const window = vscode.window as unknown as Record<string, unknown>;
+  const inputBox = window["showInputBox"];
+  window["showInputBox"] = async () => `  ${exact}  `;
+  try {
+    const custom = await change({ type: "agentConfig", role: "stage", field: "model", value: null, custom: true, scope, provider: "claude-cli" });
+    assert.deepEqual([custom.applied, custom.error], [true, undefined], `custom model: ${JSON.stringify(custom)}`);
+  } finally {
+    window["showInputBox"] = inputBox;
+  }
+  const customArgs = await lastSetArgs();
+  assert.equal(customArgs[customArgs.indexOf("--model") + 1], exact, "one exact argument, trimmed, never through a shell");
+  assert.equal(await exists(path.join(reportedRepo, "pwned")), false);
+  const customModel = await model();
+  assert.equal(customModel.agentConfig?.controls[0].model.value, exact);
+  assert.deepEqual(values(customModel.agentConfig?.controls[0].model.options).slice(0, 3), [PROVIDER_DEFAULT_VALUE, exact, "claude-opus-5-5"], "an unlisted configured model is kept");
+  window["showInputBox"] = async () => undefined;
+  try {
+    const cancelled = await change({ type: "agentConfig", role: "stage", field: "model", value: null, custom: true, scope, provider: "claude-cli" });
+    assert.equal(cancelled.applied, false, "cancelling the input changes nothing");
+  } finally {
+    window["showInputBox"] = inputBox;
+  }
+  await change({ type: "agentConfig", role: "stage", field: "model", value: "claude-opus-5-5", scope, provider: "claude-cli" });
 
   // The other role is independent, and is reported from the same re-read.
-  await change({ type: "agentConfig", role: "sparring", field: "model", value: "gpt-5.6-terra", scope });
+  await change({ type: "agentConfig", role: "sparring", field: "model", value: "gpt-5.6-terra", scope, provider: "codex-cli" });
   const both = await model();
-  assert.equal(both.agentConfig?.controls[0].model.value, "opus");
+  assert.equal(both.agentConfig?.controls[0].model.value, "claude-opus-5-5");
   assert.equal(both.agentConfig?.controls[1].model.value, "gpt-5.6-terra");
 
   // An effort from the dropdown, then the default option, which clears it.
-  await change({ type: "agentConfig", role: "stage", field: "effort", value: "xhigh", scope });
+  await change({ type: "agentConfig", role: "stage", field: "effort", value: "xhigh", scope, provider: "claude-cli" });
   assert.equal((await model()).agentConfig?.controls[0].effort?.value, "xhigh");
-  await change({ type: "agentConfig", role: "sparring", field: "effort", value: "ultra", scope });
+  await change({ type: "agentConfig", role: "sparring", field: "effort", value: "ultra", scope, provider: "codex-cli" });
   assert.equal((await model()).agentConfig?.controls[1].effort?.value, "ultra", "a level only Codex has");
+  assert.equal((await model()).agentConfig?.controls[1].effort?.summary, "ultra · Your preference");
 
   // Clearing is null on the wire and the engine's own --default flag; the
-  // words "provider default" are never written as a value.
-  await change({ type: "agentConfig", role: "sparring", field: "model", value: null, scope });
+  // words "provider default" are never saved as a value.
+  await change({ type: "agentConfig", role: "sparring", field: "model", value: null, scope, provider: "codex-cli" });
   const cleared = await model();
   assert.equal(cleared.agentConfig?.controls[1].model.value, "", "the control shows the default option");
-  assert.doesNotMatch(await read(), /provider default/i, "no such model name is ever written");
+  assert.equal(cleared.agentConfig?.controls[1].model.summary, PROVIDER_DEFAULT_LABEL, "distinct from any exact model");
+  assert.ok((await lastSetArgs()).includes("--model-default"));
+  assert.doesNotMatch(await prefs(), /provider default|sparring\.codex-cli\.model=/i, "no such model name is ever written");
   assert.match(cleared.agentConfig?.lines[1].text ?? "", /Codex · provider default/);
 
   // A level the engine refuses: nothing is written, and what stays on screen
   // is the engine's value rather than the one that was asked for.
-  const before = await read();
+  const before = await prefs();
   await fs.rm(callsLog, { force: true });
-  const refused = await change({ type: "agentConfig", role: "stage", field: "effort", value: "ultra", scope });
+  const refused = await change({ type: "agentConfig", role: "stage", field: "effort", value: "ultra", scope, provider: "claude-cli" });
   assert.equal(refused.applied, false);
   assert.match(refused.error ?? "", /not supported by provider 'claude-cli'/, "the engine's own diagnostic, not a translation");
-  assert.equal(await read(), before, "a refused change writes nothing");
+  assert.equal(await prefs(), before, "a refused change writes nothing");
   assert.equal((await model()).agentConfig?.controls[0].effort?.value, "xhigh", "the engine's value, not the requested one");
   assert.deepEqual(await calls(), ["set-config stage"], "it was attempted through the engine, and the engine said no");
 
   // A change naming a repository this window is no longer looking at.
-  const elsewhere = path.join(fixtureRoot, "sporely", "nested-repo", ".sparring", "project.toml");
+  const nestedRepo = path.join(fixtureRoot, "sporely", "nested-repo");
+  const elsewhere = path.join(nestedRepo, ".sparring", "project.toml");
   await fs.rm(elsewhere, { force: true });
   await fs.rm(callsLog, { force: true });
-  const stale = await change({ type: "agentConfig", role: "stage", field: "model", value: "sonnet", scope: elsewhere });
+  const stale = await change({ type: "agentConfig", role: "stage", field: "model", value: "claude-fable-5-1", scope: elsewhere, provider: "claude-cli" });
   assert.equal(stale.applied, false);
   assert.match(stale.refused ?? "", /active repository changed/);
   assert.deepEqual(await calls(), [], "no engine command at all");
-  assert.equal(await fs.access(elsewhere).then(() => true, () => false), false, "and nothing was written next door");
-  assert.equal((await model()).agentConfig?.controls[0].model.value, "opus", "this repository is untouched");
+  assert.equal(await exists(elsewhere), false, "and nothing was written next door");
+  assert.equal(await prefs(), before, "nor to the preferences");
+  assert.equal((await model()).agentConfig?.controls[0].model.value, "claude-opus-5-5", "this repository's view is untouched");
 
   // Switching the selected run to another repository moves the scope with
-  // it, which is what makes the check above bite.
-  const nested = runIdOf(report, path.join(fixtureRoot, "sporely", "nested-repo"), "stage-nested-only");
+  // it -- and shows the same preferences, because they are the person's own.
+  const nested = runIdOf(report, nestedRepo, "stage-nested-only");
   assert.equal(await vscode.commands.executeCommand("agentSparring._test.chooseRun", nested), nested);
   await vscode.commands.executeCommand("agentSparring.refresh");
   const moved = await model();
   assert.notEqual(moved.agentConfig?.scope, scope, "the controls now belong to the other repository");
+  assert.equal(moved.agentConfig?.controls[0].model.value, "claude-opus-5-5", "the same global preference, in another repository");
+  assert.equal(moved.agentConfig?.controls[0].model.summary, "claude-opus-5-5 · Your preference");
+  assert.equal(moved.agentConfig?.controls[0].effort?.value, "xhigh");
+  assert.equal(moved.agentConfig?.controls[1].effort?.value, "ultra");
   // And the old scope is now the stale one, refused in that direction too.
-  const backwards = await change({ type: "agentConfig", role: "stage", field: "model", value: "sonnet", scope: scope as string });
+  const backwards = await change({ type: "agentConfig", role: "stage", field: "model", value: "claude-fable-5-1", scope: scope as string, provider: "claude-cli" });
   assert.equal(backwards.applied, false);
   assert.match(backwards.refused ?? "", /active repository changed/);
-  assert.equal((await read()).includes('model = "sonnet"'), false, "the repository that is no longer selected was not written to");
+  assert.equal(await prefs(), before, "a change drawn for the repository that is no longer selected was not applied");
 
   // Back, and two changes in quick succession: both are applied, in order,
   // and neither is lost to the other's write.
@@ -3786,13 +3883,14 @@ async function agentConfigAssertions(report: DiscoveryDiagnostic, reportedRepo: 
   await vscode.commands.executeCommand("agentSparring.refresh");
   const rapid = (await model()).agentConfig?.scope as string;
   const [first, second] = await Promise.all([
-    change({ type: "agentConfig", role: "stage", field: "model", value: "sonnet", scope: rapid }),
-    change({ type: "agentConfig", role: "stage", field: "effort", value: "max", scope: rapid }),
+    change({ type: "agentConfig", role: "stage", field: "model", value: "claude-fable-5-1", scope: rapid, provider: "claude-cli" }),
+    change({ type: "agentConfig", role: "stage", field: "effort", value: "max", scope: rapid, provider: "claude-cli" }),
   ]);
   assert.deepEqual([first.applied, second.applied], [true, true]);
   const settled = await model();
-  assert.equal(settled.agentConfig?.controls[0].model.value, "sonnet", "neither write clobbered the other");
+  assert.equal(settled.agentConfig?.controls[0].model.value, "claude-fable-5-1", "neither write clobbered the other");
   assert.equal(settled.agentConfig?.controls[0].effort?.value, "max");
+  assert.equal(await exists(configPath), false, "after every change, the repository still has no configuration written by them");
 
   // A message that is not a well-formed change never reaches the engine.
   await fs.rm(callsLog, { force: true });
@@ -3800,13 +3898,36 @@ async function agentConfigAssertions(report: DiscoveryDiagnostic, reportedRepo: 
     { type: "agentConfig", role: "reviewer", field: "model", value: "x", scope: rapid },
     { type: "agentConfig", role: "stage", field: "repo.root", value: "/elsewhere", scope: rapid },
     { type: "agentConfig", role: "stage", field: "model", value: "x" },
+    { type: "agentConfig", role: "stage", field: "model", value: CUSTOM_MODEL_VALUE, scope: rapid },
+    { type: "agentConfig", role: "stage", field: "effort", value: null, custom: true, scope: rapid },
   ]) {
     const outcome = await change(bad);
     assert.equal(outcome.applied, false, `refused: ${JSON.stringify(bad)}`);
   }
   assert.deepEqual(await calls(), [], "a malformed message runs no engine command");
 
-  await fs.rm(configPath, { force: true });
+  // Old model/effort keys in project.toml: diagnosed in plain words, never
+  // used, and removed by the engine's fix-config, which picks no preference.
+  await fs.mkdir(path.dirname(configPath), { recursive: true });
+  await fs.writeFile(configPath, 'project = "fixture"\n\n[agents.stage]\nprovider = "claude-cli"\nmodel = "claude-haiku-4-5-20251001"\neffort = "low"\n');
   await vscode.commands.executeCommand("agentSparring.refresh");
-  console.log("integration: the Agents controls were built from the engine's own levels, every change ran set-config and was re-read from show-config, a refused level kept the engine's value, and a change carrying another repository was never applied");
+  const obsolete = await model();
+  assert.equal(obsolete.setup?.headline, "Agent configuration needs updating");
+  assert.deepEqual(obsolete.setup?.lines, ["Model and effort are now your own preferences, shared by every project. This project still has old model/effort settings."]);
+  assert.equal(obsolete.setup?.action.label, "Remove obsolete project settings");
+  assert.match(obsolete.setup?.technical ?? "", /role: stage\nfield: model\nvalue: claude-haiku-4-5-20251001\nconfig: \.sparring\/project\.toml/);
+  assert.equal(obsolete.agentConfig?.controls[0].model.value, "claude-fable-5-1", "the old key is not what runs: the preference is");
+  const prefsBeforeFix = await prefs();
+  await fs.rm(callsLog, { force: true });
+  await vscode.commands.executeCommand("agentSparring._test.overviewAction", "fixConfiguration");
+  assert.deepEqual(await calls(), ["fix-config --json"], "the engine's own repair");
+  assert.doesNotMatch(await read(), /^(model|effort) =/m, "the obsolete keys are gone");
+  assert.match(await read(), /^provider = "claude-cli"$/m, "and the provider, a project setting, is kept");
+  assert.equal(await prefs(), prefsBeforeFix, "removing them chose no preference");
+  assert.equal((await model()).setup, undefined, "and the notice is gone");
+
+  await fs.rm(configPath, { force: true });
+  await fs.rm(prefsPath, { force: true });
+  await vscode.commands.executeCommand("agentSparring.refresh");
+  console.log("integration: the Agents controls offered the engine's model suggestions per role and provider plus an exact custom id, every change ran set-config for the global preference and left the repository clean, a repository switch showed the same preference, a stale or refused change was never applied, and obsolete project keys were removed by fix-config");
 }

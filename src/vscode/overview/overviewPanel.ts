@@ -26,6 +26,7 @@ import {
   isHumanCheckMessage,
   isHumanFeedbackMessage,
   isAgentConfigMessage,
+  MODEL_MAX_LENGTH,
   isOpenPromptSourceMessage,
   isStopMessage,
   renderOverviewHtml,
@@ -52,7 +53,7 @@ import type { SparringController } from "../controller";
 import { gitContext } from "../git";
 import { readHead as readFileHead } from "../fileHead";
 import { configuredExecutable } from "../engineExecutable";
-import { readEffectiveConfig, writeAgentConfig } from "../configProbe";
+import { readEffectiveConfig, readModelChoices, writeAgentConfig } from "../configProbe";
 import { settingsTarget } from "../../core/settingsTarget";
 import type { EffectiveConfig } from "../../core/effectiveConfig";
 
@@ -267,26 +268,44 @@ export class OverviewPanelManager implements vscode.Disposable {
       await this.forceUpdate();
       return { applied: false, refused: "the active repository changed" };
     }
-    // Model and effort go to this worktree's local override whenever the
-    // engine offers one, so changing them mid-run leaves the repository
-    // clean and the loop running; the provider stays a project.toml change.
-    const current = await readEffectiveConfig(configuredExecutable(), target.projectDir, target.sparringDir);
-    const local = message.field !== "provider" && current.kind === "report" && current.report.local_config_path !== undefined;
-    const result = await writeAgentConfig(
-      configuredExecutable(),
-      target.projectDir,
-      target.sparringDir,
-      message.role,
-      message.field,
-      message.value,
-      local,
-    );
+    let value = message.value;
+    if (message.custom) {
+      // Other exact model…: the id is typed here and sent as one exact
+      // argument. Nothing checks it against the suggestions -- they are
+      // suggestions -- and the engine refuses what it will not save.
+      const typed = await vscode.window.showInputBox({
+        title: "Other exact model",
+        prompt: `The exact model id for the ${message.role === "stage" ? "stage agent" : "sparrer"}, saved as your own preference for every project.`,
+        placeHolder: "exact model id",
+        ignoreFocusOut: true,
+        validateInput: (text) => (text.trim().length === 0 ? "Enter an exact model id." : text.trim().length > MODEL_MAX_LENGTH ? "That is longer than any model id." : undefined),
+      });
+      const exact = typed?.trim();
+      if (!exact) {
+        await this.forceUpdate();
+        return { applied: false, refused: "no model was entered" };
+      }
+      value = exact;
+    }
+    // Model and effort are the person's own preferences, written by the
+    // engine outside every repository and keyed by the provider the control
+    // was drawn for; the provider stays a project.toml change.
+    const result = await writeAgentConfig(configuredExecutable(), target.projectDir, target.sparringDir, message.role, message.field, value, message.provider);
     if (!result.ok) {
       // The engine's own diagnostic, unedited: it knows why it refused.
       void vscode.window.showErrorMessage(`Agent Sparring: ${result.error}`);
     }
     await this.forceUpdate();
-    return result.ok ? { applied: true } : { applied: false, error: result.error };
+    if (!result.ok) {
+      return { applied: false, error: result.error };
+    }
+    // A run in progress keeps its current provider turn; say when the
+    // change lands, as a fact rather than a warning.
+    const note = message.field !== "provider" ? (await this.buildModel()).agentConfig?.activeRunNote : undefined;
+    if (note) {
+      void vscode.window.showInformationMessage(`Agent Sparring: saved. ${note}`);
+    }
+    return note ? { applied: true, note } : { applied: true };
   }
 
   /**
@@ -488,7 +507,17 @@ export class OverviewPanelManager implements vscode.Disposable {
     }
     try {
       const config = await readEffectiveConfig(configuredExecutable(), target.projectDir, target.sparringDir);
-      return config.kind === "report" ? { ...config, modelChoices: configuredModelChoices() } : config;
+      if (config.kind !== "report") {
+        return config;
+      }
+      // Suggestions for exactly the (role, provider) pairs on screen, read
+      // once per session and kept until an explicit Refresh; a slow read is
+      // not waited for, and re-renders the page when it arrives.
+      const wanted = [config.report.stage, config.report.sparring].filter((role) => role !== undefined).map((role) => ({ role: role.role, provider: role.provider }));
+      const modelChoices = config.report.error || wanted.length === 0
+        ? []
+        : await readModelChoices(configuredExecutable(), target.projectDir, target.sparringDir, wanted, 3_000, () => void this.forceUpdate());
+      return { ...config, modelChoices };
     } catch (error) {
       return { kind: "unavailable", reason: `The agent configuration could not be read: ${error instanceof Error ? error.message : String(error)}` };
     }
@@ -827,22 +856,4 @@ export function overviewRenderKey(model: OverviewModel): string {
       submittable: panel.submittable.map(item => ({ ...item, record: { outcome: item.record.outcome } })),
     },
   });
-}
-
-/**
- * `agentSparring.modelChoices`: model names to offer per provider id. Only
- * string lists survive; anything else in the setting offers nothing rather
- * than a guess.
- */
-function configuredModelChoices(): Record<string, string[]> {
-  const raw = vscode.workspace.getConfiguration("agentSparring").get<unknown>("modelChoices");
-  const out: Record<string, string[]> = {};
-  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
-    for (const [provider, names] of Object.entries(raw as Record<string, unknown>)) {
-      if (Array.isArray(names)) {
-        out[provider] = names.filter((name): name is string => typeof name === "string");
-      }
-    }
-  }
-  return out;
 }

@@ -19,7 +19,7 @@
  */
 
 import { describeRepositoryContext, emptyStateLines, emptyStateTitle, SELECT_RUN_LABEL, type RepositoryContextView } from "./activeRepository";
-import { agentConfigView, providerLabel, type AgentConfigView, type ConfigRole, type EffectiveConfig } from "./effectiveConfig";
+import { SETUP_NOT_IGNORED, SETUP_OBSOLETE_AGENT_SETTING, agentConfigView, providerLabel, type AgentConfigView, type ConfigRole, type EffectiveConfig } from "./effectiveConfig";
 import { parseBriefGoal, parseBriefOpening } from "./brief";
 import { currentStageOf, owningRoot, repositoryDisplayName, runLabel, samePath, type DiscoveredIntake, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { intakeContinuation, intakeNextAction, intakeStateLabel, isExecutionGroup, sliceHeading, sliceRoot, sliceStageName, type IntakeContinuation, type IntakeNextAction, type IntakeSliceSnapshot } from "./intake";
@@ -118,6 +118,12 @@ export interface ActorCard {
   quietFor?: string;
   /** True when the Working/Sparring claim rests on telemetry alone: no runner process has been observed alive. */
   uncertain?: boolean;
+  /**
+   * The model the provider itself stated it was running (`session.observed`),
+   * when it stated one. A runtime fact, separate from the configured model:
+   * absent means the provider did not say, never that it runs the default.
+   */
+  runtimeModel?: string;
   /**
    * What this actor was actually told, built from the engine's captured
    * prompt for its latest turn. Absent for a stage that has not run a turn
@@ -803,10 +809,12 @@ export interface AgentConfigOutcome {
   applied: boolean;
   refused?: string;
   error?: string;
+  /** Said after an applied change while a run is in progress: {@link APPLIES_NEXT_TURN}. */
+  note?: string;
 }
 
 export const APPLIES_NEXT_TURN =
-  "This run is active. A change here applies to the next agent turn; it does not affect a turn already running.";
+  "A run is in progress. A change here takes effect from the next stage; the agent turn already running is unaffected.";
 
 /**
  * A plan intake with no run yet, shown in place of older finished work.
@@ -890,27 +898,62 @@ export type IntakeApprovalAttempt =
  */
 export interface SetupNotice {
   headline: string;
-  /** One sentence per problem: `.sparring/intake/ must be ignored by Git.` */
+  /** Plain sentences: `.sparring/intake/ must be ignored by Git.` */
   lines: string[];
   /** The engine's own text, for the Technical details disclosure. */
   technical: string;
   /** The .gitignore the fix edits, so the result can say which file to commit. */
   gitignore?: string;
+  /** The one button, which always runs the engine's `fix-config`. */
+  action: { label: string; detail: string };
 }
 
 export const SETUP_HEADLINE = "Agent Sparring setup needs updating:";
 export const FIX_CONFIGURATION_LABEL = "Fix configuration";
+export const OBSOLETE_SETTINGS_HEADLINE = "Agent configuration needs updating";
+export const OBSOLETE_SETTINGS_LINE =
+  "Model and effort are now your own preferences, shared by every project. This project still has old model/effort settings.";
+export const REMOVE_OBSOLETE_LABEL = "Remove obsolete project settings";
 
 export function setupNotice(config: EffectiveConfig | undefined): SetupNotice | undefined {
   const problems = config?.kind === "report" ? (config.report.setup_problems ?? []) : [];
   if (problems.length === 0) {
     return undefined;
   }
+  const obsolete = problems.filter((problem) => problem.kind === SETUP_OBSOLETE_AGENT_SETTING);
+  const others = problems.filter((problem) => problem.kind !== SETUP_OBSOLETE_AGENT_SETTING);
+  const lines = [
+    ...(obsolete.length > 0 ? [OBSOLETE_SETTINGS_LINE] : []),
+    ...others.map((problem) => (problem.kind === SETUP_NOT_IGNORED && problem.ignore_line ? `${problem.ignore_line} must be ignored by Git.` : `${problem.what} needs updating.`)),
+  ];
+  const technical = [
+    ...obsolete.map((problem) =>
+      [
+        `role: ${problem.role ?? ""}`,
+        `field: ${problem.field ?? ""}`,
+        `value: ${problem.value ?? ""}`,
+        `config: ${problem.config_path ?? ""}`,
+        problem.message,
+      ].join("\n"),
+    ),
+    ...others.map((problem) => problem.message),
+  ].join("\n\n");
+  const gitignore = others.find((problem) => problem.gitignore)?.gitignore;
+  const onlyObsolete = others.length === 0;
   return {
-    headline: SETUP_HEADLINE,
-    lines: problems.map((problem) => `${problem.ignore_line} must be ignored by Git.`),
-    technical: problems.map((problem) => problem.message).join("\n\n"),
-    gitignore: problems[0].gitignore,
+    headline: onlyObsolete ? OBSOLETE_SETTINGS_HEADLINE : SETUP_HEADLINE,
+    lines,
+    technical,
+    ...(gitignore ? { gitignore } : {}),
+    action: onlyObsolete
+      ? {
+          label: REMOVE_OBSOLETE_LABEL,
+          detail: "Remove the old model and effort keys from this project's settings (sparring fix-config). Your own preferences are not changed; commit the file afterwards.",
+        }
+      : {
+          label: FIX_CONFIGURATION_LABEL,
+          detail: `${obsolete.length > 0 ? "Remove the old model and effort keys, and add" : "Add"} the missing lines to ${gitignore ?? ".gitignore"} (sparring fix-config); commit it afterwards`,
+        },
   };
 }
 
@@ -1075,7 +1118,7 @@ export interface OverviewModel {
 
 const SETTINGS_ACTION = {
   label: "Settings",
-  detail: "Open this project's .sparring/project.toml, where the provider, model and effort for both roles are set.",
+  detail: "Open this project's .sparring/project.toml, where the provider for both roles is set. Model and effort are your own preferences, changed here on the cards.",
 };
 
 /**
@@ -2611,6 +2654,7 @@ function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveSt
     sessionKind: role === "stage" ? "session" : "thread",
     quietFor,
     uncertain: activity === "Working" || activity === "Sparring" ? uncertain : undefined,
+    ...(actor?.model ? { runtimeModel: actor.model } : {}),
     // Built here so "this turn" versus "the last turn" rests on exactly the
     // liveness that decided the Working/Waiting word above, and the two can
     // never contradict each other on the same card.

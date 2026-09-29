@@ -18,6 +18,8 @@ import { ACTIVE_CONTEXT_HEADLINE, CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, 
 import {
   CONFIG_FIELDS,
   CONFIG_ROLES,
+  CUSTOM_MODEL_VALUE,
+  PROVIDER_DEFAULT_LABEL,
   PROVIDER_DEFAULT_VALUE,
   type AgentFieldControl,
   type AgentRoleControls,
@@ -26,7 +28,7 @@ import {
 } from "./effectiveConfig";
 import { CHECK_OUTCOMES, isCheckKey, isDraftKey, type CheckItem, type CheckOutcome } from "./humanChecks";
 import { checkName, humanTask, splitPassCriteria } from "./humanTask";
-import { FIX_CONFIGURATION_LABEL, RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type AgentConfigSection, type BranchGuard, type ActorCard, type BudgetGauge, type HistoryEntry, type OverviewModel, type PushAuthorization, type TimelineItem, type WhatsNext } from "./overviewModel";
+import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type AgentConfigSection, type BranchGuard, type ActorCard, type BudgetGauge, type HistoryEntry, type OverviewModel, type PushAuthorization, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { MatchSource } from "./planAssociation";
 import type { PromptView, PromptViewSection } from "./promptInspector";
 import type { StageRunAction } from "./runner";
@@ -279,16 +281,23 @@ export interface AgentConfigMessage {
   field: ConfigField;
   value: string | null;
   scope: string;
+  /**
+   * The provider the control was drawn for. A model or effort preference is
+   * saved for that provider (`--for-provider`), so a preference chosen
+   * while one provider was on screen can never land on another.
+   */
+  provider?: string;
+  /**
+   * "Other exact model…" was chosen: the host asks for the exact id and
+   * sends it as the value. Only for the model, and only with no value.
+   */
+  custom?: true;
 }
 
 /**
  * A model name is free text, so it is bounded here the way a note is: long
  * enough for any identifier a provider could plausibly have, short enough
  * that the message cannot be a payload. The engine validates what it means.
- *
- * No control on the page posts a model any more — the cards show it and
- * project.toml changes it — but `set-config <role> --model` is still the
- * engine's own mutation, so the wire keeps accepting and bounding one.
  */
 export const MODEL_MAX_LENGTH = 200;
 
@@ -306,7 +315,17 @@ export function isAgentConfigMessage(message: unknown): message is AgentConfigMe
   if (typeof record["scope"] !== "string" || !record["scope"]) {
     return false;
   }
+  if (record["provider"] !== undefined && (typeof record["provider"] !== "string" || !record["provider"] || record["provider"].length > MODEL_MAX_LENGTH)) {
+    return false;
+  }
   const value = record["value"];
+  if (record["custom"] !== undefined) {
+    return record["custom"] === true && record["field"] === "model" && value === null;
+  }
+  if (value === CUSTOM_MODEL_VALUE) {
+    // The "Other exact model…" entry's own value is never a model.
+    return false;
+  }
   if (value === null) {
     // "Use the provider's default" is only meaningful for an override. A
     // role always resolves to some provider, so there is nothing to clear.
@@ -626,7 +645,7 @@ function renderSetupNotice(model: OverviewModel): string {
   return `<section class="setupnotice" role="alert">
 <p class="setup-headline">${icon("warn", "escalate")}<strong>${escapeHtml(setup.headline)}</strong></p>
 <ul class="setup-lines">${setup.lines.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul>
-<div class="actions">${button("fixConfiguration", FIX_CONFIGURATION_LABEL, true, `Add the missing lines to ${setup.gitignore ?? ".gitignore"} (sparring fix-config); commit it afterwards`, "primary")}</div>
+<div class="actions">${button("fixConfiguration", setup.action.label, true, setup.action.detail, "primary")}</div>
 <details class="setup-technical"><summary>Technical details</summary><pre class="engineerror">${escapeHtml(setup.technical)}</pre></details>
 </section>`;
 }
@@ -1619,7 +1638,7 @@ function renderActor(card: ActorCard, controls: AgentRoleControls | undefined, c
   // The dials sit beside Model and Effort rather than under them, and they
   // are drawn even where there is nothing to configure: what a provider is
   // spending is worth seeing on a card that offers no controls too.
-  const settings = controls && configScope ? renderRoleControls(controls, configScope, dials) : dials ? `<div class="agentconfig-block">${dials}</div>` : "";
+  const settings = controls && configScope ? renderRoleControls(controls, configScope, dials, card.runtimeModel) : dials ? `<div class="agentconfig-block">${dials}</div>` : "";
   const body = `${identity}${settings}`;
   // No captured prompt means the engine has not run a turn for this actor
   // since prompt capture existed. An ordinary state, so the card simply
@@ -1788,24 +1807,39 @@ function whoClass(name: string): string {
  * control that lies about being a control, and a second copy of the provider
  * name would be the duplication this layout exists to remove.
  *
- * The model is a row here but not a control: it is the value the engine
- * resolved, read on the card and changed in project.toml. Nothing
- * enumerates the models a CLI accepts, so a control could only be a box
- * that takes any string and discovers on the next turn that it was wrong.
+ * Model and effort are the person's own preferences, shared by every
+ * project: the dropdowns write them through `set-config`, and the lines
+ * above them state what is configured in words -- an exact model and where
+ * it came from, or "Provider default", which is a different fact from any
+ * model. What the provider itself reported running is a third fact, shown
+ * only when the provider stated it, and never as the configured model.
  *
- * Every actual control carries the role, the field and the scope it was
- * rendered with, so the message the webview posts is self-describing and the
- * host never has to infer which repository a change was meant for from
- * whatever happens to be selected when it arrives.
+ * Every actual control carries the role, the field, the provider and the
+ * scope it was rendered with, so the message the webview posts is
+ * self-describing and the host never has to infer which repository or
+ * provider a change was meant for from whatever is selected when it arrives.
  */
-function renderRoleControls(role: AgentRoleControls, scope: string, dials = ""): string {
-  const attrs = `data-role="${escapeHtml(role.role)}" data-scope="${escapeHtml(scope)}"`;
+function renderRoleControls(role: AgentRoleControls, scope: string, dials = "", runtimeModel?: string): string {
+  const attrs = `data-role="${escapeHtml(role.role)}" data-scope="${escapeHtml(scope)}" data-provider="${escapeHtml(role.provider.value)}"`;
   const items = [...(role.provider.options ? [role.provider] : []), role.model, ...(role.effort ? [role.effort] : [])];
   const rows = items.map((item) => field(item.label, control(item, attrs))).join("");
+  const summaries = [role.model, ...(role.effort ? [role.effort] : [])]
+    .filter((item) => item.summary !== undefined)
+    .map((item) => {
+      const quiet = item.summary === PROVIDER_DEFAULT_LABEL ? " novalue" : "";
+      return `<div class="agentconfig-effective${quiet}" data-effective="${escapeHtml(item.field)}">${escapeHtml(item.label)}: ${escapeHtml(item.summary ?? "")}</div>`;
+    });
+  const runtime = runtimeModel
+    ? `<div class="agentconfig-runtime muted" data-runtime-model="${escapeHtml(runtimeModel)}">Provider reported running ${escapeHtml(runtimeModel)}</div>`
+    : "";
+  const technical = [...role.technical, { label: "Runtime-reported model", value: runtimeModel ?? "not stated by the provider" }]
+    .map((entry) => `${escapeHtml(entry.label)}: ${escapeHtml(entry.value)}`)
+    .join("\n");
+  const details = `<details class="setup-technical agentconfig-technical"${disclose(scope, role.role, "agents", "technical")}><summary>Technical details</summary><pre class="engineerror">${technical}</pre></details>`;
   // Fields left, dials right. The fields column is what gives way when the
   // card is narrow, because a truncated dropdown is still usable and a
   // squashed dial is not readable at all.
-  return `<div class="agentconfig-block"><div class="agentconfig-fields">${rows}</div>${dials}</div>`;
+  return `<div class="agentconfig-block"><div class="agentconfig-fields">${summaries.join("")}${runtime}${rows}${details}</div>${dials}</div>`;
 }
 
 /**
@@ -1886,11 +1920,13 @@ function control(item: AgentFieldControl, attrs: string): string {
   return `<select ${attrs} data-field="${escapeHtml(item.field)}" title="${escapeHtml(item.detail)}"${sent}>${options(item.options, item.value)}</select>`;
 }
 
-function options(items: readonly { value: string; label: string }[], selected: string): string {
+function options(items: readonly { value: string; label: string; custom?: boolean }[], selected: string): string {
   return items
-    .map(
-      (item) =>
-        `<option value="${escapeHtml(item.value)}"${item.value === selected ? " selected" : ""}>${escapeHtml(item.label)}</option>`,
+    .map((item) =>
+      item.custom
+        ? // Never selected: it asks for a value, it is not one.
+          `<option value="${escapeHtml(CUSTOM_MODEL_VALUE)}" data-custom="1">${escapeHtml(item.label)}</option>`
+        : `<option value="${escapeHtml(item.value)}"${item.value === selected ? " selected" : ""}>${escapeHtml(item.label)}</option>`,
     )
     .join("");
 }
@@ -2090,6 +2126,10 @@ pre.engineerror { margin: 6px 0 0; padding: 6px 8px; max-height: 9em; overflow: 
 .agentconfig-fixed { flex: 1; min-width: 0; padding: 2px 4px 2px 5px; font-size: 0.95em; font-weight: 600; overflow-wrap: anywhere; }
 /* The absence of an override is not a value, so it never borrows a value's
    weight. */
+.agentconfig-effective { font-size: 0.95em; font-weight: 600; margin-top: 2px; overflow-wrap: anywhere; }
+.agentconfig-effective.novalue { font-weight: 400; font-style: italic; color: var(--vscode-descriptionForeground); }
+.agentconfig-runtime { font-size: 0.9em; margin-top: 2px; overflow-wrap: anywhere; }
+.agentconfig-technical { margin-top: 6px; font-size: 0.9em; }
 .agentconfig-fixed.novalue { font-weight: 400; font-style: italic; color: var(--vscode-descriptionForeground); }
 
 /* The budget dials. A fixed three-across row, so it does not reflow as a
@@ -2585,9 +2625,10 @@ const SCRIPT = `
     agentConfigChanged(event.target);
   });
   // The inline agent controls, which are dropdowns and nothing else: they
-  // report on change. The model is read-only text on the card and is changed
-  // in project.toml, so there is no text field here to save on blur or on
-  // Enter, and no keystroke path that could queue a write per character.
+  // report on change. An exact model id that is not listed is asked for by
+  // the host (Other exact model…), so there is no text field here to save on
+  // blur or on Enter, and no keystroke path that could queue a write per
+  // character.
   //
   // Every message carries the scope the control was rendered with, so the
   // host can refuse one that belongs to a repository no longer on screen.
@@ -2599,7 +2640,23 @@ const SCRIPT = `
     if (!(node instanceof HTMLSelectElement)) { return; }
     if (!node.hasAttribute('data-role') || !node.hasAttribute('data-field')) { return; }
     if (node.disabled) { return; }
-    // The empty option is the sentinel for "no override", which the host
+    var chosen = node.selectedOptions && node.selectedOptions[0];
+    if (chosen && chosen.hasAttribute('data-custom')) {
+      // Other exact model…: the host asks for the id. The control goes back
+      // to what it was sent with, so nothing on screen claims a value yet.
+      node.disabled = true;
+      vscode.postMessage({
+        type: 'agentConfig',
+        role: node.getAttribute('data-role'),
+        field: node.getAttribute('data-field'),
+        value: null,
+        custom: true,
+        scope: node.getAttribute('data-scope'),
+        provider: node.getAttribute('data-provider') || undefined,
+      });
+      return;
+    }
+    // The empty option is the sentinel for "no preference", which the host
     // sends as null and the engine turns into its --*-default flag.
     var sent = node.value === '' ? null : node.value;
     var stamp = sent === null ? '-' : '=' + sent;
@@ -2612,6 +2669,7 @@ const SCRIPT = `
       field: node.getAttribute('data-field'),
       value: sent,
       scope: node.getAttribute('data-scope'),
+      provider: node.getAttribute('data-provider') || undefined,
     });
   }
   // Every text field is saved as it is typed (debounced) and on blur, so a

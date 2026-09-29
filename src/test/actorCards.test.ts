@@ -45,9 +45,9 @@ function report(overrides: Record<string, unknown> = {}): string {
       provider_display_name: "Claude",
       provider_source: "project",
       model: "opus",
-      model_source: "project",
+      model_source: "user",
       effort: "high",
-      effort_source: "project",
+      effort_source: "user",
       effort_supported: true,
       effort_levels: ["low", "medium", "high", "brisk"],
     },
@@ -57,7 +57,7 @@ function report(overrides: Record<string, unknown> = {}): string {
       provider_display_name: "Codex",
       provider_source: "project",
       model: "gpt-5.6-terra",
-      model_source: "project",
+      model_source: "user",
       effort: null,
       effort_source: "provider-default",
       effort_supported: true,
@@ -145,12 +145,13 @@ describe("each actor card is its own configuration surface", () => {
     const html = renderOverviewHtml(buildOverviewModel(await planSelection(), undefined, artifacts(parsed()), NOW), "n", "c");
 
     const stage = card(html, "Stage agent");
-    assert.match(stage, /Model<\/span><span class="agentconfig-fixed"[^>]*>opus<\/span>/);
+    assert.match(stage, /<div class="agentconfig-effective" data-effective="model">Model: opus · Your preference<\/div>/);
+    assert.match(stage, /data-role="stage"[^>]*data-field="model"/);
     assert.match(stage, /data-role="stage"[^>]*data-field="effort"/);
     assert.doesNotMatch(stage, /data-role="sparring"/, "the stage card configures the stage role only");
 
     const sparrer = card(html, "Sparrer");
-    assert.match(sparrer, /Model<\/span><span class="agentconfig-fixed"[^>]*>gpt-5\.6-terra<\/span>/);
+    assert.match(sparrer, /<div class="agentconfig-effective" data-effective="model">Model: gpt-5\.6-terra · Your preference<\/div>/);
     assert.match(sparrer, /data-role="sparring"[^>]*data-field="effort"/);
     assert.doesNotMatch(sparrer, /data-role="stage"/);
 
@@ -158,13 +159,13 @@ describe("each actor card is its own configuration surface", () => {
     // layout exists to remove.
     for (const role of ["stage", "sparring"]) {
       assert.equal(
-        (html.match(new RegExp(`data-role="${role}" data-scope="[^"]*" data-field="effort"`, "g")) ?? []).length,
+        (html.match(new RegExp(`data-role="${role}" data-scope="[^"]*" data-provider="[^"]*" data-field="effort"`, "g")) ?? []).length,
         1,
         `one ${role} effort control on the page`,
       );
     }
     for (const model of ["opus", "gpt-5.6-terra"]) {
-      assert.equal((html.match(new RegExp(`>${model.replace(".", "\\.")}</span>`, "g")) ?? []).length, 1, `${model} is stated once`);
+      assert.equal((html.match(new RegExp(`>Model: ${model.replace(".", "\\.")} ·`, "g")) ?? []).length, 1, `${model} is stated once`);
     }
   });
 
@@ -175,22 +176,44 @@ describe("each actor card is its own configuration surface", () => {
     assert.ok(!/<h3[^>]*>(<svg[^>]*>[\s\S]*?<\/svg>)?Agents<\/h3>/.test(html), "and so is its heading");
   });
 
-  it("7. reports a model the extension never heard of, and offers no control to pick one", async () => {
+  it("7. states a model the extension never heard of verbatim, and keeps it in the dropdown", async () => {
     const exotic = parsed({
       stage: { ...JSON.parse(report()).stage, model: "some-model-2031-preview" },
-      sparring: { ...JSON.parse(report()).sparring, model: null },
+      sparring: { ...JSON.parse(report()).sparring, model: null, model_source: "provider-default" },
     });
     const html = renderOverviewHtml(buildOverviewModel(await planSelection(), undefined, artifacts(exotic), NOW), "n", "c");
 
     const stage = card(html, "Stage agent");
-    assert.match(stage, /<span class="agentconfig-fixed"[^>]*>some-model-2031-preview<\/span>/, "whatever the engine resolved, stated verbatim");
-    assert.doesNotMatch(stage, /<select[^>]*data-field="model"/, "a closed list would reject a model that exists");
-    assert.doesNotMatch(stage, /<input[^>]*data-field="model"/, "and a field would be a box that only finds out on the next turn");
+    assert.match(stage, />Model: some-model-2031-preview · Your preference</, "whatever the engine resolved, stated verbatim");
+    assert.match(stage, /<option value="some-model-2031-preview" selected>some-model-2031-preview<\/option>/, "and selected, though nothing suggested it");
+    assert.match(stage, /<option value="[^"]*" data-custom="1">Other exact model…<\/option>/, "an exact id can always be entered");
+    assert.doesNotMatch(stage, /<input[^>]*data-field="model"/, "no free-text box that would post per keystroke");
 
-    // No override is the words for that, quietly, and never a model name.
+    // No preference is the words for that, quietly, and never a model name.
     const sparrer = card(html, "Sparrer");
-    assert.match(sparrer, new RegExp(`<span class="agentconfig-fixed novalue"[^>]*>${PROVIDER_DEFAULT_LABEL}</span>`));
-    assert.match(sparrer, /title="[^"]*project\.toml[^"]*"/, "and says where a model would be pinned");
+    assert.match(sparrer, new RegExp(`<div class="agentconfig-effective novalue" data-effective="model">Model: ${PROVIDER_DEFAULT_LABEL}</div>`));
+    assert.doesNotMatch(sparrer, /data-runtime-model/, "no runtime model is claimed when the provider stated none");
+  });
+
+  it("7b. shows the model the provider reported running as runtime info, apart from the configured one", async () => {
+    const live = foldEvents([
+      event("stage", "turn.started", { provider: "claude-cli" }),
+      event("stage", "session.observed", { provider: "claude-cli", session_id: "82ab12345678", model: "claude-opus-5-5-20260901" }),
+    ]);
+    const model = buildOverviewModel(await planSelection(), live, artifacts(parsed()), Date.parse(live.lastEventTs!) + 1000);
+    assert.equal(model.stageAgent?.runtimeModel, "claude-opus-5-5-20260901");
+    assert.equal(model.sparrer?.runtimeModel, undefined, "the sparrer's provider stated nothing");
+    const html = renderOverviewHtml(model, "n", "c");
+    const stage = card(html, "Stage agent");
+    assert.match(stage, />Model: opus · Your preference</, "the configured model is unchanged by what ran");
+    assert.match(stage, /<div class="agentconfig-runtime muted" data-runtime-model="claude-opus-5-5-20260901">Provider reported running claude-opus-5-5-20260901<\/div>/);
+    const technical = /<details class="setup-technical agentconfig-technical"[^>]*><summary>Technical details<\/summary><pre class="engineerror">([\s\S]*?)<\/pre>/.exec(stage)?.[1] ?? "";
+    assert.match(technical, /Role: stage/);
+    assert.match(technical, /Configured model: opus/);
+    assert.match(technical, /Model source: user/);
+    assert.match(technical, /Effort: high \(source: user\)/);
+    assert.match(technical, /Runtime-reported model: claude-opus-5-5-20260901/);
+    assert.match(card(html, "Sparrer"), /Runtime-reported model: not stated by the provider/);
   });
 
   it("8. builds every effort option from the engine's own levels, default first", async () => {
@@ -342,19 +365,31 @@ describe("each actor card is its own configuration surface", () => {
     const model = buildOverviewModel(await planSelection(), live, artifacts(parsed()), Date.parse(live.lastEventTs!) + 1000);
     assert.equal(model.agentConfig?.activeRunNote, APPLIES_NEXT_TURN, "said as a fact about when it lands");
     const html = renderOverviewHtml(model, "n", "c");
-    assert.match(html, /next agent turn/);
+    assert.match(html, /takes effect from the next stage/);
 
     const effort = elementFrom(html, "select", /<select data-role="stage"[^>]*data-field="effort"[^>]*>/, "the stage effort dropdown");
     effort.value = "brisk";
     const { document, posted } = runWebviewScript(html);
     document.dispatch("change", effort);
 
-    assert.deepEqual(posted, [{ type: "agentConfig", role: "stage", field: "effort", value: "brisk", scope: CONFIG_PATH }]);
+    assert.deepEqual(posted, [{ type: "agentConfig", role: "stage", field: "effort", value: "brisk", scope: CONFIG_PATH, provider: "claude-cli" }]);
     assert.equal(isAgentConfigMessage(posted[0]), true, "and the host accepts what the card sent");
 
-    // And the model cannot be put on the wire from the page at all: it is
-    // read-only text, so there is no element carrying the field to post.
-    assert.doesNotMatch(html, /data-field="model"/);
+    // A model from the dropdown goes out the same way, for the provider on the card.
+    const modelSelect = elementFrom(html, "select", /<select data-role="sparring"[^>]*data-field="model"[^>]*>/, "the sparrer model dropdown");
+    modelSelect.value = "gpt-6-astra";
+    const second = runWebviewScript(html);
+    second.document.dispatch("change", modelSelect);
+    assert.deepEqual(second.posted, [{ type: "agentConfig", role: "sparring", field: "model", value: "gpt-6-astra", scope: CONFIG_PATH, provider: "codex-cli" }]);
+
+    // Other exact model… asks the host for the id; it never posts its own value.
+    const custom = elementFrom(html, "select", /<select data-role="stage"[^>]*data-field="model"[^>]*>/, "the stage model dropdown");
+    custom.value = "\u2026other";
+    (custom as unknown as { selectedOptions: unknown[] }).selectedOptions = [elementFrom('<option value="x" data-custom="1">', "option", /<option[^>]*>/, "the custom option")];
+    const third = runWebviewScript(html);
+    third.document.dispatch("change", custom);
+    assert.deepEqual(third.posted, [{ type: "agentConfig", role: "stage", field: "model", value: null, custom: true, scope: CONFIG_PATH, provider: "claude-cli" }]);
+    assert.equal(isAgentConfigMessage(third.posted[0]), true);
   });
 
   it("13. adds no provider, model or effort table to the extension's source", async () => {
@@ -395,7 +430,7 @@ describe("the cards before anything is running", () => {
     assert.equal(model.sparrer?.sessionLabel, undefined);
 
     const html = renderOverviewHtml(model, "n", "c");
-    assert.match(card(html, "Stage agent"), /Model<\/span><span class="agentconfig-fixed/);
+    assert.match(card(html, "Stage agent"), /data-effective="model">Model: /);
     assert.match(card(html, "Sparrer"), /data-role="sparring"[^>]*data-field="effort"/);
     assert.doesNotMatch(html, /class="statepill/, "no Working/Idle word for a run that does not exist");
     assert.doesNotMatch(html, /class="statenote/);

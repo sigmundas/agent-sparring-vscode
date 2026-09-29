@@ -82,7 +82,7 @@ import { manifestSupport } from "./engineProbe";
 import { openCandidateDiff } from "./overview/gitDiff";
 import { configuredExecutable } from "./engineExecutable";
 import { settingsTarget } from "../core/settingsTarget";
-import { fixSetup } from "./configProbe";
+import { fixSetup, resetModelChoicesCache } from "./configProbe";
 import { OverviewPanelManager } from "./overview/overviewPanel";
 
 export function registerCommands(context: vscode.ExtensionContext, controller: SparringController): void {
@@ -95,7 +95,11 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     overview,
     vscode.commands.registerCommand("agentSparring.showLog", () => controller.showLog()),
     vscode.commands.registerCommand("agentSparring.confirmRunnerInactive", () => confirmRunnerInactiveCommand(controller, overview)),
-    vscode.commands.registerCommand("agentSparring.refresh", () => controller.refresh()),
+    // An explicit Refresh is also when model suggestions are asked for again.
+    vscode.commands.registerCommand("agentSparring.refresh", () => {
+      resetModelChoicesCache();
+      return controller.refresh();
+    }),
     vscode.commands.registerCommand("agentSparring.selectRun", () => selectRunCommand(controller)),
     vscode.commands.registerCommand("agentSparring.followActiveRepository", () => controller.followActiveRepository()),
     vscode.commands.registerCommand("agentSparring.chooseRepository", () => chooseRepositoryCommand(controller)),
@@ -4023,9 +4027,19 @@ async function fixConfigurationCommand(controller: SparringController, overview:
   const result = await fixSetup(configuredExecutable(), target.projectDir, target.sparringDir);
   if (result.ok) {
     const file = result.gitignore ? path.basename(path.dirname(result.gitignore)) + "/.gitignore" : ".gitignore";
-    controller.log(`fix-config: ${result.added.length > 0 ? `added ${result.added.join(", ")} to ${result.gitignore ?? ".gitignore"}` : "nothing to fix"}`);
+    const removed = result.removed.map((entry) => `${entry.role} ${entry.field} = ${entry.value}`);
+    controller.log(
+      `fix-config: ${[
+        result.added.length > 0 ? `added ${result.added.join(", ")} to ${result.gitignore ?? ".gitignore"}` : "",
+        removed.length > 0 ? `removed ${removed.join(", ")} from ${result.configPath ?? "project.toml"}` : "",
+      ].filter(Boolean).join("; ") || "nothing to fix"}`,
+    );
+    const said = [
+      result.added.length > 0 ? `added ${result.added.join(", ")} to ${file}` : "",
+      removed.length > 0 ? "removed the old model and effort settings from this project; your own preferences were not changed" : "",
+    ].filter(Boolean);
     void vscode.window.showInformationMessage(
-      result.added.length > 0 ? `Agent Sparring: added ${result.added.join(", ")} to ${file}. Commit it so the fix is kept.` : "Agent Sparring: the setup was already correct; nothing was changed.",
+      said.length > 0 ? `Agent Sparring: ${said.join(", and ")}. Commit the change so the fix is kept.` : "Agent Sparring: the setup was already correct; nothing was changed.",
     );
   } else {
     controller.log(`fix-config refused: ${result.error}`);

@@ -12,7 +12,19 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { PROVIDER_DEFAULT_LABEL, PROVIDER_DEFAULT_VALUE, agentConfigView, describeRole, parseEngineConfig, type ConfigRole, type EffectiveConfig } from "../core/effectiveConfig";
+import {
+  CUSTOM_MODEL_LABEL,
+  CUSTOM_MODEL_VALUE,
+  PROVIDER_DEFAULT_LABEL,
+  PROVIDER_DEFAULT_VALUE,
+  agentConfigView,
+  describeRole,
+  parseEngineConfig,
+  parseModelChoices,
+  type ConfigRole,
+  type EffectiveConfig,
+  type EngineModelChoices,
+} from "../core/effectiveConfig";
 import { discoverRuns, selectRun, type RunSelection } from "../core/discovery";
 import { MODEL_MAX_LENGTH, isActionMessage, isAgentConfigMessage, renderOverviewHtml } from "../core/overviewHtml";
 import { APPLIES_NEXT_TURN, buildOverviewModel, type OverviewArtifacts } from "../core/overviewModel";
@@ -51,15 +63,17 @@ function report(overrides: Record<string, unknown> = {}): string {
     config_exists: true,
     project: "demo",
     error: null,
+    user_config_path: "/home/me/.config/agent-sparring/preferences.toml",
+    user_config_exists: true,
     stage: {
       role: "stage",
       provider: "claude-cli",
       provider_display_name: "Claude",
       provider_source: "project",
-      model: "opus",
-      model_source: "project",
+      model: "claude-opus-5-5",
+      model_source: "user",
       effort: "high",
-      effort_source: "project",
+      effort_source: "user",
       effort_supported: true,
       effort_levels: ["low", "medium", "high", "xhigh", "max"],
     },
@@ -69,7 +83,7 @@ function report(overrides: Record<string, unknown> = {}): string {
       provider_display_name: "Codex",
       provider_source: "project",
       model: "gpt-5.6-terra",
-      model_source: "project",
+      model_source: "user",
       effort: null,
       effort_source: "provider-default",
       effort_supported: true,
@@ -91,7 +105,7 @@ describe("reading the engine's effective configuration", () => {
     assert.deepEqual(
       view?.lines.map((line) => [line.role, line.text]),
       [
-        ["Stage agent", "Claude · opus · high"],
+        ["Stage agent", "Claude · claude-opus-5-5 · high"],
         ["Sparrer", "Codex · gpt-5.6-terra"],
       ],
     );
@@ -125,6 +139,17 @@ describe("reading the engine's effective configuration", () => {
     const line = describeRole({ role: "stage", provider: "claude-cli", provider_display_name: "Claude", provider_source: "project", model: "sonnet", model_source: "cli", effort: "max", effort_source: "cli" });
     assert.match(line.detail, /Model sonnet from a command-line override/);
     assert.match(line.detail, /Effort max from a command-line override/);
+    const mine = describeRole({ role: "stage", provider: "claude-cli", model: "claude-opus-5-5", model_source: "user", effort: "high", effort_source: "env" });
+    assert.match(mine.detail, /Model claude-opus-5-5 from your own preference/);
+    assert.match(mine.detail, /Effort high from an environment variable/);
+  });
+
+  it("reads where the user preferences file is, and no per-worktree location", () => {
+    const value = parsed({ local_config_path: "/repo/.git/agent-sparring/.sparring.toml", local_config_exists: true });
+    assert.equal(value.kind === "report" ? value.report.user_config_path : undefined, "/home/me/.config/agent-sparring/preferences.toml");
+    assert.equal(value.kind === "report" ? value.report.user_config_exists : undefined, true);
+    assert.equal(value.kind === "report" ? "local_config_path" in value.report : true, false, "a per-worktree override is no longer read");
+    assert.equal(agentConfigView(value)?.userConfigPath, "/home/me/.config/agent-sparring/preferences.toml");
   });
 
   it("surfaces an engine configuration error and withholds invented role lines", () => {
@@ -287,7 +312,7 @@ describe("the Overview shows the configuration and offers Settings", () => {
     const model = buildOverviewModel(await planSelection(), undefined, artifacts(parsed()), NOW);
     assert.deepEqual(
       model.agentConfig?.lines.map((line) => line.text),
-      ["Claude · opus · high", "Codex · gpt-5.6-terra"],
+      ["Claude · claude-opus-5-5 · high", "Codex · gpt-5.6-terra"],
     );
   });
 
@@ -295,7 +320,8 @@ describe("the Overview shows the configuration and offers Settings", () => {
     const model = buildOverviewModel(await planSelection(), undefined, artifacts(parsed()), NOW);
     const html = renderOverviewHtml(model, "nonce", "csp:");
     assert.match(html, /data-action="openSettings"/);
-    assert.match(html, /<span class="agentconfig-fixed"[^>]*>opus<\/span>/, "the model is read on the card, not edited on it");
+    assert.match(html, /<div class="agentconfig-effective" data-effective="model">Model: claude-opus-5-5 · Your preference<\/div>/, "the exact model and where it came from, stated");
+    assert.match(html, /<select data-role="stage"[^>]*data-field="model"/, "and a dropdown to change it");
     assert.match(html, /<select data-role="stage"[^>]*data-field="effort"/);
     assert.match(html, /<select data-role="sparring"[^>]*data-field="effort"/);
   });
@@ -353,21 +379,47 @@ describe("the inline agent config selector", () => {
     return found;
   }
 
-  it("reports the engine's model as text, with no control to choose one", () => {
-    assert.equal(role("stage").model.value, "opus");
+  it("shows the configured exact model and where it came from, in a dropdown that keeps it", () => {
+    assert.equal(role("stage").model.value, "claude-opus-5-5");
     assert.equal(role("sparring").model.value, "gpt-5.6-terra");
-    // Neither a list nor a field. No engine or CLI enumerates the models a
-    // provider accepts, so the cockpit shows the resolved one and sends the
-    // reader to project.toml to change it.
-    assert.equal(role("stage").model.options, undefined);
-    assert.equal(role("stage").model.fixedText, "opus");
-    assert.match(role("stage").model.detail, /project\.toml/);
+    assert.equal(role("stage").model.summary, "claude-opus-5-5 · Your preference");
+    assert.equal(role("stage").model.fixedText, undefined, "an exact id can always be entered, so the model is always a control");
+    assert.deepEqual(
+      role("stage").model.options?.map((option) => option.value),
+      [PROVIDER_DEFAULT_VALUE, "claude-opus-5-5", CUSTOM_MODEL_VALUE],
+      "with no suggestions read: the default, the configured model, and Other exact model…",
+    );
+    assert.doesNotMatch(role("stage").model.detail, /project\.toml/, "model is no longer a project setting");
+    assert.match(role("stage").model.detail, /your own preference[^.]*shared by every project/);
   });
 
-  it("says the words for no override rather than naming a model nobody chose", () => {
-    const none = role("stage", { stage: { ...JSON.parse(report()).stage, model: null } });
-    assert.equal(none.model.fixedText, PROVIDER_DEFAULT_LABEL);
+  it("offers no Project setting option anywhere: clearing means the provider default", () => {
+    for (const which of ["stage", "sparring"] as const) {
+      const control = role(which);
+      const labels = [...(control.model.options ?? []), ...(control.effort?.options ?? [])].map((option) => option.label);
+      assert.ok(!labels.includes("Project setting"), `${which}: ${labels.join(", ")}`);
+      assert.equal(control.model.options?.[0]?.label, PROVIDER_DEFAULT_LABEL);
+      assert.equal(control.effort?.options?.[0]?.label, PROVIDER_DEFAULT_LABEL);
+    }
+  });
+
+  it("says the words for no preference rather than naming a model nobody chose", () => {
+    const none = role("stage", { stage: { ...JSON.parse(report()).stage, model: null, model_source: "provider-default" } });
+    assert.equal(none.model.summary, PROVIDER_DEFAULT_LABEL);
     assert.equal(none.model.value, "", "and the sentinel is still the empty string, never those words");
+    assert.deepEqual(none.model.options?.map((option) => option.value), [PROVIDER_DEFAULT_VALUE, CUSTOM_MODEL_VALUE]);
+  });
+
+  it("gives the card's Technical details the engine's facts for the role", () => {
+    const facts = Object.fromEntries(role("stage").technical.map((entry) => [entry.label, entry.value]));
+    assert.equal(facts["Role"], "stage");
+    assert.match(facts["Provider"], /^claude-cli \(from project\.toml\)$/);
+    assert.equal(facts["Preferences file"], "/home/me/.config/agent-sparring/preferences.toml");
+    assert.equal(facts["Configured model"], "claude-opus-5-5");
+    assert.equal(facts["Model source"], "user");
+    assert.equal(facts["Effort"], "high (source: user)");
+    const none = Object.fromEntries(role("sparring", { sparring: { ...JSON.parse(report()).sparring, model: null, model_source: "provider-default" } }).technical.map((entry) => [entry.label, entry.value]));
+    assert.match(none["Configured model"], /^none/, "absent, not a guessed name");
   });
 
   it("accepts a model identifier the extension has never seen", () => {
@@ -482,9 +534,23 @@ describe("what the selector puts on the wire", () => {
     assert.equal(isAgentConfigMessage({ ...good, role: "sparring" }), true);
   });
 
-  it("accepts null as clear this override", () => {
+  it("accepts null as clear this preference", () => {
     assert.equal(isAgentConfigMessage({ ...good, value: null }), true);
     assert.equal(isAgentConfigMessage({ ...good, field: "effort", value: null }), true);
+  });
+
+  it("carries the provider the control was drawn for", () => {
+    assert.equal(isAgentConfigMessage({ ...good, provider: "claude-cli" }), true);
+    assert.equal(isAgentConfigMessage({ ...good, provider: "" }), false);
+    assert.equal(isAgentConfigMessage({ ...good, provider: 7 }), false);
+  });
+
+  it("accepts Other exact model… only as a model request with no value, and never its own sentinel as a model", () => {
+    assert.equal(isAgentConfigMessage({ ...good, value: null, custom: true }), true);
+    assert.equal(isAgentConfigMessage({ ...good, value: "x", custom: true }), false, "the host asks for the value");
+    assert.equal(isAgentConfigMessage({ ...good, field: "effort", value: null, custom: true }), false);
+    assert.equal(isAgentConfigMessage({ ...good, value: null, custom: "yes" }), false);
+    assert.equal(isAgentConfigMessage({ ...good, value: CUSTOM_MODEL_VALUE }), false);
   });
 
   it("refuses a role or field outside the engine's own vocabulary", () => {
@@ -515,7 +581,7 @@ describe("what the selector puts on the wire", () => {
 });
 
 describe("the rendered controls are self-describing", () => {
-  it("every control carries its role, field and the scope it was drawn from", () => {
+  it("every control carries its role, field, provider and the scope it was drawn from", () => {
     const model = buildOverviewModel(
       { ambiguous: [], scope: { repoRoot: "/work/fresh", name: "fresh" } },
       undefined,
@@ -527,10 +593,11 @@ describe("the rendered controls are self-describing", () => {
     for (const role of ["stage", "sparring"]) {
       assert.match(html, new RegExp(`data-role="${role}"[^>]*data-field="effort"`));
     }
-    // Read-only text is not a control and carries no wire attributes at all:
-    // nothing on the page can post a model change.
-    assert.doesNotMatch(html, /data-field="model"/);
+    assert.match(html, /data-role="stage" data-scope="[^"]*" data-provider="claude-cli" data-field="model"/);
+    assert.match(html, /data-role="sparring" data-scope="[^"]*" data-provider="codex-cli" data-field="model"/);
     assert.match(html, /data-field="effort"[^>]*data-sent="-"/, "cleared is its own mark, not a value that could spell it");
+    assert.match(html, /<option value="[^"]*" data-custom="1">Other exact model…<\/option>/, "the custom entry is marked, never selected");
+    assert.doesNotMatch(html, /data-custom="1" selected/);
   });
 
   it("says a change lands on the next turn only while a run is actually active", async () => {
@@ -549,65 +616,116 @@ describe("the rendered controls are self-describing", () => {
     assert.equal(busy.agentConfig?.activeRunNote, APPLIES_NEXT_TURN);
     // A statement about when it lands, never a claim that the running agent
     // changed model part-way through its own call.
-    assert.match(APPLIES_NEXT_TURN, /next agent turn/);
+    assert.match(APPLIES_NEXT_TURN, /takes effect from the next stage/);
+    assert.match(APPLIES_NEXT_TURN, /already running is unaffected/);
     assert.doesNotMatch(APPLIES_NEXT_TURN, /cannot|blocked|not allowed/i);
-    assert.match(renderOverviewHtml(busy, "nonce", "csp:"), /next agent turn/);
+    assert.match(renderOverviewHtml(busy, "nonce", "csp:"), /takes effect from the next stage/);
     // And it is a note, not a lock: the controls are still there.
     assert.match(renderOverviewHtml(busy, "nonce", "csp:"), /data-field="effort"/);
   });
 });
 
-describe("choosing the model from a configured list", () => {
-  const CHOICES = { "claude-cli": ["claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5", "claude-haiku-4-5-20251001"], "codex-cli": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"] };
-  const withChoices = (overrides: Record<string, unknown> = {}, modelChoices: Record<string, string[]> = CHOICES): EffectiveConfig => {
+describe("choosing the model from the engine's suggestions", () => {
+  const CHOICES = parseModelChoices(
+    JSON.stringify({
+      roles: [
+        {
+          role: "stage",
+          provider: "claude-cli",
+          source: "engine-known",
+          complete: false,
+          custom_allowed: true,
+          choices: [
+            { model: "claude-opus-5-5", display_name: "Claude Opus 5.5", effort_levels: [], default_effort: null },
+            { model: "claude-fable-5-1", display_name: "Claude Fable 5.1", effort_levels: [], default_effort: null },
+            { model: "claude-sonnet-5-5", display_name: "Claude Sonnet 5.5", effort_levels: [], default_effort: null },
+          ],
+          error: null,
+        },
+        {
+          role: "sparring",
+          provider: "codex-cli",
+          source: "provider-catalog",
+          complete: false,
+          custom_allowed: true,
+          choices: [
+            { model: "gpt-6-astra", display_name: "GPT-6-Astra", effort_levels: ["low", "high"], default_effort: "low" },
+            { model: "gpt-5.6-terra", display_name: "GPT-5.6-Terra", effort_levels: ["low"], default_effort: "low" },
+            { bogus: true },
+          ],
+          error: null,
+        },
+      ],
+      error: null,
+    }),
+  )!;
+  const withChoices = (overrides: Record<string, unknown> = {}, modelChoices: readonly EngineModelChoices[] = CHOICES): EffectiveConfig => {
     const base = parsed(overrides);
     return base.kind === "report" ? { ...base, modelChoices } : base;
   };
   const controls = (config: EffectiveConfig, which: ConfigRole) => agentConfigView(config)?.controls.find((control) => control.role === which);
 
-  it("offers each provider's own list, keeping the engine's current model even when the list does not name it", () => {
+  it("parses model-choices, keeping well-formed choices and their provenance", () => {
+    assert.equal(CHOICES.length, 2);
+    assert.equal(CHOICES[1].source, "provider-catalog");
+    assert.deepEqual(CHOICES[1].choices.map((choice) => choice.model), ["gpt-6-astra", "gpt-5.6-terra"], "a malformed choice is dropped");
+    assert.equal(parseModelChoices("not json"), undefined);
+    assert.equal(parseModelChoices('{"error": "x"}'), undefined);
+  });
+
+  it("offers the default, the suggestions for this role and provider, and Other exact model…", () => {
     const stage = controls(withChoices(), "stage")!;
-    assert.equal(stage.model.fixedText, undefined);
-    assert.equal(stage.model.value, "opus");
-    assert.deepEqual(stage.model.options?.map((option) => option.value), [PROVIDER_DEFAULT_VALUE, "opus", "claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5", "claude-haiku-4-5-20251001"]);
+    assert.equal(stage.model.value, "claude-opus-5-5");
+    assert.deepEqual(stage.model.options?.map((option) => option.value), [PROVIDER_DEFAULT_VALUE, "claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5", CUSTOM_MODEL_VALUE], "the configured model is listed once");
+    assert.equal(stage.model.options?.[1]?.label, "claude-opus-5-5 · Claude Opus 5.5", "the exact id first, then the provider's name for it");
+    assert.equal(stage.model.options?.at(-1)?.label, CUSTOM_MODEL_LABEL);
+    assert.equal(stage.model.options?.at(-1)?.custom, true);
+    assert.match(stage.model.detail, /Suggestions from the models Agent Sparring knows; other exact models may exist/);
     const sparring = controls(withChoices(), "sparring")!;
-    assert.deepEqual(sparring.model.options?.map((option) => option.value), [PROVIDER_DEFAULT_VALUE, "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra"], "gpt-5.6-terra is listed, so it is not repeated");
-    assert.equal(sparring.model.value, "gpt-5.6-terra");
+    assert.match(sparring.model.detail, /Suggestions from Codex's own model list/);
+  });
+
+  it("keeps a configured model no suggestion names, verbatim", () => {
+    const exotic = controls(withChoices({ stage: { ...JSON.parse(report()).stage, model: "claude-opus-5-5-20260901" } }), "stage")!;
+    assert.deepEqual(exotic.model.options?.slice(0, 3).map((option) => option.value), [PROVIDER_DEFAULT_VALUE, "claude-opus-5-5-20260901", "claude-opus-5-5"]);
+    assert.equal(exotic.model.summary, "claude-opus-5-5-20260901 · Your preference");
+  });
+
+  it("never offers one provider's suggestions for another", () => {
+    // The stage role now runs a different provider: the Claude list must not follow it.
+    const moved = controls(withChoices({ stage: { ...JSON.parse(report()).stage, provider: "codex-cli", provider_display_name: "Codex", model: null, model_source: "provider-default" } }), "stage")!;
+    assert.deepEqual(moved.model.options?.map((option) => option.value), [PROVIDER_DEFAULT_VALUE, CUSTOM_MODEL_VALUE], "no stage suggestions exist for codex-cli");
+    // Nor does the sparrer's Codex list stand in for the stage role's.
+    assert.ok(!moved.model.options?.some((option) => option.value === "gpt-6-astra"));
   });
 
   it("renders the model as a dropdown that posts the same agentConfig message as effort", () => {
     const html = renderOverviewHtml(buildOverviewModel({ ambiguous: [] }, undefined, { handoff: false, sparring: false, brief: false, plan: false, agentConfig: withChoices() } as OverviewArtifacts, NOW), "n", "c");
-    assert.match(html, /<select [^>]*data-field="model"[^>]*>[\s\S]*?<option value="claude-fable-5-1">claude-fable-5-1<\/option>/);
+    assert.match(html, /<select [^>]*data-field="model"[^>]*>[\s\S]*?<option value="claude-fable-5-1">claude-fable-5-1 · Claude Fable 5\.1<\/option>/);
   });
 
-  it("with no names configured for a provider, the model stays read-only as before", () => {
-    assert.equal(controls(withChoices({}, {}), "stage")!.model.fixedText, "opus");
-  });
-
-  it("reads where local overrides go, and then names the clear option for what it does", () => {
-    const local = withChoices({ local_config_path: "/repo/.git/agent-sparring/.sparring.toml", local_config_exists: false });
-    assert.equal(local.kind === "report" ? local.report.local_config_path : undefined, "/repo/.git/agent-sparring/.sparring.toml");
-    const stage = controls(local, "stage")!;
-    assert.equal(stage.model.options?.[0]?.label, "Project setting", "clearing a local override falls back to project.toml");
-    assert.equal(stage.effort?.options?.[0]?.label, "Project setting");
-    assert.match(stage.model.detail, /this worktree only, from the next stage, and leave the repository clean/);
-    assert.equal(controls(withChoices(), "stage")!.model.options?.[0]?.label, PROVIDER_DEFAULT_LABEL, "an engine without local overrides writes project.toml, as before");
-  });
-
-  it("reports a value from the local override as such", () => {
-    const view = agentConfigView(
-      withChoices({
-        local_config_path: "/repo/.git/agent-sparring/.sparring.toml",
-        stage: { role: "stage", provider: "claude-cli", provider_display_name: "Claude", provider_source: "project", model: "claude-fable-5-1", model_source: "local", effort: "high", effort_source: "project", effort_supported: true, effort_levels: ["low", "high"] },
-      }),
-    );
-    assert.match(view?.lines[0]?.detail ?? "", /Model claude-fable-5-1 from this worktree's local override/);
-  });
-
-  it("the write goes to --local for model and effort only, and only when the engine reported a local location", async () => {
-    const panel = stripComments(await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "overview", "overviewPanel.ts"), "utf8"));
-    assert.match(panel, /const local = message\.field !== "provider" && current\.kind === "report" && current\.report\.local_config_path !== undefined;/);
+  it("the write is set-config for the provider on screen, with no per-worktree flag", async () => {
     const probe = stripComments(await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "configProbe.ts"), "utf8"));
-    assert.match(probe, /if \(local\) \{\s*args\.push\("--local"\);/);
+    assert.match(probe, /args\.push\("--for-provider", forProvider\)/);
+    assert.match(probe, /args\.push\("--json"\)/);
+    assert.doesNotMatch(probe, /"--local"/);
+    const panel = stripComments(await fs.readFile(path.join(__dirname, "..", "..", "src", "vscode", "overview", "overviewPanel.ts"), "utf8"));
+    assert.doesNotMatch(panel, /local_config_path|modelChoices"\)|--local/);
+  });
+
+  it("no extension source carries a list of model names, or the old modelChoices setting", async () => {
+    const offenders: string[] = [];
+    for (const file of await sources(path.join(__dirname, "..", "..", "src"))) {
+      if (file.includes(`${path.sep}test${path.sep}`) || file.includes(`${path.sep}integration${path.sep}`)) {
+        continue;
+      }
+      const code = stripComments(await fs.readFile(file, "utf8"));
+      if (/claude-(opus|sonnet|haiku|fable)-\d|gpt-\d|agentSparring\.modelChoices/.test(code)) {
+        offenders.push(path.relative(process.cwd(), file));
+      }
+    }
+    assert.deepEqual(offenders, []);
+    const manifest = JSON.parse(await fs.readFile(path.join(__dirname, "..", "..", "package.json"), "utf8"));
+    assert.equal(manifest.contributes.configuration.properties["agentSparring.modelChoices"], undefined);
   });
 });

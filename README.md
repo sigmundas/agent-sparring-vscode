@@ -45,7 +45,7 @@ navigates.
 | `Agent Sparring: Sibling Repositories for a Plan Stage…` | Declare which *other* repositories a plan stage's reviewed candidate spans, so acceptance pins and verifies the complete set instead of the primary commit alone. Pick the stage, pick a repository this window knows (or browse to one) and confirm the branch its candidate must be on; no commit is ever asked for. Stored in VS Code workspace state per worktree, plan and stage label, emitted into the execution manifest, and shown quietly in the Overview. Removing a declaration is the same command. |
 | `Agent Sparring: Stage Mode for a Plan Stage…` | Declare that a plan stage is a *review* of work rather than work: no implementation agent runs for it, and a fresh independent reviewer inspects the candidates the earlier stages accepted. Nothing is inferred from a stage's title or its brief's prose — this command is the only way to say it. Stored in VS Code workspace state per worktree, plan and stage label, and emitted into the execution manifest as `mode`. Setting it back to *Implementation* removes the declaration. |
 | `Agent Sparring: Copy Review Context for Chat` | For a stage the reviewer handed back to you: put the whole review on the clipboard as plain Markdown — the stage and its goal, the routing state, the reviewer's summary and note, every human-gate check with its instruction and pass criteria verbatim, the concrete names the review refers to, the latest handoff claims, the reviewer's findings and the stage's plan section — so it can be pasted into ChatGPT/Claude, an issue or a message and asked about. No provider prompts, model reasoning, command output or activity log. Also **Copy context for chat** in the Overview, beside **Open detailed review**, with **Copy this check** under each outstanding check. |
-| `Agent Sparring: Open Project Settings` | Open the active repository's `.sparring/project.toml` — where the provider, model and effort for the stage agent and the sparrer are set. If the file does not exist yet, offers **Create project settings**, which runs the engine's own `sparring init-config` and opens what it wrote. The Overview's **Agents** section also edits the model and effort in place, through the engine's `sparring set-config`; this file stays the place the whole configuration is visible, and nothing in the extension writes TOML. |
+| `Agent Sparring: Open Project Settings` | Open the active repository's `.sparring/project.toml` — where the provider for the stage agent and the sparrer is set. If the file does not exist yet, offers **Create project settings**, which runs the engine's own `sparring init-config` and opens what it wrote. Model and effort are your own preferences, outside every repository, and are changed on the Overview's actor cards through the engine's `sparring set-config`; nothing in the extension writes TOML. |
 | `Agent Sparring: Choose sparring Executable…` | Pick the `sparring` CLI with a file dialog and store it as `agentSparring.executable`. |
 | `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / finalizing / future stages), the current stage as primary content (the stage as the plan names it — `Stage 3D — title`, with `6 of 8` as secondary metadata — a human state word with one explaining sentence, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), latest sparring result, small Stage Agent / Sparrer cards, Brief / Handoff / Sparring report / Diff / Plan document / Log buttons, and quiet metadata (where the engine's own words live). Never auto-opens; updates in place. |
 | `Agent Sparring: Show Log` | Focus the Output Channel. |
@@ -56,84 +56,107 @@ navigates.
 
 ## Which model and effort the agents run at
 
-That is project configuration, not a VS Code setting. It lives in the
-repository's own `.sparring/project.toml` under `[agents.stage]` and
-`[agents.sparring]`, and this extension deliberately adds **no** setting
-that could override it — a hidden per-window preference silently changing
-what a managed run costs is exactly the surprise worth avoiding.
+**Model and effort are your own preferences**, not project configuration.
+They are kept per role (stage agent, sparrer) *and per provider*, in one
+engine-owned file outside every repository, whose path the engine reports.
+Every project you open shares them, and changing one never dirties a
+repository. **The provider is still a project setting**: it lives in the
+repository's `.sparring/project.toml` under `[agents.stage]` and
+`[agents.sparring]`. The engine resolves each value as: command-line flag,
+then environment, then your preference, then the provider's own default.
+This extension adds **no** VS Code setting that could override any of it.
 
-The Overview's **Agents** section shows what the *next* provider turn would
-run with, for example:
+The Overview's actor cards show what the *next* provider turn would run with,
+for example:
 
 ```text
-Stage agent   Claude · opus · high
-Sparrer       Codex · provider default
+Stage agent   Model: claude-opus-5-5 · Your preference
+Sparrer       Model: Provider default
 ```
 
 Every one of those values is the engine's own answer, obtained by running
 `sparring show-config --json`. The extension does not parse TOML, does not
-know which providers or effort levels exist, and does not work out what an
-omitted model means for a given provider: that resolution (an explicit CLI
-flag, then `project.toml`, then the provider's own default) belongs to the
-engine, and a second opinion about what is about to run would be worse than
-none. An unset model therefore reads *provider default* rather than a
-guessed name, and an effort that is unset — or that the provider has no
-concept of — is simply absent from the line rather than rendered as
-nothing-in-particular. Hovering a role says where each value came from.
+know which providers or effort levels exist, and does not decide precedence.
+An exact configured model is stated with where it came from; no configured
+model reads **Provider default**, drawn quietly, which is a different fact
+from any model and never a guessed name. An effort that is unset — or that
+the provider has no concept of — is not rendered as a level.
+
+The model a provider *reported running* is a third, separate fact. When the
+provider stated it (the stage's `session.observed` telemetry), the card says
+"Provider reported running …" beneath the configured value; when it did not,
+nothing is claimed.
+
+Each card's **Technical details** lists the engine's facts for the role: role
+id, provider id and its source, the user preferences file, the configured
+model (or none) and its source, effort and its source, where the model
+suggestions came from, and the runtime-reported model if known.
 
 If the engine cannot answer (an older engine without `show-config`, or one
 this window cannot resolve), the section says so in one line and the rest of
 the Overview is unaffected. If the engine reports the configuration as
-invalid, its own sentence is shown and no role values are displayed — an
-invalid configuration has no effective values, and plausible-looking ones
-beside an error are how a person ends up trusting the wrong thing.
+invalid, its own sentence is shown and no role values are displayed.
 
 ### Changing it from the Overview
 
-Each role's **Model** and **Effort** are editable in place.
+Each role's **Model** and **Effort** are dropdowns on its card.
 
-**Model** is a plain text field, because both installed CLIs accept
-free-form model identifiers and gain new ones without an engine release; a
-closed list here would reject a model that exists. Leaving it empty means
-*Provider default* — the override is removed and the provider chooses. The
-words "provider default" are never written into the file as a model name.
+**Model** offers, in order: *Provider default* (clears your preference);
+the model currently configured, even when no suggestion names it; the
+engine's suggestions for exactly that role and provider; and **Other exact
+model…**, which asks for an exact model id and sends it to the engine as one
+argument, never through a shell. The suggestions come from
+`sparring model-choices --json` — for Codex the provider's own catalog, for
+Claude the models the engine knows — and are only suggestions: they are
+never a validation boundary and are not called complete. A list for one
+provider is never offered for another. They are read once per session per
+role and provider (the Codex catalog spawns `codex`) and read again on an
+explicit **Refresh**. The engine refuses a Claude alias such as `opus` as a
+saved model, because it is not an exact model; its sentence is shown.
 
-**Effort** is a dropdown whose entries are the levels the engine reported
-for that role's provider, in the engine's own order, with *Provider default*
-first. This extension contains no list of effort levels; the two providers'
-vocabularies differ, and the difference arrives from `show-config --json`. A
-provider with no effort setting at all gets no dropdown, rather than a
-disabled one that would suggest the setting exists and is merely
-unavailable.
+**Effort** lists the levels the engine reported for that role's provider,
+with *Provider default* first. This extension contains no list of effort
+levels. A provider with no effort setting gets no dropdown.
 
 **Provider** is shown rather than chosen while the engine reports one
-provider for the role, which is the case today. It becomes a real dropdown
-as soon as the engine reports a second, without a change here.
+provider for the role. It becomes a dropdown as soon as the engine reports a
+second, and a provider change is written to `project.toml` by the engine.
 
-A change runs the engine's own `sparring set-config`; **nothing in this
-extension writes TOML**, and a test asserts that nothing does. Afterwards the
-effective configuration is re-read with `show-config` and the controls are
-redrawn from the engine's answer — never from the value that was requested.
-So a change the engine refuses leaves the engine's own diagnostic on screen
-and the engine's own value in the control.
+A model or effort change runs `sparring set-config <role> --model … |
+--effort … --for-provider <provider on the card> --json`, which writes your
+preference file; there is no per-worktree override and no "Project setting"
+option. **Nothing in this extension writes a configuration file**, and a
+test asserts that nothing does. Afterwards the effective configuration is
+re-read with `show-config` and the controls are redrawn from the engine's
+answer — never from the value that was requested — so a refused change
+leaves the engine's diagnostic on screen and its value in the control.
+Switching repositories re-reads `show-config` for the new repository, which
+reports the same preference while the role and provider are the same.
 
-While a run is executing, the section says the change applies to the next
-agent turn. That is a statement about when it lands, not a restriction:
-configuration is resolved when a turn is launched, so an edit never
-reconfigures or restarts a provider process already running, and it does not
-touch run state or any prompt already captured. What a mid-session model
-change means on provider session resume is the provider's business, and
-neither the engine nor this extension claims to know.
+While a run is in progress, the card says — and a saved change repeats —
+that the change takes effect from the next stage; the provider turn already
+running is unaffected.
 
 A change carries the `project.toml` its control was drawn from, and is
-applied only if that is still the file this window is looking at. Switching
-the active repository with a control open therefore refuses the change and
-redraws, rather than applying it to the repository that is now on screen. A
+applied only if that is still the repository this window is looking at, so
+a control left open across a repository switch is refused and redrawn. A
 control is disabled while its own change is in flight, and changes are
 carried out one at a time.
 
-**Settings**, beside that section, still opens the file. The controls are a
-convenience surface, not a replacement for seeing the real configuration.
+### Obsolete project model/effort settings
+
+Older projects may still set `model` or `effort` in `project.toml`. The
+engine no longer reads them and reports each as a setup problem; the
+Overview shows **Agent configuration needs updating** — "Model and effort
+are now your own preferences, shared by every project. This project still
+has old model/effort settings." — with a **Remove obsolete project
+settings** button. It runs `sparring fix-config --json`, which removes the
+keys and chooses no preference in their place; commit the file afterwards.
+Role, field, value, config path and the engine's own message are under
+Technical details.
+
+**Settings**, beside the cards, still opens `project.toml`, where the
+provider is set.
 
 ## Settings
 
@@ -596,7 +619,7 @@ run them.
 | What sending feedback does | records the text verbatim under `## Human evidence` in a `### Additional human feedback` block — dated, never summarised or classified — and asks the **reviewer** to rule again on the unchanged candidate, by the same route a check result takes (`resume-plan --evidence` in a managed run, `run-sparring <stage>` standalone). The reviewer then decides: `SEND_BACK` if the feedback is an implementation defect, `NEEDS_YOU` again if the original checks still stand, revised or replaced checks if the feedback invalidated their assumptions, `READY` only where its own acceptance rules already allow it. Human feedback is evidence for that decision, not an instruction to the implementing agent — the prose is never handed to the stage agent, and this extension never routes on it. Each submission appends its own entry rather than replacing the last, and a block under that sub-heading is never matched as evidence *for a check*, however much of a check's wording it repeats |
 | **Resume stage (implementation)** | the separate action, behind the panel's `…` disclosure: `run-loop`, which starts the stage agent again. Use it when there is work to do, not to hand over evidence — it is never the answer to a review |
 | **Copy context for chat**, and **Copy this check** under each outstanding check | the same recorded artifacts, assembled as plain Markdown on the clipboard so the review can be pasted into a chat assistant, an issue or a message and asked about. The whole-review copy carries the repository, the plan, the stage and its goal, the routing state and the reviewer's summary and note, every gate check with its `instruction` and `pass_criteria` verbatim and the recorded result so far, the concrete names the review refers to (the gate's category, each check's stable id, the source the reviewer named), the stage agent's `## Claims` from `handoff.md`, the reviewer's `## Finding / discussion` from `sparring.md`, and the stage's own plan section. Freeform human feedback is carried too, and the workflow state it is in is never blurred: what has been sent to the reviewer appears as `## Additional human feedback` (from `notes.md`, verbatim), and what is still sitting in the field as `## Draft human feedback — not yet submitted`. A per-check copy is that check plus enough of the stage to make sense outside the extension, and carries no unrelated feedback. Nothing is composed or summarised, long quotes are cut at a line boundary and name the file they came from, and provider prompts, model reasoning, command transcripts, the self-contained handoff's embedded diff and the activity log are never included. Also `Agent Sparring: Copy Review Context for Chat` |
-| **Agents** — the effective provider, model and effort per role, and where each value came from | `sparring show-config --json` for the repository the cockpit is in. Never `project.toml` read directly: precedence, provider capabilities and the meaning of an omitted value are the engine's, and the extension displays its answer verbatim, down to the words *provider default*. A configuration error is shown as the engine's own sentence with no role values beside it |
+| **Agents** — the effective provider, model and effort per role, and where each value came from | `sparring show-config --json` for the repository the cockpit is in. Never `project.toml` read directly: precedence, provider capabilities and the meaning of an omitted value are the engine's, and the extension displays its answer verbatim, down to the words *provider default*. Model suggestions are `sparring model-choices --json` for that role and provider, never a closed list; the model a provider reported running is `session.observed` in the stage's activity log, shown only when stated. A configuration error is shown as the engine's own sentence with no role values beside it |
 | **Show instructions** on the Claude or Codex card | the engine's captured prompt for that actor's latest turn: `.sparring/stages/<id>/prompts/index.jsonl` names the current capture per role, and the `.md` file beside it is the exact text the provider was handed, written at the moment it was handed over. Nothing is reconstructed and nothing is re-parsed — each section's character span comes from the engine, so what the sections show is a slice of the captured bytes. The card opens to the full width of the panel and leads with the role and the turn kind (**Implementation turn · first turn of this stage**, **Commit turn**, **Review turn · judging the evidence you recorded**, …), because that line alone is usually enough to see a stage running the wrong kind of turn. **This turn** and **Last turn** come from the same liveness as the card's own Working/Waiting word. Each section names where it came from: a file section offers to open it (`brief.md`, `PROJECT.md`, `sparring.md`, `handoff.md`, `notes.md`), and text Agent Sparring itself wrote — the branch constraint, the self-check, the scope reminder, the finalization instruction, the sparrer's verdict instruction — is labelled **Agent Sparring** rather than left looking like part of the plan. Sections over 2 000 characters start collapsed. Everything is escaped text, never rendered Markdown. A stage last run by an engine without prompt capture simply has no disclosure |
 | **View exact generated prompt** and **Copy prompt** | the captured file verbatim. This is the one place the extension exports a provider prompt on purpose; **Copy context for chat** still excludes prompts entirely, because that artifact is the review and this one is the prompt |
 | Plan button, this stage's section, the next stage label and "What's next" for a standalone stage | the Markdown file you associated and, when you picked one, the stage you matched (VS Code workspace state; display only) |
