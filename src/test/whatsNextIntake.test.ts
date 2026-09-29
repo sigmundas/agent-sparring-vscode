@@ -151,7 +151,7 @@ function slice(runId: string, state: IntakeSliceSnapshot["state"], repo: string,
 }
 
 function intakeOf(slices: IntakeSliceSnapshot[]): IntakeSnapshot {
-  return { dir: "/i", sparringDir: "/s", record: { intakeId: "i", planLabel: "p", runKeys: slices.map((s) => ({ runId: s.runId, runKey: s.runKey })), repositories: {} }, slices, state: "running", reportPath: "/i/report.md" };
+  return { dir: "/i", sparringDir: "/s", record: { intakeId: "i", planLabel: "p", runKeys: slices.map((s) => ({ runId: s.runId, runKey: s.runKey })), repositories: {} }, slices, state: "running", reportPath: "/i/report.md", usable: true };
 }
 
 /** Taxonomy v3 as recorded: slice order and earlier_slices from its intake.json. */

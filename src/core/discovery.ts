@@ -994,8 +994,10 @@ export function selectRun(
     }
     if (pick.id.includes("|intake:")) {
       if (pinnedIntake) {
-        // A plan's current intake is its newest in that project. Only a
-        // person's explicit choice keeps an older one on screen, labelled.
+        // A plan's current intake is its newest USABLE one in that project;
+        // an intake still being prepared, or left behind by a failed prepare,
+        // is never followed to. Only a person's explicit choice keeps an
+        // older one on screen, labelled.
         const current = currentIntakeOf(pinnedIntake, intakes);
         if (current !== pinnedIntake && origin !== "explicit") {
           const to = intakeIdFor(current.location, current.record.intakeId);
@@ -1035,10 +1037,16 @@ export function selectRun(
 }
 
 /**
- * The newest intake of each plan, per project. Preparing a plan again
- * supersedes the earlier proposal. A plan with an intake whose age cannot be
- * read has no knowable newest intake — the unreadable one may be the prepare
- * that replaced the others — so none of that plan's intakes is returned.
+ * The newest USABLE intake of each plan, per project. Preparing a plan again
+ * supersedes the earlier proposal, but only once that newer prepare is known
+ * finished ({@link IntakeSnapshot.usable}) — an intake still being written, or
+ * left behind by a prepare that failed after `intake.json` but before its
+ * completion marker, is never newest here, however recent its `created_at`.
+ * It stays out of this list, not merely behind the older one: the caller sees
+ * exactly the same result as if it did not exist yet. A plan with an intake
+ * whose age cannot be read has no knowable newest intake — the unreadable one
+ * may be the prepare that replaced the others — so none of that plan's
+ * intakes is returned.
  */
 function newestIntakePerPlan(intakes: readonly DiscoveredIntake[]): DiscoveredIntake[] {
   const newestPerPlan = new Map<string, DiscoveredIntake>();
@@ -1046,7 +1054,7 @@ function newestIntakePerPlan(intakes: readonly DiscoveredIntake[]): DiscoveredIn
   for (const intake of intakes) {
     const created = intake.record.createdAtMs;
     const key = `${intake.location.projectDir}|${intake.record.planLabel}`;
-    if (created === undefined || unordered.has(key)) {
+    if (created === undefined || unordered.has(key) || !intake.usable) {
       continue;
     }
     const held = newestPerPlan.get(key);
@@ -1058,10 +1066,13 @@ function newestIntakePerPlan(intakes: readonly DiscoveredIntake[]): DiscoveredIn
 }
 
 /**
- * The current intake of `intake`'s plan: the newest one prepared for the same
- * plan in the same project, which is `intake` itself when it is the newest or
- * when the plan's intakes cannot all be ordered (see {@link newestIntakePerPlan}).
- * Recent run activity and the active repository play no part.
+ * The current intake of `intake`'s plan: the newest USABLE one prepared for
+ * the same plan in the same project, which is `intake` itself when it is the
+ * newest, when the plan's intakes cannot all be ordered, or when none of them
+ * is usable yet (see {@link newestIntakePerPlan}) — including `intake` itself,
+ * so an unusable intake is still shown as its own current rather than
+ * resolving to nothing. Recent run activity and the active repository play
+ * no part.
  */
 export function currentIntakeOf(intake: DiscoveredIntake, intakes: readonly DiscoveredIntake[]): DiscoveredIntake {
   const key = (entry: DiscoveredIntake) => `${entry.location.projectDir}|${entry.record.planLabel}`;

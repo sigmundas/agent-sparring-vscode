@@ -270,6 +270,32 @@ describe("pre-run intake state", () => {
     assert.equal(parseEngineTimestamp("yesterday"), undefined);
     assert.equal(parseEngineTimestamp(undefined), undefined);
   });
+
+  it("a legacy intake (no completion_marker key) is usable, exactly as before", async () => {
+    const { location } = await project("approved");
+    const [intake] = (await discoverRuns([location])).intakes ?? [];
+    assert.equal(intake.record.completionMarker, undefined);
+    assert.equal(intake.usable, true);
+  });
+
+  it("a completion_marker naming a file that does not exist yet makes the intake unusable", async () => {
+    const { root, location } = await project("approved");
+    const recordPath = path.join(root, ".sparring", "intake", INTAKE_ID, "intake.json");
+    await writeJson(recordPath, { ...JSON.parse(await fs.readFile(recordPath, "utf8")), completion_marker: "prepared.json" });
+    const [intake] = (await discoverRuns([location])).intakes ?? [];
+    assert.equal(intake.record.completionMarker, "prepared.json");
+    assert.equal(intake.usable, false, "prepare-plan has not written prepared.json as its last write yet");
+  });
+
+  it("once that marker file exists, the same intake is usable", async () => {
+    const { root, location } = await project("approved");
+    const intakeDir = path.join(root, ".sparring", "intake", INTAKE_ID);
+    const recordPath = path.join(intakeDir, "intake.json");
+    await writeJson(recordPath, { ...JSON.parse(await fs.readFile(recordPath, "utf8")), completion_marker: "prepared.json" });
+    await writeJson(path.join(intakeDir, "prepared.json"), { intake_id: INTAKE_ID, prepared_at: "2026-09-27T20:49:30.293065+00:00", verdict: "executable_with_recommendations" });
+    const [intake] = (await discoverRuns([location])).intakes ?? [];
+    assert.equal(intake.usable, true);
+  });
 });
 
 describe("selection: a newer pre-run intake replaces older finished work", () => {

@@ -89,6 +89,16 @@ export interface IntakeRecord {
    * metadata, never an input to approval. Absent from older intakes.
    */
   requirements?: Record<string, IntakeSliceRequirements>;
+  /**
+   * `completion_marker`: the file name (relative to this intake's directory)
+   * whose presence proves prepare-plan finished successfully. The engine
+   * writes it — `prepared.json`, holding `intake_id`/`prepared_at`/`verdict`
+   * — as the very last write of a successful run, so it exists only once
+   * `intake.json` itself is final. Absent from an intake prepared before the
+   * engine recorded it, which is read as already complete (see
+   * {@link IntakeSnapshot.usable}).
+   */
+  completionMarker?: string;
 }
 
 export interface IntakeFindingCounts {
@@ -212,6 +222,7 @@ export function parseIntakeRecord(text: string): IntakeRecord {
     repositories: recordedRepositories(payload["repositories"]),
     findings: findingCounts(payload["findings"]),
     requirements: sliceRequirements(payload["approval_requirements"]),
+    ...(typeof payload["completion_marker"] === "string" && payload["completion_marker"] ? { completionMarker: payload["completion_marker"] } : {}),
   };
 }
 
@@ -513,6 +524,17 @@ export interface IntakeSnapshot {
    * anything, so it stays discoverable but is never promoted automatically.
    */
   activityMs?: number;
+  /**
+   * Whether `intake.json`'s own write is known finished. True for a legacy
+   * intake (no `record.completionMarker`: prepared before the engine recorded
+   * one, read as already complete) and for one whose named completion marker
+   * file exists in {@link IntakeSnapshot.dir}; false while a `prepare-plan`
+   * is still writing this directory, or left it unfinished by failing after
+   * `intake.json` but before that marker. An unusable intake stays
+   * discoverable — it may still be listed — but is never the current intake
+   * of its plan and never selected other than by an explicit choice of it.
+   */
+  usable: boolean;
 }
 
 /** The status of each plan run in the same `.sparring`, by run key. */
@@ -593,7 +615,18 @@ async function snapshotIntake(dir: string, sparringDir: string, record: IntakeRe
       }
     }
   }
-  return { dir, sparringDir, record, slices, state: intakeState(slices), reportPath: path.join(dir, INTAKE_REPORT_FILENAME), activityMs };
+  const usable = record.completionMarker === undefined || (await fileExists(path.join(dir, record.completionMarker)));
+  return { dir, sparringDir, record, slices, state: intakeState(slices), reportPath: path.join(dir, INTAKE_REPORT_FILENAME), activityMs, usable };
+}
+
+/** Whether a regular file (or anything statable) exists at `file`. */
+async function fileExists(file: string): Promise<boolean> {
+  try {
+    await fs.stat(file);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**

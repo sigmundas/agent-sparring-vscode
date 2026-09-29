@@ -1,5 +1,7 @@
 /**
- * A plan's current intake is its newest in the project that prepared it.
+ * A plan's current intake is its newest USABLE intake in the project that
+ * prepared it — not merely its newest by timestamp (see "an intake still
+ * being prepared is never current" below for the completion-marker rules).
  *
  *  - an intake opened by an action (not chosen by a person) follows its plan
  *    to the current intake once the plan is prepared again;
@@ -13,7 +15,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { currentIntakeOf, discoverRuns, intakeIdFor, selectRun, type SparringLocation } from "../core/discovery";
+import { currentIntakeOf, discoverRuns, intakeIdFor, promotableIntake, selectRun, type DiscoveredIntake, type SparringLocation } from "../core/discovery";
 import { renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel } from "../core/overviewModel";
 
@@ -93,5 +95,111 @@ describe("a plan's current intake", () => {
     const selection = selectRun(discovery.runs, { id: newId, origin: "explicit" }, undefined, undefined, undefined, [location], discovery.intakes);
     assert.equal(selection.intake?.record.intakeId, NEW_ID);
     assert.equal(selection.newerIntake, undefined);
+  });
+});
+
+// -------------------------------------------------------------------------
+// completion_marker: current = newest USABLE intake, not newest timestamp.
+// These are pure selection-logic tests — no filesystem, no prepare-plan.
+// `usable` is set directly, standing in for what discoverIntakes computes
+// from `intake.json`'s `completion_marker` and whether that file exists
+// (src/core/intake.ts: snapshotIntake). A legacy intake (no marker recorded)
+// is exactly `usable: true`.
+// -------------------------------------------------------------------------
+
+function fixtureLocation(project = "app"): SparringLocation {
+  const root = `/synthetic/${project}`;
+  return { sparringDir: path.join(root, ".sparring"), projectDir: root, repoRoot: root, workspaceFolder: root, folderName: project };
+}
+
+/** A synthetic intake for pure selection-logic tests: `usable` set directly, standing in for a marker check. */
+function fixtureIntake(id: string, createdAtMs: number, usable: boolean, location: SparringLocation = fixtureLocation()): DiscoveredIntake {
+  const dir = path.join(location.sparringDir, "intake", id);
+  return {
+    location,
+    dir,
+    sparringDir: location.sparringDir,
+    record: { intakeId: id, planLabel: "docs/plan.md", createdAtMs, runKeys: [], repositories: {} },
+    slices: [],
+    state: "prepared",
+    reportPath: path.join(dir, "report.md"),
+    activityMs: createdAtMs,
+    usable,
+  };
+}
+
+describe("an intake still being prepared is never current", () => {
+  it("a newer intake with no completion marker yet does not replace the current one", () => {
+    const older = fixtureIntake("older", 1000, true);
+    const midPrepare = fixtureIntake("newer", 2000, false);
+    assert.equal(currentIntakeOf(older, [older, midPrepare]).record.intakeId, "older");
+  });
+
+  it("once the marker is written, that same intake becomes current", () => {
+    const older = fixtureIntake("older", 1000, true);
+    const nowPrepared = fixtureIntake("newer", 2000, true);
+    assert.equal(currentIntakeOf(older, [older, nowPrepared]).record.intakeId, "newer");
+  });
+
+  it("legacy intakes (no completion_marker key, so usable as today) behave exactly as before", () => {
+    const older = fixtureIntake("older", 1000, true);
+    const newer = fixtureIntake("newer", 2000, true);
+    assert.equal(currentIntakeOf(older, [older, newer]).record.intakeId, "newer");
+    assert.equal(currentIntakeOf(newer, [older, newer]).record.intakeId, "newer");
+  });
+
+  it("an action-origin (incidental) selection does not follow to an unfinished intake, and pins nothing new", () => {
+    const location = fixtureLocation();
+    const older = fixtureIntake("older", 1000, true, location);
+    const midPrepare = fixtureIntake("newer", 2000, false, location);
+    const oldId = intakeIdFor(location, "older");
+    const selection = selectRun([], { id: oldId, origin: "action", intent: "inspect" }, undefined, undefined, undefined, [location], [older, midPrepare]);
+    assert.equal(selection.intake?.record.intakeId, "older");
+    assert.equal(selection.released, undefined, "there is nothing current to switch to yet");
+  });
+
+  it("once that prepare succeeds, the same action-origin pin follows to the now-current intake", () => {
+    const location = fixtureLocation();
+    const older = fixtureIntake("older", 1000, true, location);
+    const nowPrepared = fixtureIntake("newer", 2000, true, location);
+    const oldId = intakeIdFor(location, "older");
+    const newId = intakeIdFor(location, "newer");
+    const selection = selectRun([], { id: oldId, origin: "action", intent: "inspect" }, undefined, undefined, undefined, [location], [older, nowPrepared]);
+    assert.equal(selection.intake?.record.intakeId, "newer");
+    assert.deepEqual(selection.released, { id: oldId, reason: "replaced", to: newId });
+  });
+
+  it("a failed prepare (intake.json written, marker never appears) leaves the previous current intake selected, and stays that way across a reload", () => {
+    const location = fixtureLocation();
+    const older = fixtureIntake("older", 1000, true, location);
+    const failed = fixtureIntake("failed", 2000, false, location);
+    const oldId = intakeIdFor(location, "older");
+    const live = selectRun([], { id: oldId, origin: "action", intent: "inspect" }, undefined, undefined, undefined, [location], [older, failed]);
+    assert.equal(live.intake?.record.intakeId, "older");
+    // A reload restores the identical persisted pin from workspaceState; the
+    // failed intake's marker still never appears, so nothing changes.
+    const reloaded = selectRun([], { id: oldId, origin: "action", intent: "inspect" }, undefined, undefined, undefined, [location], [older, failed]);
+    assert.equal(reloaded.intake?.record.intakeId, "older");
+    assert.equal(reloaded.released, undefined);
+  });
+
+  it("an explicit pin on the older intake claims no newerIntake while the newer one is unfinished", () => {
+    const location = fixtureLocation();
+    const older = fixtureIntake("older", 1000, true, location);
+    const midPrepare = fixtureIntake("newer", 2000, false, location);
+    const oldId = intakeIdFor(location, "older");
+    const selection = selectRun([], { id: oldId, origin: "explicit" }, undefined, undefined, undefined, [location], [older, midPrepare]);
+    assert.equal(selection.intake?.record.intakeId, "older");
+    assert.equal(selection.newerIntake, undefined, "an unusable intake is not yet 'the current one' to name as newer");
+  });
+
+  it("an unfinished intake is discoverable but never auto-followed when nothing is pinned", () => {
+    const midPrepare = fixtureIntake("mid-prepare", 1000, false);
+    const automatic = selectRun([], undefined, undefined, undefined, undefined, [midPrepare.location], [midPrepare]);
+    assert.equal(automatic.intake, undefined, "not promoted while its own completion marker is missing");
+    assert.equal(promotableIntake([midPrepare], []), undefined);
+
+    const sameOnceUsable = fixtureIntake("mid-prepare", 1000, true);
+    assert.equal(promotableIntake([sameOnceUsable], [])?.record.intakeId, "mid-prepare", "sanity: the same intake IS promotable once usable");
   });
 });
