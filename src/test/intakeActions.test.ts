@@ -137,8 +137,8 @@ describe("the action comes from what the engine recorded", () => {
     const intake = await onlyIntake(location);
     const model = buildOverviewModel({ ambiguous: [], intake }, undefined);
     assert.equal(model.intake?.action?.runId, "web");
+    // Stages 0 + 1A (slice app) are complete, so nothing is still waited for.
     assert.deepEqual(model.intake?.requirements, [
-      "Waits for Stages 0 + 1A to be approved and complete.",
       "Needs a person to confirm gate release (sparring approve-plan --confirm-prerequisite) once actually satisfied.",
     ]);
   });

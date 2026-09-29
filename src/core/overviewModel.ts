@@ -1226,8 +1226,11 @@ function requirementLines(slice: IntakeSliceSnapshot | undefined, intake: Discov
     return [];
   }
   const lines: string[] = [];
-  if (needs.earlierSlices.length > 0) {
-    const named = needs.earlierSlices.map((runId) => {
+  // Only what is still outstanding: a prerequisite whose run is complete is
+  // not something this slice waits for any more.
+  const pending = needs.earlierSlices.filter((runId) => intake.slices.find((entry) => entry.runId === runId)?.state !== "complete");
+  if (pending.length > 0) {
+    const named = pending.map((runId) => {
       const earlier = intake.slices.find((entry) => entry.runId === runId);
       return earlier ? sliceStageName(earlier) : runId;
     });
