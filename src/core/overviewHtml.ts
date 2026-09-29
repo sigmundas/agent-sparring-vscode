@@ -43,6 +43,7 @@ export type OverviewAction =
   | "showLog"
   | "selectRun"
   | "followActiveRepository"
+  | "showNextWork"
   | "chooseRepository"
   | "fixConfiguration"
   | "sliceBranch"
@@ -354,6 +355,7 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "showLog",
   "selectRun",
   "followActiveRepository",
+  "showNextWork",
   "chooseRepository",
   "fixConfiguration",
   "sliceBranch",
@@ -1447,9 +1449,9 @@ function renderCurrentPlanStage(current: string, matched: MatchSource | undefine
  * document and never claims to start a stage.
  */
 /**
- * What's next for an intake-backed run, from the whole intake. Switching
- * repository only changes what this screen follows; the next work's own
- * screen then offers its approval or start.
+ * What's next for an intake-backed run, from the whole intake. Both buttons
+ * show the next work's own screen, which offers its approval or start;
+ * Switch also follows its repository.
  */
 function renderIntakeWhatsNext(model: OverviewModel, next: WhatsNext, heading: string, text: string): string {
   const repository = next.repository ? `<p class="muted">Repository: ${escapeHtml(next.repository.name)}</p>` : "";
@@ -1459,9 +1461,9 @@ function renderIntakeWhatsNext(model: OverviewModel, next: WhatsNext, heading: s
     buttons.push(button("resumePlan", model.planAction.label, true, model.planAction.detail, "primary"));
   }
   if (next.repository?.action === "switch") {
-    buttons.push(button("switchToNextRepository", `Switch to ${next.repository.name}`, true, `Follow ${next.repository.name}'s current work. Nothing is approved or started.`, model.planAction ? "" : "primary"));
+    buttons.push(button("switchToNextRepository", `Switch to ${next.repository.name}`, true, `Follow ${next.repository.name} and show the next stage there. Nothing is approved or started.`, model.planAction ? "" : "primary"));
   } else if (next.repository?.action === "show") {
-    buttons.push(button("followActiveRepository", "Show next stage", true, "Release this pin and show this repository's current work. Nothing is approved or started.", model.planAction ? "" : "primary"));
+    buttons.push(button("showNextWork", "Show next stage", true, "Show the next stage's approval or start. Nothing is approved or started.", model.planAction ? "" : "primary"));
   }
   if (model.actions?.plan) {
     buttons.push(button("openPlan", "Open plan document", true, `Open the document ${model.plan?.name ?? "the plan"}`));

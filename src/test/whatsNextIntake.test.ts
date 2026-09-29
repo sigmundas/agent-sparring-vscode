@@ -87,7 +87,7 @@ describe("What's next for an intake-backed run", () => {
     assert.equal(model.whatsNext?.repository?.action, "show");
     const html = renderOverviewHtml(model, "n", "c");
     assert.doesNotMatch(html, /switchToNextRepository/, "same repository: no switch");
-    assert.match(html, /data-action="followActiveRepository"[^>]*>Show next stage</);
+    assert.match(html, /data-action="showNextWork"[^>]*>Show next stage</);
   });
 
   it("after switching to web, current-work discovery selects the intake's continuation, and nothing was written", async () => {

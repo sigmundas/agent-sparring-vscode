@@ -26,7 +26,7 @@ import {
   type SparringOutcome,
   type StageState,
 } from "./engineFormats";
-import { discoverIntakes, isPreRunIntake, nextIntakeSlice, resolveIntakeRun, sliceEligible, sliceRoot, type IntakeRunBinding, type IntakeSnapshot } from "./intake";
+import { discoverIntakes, intakeContinuation, isPreRunIntake, nextIntakeSlice, resolveIntakeRun, sliceEligible, sliceRoot, type IntakeRunBinding, type IntakeSliceSnapshot, type IntakeSnapshot } from "./intake";
 import { planTitle } from "./planAssociation";
 
 export const SPARRING_DIRNAME = ".sparring";
@@ -1101,6 +1101,43 @@ export function intakeOfRun(run: RunSnapshot, intakes: readonly DiscoveredIntake
   }
   const binding = run.intake;
   return (intakes ?? []).find((intake) => samePath(intake.dir, binding.intakeDir) && intake.slices.some((slice) => slice.runId === binding.runId));
+}
+
+/** The work What's next names for a finished intake-backed run: the intake, its next slice, and the repository it runs in. */
+export interface NextWork {
+  intake: DiscoveredIntake;
+  slice: IntakeSliceSnapshot;
+  root: string;
+}
+
+/**
+ * The next work after `run`, exactly as What's next computes it — the
+ * continuation of the intake the run's own binding names, not the plan's
+ * newest intake — or undefined when there is none to go to yet: no intake,
+ * the plan complete or waiting, or the run itself still open.
+ *
+ * "Show next stage" navigates to this. It must not rely on current-work
+ * selection reaching the same answer: that selection only considers a plan's
+ * newest intake, and a repository that does not change selects nothing new.
+ */
+export function nextWorkOf(run: RunSnapshot, intakes: readonly DiscoveredIntake[] | undefined): NextWork | undefined {
+  const intake = intakeOfRun(run, intakes);
+  if (!intake || run.kind !== "plan" || !run.intake) {
+    return undefined;
+  }
+  const continuation = intakeContinuation(intake, run.intake.runId);
+  const root = continuation.kind === "next" && !continuation.afterCurrent ? sliceRoot(continuation.slice) : undefined;
+  return continuation.kind === "next" && root ? { intake, slice: continuation.slice, root } : undefined;
+}
+
+/**
+ * The selection preference that shows `next`: its intake, pinned as a
+ * person's explicit choice — the click is one — so it is shown whatever
+ * repository is followed and is not swapped for a newer intake of the plan
+ * whose next work is different. Nothing is approved or started.
+ */
+export function nextWorkPreference(next: NextWork, atMs: number): RunPreference {
+  return { id: intakeIdFor(next.intake.location, next.intake.record.intakeId), atMs, intent: "inspect", origin: "explicit" };
 }
 
 /**

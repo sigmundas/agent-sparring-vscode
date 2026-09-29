@@ -36,7 +36,8 @@ import {
   NOTES_FILENAME,
   SPARRING_FILENAME,
   currentStageOf,
-  intakeOfRun,
+  nextWorkOf,
+  runLabel,
   owningRoot,
   isInsidePath,
   runIdFor,
@@ -48,7 +49,7 @@ import {
   type StandaloneStageSnapshot,
   type DiscoveredIntake,
 } from "../core/discovery";
-import { intakeContinuation, intakeNextAction, intakeStateLabel, sliceRoot, sliceStageName, sourcePlanDigest, type IntakeSliceSnapshot } from "../core/intake";
+import { intakeNextAction, intakeStateLabel, sliceStageName, sourcePlanDigest, type IntakeSliceSnapshot } from "../core/intake";
 import type { IntakeActionMessage } from "../core/overviewHtml";
 import { approveInvocation, preparedFromCurrentPlan, prepareInvocation, proposeSiblingMappings, staleContextRepositories, startInvocation } from "../core/intakeActions";
 import { checkedOutBranch, checkRepositoryMapping } from "../core/repositoryMapping";
@@ -1014,7 +1015,8 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       await overview.update();
       return;
     case "switchToNextRepository":
-      await switchToNextRepository(controller);
+    case "showNextWork":
+      await showNextWork(controller);
       await overview.update();
       return;
     case "runPlan":
@@ -4047,29 +4049,27 @@ async function cleanUpRunnerTerminalsCommand(controller: SparringController): Pr
 }
 
 /**
- * What's next's "Switch to <repository>": follow the repository that owns the
- * intake's next work, recomputed here from the same continuation the screen
- * was drawn from — never a path the webview sent. Only the followed
- * repository changes (which releases a run pin); nothing is approved,
- * started, pinned or opened, and that repository's current-work selection
- * then shows the next stage.
+ * What's next's "Show next stage" and "Switch to <repository>": show the next
+ * work, recomputed here from the same continuation the screen was drawn from
+ * — never a path the webview sent — following its repository first only when
+ * that is another one. Nothing is approved or started.
  */
-async function switchToNextRepository(controller: SparringController): Promise<void> {
+async function showNextWork(controller: SparringController): Promise<void> {
   const run = controller.currentSelection.selected;
-  const intake = run ? intakeOfRun(run, controller.currentDiscovery.intakes) : undefined;
-  const continuation = run?.kind === "plan" && run.intake && intake ? intakeContinuation(intake, run.intake.runId) : undefined;
-  const root = continuation?.kind === "next" && !continuation.afterCurrent ? sliceRoot(continuation.slice) : undefined;
-  if (!root) {
-    void vscode.window.showInformationMessage("Agent Sparring: what comes next changed since this screen was drawn, so the repository was not switched. Check the updated screen.");
+  const next = run ? nextWorkOf(run, controller.currentDiscovery.intakes) : undefined;
+  if (!next) {
+    controller.log(`show next stage: nothing to show — ${run ? `what comes after ${runLabel(run)} is not a stage that can begin now` : "no run is on screen"}; the screen was left as it is.`);
+    void vscode.window.showInformationMessage("Agent Sparring: what comes next changed since this screen was drawn, so nothing was shown. Check the updated screen.");
     return;
   }
   const choices = await controller.repositoryChoices();
-  const owner = owningRoot(root, choices.map((choice) => choice.root));
+  const owner = owningRoot(next.root, choices.map((choice) => choice.root));
   if (!owner) {
-    void vscode.window.showInformationMessage(`Agent Sparring: the next stage belongs to ${root}, which is not open in this window. Add it to the workspace to follow it.`);
+    controller.log(`show next stage: ${next.root} is not open in this window; the screen was left as it is.`);
+    void vscode.window.showInformationMessage(`Agent Sparring: the next stage belongs to ${next.root}, which is not open in this window. Add it to the workspace to follow it.`);
     return;
   }
-  await controller.chooseRepository(owner);
+  await controller.navigateToNextWork(next, owner);
 }
 
 /**

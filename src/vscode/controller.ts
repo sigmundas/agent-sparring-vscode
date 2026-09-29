@@ -29,6 +29,8 @@ import {
   type DiscoveredIntake,
   type PinOrigin,
   intakeIdFor,
+  nextWorkPreference,
+  type NextWork,
   type RepositoryScope,
   type RunSelection,
   type PlanRunSnapshot,
@@ -1464,6 +1466,35 @@ export class SparringController implements vscode.Disposable {
     await this.context.workspaceState.update(PIN_INTENT_KEY, "inspect");
     await this.recordPinOrigin("action");
     this.log(`showing the plan intake ${intake.record.intakeId} in ${intake.location.folderName}.`);
+    await this.refresh();
+  }
+
+  /**
+   * What's next's "Show next stage" / "Switch to <repository>": show `next`
+   * — its intake, at its next stage's approval or start — following `owner`
+   * first when it is another repository. One operation, one refresh.
+   *
+   * Showing the next stage never depends on the followed repository
+   * changing: a plan's stages share repositories, and releasing a pin to let
+   * current-work selection find the next stage found nothing new when the
+   * repository stayed the same. Nothing is approved or started.
+   */
+  async navigateToNextWork(next: NextWork, owner: string): Promise<void> {
+    const scope = await this.repositoryScope();
+    const switching = !scope || !samePath(scope.repoRoot, owner);
+    if (switching) {
+      await this.context.workspaceState.update(CHOSEN_REPOSITORY_KEY, owner);
+    }
+    const preference = nextWorkPreference(next, Date.now());
+    await this.context.workspaceState.update(SELECTED_RUN_KEY, preference.id);
+    await this.context.workspaceState.update(SELECTED_AT_KEY, preference.atMs);
+    await this.context.workspaceState.update(PIN_INTENT_KEY, preference.intent);
+    await this.recordPinOrigin(preference.origin);
+    this.log(
+      `show next stage: ${next.slice.stages[0]?.label ?? next.slice.runId} of intake ${next.intake.record.intakeId}` +
+        (switching ? `, following ${path.basename(owner)}` : ` in ${path.basename(owner)}, the repository already followed`) +
+        `; nothing was approved or started. ${FOLLOW_ACTIVE_LABEL} goes back to automatic selection.`,
+    );
     await this.refresh();
   }
 
