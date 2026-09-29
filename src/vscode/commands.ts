@@ -48,9 +48,10 @@ import {
   type StandaloneStageSnapshot,
   type DiscoveredIntake,
 } from "../core/discovery";
-import { intakeContinuation, intakeNextAction, intakeStateLabel, sliceRoot, sliceStageName } from "../core/intake";
+import { intakeContinuation, intakeNextAction, intakeStateLabel, sliceRoot, sliceStageName, sourcePlanDigest } from "../core/intake";
 import type { IntakeActionMessage } from "../core/overviewHtml";
-import { approveInvocation, startInvocation } from "../core/intakeActions";
+import { approveInvocation, preparedFromCurrentPlan, prepareInvocation, staleContextRepositories, startInvocation } from "../core/intakeActions";
+import { checkRepositoryMapping } from "../core/repositoryMapping";
 import { stageScopeOf } from "../core/stageScope";
 import { CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
@@ -550,6 +551,10 @@ function canonicalPathOrSelf(file: string): string {
  * engine's: approve-plan and run-plan are invoked, and their answer stands.
  */
 async function handleIntakeAction(controller: SparringController, overview: OverviewPanelManager, message: IntakeActionMessage): Promise<void> {
+  if (message.action === "prepare") {
+    await prepareUpdatedIntake(controller, overview, message);
+    return;
+  }
   const intake = (controller.currentDiscovery.intakes ?? []).find((candidate) => samePath(candidate.dir, message.intakeDir));
   const next = intake ? intakeNextAction(intake) : undefined;
   if (!intake || !next || next.kind !== message.action || next.slice.runId !== message.runId) {
@@ -663,6 +668,123 @@ async function handleIntakeAction(controller: SparringController, overview: Over
     // Once plans/<run key>.json exists the managed run is the authority; until
     // then the screen is attached to the run it is about to become.
     await controller.showStartedRun(invocation.runId);
+  }
+  await overview.update();
+}
+
+/**
+ * Recover from a source plan edited after its intake: follow an intake
+ * already prepared from the plan as it is now, else run prepare-plan again
+ * with the previous intake's mode and context repositories.
+ *
+ * Only a recorded repository mapping that no longer checks out is put to the
+ * person. Nothing is approved or started: the new intake is shown, and
+ * approving it stays a separate click. A failed prepare leaves the old
+ * intake selected with the engine's error on it; continuity with completed
+ * work is the engine's, never copied here.
+ */
+async function prepareUpdatedIntake(controller: SparringController, overview: OverviewPanelManager, message: IntakeActionMessage): Promise<void> {
+  const intake = (controller.currentDiscovery.intakes ?? []).find((candidate) => samePath(candidate.dir, message.intakeDir) && candidate.record.intakeId === message.runId);
+  if (!intake || controller.intakeRecovery(intake.dir)?.preparing) {
+    await overview.update();
+    return;
+  }
+  const digest = await sourcePlanDigest(intake.record.sourcePath);
+  if (digest === undefined || digest === intake.record.sourceDigest) {
+    void vscode.window.showInformationMessage("Agent Sparring: the source plan is the one this intake read, so there is nothing to prepare again.");
+    await overview.update();
+    return;
+  }
+  const already = preparedFromCurrentPlan(intake, controller.currentDiscovery.intakes ?? [], digest);
+  if (already) {
+    controller.log(`Intake: ${already.record.intakeId} was already prepared from the current ${intake.record.planLabel}; showing it.`);
+    await controller.showIntake(already);
+    await overview.update();
+    return;
+  }
+  const overrides: Record<string, string | null> = {};
+  for (const stale of await staleContextRepositories(intake, checkRepositoryMapping)) {
+    const choose = "Choose another folder…";
+    const omit = `Leave out ${stale.name}`;
+    const answer = await vscode.window.showWarningMessage(
+      `Agent Sparring: repository ${stale.name} cannot be reused for the updated intake.`,
+      { modal: true, detail: `Path: ${stale.path}\nWhy: ${stale.reason}.` },
+      choose,
+      omit,
+    );
+    if (answer === omit) {
+      overrides[stale.name] = null;
+      continue;
+    }
+    if (answer !== choose) {
+      return;
+    }
+    const picked = await vscode.window.showOpenDialog({ canSelectFolders: true, canSelectFiles: false, canSelectMany: false, openLabel: `Use for ${stale.name}` });
+    const folder = picked?.[0]?.fsPath;
+    if (!folder) {
+      return;
+    }
+    const check = await checkRepositoryMapping(stale.name, folder, undefined);
+    if (!check.valid) {
+      void vscode.window.showWarningMessage(`Agent Sparring: ${folder} cannot be used for ${stale.name}: ${check.reason}. Nothing was prepared.`);
+      return;
+    }
+    overrides[stale.name] = folder;
+  }
+  const invocation = prepareInvocation(intake, overrides);
+  if (!invocation.ok) {
+    void vscode.window.showWarningMessage(`Agent Sparring: ${invocation.problem}`);
+    return;
+  }
+  const label = "Prepare updated intake";
+  const repositories = Object.entries(invocation.contextRepositories).map(([name, repoPath]) => `${name}: ${repoPath}`);
+  const choice = await vscode.window.showInformationMessage(
+    `${label}?`,
+    {
+      modal: true,
+      detail: [
+        `The engine reads ${intake.record.planLabel} again with one read-only intake turn and writes a new intake to review. Nothing is approved or started.`,
+        "",
+        `Repository: ${intake.record.primaryRepository} (${invocation.repoRoot})`,
+        ...(repositories.length > 0 ? ["Context repositories:", ...repositories] : []),
+      ].join("\n"),
+    },
+    label,
+  );
+  if (choice !== label) {
+    return;
+  }
+  controller.setIntakeRecovery(intake.dir, { preparing: true });
+  await overview.update();
+  controller.log(`Intake: ${invocation.describe}`);
+  const result = await controller.runCommand({
+    configured: configuredExecutable(),
+    args: invocation.args,
+    cwd: invocation.cwd,
+    name: `Prepare ${intake.record.planLabel}`,
+    operation: { subcommand: "prepare-plan", target: intake.record.sourcePath },
+    repoRoot: invocation.repoRoot,
+    sparringDir: invocation.sparringDir,
+  });
+  // 0: prepared; 2: prepared, with blocking findings the new report lists.
+  const exitCode = result.ok ? result.outcome.exitCode : undefined;
+  await controller.refresh();
+  const prepared = exitCode === 0 || exitCode === 2 ? preparedFromCurrentPlan(intake, controller.currentDiscovery.intakes ?? [], digest) : undefined;
+  if (prepared) {
+    controller.setIntakeRecovery(intake.dir, undefined);
+    controller.log(`Intake: prepared ${prepared.record.intakeId} from the current ${intake.record.planLabel}.`);
+    await controller.showIntake(prepared);
+  } else {
+    const failure = !result.ok
+      ? result.error
+      : exitCode === 0 || exitCode === 2
+        ? "prepare-plan reported success, but no intake of the current plan text was found."
+        : result.outcome.output.trim() || `prepare-plan exited with ${exitCode ?? "no exit code"} and printed nothing.`;
+    controller.setIntakeRecovery(intake.dir, { failure });
+    controller.log(`Intake: prepare-plan did not produce an updated intake: ${failure.split("\n")[0]}`);
+    if (!result.ok) {
+      await explainCommandProblem(controller, result);
+    }
   }
   await overview.update();
 }

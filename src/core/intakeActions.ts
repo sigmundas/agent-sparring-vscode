@@ -15,7 +15,7 @@
  */
 
 import * as path from "node:path";
-import { buildApprovePlanArgs, buildRunPlanArgs } from "./cli";
+import { buildApprovePlanArgs, buildPreparePlanArgs, buildRunPlanArgs } from "./cli";
 import { runIdFor, samePath, type SparringLocation } from "./discovery";
 import { sliceStageName, type IntakeSliceSnapshot, type IntakeSnapshot } from "./intake";
 
@@ -85,4 +85,88 @@ export function startInvocation(
     expectedBranch: approval.expectedBranch,
     describe: `run-plan --manifest ${slice.manifestPath} --run-key ${approval.runKey}`,
   };
+}
+
+/**
+ * Where a repository mapping stands before it is handed to the engine again:
+ * `valid` when `path` is still a git worktree root of the same repository
+ * (its git common directory is the one intake recorded, when it recorded
+ * one), otherwise why not.
+ */
+export type RepositoryMappingCheck = { valid: true } | { valid: false; reason: string };
+
+/** Answers {@link RepositoryMappingCheck} for one name → path; injected so tests need no git. */
+export type RepositoryMappingValidator = (name: string, repoPath: string, recordedGitDir: string | undefined) => Promise<RepositoryMappingCheck>;
+
+export type PrepareInvocation =
+  | { ok: true; args: string[]; cwd: string; repoRoot: string; sparringDir: string; contextRepositories: Record<string, string>; describe: string }
+  | { ok: false; problem: string };
+
+/**
+ * prepare-plan again for the plan `intake` read, from the project that
+ * prepared it, in the same mode, with the context repositories it was given
+ * — `overrides` replacing (or, as `null`, leaving out) any a person resolved.
+ * Everything else, including what carries over from completed work, is the
+ * engine's.
+ */
+export function prepareInvocation(intake: IntakeSnapshot & { location: SparringLocation }, overrides: Readonly<Record<string, string | null>> = {}): PrepareInvocation {
+  const { record } = intake;
+  if (!record.sourcePath) {
+    return { ok: false, problem: `intake ${record.intakeId} does not record the source plan's path.` };
+  }
+  if (!record.primaryRepository) {
+    return { ok: false, problem: `intake ${record.intakeId} does not record which repository prepared it.` };
+  }
+  const contextRepositories: Record<string, string> = {};
+  for (const [name, recorded] of Object.entries({ ...recordedContextRepositories(intake), ...overrides })) {
+    if (recorded) {
+      contextRepositories[name] = recorded;
+    }
+  }
+  const repoRoot = intake.location.repoRoot;
+  const args = buildPreparePlanArgs({ planPath: record.sourcePath, repoRoot, repositoryName: record.primaryRepository, mode: record.mode, contextRepositories, sparringDir: intake.sparringDir });
+  return { ok: true, args, cwd: repoRoot, repoRoot, sparringDir: intake.sparringDir, contextRepositories, describe: `prepare-plan ${record.planLabel} (from ${record.primaryRepository})` };
+}
+
+/**
+ * The context repositories the previous prepare was given; for an intake that
+ * did not record them, every repository it inspected except its own.
+ */
+export function recordedContextRepositories(intake: IntakeSnapshot): Record<string, string> {
+  const { record } = intake;
+  if (record.contextRepositories) {
+    return { ...record.contextRepositories };
+  }
+  return Object.fromEntries(Object.entries(record.repositories).filter(([name]) => name !== record.primaryRepository));
+}
+
+/** Each context repository of `intake` that no longer checks out, with why. */
+export async function staleContextRepositories(intake: IntakeSnapshot, validate: RepositoryMappingValidator): Promise<{ name: string; path: string; reason: string }[]> {
+  const stale: { name: string; path: string; reason: string }[] = [];
+  for (const [name, repoPath] of Object.entries(recordedContextRepositories(intake)).sort(([a], [b]) => a.localeCompare(b))) {
+    const check = await validate(name, repoPath, intake.record.repositoryGitDirs?.[name]);
+    if (!check.valid) {
+      stale.push({ name, path: repoPath, reason: check.reason });
+    }
+  }
+  return stale;
+}
+
+/**
+ * The intake already prepared from the plan as it is now, newer than
+ * `intake` and in the same project, if there is one: recovery then follows
+ * it instead of preparing a duplicate.
+ */
+export function preparedFromCurrentPlan<T extends IntakeSnapshot & { location: SparringLocation }>(intake: T, intakes: readonly T[], currentDigest: string): T | undefined {
+  return intakes
+    .filter(
+      (candidate) =>
+        candidate !== intake &&
+        samePath(candidate.location.projectDir, intake.location.projectDir) &&
+        candidate.record.planLabel === intake.record.planLabel &&
+        candidate.record.sourceDigest === currentDigest &&
+        candidate.record.createdAtMs !== undefined &&
+        (intake.record.createdAtMs === undefined || candidate.record.createdAtMs > intake.record.createdAtMs),
+    )
+    .sort((a, b) => (b.record.createdAtMs ?? 0) - (a.record.createdAtMs ?? 0))[0];
 }

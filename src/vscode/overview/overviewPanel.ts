@@ -11,10 +11,10 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, intakeOfRun, type PlanRunSnapshot, type RunSnapshot } from "../../core/discovery";
+import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, intakeOfRun, type DiscoveredIntake, type PlanRunSnapshot, type RunSnapshot } from "../../core/discovery";
 import { stageScopeOf } from "../../core/stageScope";
-import { intakeNextAction } from "../../core/intake";
-import { approveInvocation, startInvocation } from "../../core/intakeActions";
+import { intakeNextAction, sourcePlanDigest } from "../../core/intake";
+import { approveInvocation, preparedFromCurrentPlan, startInvocation } from "../../core/intakeActions";
 import { parseStageState, type StageStatus } from "../../core/engineFormats";
 import { planRunDisplayName } from "../../core/planMembership";
 import {
@@ -41,7 +41,7 @@ import {
   type StopMessage,
 } from "../../core/overviewHtml";
 import { PROMPTS_DIRNAME, PROMPT_INDEX_FILENAME, latestCapture, parseCaptureIndex } from "../../core/promptInspector";
-import { buildOverviewModel, type AgentConfigOutcome, type CapturedPrompt, type ManagedPlanRun, type ManifestStageView, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
+import { buildOverviewModel, type AgentConfigOutcome, type CapturedPrompt, type ManagedPlanRun, type IntakeRecovery, type ManifestStageView, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
 import { outstanding as operationOutstanding } from "../operationRegistry";
 import { checkCopyText, reviewCopyText, type ReviewCopySource } from "../../core/reviewCopy";
 import { locateStage, parsePlanHeadings, type HeadingRef } from "../../core/planAssociation";
@@ -429,6 +429,7 @@ export class OverviewPanelManager implements vscode.Disposable {
         planText,
         intakeApproval: next.kind === "approve" ? this.controller.intakeApproval(intake.dir, next.slice.runId) : undefined,
         intakeCommand: invocation ? (invocation.ok ? `sparring ${invocation.args.join(" ")}` : invocation.problem) : undefined,
+        intakeRecovery: await this.intakeRecovery(intake),
       };
       repository = intake.location.folderName;
     }
@@ -438,6 +439,20 @@ export class OverviewPanelManager implements vscode.Disposable {
     }
     const model = buildOverviewModel(selection, this.controller.currentLive, artifacts, Date.now(), this.controller.executionFor(selection.selected?.id));
     return { model, source: { model, artifacts, sparringText, repository } };
+  }
+
+  /**
+   * Whether the source plan changed since `intake` read it — the same digest
+   * approve-plan compares — and, if so, an intake already prepared from the
+   * plan as it is now. Undefined when unchanged or not knowable.
+   */
+  private async intakeRecovery(intake: DiscoveredIntake): Promise<IntakeRecovery | undefined> {
+    const digest = await sourcePlanDigest(intake.record.sourcePath);
+    if (digest === undefined || !intake.record.sourceDigest || digest === intake.record.sourceDigest) {
+      return undefined;
+    }
+    const newer = preparedFromCurrentPlan(intake, this.controller.currentDiscovery.intakes ?? [], digest);
+    return { ...(newer ? { newerIntakeId: newer.record.intakeId } : {}), ...this.controller.intakeRecovery(intake.dir) };
   }
 
   /**

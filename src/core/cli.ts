@@ -114,6 +114,32 @@ export function buildApprovePlanArgs(invocation: ApprovePlanInvocation): string[
   ];
 }
 
+export interface PreparePlanInvocation {
+  planPath: string;
+  repoRoot: string;
+  repositoryName: string;
+  mode?: string;
+  /** `--context-repository NAME=PATH`, in name order. */
+  contextRepositories: Record<string, string>;
+  sparringDir?: string;
+}
+
+export function buildPreparePlanArgs(invocation: PreparePlanInvocation): string[] {
+  return [
+    ...globalArgs(invocation),
+    "prepare-plan",
+    invocation.planPath,
+    ...(invocation.mode ? ["--mode", invocation.mode] : []),
+    ...Object.keys(invocation.contextRepositories)
+      .sort()
+      .flatMap((name) => ["--context-repository", `${name}=${invocation.contextRepositories[name]}`]),
+    "--repo-root",
+    invocation.repoRoot,
+    "--repository-name",
+    invocation.repositoryName,
+  ];
+}
+
 /**
  * A person's answer to the engine's push-authorization request.
  *

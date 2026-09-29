@@ -641,6 +641,26 @@ export class SparringController implements vscode.Disposable {
     this.render();
   }
 
+  /**
+   * This window's recovery of intakes whose source plan changed, by intake
+   * directory: a prepare-plan in flight, or its failure verbatim. In memory
+   * only; a prepare that succeeded is on disk as the new intake.
+   */
+  private readonly intakeRecoveries = new Map<string, { preparing?: boolean; failure?: string }>();
+
+  intakeRecovery(intakeDir: string): { preparing?: boolean; failure?: string } | undefined {
+    return this.intakeRecoveries.get(intakeDir);
+  }
+
+  setIntakeRecovery(intakeDir: string, state: { preparing?: boolean; failure?: string } | undefined): void {
+    if (state) {
+      this.intakeRecoveries.set(intakeDir, state);
+    } else {
+      this.intakeRecoveries.delete(intakeDir);
+    }
+    this.render();
+  }
+
   /** Run one short sparring command to completion (see SparringCommandRunner). */
   runCommand(options: RunCommandOptions): Promise<RunCommandResult> {
     return this.commands.run(options);
@@ -1431,6 +1451,20 @@ export class SparringController implements vscode.Disposable {
     // the Git extension's raw path, or a symlinked spelling would read as a
     // repository move on the very next refresh.
     await this.context.workspaceState.update(PIN_ACTIVE_ROOT_KEY, origin === "action" ? (await this.repositoryScope())?.repoRoot : undefined);
+  }
+
+  /**
+   * Show a plan intake an action led to (recovering from a changed plan), as
+   * an action attachment: it follows its plan to any newer intake, and moving
+   * to another repository lets it go.
+   */
+  async showIntake(intake: DiscoveredIntake): Promise<void> {
+    await this.context.workspaceState.update(SELECTED_RUN_KEY, intakeIdFor(intake.location, intake.record.intakeId));
+    await this.context.workspaceState.update(SELECTED_AT_KEY, Date.now());
+    await this.context.workspaceState.update(PIN_INTENT_KEY, "inspect");
+    await this.recordPinOrigin("action");
+    this.log(`showing the plan intake ${intake.record.intakeId} in ${intake.location.folderName}.`);
+    await this.refresh();
   }
 
   /**

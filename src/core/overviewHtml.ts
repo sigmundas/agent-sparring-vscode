@@ -218,7 +218,8 @@ export function isCopyPromptMessage(message: unknown): message is CopyPromptMess
 /** Approve or start one exact run slice of one intake, as the intake screen rendered it. */
 export interface IntakeActionMessage {
   type: "intake";
-  action: "approve" | "start";
+  /** `prepare`: recover from a changed source plan; `runId` is then the intake id it was drawn for. */
+  action: "approve" | "start" | "prepare";
   intakeDir: string;
   runId: string;
 }
@@ -228,7 +229,7 @@ export function isIntakeActionMessage(message: unknown): message is IntakeAction
   return (
     record !== undefined &&
     record["type"] === "intake" &&
-    (record["action"] === "approve" || record["action"] === "start") &&
+    (record["action"] === "approve" || record["action"] === "start" || record["action"] === "prepare") &&
     typeof record["intakeDir"] === "string" &&
     record["intakeDir"] !== "" &&
     typeof record["runId"] === "string" &&
@@ -513,6 +514,7 @@ ${
     ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}Approval refused by the engine. Nothing was approved.</p><pre class="engineerror">${escapeHtml(intake.refusal.text)}</pre></div>`
     : ""
 }
+${intake.recovery?.failure ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}Preparing the updated intake failed. This intake is unchanged and still selected.</p><pre class="engineerror">${escapeHtml(intake.recovery.failure)}</pre></div>` : ""}
 ${intake.unconfirmed ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}${escapeHtml(intake.unconfirmed.text)}</p></div>` : ""}
 <ul class="intake-slices">${slices}</ul>
 <div class="actions">${intake.action ? intakeButton(intake.action) : ""}${button("openIntakeReport", "Open intake report", true, undefined, intake.action ? "" : "primary")}${intake.hasSource ? button("openIntakeSource", "Open plan") : ""}${button("showLog", "Show log")}</div>

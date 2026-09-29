@@ -22,6 +22,7 @@
  * No dependency on the vscode API.
  */
 
+import { createHash } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { EngineFormatError, parsePlanRunState, type PlanRunStatus } from "./engineFormats";
@@ -62,6 +63,16 @@ export interface IntakeRecord {
   createdAtMs?: number;
   /** Absolute path of the source Markdown plan intake read. */
   sourcePath?: string;
+  /** `source_digest`: sha256 of the source plan text intake read. */
+  sourceDigest?: string;
+  /** `mode`: how prepare-plan was asked to read the plan (`faithful`, `refine`). */
+  mode?: string;
+  /** `primary_repository`: the repository name of the project that prepared it. */
+  primaryRepository?: string;
+  /** `context_repositories`: the `--context-repository NAME=PATH` pairs prepare-plan was given. */
+  contextRepositories?: Record<string, string>;
+  /** `repositories[*].git_common_dir`, by repository name: each repository's git identity. */
+  repositoryGitDirs?: Record<string, string>;
   /** `run_keys`, in the order the engine wrote them: run slice id → run key. */
   runKeys: { runId: string; runKey: string }[];
   /** `repositories`: every repository intake inspected, by name → its recorded path. */
@@ -192,6 +203,11 @@ export function parseIntakeRecord(text: string): IntakeRecord {
     planLabel: nonEmpty(payload, "plan_label", "intake record"),
     createdAtMs: parseEngineTimestamp(payload["created_at"]),
     sourcePath: typeof sourcePath === "string" && sourcePath ? sourcePath : undefined,
+    ...(typeof payload["source_digest"] === "string" && payload["source_digest"] ? { sourceDigest: payload["source_digest"] } : {}),
+    ...(typeof payload["mode"] === "string" && payload["mode"] ? { mode: payload["mode"] } : {}),
+    ...(typeof payload["primary_repository"] === "string" && payload["primary_repository"] ? { primaryRepository: payload["primary_repository"] } : {}),
+    ...(recordOf(payload["context_repositories"]) ? { contextRepositories: stringValues(payload["context_repositories"]) } : {}),
+    repositoryGitDirs: recordedRepositories(payload["repositories"], "git_common_dir"),
     runKeys,
     repositories: recordedRepositories(payload["repositories"]),
     findings: findingCounts(payload["findings"]),
@@ -207,10 +223,20 @@ function strings(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
 }
 
-function recordedRepositories(value: unknown): Record<string, string> {
+function stringValues(value: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, entry] of Object.entries(recordOf(value) ?? {})) {
+    if (typeof entry === "string" && entry) {
+      out[name] = entry;
+    }
+  }
+  return out;
+}
+
+function recordedRepositories(value: unknown, field = "path"): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [name, snapshot] of Object.entries(recordOf(value) ?? {})) {
-    const recorded = recordOf(snapshot)?.["path"];
+    const recorded = recordOf(snapshot)?.[field];
     if (typeof recorded === "string" && recorded) {
       out[name] = recorded;
     }
@@ -595,6 +621,32 @@ async function recordedRunStatus(sparringDirs: readonly (string | undefined)[], 
     }
   }
   return undefined;
+}
+
+/**
+ * Whether the source plan's current text is no longer the text intake read,
+ * computed exactly as approve-plan checks it: sha256 of the file read as
+ * Python's `Path.read_text(encoding="utf-8")` returns it, which turns `\r\n`
+ * and `\r` into `\n`. Undefined when that cannot be answered — no recorded
+ * path or digest, or a file that cannot be read — which is never "changed".
+ */
+export async function intakeSourceChanged(record: Pick<IntakeRecord, "sourcePath" | "sourceDigest">): Promise<boolean | undefined> {
+  const digest = await sourcePlanDigest(record.sourcePath);
+  return digest === undefined || !record.sourceDigest ? undefined : digest !== record.sourceDigest;
+}
+
+/** {@link intakeSourceChanged}'s digest of the plan file as it is now. */
+export async function sourcePlanDigest(sourcePath: string | undefined): Promise<string | undefined> {
+  if (!sourcePath) {
+    return undefined;
+  }
+  let text: string;
+  try {
+    text = await fs.readFile(sourcePath, "utf8");
+  } catch {
+    return undefined;
+  }
+  return createHash("sha256").update(text.replace(/\r\n?/g, "\n"), "utf8").digest("hex");
 }
 
 /** The intake's own state from its slices; see {@link IntakeState}. */

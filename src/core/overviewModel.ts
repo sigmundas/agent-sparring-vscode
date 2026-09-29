@@ -265,6 +265,8 @@ export interface OverviewArtifacts {
   intakeApproval?: IntakeApprovalAttempt;
   /** For the intake screen: the engine command its action runs, shown in the details layer. */
   intakeCommand?: string;
+  /** For the intake screen: the source plan changed since this intake read it. */
+  intakeRecovery?: IntakeRecovery;
   handoff: boolean;
   sparring: boolean;
   brief: boolean;
@@ -838,7 +840,9 @@ export interface IntakeView {
    * The primary action, carrying the exact slice it acts on — the host acts
    * on that slice or on nothing, never on a fresh lookup at click time.
    */
-  action?: { kind: "approve" | "start"; label: string; detail: string; intakeDir: string; runId: string; enabled: boolean };
+  action?: { kind: "approve" | "start" | "prepare"; label: string; detail: string; intakeDir: string; runId: string; enabled: boolean };
+  /** The source plan changed since intake: see {@link IntakeRecovery}. The action is then the recovery. */
+  recovery?: IntakeRecovery;
   /** Blocked, or not approvable from this intake: the reason, and no action. */
   blocked?: string;
   /** What approve-plan said it will ask for this slice (gates, siblings, …), from the engine's record. */
@@ -853,6 +857,18 @@ export interface IntakeView {
   intakeId: string;
   /** Explicitly chosen although the plan has a newer intake, which is this one. */
   historical?: { currentIntakeId: string };
+}
+
+/**
+ * The source plan changed since the intake on screen read it, so approve-plan
+ * would refuse. `newerIntakeId` names an intake already prepared from the
+ * plan as it is now; otherwise recovery prepares one. `failure` is the last
+ * prepare-plan's own error, verbatim.
+ */
+export interface IntakeRecovery {
+  newerIntakeId?: string;
+  preparing?: boolean;
+  failure?: string;
 }
 
 /** An approval of one slice this window has asked the engine for. */
@@ -1265,7 +1281,14 @@ function sliceStateLabel(entry: IntakeSliceSnapshot, offered: IntakeNextAction["
  * The intake screen. `sourceText` is the source plan's text, read only for
  * its title; `attempt` is this window's last approval of the next slice.
  */
-export function intakeView(intake: DiscoveredIntake, sourceText: string | undefined, attempt?: IntakeApprovalAttempt, command?: string, branchReport?: SliceBranchReport): IntakeView {
+export function intakeView(
+  intake: DiscoveredIntake,
+  sourceText: string | undefined,
+  attempt?: IntakeApprovalAttempt,
+  command?: string,
+  branchReport?: SliceBranchReport,
+  recovery?: IntakeRecovery,
+): IntakeView {
   const next = intakeNextAction(intake);
   const slice = next.kind === "none" ? undefined : next.slice;
   // The engine said this slice cannot run (or be approved) on the branch it
@@ -1322,6 +1345,26 @@ export function intakeView(intake: DiscoveredIntake, sourceText: string | undefi
     case "none":
       break;
   }
+  if (recovery && next.kind !== "none") {
+    // Approving would be refused: the plan the report describes is not the
+    // plan on disk. Recovery is the one action; approval stays a separate,
+    // later step on the intake it leads to.
+    stateLabel = "Source plan changed since this intake";
+    lines.unshift(
+      recovery.newerIntakeId
+        ? `The source plan was edited after this intake read it, and intake ${recovery.newerIntakeId} was already prepared from it as it is now. Nothing here can be approved.`
+        : "The source plan was edited after this intake read it, so the engine would refuse to approve anything from it. Preparing an updated intake reads the plan again; nothing is approved or started.",
+    );
+    action = {
+      kind: "prepare",
+      label: recovery.preparing ? "Preparing…" : recovery.newerIntakeId ? "Open updated intake" : "Prepare updated intake",
+      detail: recovery.newerIntakeId ? `Show intake ${recovery.newerIntakeId}` : `sparring prepare-plan ${intake.record.planLabel}, with this intake's repositories`,
+      intakeDir: intake.dir,
+      runId: intake.record.intakeId,
+      enabled: !recovery.preparing,
+    };
+    blocked = undefined;
+  }
   if (ran.length > 0) {
     const several = ran.length > 1 || ran.some((entry) => isExecutionGroup(entry));
     lines.push(`${ran.map((entry) => sliceStageName(entry)).join(", ")} ${several ? "are" : "is"} complete; ${SELECT_RUN_LABEL} still opens ${ran.length === 1 ? "it" : "them"}.`);
@@ -1359,6 +1402,7 @@ export function intakeView(intake: DiscoveredIntake, sourceText: string | undefi
       : {}),
     ...(command ? { command } : {}),
     hasSource: intake.record.sourcePath !== undefined,
+    ...(recovery && next.kind !== "none" ? { recovery } : {}),
     intakeId: intake.record.intakeId,
   };
 }
@@ -1387,7 +1431,7 @@ function buildScreen(
 ): OverviewModel {
   const repositoryContext = describeRepositoryContext(selection);
   if (!selection.selected && selection.intake) {
-    const intake = intakeView(selection.intake, artifacts.planText, artifacts.intakeApproval, artifacts.intakeCommand, artifacts.sliceBranch);
+    const intake = intakeView(selection.intake, artifacts.planText, artifacts.intakeApproval, artifacts.intakeCommand, artifacts.sliceBranch, artifacts.intakeRecovery);
     if (selection.newerIntake) {
       intake.historical = { currentIntakeId: selection.newerIntake.record.intakeId };
     }
