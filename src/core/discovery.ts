@@ -601,7 +601,22 @@ export interface RunSelection {
    *  - `gone` — the pinned run is not in this discovery although its project
    *    still is, so it was deleted rather than merely not scanned yet.
    */
-  released?: { id: string; reason: "superseded"; by: PlanRunSnapshot } | { id: string; reason: "gone" } | { id: string; reason: "repository"; to: string };
+  released?:
+    | { id: string; reason: "superseded"; by: PlanRunSnapshot }
+    | { id: string; reason: "gone" }
+    | { id: string; reason: "repository"; to: string }
+    /**
+     * An intake shown because an action opened it, not because a person chose
+     * it, whose plan has since been prepared again: the selection shows
+     * {@link intake} (the plan's current intake) and the caller re-points the
+     * stored selection at `to`, keeping its origin.
+     */
+    | { id: string; reason: "replaced"; to: string };
+  /**
+   * {@link intake} is a person's explicit choice of an intake that is not its
+   * plan's current one; this is the current one. Shown, never followed.
+   */
+  newerIntake?: DiscoveredIntake;
   /** Why {@link pinned} holds: a person's explicit pin, or an action attachment. */
   pinOrigin?: PinOrigin;
   /**
@@ -979,7 +994,21 @@ export function selectRun(
     }
     if (pick.id.includes("|intake:")) {
       if (pinnedIntake) {
-        return decorate({ ambiguous: [], intake: pinnedIntake, pinned: true, pinOrigin: origin, ...(attachedAt ? { attachedAt } : {}) });
+        // A plan's current intake is its newest in that project. Only a
+        // person's explicit choice keeps an older one on screen, labelled.
+        const current = currentIntakeOf(pinnedIntake, intakes);
+        if (current !== pinnedIntake && origin !== "explicit") {
+          const to = intakeIdFor(current.location, current.record.intakeId);
+          return decorate({ ambiguous: [], intake: current, pinned: true, pinOrigin: origin, released: { id: pick.id, reason: "replaced", to }, ...(attachedAt ? { attachedAt } : {}) });
+        }
+        return decorate({
+          ambiguous: [],
+          intake: pinnedIntake,
+          pinned: true,
+          pinOrigin: origin,
+          ...(current !== pinnedIntake ? { newerIntake: current } : {}),
+          ...(attachedAt ? { attachedAt } : {}),
+        });
       }
       const gone = locations.some((location) => runIdBelongsTo(pick.id, location));
       return decorate({ ...automatic(), ...(gone ? { released: { id: pick.id, reason: "gone" as const } } : {}) });
@@ -1026,6 +1055,17 @@ function newestIntakePerPlan(intakes: readonly DiscoveredIntake[]): DiscoveredIn
     }
   }
   return [...newestPerPlan.values()];
+}
+
+/**
+ * The current intake of `intake`'s plan: the newest one prepared for the same
+ * plan in the same project, which is `intake` itself when it is the newest or
+ * when the plan's intakes cannot all be ordered (see {@link newestIntakePerPlan}).
+ * Recent run activity and the active repository play no part.
+ */
+export function currentIntakeOf(intake: DiscoveredIntake, intakes: readonly DiscoveredIntake[]): DiscoveredIntake {
+  const key = (entry: DiscoveredIntake) => `${entry.location.projectDir}|${entry.record.planLabel}`;
+  return newestIntakePerPlan(intakes.filter((entry) => key(entry) === key(intake)))[0] ?? intake;
 }
 
 /**

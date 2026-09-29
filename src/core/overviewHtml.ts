@@ -505,6 +505,7 @@ ${renderActors(model, discloseScope(model))}
     return `${renderRepositoryContext(model)}
 <header class="top"><div><h1>${escapeHtml(intake.planName)}</h1><div class="run muted">Plan intake · ${escapeHtml(intake.stateLabel)}</div></div></header>
 ${intake.blocked ? `<p class="intake-blocked"><strong>${escapeHtml(intake.blocked)}</strong></p>` : ""}
+${intake.historical ? `<p class="preserved">${icon("warn", "escalate")}Historical intake · Source plan has newer intake <code>${escapeHtml(intake.historical.currentIntakeId)}</code></p>` : ""}
 ${intake.lines.map((line) => `<p>${escapeHtml(line)}</p>`).join("\n")}
 ${intake.requirements.length > 0 ? `<ul class="intake-requirements">${intake.requirements.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul>` : ""}
 ${

@@ -1400,6 +1400,12 @@ export class SparringController implements vscode.Disposable {
    * cockpit does not jump anywhere else either.
    */
   private async retireReleasedPin(released: NonNullable<RunSelection["released"]>): Promise<void> {
+    if (released.reason === "replaced") {
+      // Same origin and intent, now naming the plan's current intake.
+      await this.context.workspaceState.update(SELECTED_RUN_KEY, released.to);
+      this.log(`the plan of intake ${released.id.split("|intake:").pop()} was prepared again; showing its current intake ${released.to.split("|intake:").pop()}.`);
+      return;
+    }
     await this.context.workspaceState.update(SELECTED_RUN_KEY, undefined);
     await this.context.workspaceState.update(SELECTED_AT_KEY, undefined);
     await this.context.workspaceState.update(PIN_INTENT_KEY, undefined);

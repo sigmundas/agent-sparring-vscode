@@ -851,6 +851,8 @@ export interface IntakeView {
   command?: string;
   hasSource: boolean;
   intakeId: string;
+  /** Explicitly chosen although the plan has a newer intake, which is this one. */
+  historical?: { currentIntakeId: string };
 }
 
 /** An approval of one slice this window has asked the engine for. */
@@ -1386,6 +1388,9 @@ function buildScreen(
   const repositoryContext = describeRepositoryContext(selection);
   if (!selection.selected && selection.intake) {
     const intake = intakeView(selection.intake, artifacts.planText, artifacts.intakeApproval, artifacts.intakeCommand, artifacts.sliceBranch);
+    if (selection.newerIntake) {
+      intake.historical = { currentIntakeId: selection.newerIntake.record.intakeId };
+    }
     return { kind: "intake", title: `Plan intake: ${intake.planName}`, intake, repositoryContext };
   }
   if (!selection.selected) {
