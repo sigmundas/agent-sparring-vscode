@@ -24,7 +24,7 @@ import { SETUP_NOT_IGNORED, SETUP_OBSOLETE_AGENT_SETTING, agentConfigView, provi
 import { parseBriefGoal, parseBriefOpening } from "./brief";
 import { currentStageOf, owningRoot, repositoryDisplayName, runLabel, samePath, type DiscoveredIntake, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { intakeContinuation, intakeNextAction, intakeStateLabel, isExecutionGroup, sliceHeading, sliceRoot, sliceStageName, type IntakeContinuation, type IntakeNextAction, type IntakeSliceSnapshot } from "./intake";
-import { activeDurationMs, formatDuration, providerDisplayName, type ActorBudget, type ActorLive, type LiveState, type MeaningfulEvent } from "./liveState";
+import { activeDurationMs, commandInFlight as anyCommandInFlight, formatDuration, providerDisplayName, quietSince, type ActorBudget, type ActorLive, type LiveState, type MeaningfulEvent } from "./liveState";
 import { DEFERRED_VERIFICATION_REQUIRED, PUSH_AUTHORIZATION_REQUIRED, obligationFailed, obligationResolved, parseHandoffBranch, type DeferredObligation, type PlanRunState, type RoutingAction, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
 import type { DeclaredRepository } from "./stageRepositories";
 import { deriveDeferredVerification, deriveVerification, draftKeyFor, HUMAN_FEEDBACK_HEADING, parseHumanEvidence, parseHumanFeedback, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
@@ -1616,7 +1616,7 @@ function buildScreen(
     plan,
   };
   model.lastEvent = model.history?.[model.history.length - 1];
-  const commandInFlight = Boolean(live?.stage.commandBusy || live?.sparrer.commandBusy);
+  const commandInFlight = anyCommandInFlight(live);
   if (liveness.interrupted) {
     model.activity = { kind: "stopped", text: liveness.execution?.kind === "run-sparring" ? "Stopped · independent review did not finish" : "Stopped · last turn interrupted" };
   } else if (liveness.stale && !commandInFlight) {
@@ -2732,7 +2732,9 @@ function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveSt
     // demonstrable activity telemetry already reported, just not yet
     // finished: claiming "no meaningful activity" under it would contradict
     // a fact this very panel already has.
-    const since = live?.lastMeaningful?.ts ?? actor.lastEventTs;
+    // A tool call (a subagent reading files, say) is activity too, though it
+    // earns no Output line (liveState.ts: quietSince).
+    const since = live ? quietSince(live, actor.lastEventTs) : actor.lastEventTs;
     const age = since ? nowMs - Date.parse(since) : NaN;
     if (!actor.commandBusy && Number.isFinite(age) && age > QUIET_AFTER_MS) {
       quietFor = formatAge(age);

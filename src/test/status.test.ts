@@ -54,6 +54,26 @@ describe("status bar derivation", () => {
     assert.match(view.tooltip, /No meaningful activity for 11m/);
   });
 
+  it("never says 'no activity' while a command the agent started is still running", async () => {
+    const selection = await planSelection("running", 0);
+    const live = foldEvents([event("stage", "turn.started", { provider: "claude-cli" }), event("stage", "command.started", { tool: "Bash", tool_use_id: "toolu_a" })]);
+    const view = deriveStatus(selection, live, Date.parse(live.lastEventTs!) + QUIET_AFTER_MS + 60_000);
+    assert.doesNotMatch(view.text, /no activity/);
+    assert.doesNotMatch(view.tooltip, /No meaningful activity/);
+    assert.match(view.text, /Claude working$/);
+    assert.match(view.tooltip, /Running a command/);
+  });
+
+  it("a recent tool call is activity, so the status bar does not call the turn quiet", async () => {
+    const selection = await planSelection("running", 0);
+    const live = foldEvents([event("stage", "turn.started", { provider: "claude-cli" })]);
+    const started = Date.parse(live.lastEventTs!);
+    // A subagent reading files: only tool calls, none of them an Output line.
+    foldEvents([{ v: 1, ts: new Date(started + QUIET_AFTER_MS).toISOString(), actor: "stage", event: "tool.call", tool: "Read", parent_id: "toolu_task" }], live);
+    const view = deriveStatus(selection, live, started + QUIET_AFTER_MS + 60_000);
+    assert.doesNotMatch(view.text, /no activity/);
+  });
+
   it("telemetry never overrides authoritative pause/complete", async () => {
     const paused = await planSelection("paused", 1, sparringMarkdown("NEEDS_YOU", "Check on device", "device_manual_check"));
     const busyLive = foldEvents([event("stage", "turn.started", { provider: "claude-cli" })]);

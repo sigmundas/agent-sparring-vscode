@@ -312,6 +312,59 @@ describe("active duration", () => {
     assert.equal(live.stage.commandBusy, false);
   });
 
+  it("tracks parallel commands by id: the first to finish does not end the second", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("hotfix-1", { status: "working" });
+    const selection = selectRun((await discoverRuns([ws.location])).runs);
+    const live = emptyLiveState();
+    applyEvent(live, { v: 1, ts: at(0), actor: "stage", event: "turn.started", provider: "claude-cli" });
+    applyEvent(live, { v: 1, ts: at(1), actor: "stage", event: "command.started", tool: "Bash", tool_use_id: "toolu_a" });
+    applyEvent(live, { v: 1, ts: at(2), actor: "stage", event: "command.started", tool: "Bash", tool_use_id: "toolu_b" });
+    applyEvent(live, { v: 1, ts: at(3), actor: "stage", event: "command.finished", tool: "Bash", tool_use_id: "toolu_a" });
+    assert.equal(live.stage.commandBusy, true, "toolu_b has not reported finishing");
+    assert.equal(live.stage.commandSince, at(2), "measured from the command still running");
+
+    const stale = buildOverviewModel(selection, live, ALL, T0 + 40 * 60_000);
+    assert.notEqual(stale.activity?.kind, "stale");
+    assert.equal(stale.stageAgent?.quietFor, undefined);
+
+    // A finish for an id never seen starting changes nothing.
+    applyEvent(live, { v: 1, ts: at(4), actor: "stage", event: "command.finished", tool: "Bash", tool_use_id: "toolu_zzz" });
+    assert.equal(live.stage.commandBusy, true);
+    applyEvent(live, { v: 1, ts: at(5), actor: "stage", event: "command.finished", tool: "Bash", tool_use_id: "toolu_b" });
+    assert.equal(live.stage.commandBusy, false);
+    assert.equal(live.stage.commandSince, undefined);
+  });
+
+  it("counts commands that carry no id (Codex), one finish per start", () => {
+    const live = emptyLiveState();
+    applyEvent(live, { v: 1, ts: at(0), actor: "sparrer", event: "sparring.started", provider: "codex-cli" });
+    applyEvent(live, { v: 1, ts: at(1), actor: "sparrer", event: "command.started", tool: "shell" });
+    applyEvent(live, { v: 1, ts: at(2), actor: "sparrer", event: "command.started", tool: "shell" });
+    applyEvent(live, { v: 1, ts: at(3), actor: "sparrer", event: "command.finished", tool: "shell", exit_code: 0 });
+    assert.equal(live.sparrer.commandBusy, true);
+    applyEvent(live, { v: 1, ts: at(4), actor: "sparrer", event: "command.finished", tool: "shell", exit_code: 0 });
+    assert.equal(live.sparrer.commandBusy, false);
+    applyEvent(live, { v: 1, ts: at(5), actor: "sparrer", event: "command.finished", tool: "shell", exit_code: 0 });
+    assert.equal(live.sparrer.commandBusy, false, "an unmatched finish never goes negative");
+  });
+
+  it("a subagent's tool calls count as activity, though they earn no Output line", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("hotfix-1", { status: "working" });
+    const selection = selectRun((await discoverRuns([ws.location])).runs);
+    const live = emptyLiveState();
+    applyEvent(live, { v: 1, ts: at(0), actor: "stage", event: "turn.started", provider: "claude-cli" });
+    applyEvent(live, { v: 1, ts: at(1), actor: "stage", event: "subagent.started", tool: "Task", tool_use_id: "toolu_task" });
+    applyEvent(live, { v: 1, ts: at(20 * 60), actor: "stage", event: "tool.call", tool: "Read", parent_id: "toolu_task" });
+    const running: ExecutionRecord = { id: "e", runId: selection.selected!.id, kind: "run-loop", source: "launched", state: "running", startedAtMs: T0 - 1000 };
+    const model = buildOverviewModel(selection, live, ALL, T0 + 21 * 60_000, running);
+    assert.equal(model.stageAgent?.quietFor, undefined, "a tool call a minute ago is not silence");
+    // Long after the last tool call, the turn is quiet again.
+    const later = buildOverviewModel(selection, live, ALL, T0 + 40 * 60_000, running);
+    assert.ok(later.stageAgent?.quietFor);
+  });
+
   it("a halted run shows no active duration even if telemetry claims busy", async () => {
     const ws = await Workspace.create();
     await ws.writeStage("hotfix-1", { status: "accepted", candidate_sha: "c" });

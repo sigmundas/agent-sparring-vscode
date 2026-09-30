@@ -227,7 +227,9 @@ export function latestTurnStart(live: LiveState): number {
 }
 
 function clearBusy(live: LiveState): LiveState {
-  return { ...live, stage: { ...live.stage, busy: false, busySince: undefined }, sparrer: { ...live.sparrer, busy: false, busySince: undefined } };
+  // An ended runner has no command running either.
+  const quiet = { busy: false, busySince: undefined, commandBusy: false, commandSince: undefined, openCommands: undefined };
+  return { ...live, stage: { ...live.stage, ...quiet }, sparrer: { ...live.sparrer, ...quiet } };
 }
 
 function runningDetail(execution: ExecutionRecord): string {

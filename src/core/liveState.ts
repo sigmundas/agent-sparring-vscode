@@ -67,16 +67,24 @@ export interface ActorLive {
   busySince?: string;
   lastEventTs?: string;
   /**
-   * A shell command this actor started has not yet reported finishing
-   * (`command.started` seen with no matching `command.finished`). The one
-   * concrete fact telemetry offers about what a busy actor is doing right
-   * now, and demonstrable activity in its own right: a long command with no
-   * other event in between must never be presented as "no meaningful
-   * activity" while this is true.
+   * At least one shell command this actor started has not yet reported
+   * finishing (see `openCommands`). The one concrete fact telemetry offers
+   * about what a busy actor is doing right now, and demonstrable activity
+   * in its own right: a long command with no other event in between must
+   * never be presented as "no meaningful activity" while this is true.
+   * Derived from `openCommands`; never set on its own.
    */
   commandBusy?: boolean;
-  /** Timestamp the in-flight command started, while `commandBusy`. */
+  /** When the oldest still-running command started, while `commandBusy`. */
   commandSince?: string;
+  /**
+   * Every command started and not yet reported finished, oldest first.
+   * The Claude CLI names each by the provider's `tool_use_id`, and parallel
+   * calls finish in any order, so a finish removes exactly the command it
+   * names. Codex events carry no id; those are counted, one finish per
+   * start. A finish that matches nothing changes nothing.
+   */
+  openCommands?: { id?: string; ts: string }[];
 }
 
 /** The last event that would earn a line in the Output Channel. */
@@ -105,6 +113,14 @@ export interface LiveState {
   currentCycle?: number;
   /** Last event that passes the shared Output filter; suppressed noise never lands here. */
   lastMeaningful?: MeaningfulEvent;
+  /**
+   * When an actor last reported using a tool (a tool call, a subagent
+   * starting, a command starting or finishing, a file edit), whether or not
+   * it earned an Output line. A tool in use is activity: a subagent that
+   * only reads files emits nothing but tool calls, and must not read as a
+   * silent turn. See {@link quietSince}.
+   */
+  lastToolTs?: string;
   /**
    * The most recent meaningful events, oldest first, capped at
    * RECENT_MEANINGFUL_MAX; consecutive repeats (same actor and description,
@@ -185,6 +201,10 @@ export function applyEvent(state: LiveState, event: ActivityEvent): LiveState {
     actor.budget = budget;
   }
 
+  if (actor && TOOL_EVENTS.has(event.event)) {
+    state.lastToolTs = event.ts;
+  }
+
   switch (event.event) {
     case "turn.started":
       state.stage.busy = true;
@@ -216,14 +236,17 @@ export function applyEvent(state: LiveState, event: ActivityEvent): LiveState {
       break;
     case "command.started":
       if (actor) {
-        actor.commandBusy = true;
-        actor.commandSince = event.ts;
+        (actor.openCommands ??= []).push({ id: event.tool_use_id, ts: event.ts });
+        syncCommand(actor);
       }
       break;
     case "command.finished":
-      if (actor) {
-        actor.commandBusy = false;
-        actor.commandSince = undefined;
+      if (actor?.openCommands) {
+        const at = actor.openCommands.findIndex((open) => open.id === event.tool_use_id);
+        if (at >= 0) {
+          actor.openCommands.splice(at, 1);
+        }
+        syncCommand(actor);
       }
       break;
     default:
@@ -254,8 +277,36 @@ export function applyEvent(state: LiveState, event: ActivityEvent): LiveState {
 function idle(actor: ActorLive): void {
   actor.busy = false;
   actor.busySince = undefined;
-  actor.commandBusy = false;
-  actor.commandSince = undefined;
+  actor.openCommands = undefined;
+  syncCommand(actor);
+}
+
+function syncCommand(actor: ActorLive): void {
+  const open = actor.openCommands ?? [];
+  actor.commandBusy = open.length > 0;
+  actor.commandSince = open[0]?.ts;
+}
+
+/** Events that say an actor is using a tool right now (see `lastToolTs`). */
+const TOOL_EVENTS = new Set(["tool.call", "subagent.started", "command.started", "command.finished", "file.changed"]);
+
+/**
+ * The moment a busy turn's silence is measured from: the later of the last
+ * Output-worthy event and the last tool use. Hidden bookkeeping (usage
+ * dials, session notices) still does not make a turn look lively, but a
+ * tool in use does. `fallback` is used when neither has happened.
+ */
+export function quietSince(live: LiveState, fallback?: string): string | undefined {
+  const candidates = [live.lastMeaningful?.ts, live.lastToolTs].filter((ts): ts is string => typeof ts === "string" && Number.isFinite(Date.parse(ts)));
+  if (candidates.length === 0) {
+    return fallback;
+  }
+  return candidates.reduce((a, b) => (Date.parse(a) >= Date.parse(b) ? a : b));
+}
+
+/** Whether either actor has a command running, which is never silence. */
+export function commandInFlight(live: LiveState | undefined): boolean {
+  return Boolean(live?.stage.commandBusy || live?.sparrer.commandBusy);
 }
 
 /** Milliseconds an actor has been in its current turn, or undefined when not busy / unparseable. */

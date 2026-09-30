@@ -18,7 +18,7 @@ import { FOLLOW_ACTIVE_LABEL, describeRepositoryContext, emptyStateLines, emptyS
 import { intakeStateLabel } from "./intake";
 import { currentStageOf, runLabel, totalStagesOf, type RunSelection, type RunSnapshot } from "./discovery";
 import type { RunnerLiveness } from "./liveness";
-import { providerDisplayName, type LiveState } from "./liveState";
+import { commandInFlight, providerDisplayName, quietSince, type LiveState } from "./liveState";
 import { actionWord, presentRunStage, stageDisplayName, truncateLabel } from "./presentation";
 
 export type StatusSeverity = "none" | "info" | "warning" | "error";
@@ -172,10 +172,16 @@ function liveSuffix(live: LiveState | undefined, nowMs: number, tooltipLines: st
     suffix += " (unconfirmed)";
     tooltipLines.push("Runner status unknown: " + liveness.detail);
   }
-  const since = live.lastMeaningful?.ts ?? live.lastEventTs;
+  // A running command, or a tool used recently, is activity: the status bar
+  // must never call such a turn quiet (the Overview does not either).
+  const running = commandInFlight(live);
+  if (suffix && running) {
+    tooltipLines.push("Running a command");
+  }
+  const since = quietSince(live, live.lastEventTs);
   if (since) {
     const age = nowMs - Date.parse(since);
-    if (suffix && age > QUIET_AFTER_MS) {
+    if (suffix && !running && age > QUIET_AFTER_MS) {
       suffix += ` · no activity ${formatAge(age)}`;
       tooltipLines.push(`No meaningful activity for ${formatAge(age)}`);
     } else if (live.lastMeaningful) {
