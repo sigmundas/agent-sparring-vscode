@@ -66,6 +66,17 @@ export interface ActorLive {
   /** Timestamp of the latest turn start/resume while busy; cleared when the turn ends. */
   busySince?: string;
   lastEventTs?: string;
+  /**
+   * A shell command this actor started has not yet reported finishing
+   * (`command.started` seen with no matching `command.finished`). The one
+   * concrete fact telemetry offers about what a busy actor is doing right
+   * now, and demonstrable activity in its own right: a long command with no
+   * other event in between must never be presented as "no meaningful
+   * activity" while this is true.
+   */
+  commandBusy?: boolean;
+  /** Timestamp the in-flight command started, while `commandBusy`. */
+  commandSince?: string;
 }
 
 /** The last event that would earn a line in the Output Channel. */
@@ -203,6 +214,18 @@ export function applyEvent(state: LiveState, event: ActivityEvent): LiveState {
     case "file.changed":
       state.lastFileChanged = { path: event.path, actor: event.actor, ts: event.ts };
       break;
+    case "command.started":
+      if (actor) {
+        actor.commandBusy = true;
+        actor.commandSince = event.ts;
+      }
+      break;
+    case "command.finished":
+      if (actor) {
+        actor.commandBusy = false;
+        actor.commandSince = undefined;
+      }
+      break;
     default:
       break;
   }
@@ -231,6 +254,8 @@ export function applyEvent(state: LiveState, event: ActivityEvent): LiveState {
 function idle(actor: ActorLive): void {
   actor.busy = false;
   actor.busySince = undefined;
+  actor.commandBusy = false;
+  actor.commandSince = undefined;
 }
 
 /** Milliseconds an actor has been in its current turn, or undefined when not busy / unparseable. */

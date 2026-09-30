@@ -187,7 +187,7 @@ describe("runner lifecycle presentation", () => {
     assert.match(html, /class="quiet danger" data-stop="e1"/);
     assert.match(html, /<span class="busy" title="[^"]*"><svg[^>]*>.*?<\/svg>Working<\/span>/);
     assert.ok(!html.includes('data-action="runStage"'));
-    assert.match(html, /Claude<\/span> working for <span class="dur">59s<\/span>/);
+    assert.match(html, /<p class="now"><span class="who claude">Claude<\/span> Working on the implementation<\/p><p class="elapsed muted">Working for 59s<\/p>/);
   });
 
   it("runner ended mid-turn (Ctrl-C, crash, reload): Stopped · last turn interrupted, duration frozen, Resume stage", async () => {

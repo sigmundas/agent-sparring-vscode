@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { isMeaningfulActivity } from "../core/activityFilter";
-import { parseBriefGoal } from "../core/brief";
+import { parseBriefGoal, parseBriefOpening } from "../core/brief";
 import { discoverRuns, selectRun, type PlanRunSnapshot } from "../core/discovery";
 import { RECENT_MEANINGFUL_MAX, activeDurationMs, applyEvent, emptyLiveState, foldEvents, formatDuration } from "../core/liveState";
 import type { ExecutionRecord } from "../core/liveness";
 import { LogRenderer } from "../core/logFormat";
 import { HISTORY_MAX, activityLine, buildOverviewModel, history, timelineState, type OverviewArtifacts } from "../core/overviewModel";
 import { renderOverviewHtml } from "../core/overviewHtml";
-import { FOO_PLAN_KEY, FOO_PLAN_LABEL, FOO_STAGE_IDS, Workspace, event, sparringMarkdown } from "./fixtures";
+import { FOO_PLAN_KEY, FOO_PLAN_LABEL, FOO_PLAN_MARKDOWN, FOO_STAGE_IDS, Workspace, event, sparringMarkdown } from "./fixtures";
 
 const ALL: OverviewArtifacts = { handoff: true, sparring: true, brief: true, plan: true };
 const T0 = Date.parse("2026-09-12T19:00:00.000Z");
@@ -60,6 +60,46 @@ describe("goal extraction from brief.md", () => {
     assert.ok(!/Goal<\/h3>/.test(renderOverviewHtml(nothing, "n", "c")), "nothing to say about the goal: no section, and no complaint");
     assert.ok(!/has no ## Goal/.test(renderOverviewHtml(nothing, "n", "c")));
   });
+
+  const INTAKE_STYLE_BRIEF_PREFIX = [
+    "# Stage brief: foo-1cd13d24-stage-1-contract",
+    "",
+    "Stage 1 (1 of 2 in run slice `app`) from plan `docs/plans/foo.md`, prepared by plan intake. Implement only this stage; the other stages are separate.",
+    "",
+    "# Plan context",
+    "",
+    "Plan-wide text this stage is bound by, quoted verbatim from the source plan.",
+    "",
+    "## Principles",
+    "",
+    "Widget identity never changes.",
+    "",
+  ];
+
+  it("parseBriefOpening never picks intake's own Plan context / Intake scoping boilerplate", () => {
+    const brief = [...INTAKE_STYLE_BRIEF_PREFIX, "# Stage source", "", "## Stage 1 — Contract", "", "This is the brief's own quoted excerpt.", ""].join("\n");
+    const opening = parseBriefOpening(brief);
+    assert.equal(opening, "This is the brief's own quoted excerpt.");
+    assert.ok(!opening?.includes("Plan-wide text"), "never the Plan context preamble");
+
+    const scoped = [...INTAKE_STYLE_BRIEF_PREFIX, "# Stage source", "", "## Stage 1 — Contract", "", "Quoted stage text.", "", "# Intake scoping", "", "This block was written by plan intake; it is not text from the source plan.", "", "Implementation only; the production run is a separate gated action."].join("\n");
+    assert.equal(parseBriefOpening(scoped), "Quoted stage text.", "an Intake scoping note is never a stage description either");
+  });
+
+  it("an old brief without ## Goal falls back to the plan's own structured summary, never the brief's Plan context boilerplate", async () => {
+    const ws = await Workspace.create();
+    await ws.writePlan();
+    await ws.writePlanRun(FOO_PLAN_KEY, { plan: FOO_PLAN_LABEL, status: "running", current_stage_index: 0, current_stage: FOO_STAGE_IDS[0] });
+    await ws.writeStage(FOO_STAGE_IDS[0], {});
+    const selection = selectRun((await discoverRuns([ws.location])).runs);
+    // An old, pre-`## Goal` intake brief: its own opening paragraph (under
+    // "# Stage source") reads differently from what the live plan document
+    // now says, so which one wins is observable.
+    const briefText = [...INTAKE_STYLE_BRIEF_PREFIX, "# Stage source", "", "## Stage 1 — Contract", "", "The brief's own stale excerpt, not the live plan text.", ""].join("\n");
+    const model = buildOverviewModel(selection, undefined, { ...ALL, briefText, planText: FOO_PLAN_MARKDOWN }, T0);
+    assert.equal(model.goal, "Define the contract.", "the plan document's own structured summary, not the brief's prose");
+    assert.ok(!/Plan-wide text|stale excerpt/.test(model.goal ?? ""));
+  });
 });
 
 describe("meaningful-event selection", () => {
@@ -110,6 +150,31 @@ describe("meaningful-event selection", () => {
     assert.match(line.time ?? "", /^\d\d:\d\d:\d\d$/);
     assert.equal(activityLine(undefined, false, T0).kind, "none");
     assert.equal(activityLine(emptyLiveState(), false, T0).kind, "none");
+  });
+
+  it("a session announcement is never shown as Last activity or in Recent events", () => {
+    const live = foldEvents([
+      event("stage", "turn.started", { provider: "claude-cli" }),
+      event("stage", "file.changed", { path: "src/a.py", kind: "modify" }),
+      event("stage", "turn.finished"),
+      event("stage", "session.observed", { provider: "claude-cli", session_id: "fc43f253aaaa", model: "claude-opus-5-5" }),
+    ]);
+    const line = activityLine(live, false, Date.parse(live.lastEventTs!) + 1000);
+    assert.equal(line.kind, "last");
+    assert.equal(line.text, "Claude · turn finished", "never 'session fc43f253… (claude-opus-5-5)'");
+    assert.deepEqual(
+      history(live)!.map((entry) => entry.description),
+      ["started work", "changed src/a.py", "turn finished"],
+    );
+  });
+
+  it("a resumed turn becomes 'resumed work', not the engine's own 'turn resumed'", () => {
+    // Halted (a plan not currently running) so this reads as the last past
+    // fact rather than a currently-active turn, which is what makes "the
+    // most recent meaningful thing" here the resume itself.
+    const live = foldEvents([event("stage", "turn.started", { provider: "claude-cli", resumed: true })]);
+    const line = activityLine(live, true, Date.parse(live.lastEventTs!) + 1000);
+    assert.equal(line.text, "Claude · resumed work");
   });
 });
 
@@ -164,8 +229,8 @@ describe("recent events résumé", () => {
     const selection = selectRun((await discoverRuns([ws.location])).runs);
     const live = foldEvents([event("stage", "turn.started", { provider: "claude-cli" }), event("stage", "file.changed", { path: "src/a.py", kind: "modify" })]);
     const html = renderOverviewHtml(buildOverviewModel(selection, live, ALL, Date.parse(live.lastEventTs!) + 1000), "n", "c");
-    assert.match(html, /<section class="history"><h3><svg[^>]*>.*?<\/svg>Recent events<\/h3><ol><li><span class="time">\d\d:\d\d:\d\d<\/span><span class="who claude">Claude<\/span><span>turn started<\/span><\/li><li>.*changed src\/a.py<\/span><\/li><\/ol><\/section>/);
-    assert.match(html, /Last meaningful event<\/h3><p><span class="time">\d\d:\d\d:\d\d<\/span><span class="sep">·<\/span><span class="who claude">Claude<\/span> changed src\/a.py<\/p>/);
+    assert.match(html, /<section class="history"><h3><svg[^>]*>.*?<\/svg>Recent events<\/h3><ol><li><span class="time">\d\d:\d\d:\d\d<\/span><span class="who claude">Claude<\/span><span>started work<\/span><\/li><li>.*changed src\/a.py<\/span><\/li><\/ol><\/section>/);
+    assert.match(html, /Last activity<\/h3><p><span class="time">\d\d:\d\d:\d\d<\/span><span class="sep">·<\/span><span class="who claude">Claude<\/span> changed src\/a.py<\/p>/);
     assert.ok(html.indexOf('<section class="actors">') < html.indexOf('<section class="history">'));
     const quiet = renderOverviewHtml(buildOverviewModel(selection, undefined, ALL, T0), "n", "c");
     assert.ok(!quiet.includes('class="history"'));
@@ -205,21 +270,46 @@ describe("active duration", () => {
     // Certain "Working for" wording needs an observed-alive runner; telemetry alone reads as inferred.
     const running: ExecutionRecord = { id: "e", runId: selection.selected!.id, kind: "run-loop", source: "launched", state: "running", startedAtMs: T0 - 1000 };
     let model = buildOverviewModel(selection, live, ALL, T0 + 192_000, running);
-    assert.deepEqual(model.activity, { kind: "active", text: "Working for 3m 12s · Claude" });
+    assert.deepEqual(model.activity, { kind: "active", text: "Working for 3m 12s · Claude", description: "Working on the implementation", elapsed: "Working for 3m 12s" });
     assert.equal(model.stageAgent?.duration, "3m 12s");
     assert.equal(model.sparrer?.duration, undefined);
 
     applyEvent(live, { v: 1, ts: at(180), actor: "sparrer", event: "sparring.started", provider: "codex-cli" });
     model = buildOverviewModel(selection, live, ALL, T0 + 192_000, running);
-    assert.deepEqual(model.activity, { kind: "active", text: "Sparring for 12s · Codex" });
+    assert.deepEqual(model.activity, { kind: "active", text: "Sparring for 12s · Codex", description: "Reviewing the latest changes", elapsed: "Sparring for 12s" });
     assert.equal(model.sparrer?.duration, "12s");
     const html = renderOverviewHtml(model, "n", "c");
-    assert.match(html, /Current activity<\/h3><p class="now"><span class="who codex">Codex<\/span> sparring for <span class="dur">12s<\/span><\/p>/);
+    assert.match(html, /Current activity<\/h3><p class="now"><span class="who codex">Codex<\/span> Reviewing the latest changes<\/p><p class="elapsed muted">Sparring for 12s<\/p>/);
     // A confirmed turn: the pill carries the state and how long it has been
     // true, in the card's corner.
     assert.match(html, /<span class="statepill sparring"><svg[^>]*>.*?<\/svg><span>Sparring for 12s<\/span><\/span>/);
     assert.match(html, /<span class="avatar codex"><svg class="glyph"[^>]*>.*?<\/svg><\/span>/);
     assert.match(html, /<span class="hpill good"><svg[^>]*>.*?<\/svg>Working<\/span>/, "standalone working stage status pill");
+  });
+
+  it("a shell command in flight counts as current activity and is never presented as 'no meaningful activity'", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("hotfix-1", { status: "working" });
+    const selection = selectRun((await discoverRuns([ws.location])).runs);
+    const live = emptyLiveState();
+    applyEvent(live, { v: 1, ts: at(0), actor: "stage", event: "turn.started", provider: "claude-cli" });
+    applyEvent(live, { v: 1, ts: at(1), actor: "stage", event: "command.started", tool: "Bash" });
+    assert.equal(live.stage.commandBusy, true, "the command has not reported finishing");
+
+    const running: ExecutionRecord = { id: "e", runId: selection.selected!.id, kind: "run-loop", source: "launched", state: "running", startedAtMs: T0 - 1000 };
+    const model = buildOverviewModel(selection, live, ALL, T0 + 192_000, running);
+    assert.equal(model.activity?.kind, "active");
+    assert.equal(model.activity?.description, "Running a command");
+    assert.equal(model.stageAgent?.quietFor, undefined, "an in-flight command is demonstrable activity, not silence");
+
+    // The same fact must stop the "no meaningful activity for Xm" wording
+    // that a long, otherwise-silent command would otherwise earn: telemetry
+    // only (no observed runner process), 40 minutes on from the one
+    // command.started event and nothing since.
+    const stale = buildOverviewModel(selection, live, ALL, T0 + 40 * 60_000);
+    assert.notEqual(stale.activity?.kind, "stale");
+    applyEvent(live, { v: 1, ts: at(2), actor: "stage", event: "command.finished", tool: "Bash", exit_code: 0 });
+    assert.equal(live.stage.commandBusy, false);
   });
 
   it("a halted run shows no active duration even if telemetry claims busy", async () => {
@@ -246,7 +336,7 @@ describe("loop cycle", () => {
     const model = buildOverviewModel(selection, live, ALL, Date.parse(live.lastEventTs!) + 1000);
     assert.equal(model.cycle, 2);
     assert.equal(model.stageStatus, "Working", "a live correction turn is plainly Working");
-    assert.equal(model.lastSparring?.word, "Changes requested", "the finding stays visible as the latest sparring result");
+    assert.equal(model.lastSparring?.badge, "Changes requested", "the finding stays visible as the latest sparring result");
     assert.match(renderOverviewHtml(model, "n", "c"), /<span class="muted" title="loop cycle from telemetry">cycle 2<\/span>/);
     assert.equal(buildOverviewModel(selection, foldEvents([event("loop", "loop.started")]), ALL, T0).cycle, undefined, "no cycle reported yet");
   });
@@ -319,7 +409,13 @@ describe("standalone-stage degradation", () => {
     assert.equal(model.position, undefined);
     assert.equal(model.stageHeading, "Reported statistics typed parser");
     assert.equal(model.goal, "Parse it.");
-    assert.deepEqual(model.lastSparring, { action: "READY", word: "Review passed", summary: "Looks done", reason: undefined });
+    assert.deepEqual(model.lastSparring, {
+      action: "READY",
+      badge: "Approved",
+      summary: "Looks done",
+      reason: undefined,
+      report: "Long findings that must never reach the status bar.",
+    });
     assert.deepEqual(
       model.facts?.map((fact) => fact.label),
       ["Repository", "Engine state", "Stage session", "Sparring thread"],
@@ -332,7 +428,7 @@ describe("standalone-stage degradation", () => {
     assert.ok(!html.includes('class="journey"'));
     assert.ok(!/Stage \d+ (of|\/) \d+/.test(html), "no position pill without a plan");
     assert.match(html, /<span class="hpill" [^>]*>Standalone stage<\/span>/);
-    assert.match(html, /<span class="verdict ready" title="Routing action: READY">Review passed<\/span>/);
+    assert.match(html, /<span class="verdict ready" title="Routing action: READY">Approved<\/span>/);
     assert.equal(model.status?.label, "Review complete");
   });
 });

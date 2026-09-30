@@ -11,7 +11,8 @@
  *
  * Layout: header with status pills; plan journey; the current-stage card
  * (Goal + latest sparring result on the left, current activity + last
- * meaningful event on the right); provider cards; recent events; metadata.
+ * activity on the right); provider cards; recent events; metadata (Technical
+ * details, collapsed).
  */
 
 import { workingFor } from "./activeOperation";
@@ -32,6 +33,7 @@ import { checkName, humanTask, splitPassCriteria } from "./humanTask";
 import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type AgentConfigSection, type BranchGuard, type ActorCard, type BudgetGauge, type HistoryEntry, type OverviewModel, type PushAuthorization, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { MatchSource } from "./planAssociation";
 import type { PromptView, PromptViewSection } from "./promptInspector";
+import { renderReportMarkdown } from "./reportMarkdown";
 import type { StageRunAction } from "./runner";
 
 export type OverviewAction =
@@ -614,7 +616,13 @@ ${intake.command ? `<details class="intake-command"><summary>Engine command</sum
     parts.push(`<section class="history"><h3>${icon("history")}Recent events</h3><ol>${rows}</ol></section>`);
   }
   if (model.facts && model.facts.length > 0) {
-    parts.push(`<dl class="facts">${model.facts.map((fact) => `<dt>${escapeHtml(fact.label)}</dt><dd>${escapeHtml(fact.value)}</dd>`).join("")}</dl>`);
+    // Repository, plan path, branch, engine state, run key, commits and
+    // session/thread ids: what a person needs to act on the run is already
+    // answered above (Goal, Latest sparring result, Current/Last activity);
+    // this is why the harness believes it, one disclosure away and closed
+    // by default.
+    const rows = model.facts.map((fact) => `<dt>${escapeHtml(fact.label)}</dt><dd>${escapeHtml(fact.value)}</dd>`).join("");
+    parts.push(`<details class="tech facts"${disclose(scope, "technical-details")}><summary>Technical details</summary><dl class="facts">${rows}</dl></details>`);
   }
   return parts.filter(Boolean).join("\n");
 }
@@ -1275,6 +1283,7 @@ function stageActionButton(action: StageRunAction, stageId: string | undefined, 
 }
 
 function renderStageCard(model: OverviewModel): string {
+  const scope = discloseScope(model);
   const accepted = model.whatsNext !== undefined;
   const handedOver = model.actionRequired !== undefined;
   // Once accepted, the header pill already says Accepted: the card line
@@ -1332,7 +1341,9 @@ function renderStageCard(model: OverviewModel): string {
   if (actions) {
     buttons.push(button("openBrief", "Brief", actions.brief, "Open brief.md"));
     buttons.push(button("openHandoff", "Handoff", actions.handoff, "Open handoff.md"));
-    buttons.push(button("openSparring", "Sparring report", actions.sparring, "Open sparring.md"));
+    // Opening sparring.md itself lives inside Latest sparring result now
+    // ("Open full report", under Read feedback) — the button row is the
+    // stage's controls, not a duplicate of what that card already offers.
     if (actions.diff) {
       buttons.push(button("openDiff", actions.diff.label, true, actions.diff.detail));
     }
@@ -1359,12 +1370,19 @@ function renderStageCard(model: OverviewModel): string {
   if (handedOver) {
     sparring = ""; // the Action required panel is the latest sparring result
   } else if (model.lastSparring) {
-    const action = model.lastSparring.action;
-    const reason = model.lastSparring.reason ? ` <span class="muted">(${escapeHtml(model.lastSparring.reason)})</span>` : "";
-    const iconName = action === "READY" ? "check" : "warn";
-    sparring = `<div class="block"><h3>${icon(iconName, action.toLowerCase())}Latest sparring result</h3>
-<p><span class="verdict ${escapeHtml(action.toLowerCase())}" title="${escapeHtml(`Routing action: ${action}`)}">${escapeHtml(model.lastSparring.word)}</span>${reason}</p>
-<p>${escapeHtml(model.lastSparring.summary || "(no summary recorded)")}</p></div>`;
+    const result = model.lastSparring;
+    const reason = result.reason ? ` <span class="muted">(${escapeHtml(result.reason)})</span>` : "";
+    const iconName = result.action === "READY" ? "check" : "warn";
+    const summary = result.summary ? `<p>${escapeHtml(result.summary)}</p>` : "";
+    // "Read feedback" expands the reviewer's full written report inline
+    // (rendered Markdown, verbatim); "Open full report" still opens
+    // sparring.md itself in the editor, unchanged.
+    const feedback = result.report
+      ? `<details class="report"${disclose(scope, "sparring-report")}><summary>Read feedback</summary><div class="reportbody">${renderReportMarkdown(result.report)}</div>${button("openSparring", "Open full report", model.actions?.sparring !== false, "Open sparring.md")}</details>`
+      : "";
+    sparring = `<div class="block"><h3>${icon(iconName, result.action.toLowerCase())}Latest sparring result</h3>
+<p><span class="verdict ${escapeHtml(result.action.toLowerCase())}" title="${escapeHtml(`Routing action: ${result.action}`)}">${escapeHtml(result.badge)}</span>${reason}</p>
+${summary}${feedback}</div>`;
   }
   const planPlace = renderPlanPlace(model);
 
@@ -1378,11 +1396,13 @@ function renderStageCard(model: OverviewModel): string {
   } else if (model.runner?.alive && model.activity?.kind !== "active") {
     current = `<p class="muted">Runner started; waiting for the first turn.</p>`;
   } else if (model.activity?.kind === "active") {
-    // "Sparring for 12s · Codex" → "Codex sparring for 12s"
-    const match = /^(Working|Sparring) for (.+) · (.+)$/.exec(model.activity.text);
-    current = match
-      ? `<p class="now"><span class="who ${whoClass(match[3])}">${escapeHtml(match[3])}</span> ${match[1].toLowerCase()} for <span class="dur">${escapeHtml(match[2])}</span></p>`
-      : `<p class="now">${escapeHtml(model.activity.text)}</p>`;
+    // The activity line carries `text` ("Sparring for 12s · Codex") for any
+    // surface that still wants one string; the card shows what is happening
+    // and how long it has taken as two separate lines instead.
+    const who = /· ([^·]+)$/.exec(model.activity.text)?.[1];
+    const whoSpan = who ? `<span class="who ${whoClass(who)}">${escapeHtml(who)}</span> ` : "";
+    const description = model.activity.description ?? model.activity.text;
+    current = `<p class="now">${whoSpan}${escapeHtml(description)}</p>${model.activity.elapsed ? `<p class="elapsed muted">${escapeHtml(model.activity.elapsed)}</p>` : ""}`;
   }
   const last = model.lastEvent
     ? `<p><span class="time">${escapeHtml(model.lastEvent.time)}</span><span class="sep">·</span><span class="who ${whoClass(model.lastEvent.who)}">${escapeHtml(model.lastEvent.who)}</span> ${escapeHtml(model.lastEvent.description)}</p>`
@@ -1393,7 +1413,7 @@ function renderStageCard(model: OverviewModel): string {
   const right = model.whatsNext
     ? renderWhatsNext(model, model.whatsNext)
     : `<div class="block"><h3>${icon("pulse", "accent")}Current activity</h3>${current}</div>
-<div class="block"><h3>${icon("doc")}Last meaningful event</h3>${last}</div>`;
+<div class="block"><h3>${icon("doc")}Last activity</h3>${last}</div>`;
 
   const position = model.positionNote ? `<span class="muted" title="${escapeHtml(model.position ?? "")}">${escapeHtml(model.positionNote)}</span><span class="sep">·</span>` : "";
   // Where the work actually is, when this screen is a finished stage of a
@@ -2304,7 +2324,18 @@ p { margin: 0 0 4px; line-height: 1.45; }
 .verdict.send_back, .verdict.needs_you { color: var(--warn); }
 .verdict.escalate { color: var(--bad); }
 .now { font-size: 1.05em; }
+.elapsed { font-size: 0.92em; }
 .dur { font-weight: 600; }
+/* The reviewer's full report, rendered inline and scrollable once it runs
+   long, rather than pushing the rest of the card down. */
+details.report { margin-top: 6px; }
+details.report > summary { cursor: pointer; color: var(--vscode-descriptionForeground); width: fit-content; }
+details.report > summary:hover { color: var(--vscode-foreground); }
+.reportbody { margin: 6px 0; padding: 8px 10px; max-height: 22em; overflow-y: auto; border-left: 2px solid var(--vscode-panel-border); background: var(--vscode-textBlockQuote-background); }
+.reportbody p, .reportbody ul, .reportbody ol { margin: 0 0 6px; }
+.reportbody :last-child { margin-bottom: 0; }
+.reportbody pre { margin: 0 0 6px; padding: 6px 8px; overflow: auto; background: var(--vscode-editor-background); border: 1px solid var(--line); border-radius: 4px; font-family: var(--vscode-editor-font-family); font-size: 0.92em; white-space: pre-wrap; }
+.reportheading { font-size: 0.95em; }
 .who.claude { color: var(--claude); font-weight: 600; }
 .who.codex { color: var(--codex); font-weight: 600; }
 .who.other { font-weight: 600; }

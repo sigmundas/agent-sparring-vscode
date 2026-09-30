@@ -99,7 +99,13 @@ describe("overview view model", () => {
     const ws = await planWorkspace("running", 2, { sparring: sparringMarkdown("SEND_BACK", "Empty vs missing statistics state conflated."), stageState: { base_sha: "a".repeat(40) } });
     const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
     assert.equal(model.stageLine, "The independent reviewer found something to fix. Work will continue automatically.");
-    assert.deepEqual(model.lastSparring, { action: "SEND_BACK", word: "Changes requested", summary: "Empty vs missing statistics state conflated.", reason: undefined });
+    assert.deepEqual(model.lastSparring, {
+      action: "SEND_BACK",
+      badge: "Changes requested",
+      summary: "Empty vs missing statistics state conflated.",
+      reason: undefined,
+      report: "Long findings that must never reach the status bar.",
+    });
     assert.equal(model.actions?.diff?.label, "Diff");
     assert.equal(model.actions?.diff?.detail, "base aaaaaaaa… … current HEAD");
     assert.equal(model.actions?.diff?.targetSha, undefined);
@@ -133,6 +139,53 @@ describe("overview view model", () => {
     assert.equal(model.stageAgent?.activity, "Idle");
     assert.equal(model.lastSparring?.reason, "device_manual_check");
     assert.match(model.stageLine ?? "", /Waiting for you/);
+  });
+
+  it("NEEDS_YOU with no turn in progress is the Action required hand-back, badged 'Needs you' underneath it", async () => {
+    const ws = await planWorkspace("paused", 1, { sparring: sparringMarkdown("NEEDS_YOU", "Return to the stage agent and tell it the account is provisioned.", "device_manual_check") });
+    const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
+    assert.equal(model.actionRequired?.kind, "needs_you", "the hand-back panel is up: no turn is in progress");
+    assert.equal(model.lastSparring?.badge, "Needs you");
+    assert.equal(model.lastSparring?.action, "NEEDS_YOU");
+  });
+
+  it("a resumed turn after NEEDS_YOU reads as 'Your input was accepted', never the reviewer's stage-agent-addressed prose", async () => {
+    const ws = await planWorkspace("running", 1, {
+      sparring: sparringMarkdown("NEEDS_YOU", "Return to the stage agent and tell it the account is provisioned.", "device_manual_check"),
+    });
+    const live = foldEvents([event("stage", "turn.started", { provider: "claude-cli", resumed: true })]);
+    const model = buildOverviewModel(await selection(ws), live, ALL, NOW);
+    assert.equal(model.actionRequired, undefined, "the hand-back panel is gone: a turn is in progress again");
+    assert.equal(model.stageStatus, "Working");
+    assert.equal(model.lastSparring?.action, "NEEDS_YOU", "sparring.md itself still literally says NEEDS_YOU");
+    assert.equal(model.lastSparring?.badge, "Your input was accepted");
+    assert.ok(
+      !model.lastSparring?.summary?.includes("Return to the stage agent"),
+      "the reviewer's prose, addressed to the stage agent, is never the primary summary",
+    );
+    const html = renderOverviewHtml(model, "n", "c");
+    assert.match(html, /<span class="verdict needs_you"[^>]*>Your input was accepted<\/span>/);
+    assert.ok(!html.includes("Return to the stage agent"));
+  });
+
+  it("Read feedback expands the reviewer's full report inline, and it can still be opened in the editor", async () => {
+    const ws = await planWorkspace("running", 0, {
+      sparring: sparringMarkdown("SEND_BACK", "Fix the boundary check."),
+    });
+    const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
+    assert.equal(model.lastSparring?.report, "Long findings that must never reach the status bar.");
+    const html = renderOverviewHtml(model, "n", "c");
+    assert.match(html, /<details class="report"[^>]*><summary>Read feedback<\/summary><div class="reportbody"><p>Long findings that must never reach the status bar\.<\/p><\/div>/);
+    assert.match(html, /<button type="button" data-action="openSparring" title="Open sparring.md">Open full report<\/button><\/details>/);
+  });
+
+  it("no report to read: Read feedback is not offered, only the verdict and summary", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("hotfix-1", { status: "working" }, { "sparring.md": ["# Sparring: x", "", "## Routing outcome", "", "- Action: `READY`", "- Summary: fine", ""].join("\n") });
+    const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
+    assert.equal(model.lastSparring?.report, undefined);
+    const html = renderOverviewHtml(model, "n", "c");
+    assert.ok(!html.includes("Read feedback"));
   });
 
   it("ESCALATE", async () => {
@@ -255,7 +308,7 @@ describe("overview view model", () => {
     assert.equal(model.stageLine, "Independent review passed. No unresolved findings remain.");
     const html = renderOverviewHtml(model, "n", "c");
     assert.match(html, /<span class="status ready" title="Engine state: working · READY">Review complete<\/span>/);
-    assert.match(html, /<span class="verdict ready" title="Routing action: READY">Review passed<\/span>/);
+    assert.match(html, /<span class="verdict ready" title="Routing action: READY">Approved<\/span>/);
     assert.ok(!/<span class="status[^>]*>working</.test(html));
     assert.ok(!/awaiting acceptance/.test(html));
   });
@@ -299,18 +352,47 @@ describe("overview HTML", () => {
     const withAll = renderOverviewHtml(buildOverviewModel(await selection(ws), undefined, ALL, NOW), "n", "c");
     assert.match(withAll, /<button type="button" data-action="openDiff" title="base bbbbbbbb… … current HEAD">Diff<\/button>/);
     assert.match(withAll, /<button type="button" data-action="openHandoff" title="Open handoff.md">Handoff<\/button>/);
-    assert.match(withAll, />Sparring report<\/button>/);
+    // Sparring report is no longer a top-row button: opening sparring.md
+    // lives inside Latest sparring result (Read feedback / Open full
+    // report), tested separately where an outcome actually exists.
+    assert.ok(!withAll.includes(">Sparring report</button>"));
     assert.match(withAll, />Log<\/button>/);
     assert.match(withAll, /data-action="openPlan"/);
 
     const withNone = renderOverviewHtml(buildOverviewModel(await selection(ws), undefined, NONE, NOW), "n", "c");
     assert.match(withNone, /<button type="button" data-action="openHandoff" title="Open handoff.md" disabled>Handoff<\/button>/);
-    assert.match(withNone, /data-action="openSparring" title="Open sparring.md" disabled/);
+    assert.ok(!withNone.includes('data-action="openSparring"'), "no top-row Sparring report button, disabled or not");
     assert.ok(!withNone.includes('data-action="openPlan"'));
 
     const ws2 = await planWorkspace("running", 0);
     const noDiff = renderOverviewHtml(buildOverviewModel(await selection(ws2), undefined, ALL, NOW), "n", "c");
     assert.ok(!noDiff.includes('data-action="openDiff"'));
+  });
+
+  it("Technical details holds the run key, session/thread ids and provider/model, collapsed by default and nowhere else on the page", async () => {
+    const ws = await Workspace.create();
+    await ws.writePlan();
+    await ws.writePlanRun(FOO_PLAN_KEY, { plan: FOO_PLAN_LABEL, status: "running", current_stage_index: 0, current_stage: FOO_STAGE_IDS[0] });
+    await ws.writeStage(FOO_STAGE_IDS[0], { status: "working", implementation_session_id: "82ab1234deadbeef", sparring_session_id: "019d1234deadbeef" }, { "sparring.md": sparringMarkdown("READY", "fine") });
+    const live = foldEvents([event("stage", "session.observed", { provider: "claude-cli", session_id: "82ab1234deadbeef", model: "claude-opus-5-5" })]);
+    const model = buildOverviewModel(await selection(ws), live, ALL, NOW);
+    assert.ok(model.facts?.some((fact) => fact.label === "Run key" && fact.value === FOO_PLAN_KEY));
+    assert.ok(model.facts?.some((fact) => fact.label === "Stage session"));
+    assert.ok(model.facts?.some((fact) => fact.label === "Sparring thread"));
+    assert.ok(model.facts?.some((fact) => fact.label === "Stage provider" && fact.value.includes("claude-opus-5-5")));
+
+    const html = renderOverviewHtml(model, "n", "c");
+    const details = /<details class="tech facts"[^>]*><summary>Technical details<\/summary>([\s\S]*?)<\/details>/.exec(html);
+    assert.ok(details, "a collapsed Technical details section exists");
+    assert.ok(!/<details class="tech facts"[^>]* open[^>]*>/.test(html), "collapsed by default");
+    assert.match(details![1], /claude-opus-5-5/);
+    assert.match(details![1], /82ab1234/);
+    // The same raw facts never leak into the primary card above it (the
+    // run key does still appear in the stage heading's tooltip, one of the
+    // established advanced surfaces alongside Technical details itself).
+    const beforeTechnical = html.slice(0, html.indexOf('<details class="tech facts"'));
+    assert.ok(!beforeTechnical.includes("claude-opus-5-5"));
+    assert.ok(!beforeTechnical.includes("82ab1234"));
   });
 
   it("renders the compact journey, the primary stage block and the small actor cards", async () => {
@@ -335,7 +417,6 @@ describe("overview HTML", () => {
     assert.match(html, /<details class="more"[^>]*><summary[^>]*>…<\/summary><div class="actions"><button type="button" class="quiet" data-action="resumePlan"[^>]*>Resume plan \(implementation\)</);
     assert.ok(!html.includes("Latest sparring result"), "the panel is the latest sparring result");
     assert.match(html, /<div class="run muted" title="[^"]*"><span class="plan">docs\/plans\/foo.md<\/span><span class="sep">›<\/span><span>Stage 2 — Schema &amp; API<\/span><\/div>/, "the header names the plan (its label when the document is not read), then the stage");
-    assert.ok(!html.includes("Last activity"));
   });
 
   it("ambiguous model lists the choices, names the repository and offers selection", () => {

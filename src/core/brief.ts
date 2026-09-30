@@ -10,7 +10,18 @@ export const GOAL_MAX_LENGTH = 240;
 
 const GOAL_HEADING_RE = /^#{1,6}\s+goal\s*$/i;
 const ANY_HEADING_RE = /^#{1,6}\s/;
+const TOP_LEVEL_HEADING_RE = /^#\s+(\S.*?)\s*$/;
 const FENCE_RE = /^\s*(```|~~~)/;
+
+/**
+ * Plan intake's own non-content sections (`intake.py`: `render_brief`):
+ * a labelled note about how the stage was scoped, and a preamble sentence
+ * introducing the attached plan-wide context blocks. Both are intake's own
+ * words about the brief, never a description of the stage's own work, so a
+ * paragraph under either -- including its nested, quoted plan headings --
+ * is never mistaken for the stage's opening description.
+ */
+const NON_CONTENT_TOP_SECTIONS = new Set(["plan context", "intake scoping"]);
 
 /**
  * The first non-empty paragraph beneath a `## Goal` heading (any heading
@@ -79,6 +90,10 @@ export function parseBriefGoal(markdown: string | undefined | null, maxLength = 
  * provenance line. Falling back through: the first paragraph after a second
  * heading, else the first paragraph after the first heading, else the first
  * paragraph at all. Lists, tables and fenced code are never a description.
+ * A paragraph under intake's own `# Plan context` or `# Intake scoping`
+ * section (including a plan heading quoted beneath it) is never a candidate
+ * either — that text is intake's boilerplate about the brief, not the
+ * stage's own opening description, however many headings precede it.
  *
  * Display only, like the Goal it stands in for. Undefined when the brief has
  * no prose paragraph — and then the Overview says nothing rather than
@@ -89,15 +104,16 @@ export function parseBriefOpening(markdown: string | undefined | null, maxLength
   if (typeof markdown !== "string" || !markdown.trim()) {
     return undefined;
   }
-  const paragraphs: { text: string; headings: number }[] = [];
+  const paragraphs: { text: string; headings: number; excluded: boolean }[] = [];
   let headings = 0;
+  let topSection: string | undefined;
   let inFence = false;
   let current: string[] = [];
   const flush = () => {
     const text = current.join(" ").replace(/\s+/g, " ").trim();
     current = [];
     if (text) {
-      paragraphs.push({ text, headings });
+      paragraphs.push({ text, headings, excluded: topSection !== undefined && NON_CONTENT_TOP_SECTIONS.has(topSection) });
     }
   };
   for (const line of markdown.split(/\r?\n/)) {
@@ -112,6 +128,10 @@ export function parseBriefOpening(markdown: string | undefined | null, maxLength
     if (ANY_HEADING_RE.test(line)) {
       flush();
       headings++;
+      const topLevel = TOP_LEVEL_HEADING_RE.exec(line);
+      if (topLevel) {
+        topSection = topLevel[1].trim().toLowerCase();
+      }
       continue;
     }
     if (!line.trim() || /^\s*(?:[-*+>|]|\d+[.)])\s/.test(line)) {
@@ -121,7 +141,8 @@ export function parseBriefOpening(markdown: string | undefined | null, maxLength
     current.push(line.trim());
   }
   flush();
-  const chosen = paragraphs.find((entry) => entry.headings >= 2) ?? paragraphs.find((entry) => entry.headings >= 1) ?? paragraphs[0];
+  const candidates = paragraphs.filter((entry) => !entry.excluded);
+  const chosen = candidates.find((entry) => entry.headings >= 2) ?? candidates.find((entry) => entry.headings >= 1) ?? candidates[0];
   if (!chosen) {
     return undefined;
   }

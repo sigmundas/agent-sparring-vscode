@@ -24,8 +24,8 @@ import { SETUP_NOT_IGNORED, SETUP_OBSOLETE_AGENT_SETTING, agentConfigView, provi
 import { parseBriefGoal, parseBriefOpening } from "./brief";
 import { currentStageOf, owningRoot, repositoryDisplayName, runLabel, samePath, type DiscoveredIntake, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { intakeContinuation, intakeNextAction, intakeStateLabel, isExecutionGroup, sliceHeading, sliceRoot, sliceStageName, type IntakeContinuation, type IntakeNextAction, type IntakeSliceSnapshot } from "./intake";
-import { activeDurationMs, formatDuration, providerDisplayName, type ActorBudget, type LiveState, type MeaningfulEvent } from "./liveState";
-import { DEFERRED_VERIFICATION_REQUIRED, PUSH_AUTHORIZATION_REQUIRED, obligationFailed, obligationResolved, parseHandoffBranch, type DeferredObligation, type PlanRunState, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
+import { activeDurationMs, formatDuration, providerDisplayName, type ActorBudget, type ActorLive, type LiveState, type MeaningfulEvent } from "./liveState";
+import { DEFERRED_VERIFICATION_REQUIRED, PUSH_AUTHORIZATION_REQUIRED, obligationFailed, obligationResolved, parseHandoffBranch, type DeferredObligation, type PlanRunState, type RoutingAction, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
 import type { DeclaredRepository } from "./stageRepositories";
 import { deriveDeferredVerification, deriveVerification, draftKeyFor, HUMAN_FEEDBACK_HEADING, parseHumanEvidence, parseHumanFeedback, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
 import { categoryWord, checkNameList } from "./humanTask";
@@ -200,9 +200,14 @@ export interface ActivityLine {
    * telemetry for a long time.
    */
   kind: "active" | "inferred" | "last" | "none" | "stopped" | "stale";
+  /** Legacy combined rendering, kept for surfaces that show one line (status bar, tooltips). */
   text: string;
   /** Time of day of the last visible event (kind `last`). */
   time?: string;
+  /** What is happening right now, in the user's terms, separate from `elapsed` (kind `active` only). */
+  description?: string;
+  /** `Working for 4m 12s` / `Sparring for 12s`: elapsed time alone, separate from `description` (kind `active` only). */
+  elapsed?: string;
 }
 
 /** One line of the glanceable résumé: a past event, never a claim about the present. */
@@ -1146,7 +1151,19 @@ export interface OverviewModel {
   /** The last few meaningful events, oldest first; omitted without telemetry. */
   history?: HistoryEntry[];
   banner?: Banner;
-  lastSparring?: { action: string; word: string; summary: string; reason?: string };
+  /**
+   * The latest routing outcome, addressed to the person reading it rather
+   * than to the stage agent the reviewer wrote it for.
+   *
+   * `badge` is always shown; `summary` is the reviewer's own one-liner and
+   * is omitted (badge alone) when sparring.md recorded none. `report` is
+   * the reviewer's full written findings (`## Finding / discussion`,
+   * verbatim), for "Read feedback" and "Open full report" — undefined when
+   * the reviewer recorded nothing beyond the summary. `action` and `reason`
+   * are the engine's own vocabulary, kept for the CSS class, the tooltip
+   * and Technical details, never rendered as prose.
+   */
+  lastSparring?: { action: string; badge: string; summary?: string; reason?: string; report?: string };
   plan?: PlanContext;
   /** Present only for an accepted stage. */
   whatsNext?: WhatsNext;
@@ -1589,7 +1606,7 @@ function buildScreen(
       diff: diffAction(stage),
     },
     agentConfig: agentConfigSection(artifacts.agentConfig, stageInProgress(stage, halted, liveness), stage),
-    facts: facts(run, stage, artifacts.git, presentation, artifacts.associatedPlan, artifacts.siblingRepositories),
+    facts: facts(run, stage, artifacts.git, presentation, artifacts.associatedPlan, artifacts.siblingRepositories, live),
     goal: goal(artifacts, plan),
     activity: activityLine(live, halted, nowMs, uncertain),
     history: history(live),
@@ -1599,9 +1616,14 @@ function buildScreen(
     plan,
   };
   model.lastEvent = model.history?.[model.history.length - 1];
+  const commandInFlight = Boolean(live?.stage.commandBusy || live?.sparrer.commandBusy);
   if (liveness.interrupted) {
     model.activity = { kind: "stopped", text: liveness.execution?.kind === "run-sparring" ? "Stopped · independent review did not finish" : "Stopped · last turn interrupted" };
-  } else if (liveness.stale) {
+  } else if (liveness.stale && !commandInFlight) {
+    // A shell command started and still has not finished is demonstrable,
+    // reported activity, even while nothing else has happened since: saying
+    // "no meaningful activity" under it would contradict a fact this same
+    // model already has (liveState.ts: commandBusy).
     model.activity = { kind: "stale", text: `${model.activity?.text ?? "Working"} · no meaningful activity for ${formatAge(nowMs - Date.parse(live?.lastMeaningful?.ts ?? live?.lastEventTs ?? ""))}` };
   }
   // Stop is offered only for a target that is positively this run's live
@@ -1724,7 +1746,7 @@ function buildScreen(
   }
 
   if (outcome) {
-    model.lastSparring = { action: outcome.action, word: actionWord(outcome.action), summary: outcome.summary, reason: outcome.needsYouReason };
+    model.lastSparring = sparringResultView(outcome, presentation);
   }
   Object.assign(model, currentLine(run, stage, live, presentation, liveness, Boolean(artifacts.accepting), model.planAction, fresh));
   const continuation = run.kind === "plan" && !plan?.next && artifacts.intake ? intakeContinuation(artifacts.intake, run.intake?.runId ?? "") : undefined;
@@ -2705,10 +2727,14 @@ function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveSt
     const active = activeDurationMs(actor, nowMs);
     duration = active === undefined ? undefined : formatDuration(active);
     // Measured from the last event the Output Channel would show, so hidden
-    // tool noise does not make a silent turn look lively.
+    // tool noise does not make a silent turn look lively -- except a shell
+    // command genuinely in flight (liveState.ts: commandBusy), which is
+    // demonstrable activity telemetry already reported, just not yet
+    // finished: claiming "no meaningful activity" under it would contradict
+    // a fact this very panel already has.
     const since = live?.lastMeaningful?.ts ?? actor.lastEventTs;
     const age = since ? nowMs - Date.parse(since) : NaN;
-    if (Number.isFinite(age) && age > QUIET_AFTER_MS) {
+    if (!actor.commandBusy && Number.isFinite(age) && age > QUIET_AFTER_MS) {
       quietFor = formatAge(age);
     }
   }
@@ -2770,21 +2796,41 @@ export function activityLine(live: LiveState | undefined, halted: boolean, nowMs
       const active = activeDurationMs(actor, nowMs);
       if (actor.busy && active !== undefined) {
         const verb = role === "stage" ? "Working" : "Sparring";
+        const elapsed = `${verb} for ${formatDuration(active)}`;
+        const who = providerDisplayName(actor.provider, role);
         if (uncertain) {
           // Telemetry saw the turn start; nothing has seen the runner alive.
-          return { kind: "inferred", text: `${role === "stage" ? "Turn" : "Sparring turn"} started ${formatDuration(active)} ago · ${providerDisplayName(actor.provider, role)} · runner status unknown` };
+          return { kind: "inferred", text: `${role === "stage" ? "Turn" : "Sparring turn"} started ${formatDuration(active)} ago · ${who} · runner status unknown` };
         }
-        return { kind: "active", text: `${verb} for ${formatDuration(active)} · ${providerDisplayName(actor.provider, role)}` };
+        return { kind: "active", text: `${elapsed} · ${who}`, description: currentActivityDescription(role, actor), elapsed };
       }
     }
   }
-  if (live?.lastMeaningful) {
+  const last = live ? displayableTimeline(live).at(-1) : undefined;
+  if (last) {
     // Phrased as a past fact ("last event: Claude · changed x.py"), never as
     // what an actor is doing right now; telemetry cannot support the latter.
-    const last = live.lastMeaningful;
-    return { kind: "last", time: formatTime(last.ts), text: `${whoFor(last, live)} · ${describeForOverview(last)}` };
+    return { kind: "last", time: last.time, text: `${last.who} · ${last.description}` };
   }
   return { kind: "none", text: "No activity telemetry for this stage." };
+}
+
+/**
+ * What a busy actor is doing right now, in the user's terms, separate from
+ * how long it has taken (see `elapsed` on {@link ActivityLine}). A shell
+ * command in flight (`command.started` with no matching `command.finished`
+ * yet, see `liveState.ts`) is the one concrete fact telemetry offers about
+ * *what* is running, without ever recording the command text itself; short
+ * of that, the role's own job is the honest answer -- the exact file or
+ * requirement being worked on is not something telemetry states, and
+ * guessing at one from a stage title would be inventing a fact nobody
+ * reported.
+ */
+function currentActivityDescription(role: "stage" | "sparrer", actor: ActorLive): string {
+  if (role === "sparrer") {
+    return "Reviewing the latest changes";
+  }
+  return actor.commandBusy ? "Running a command" : "Working on the implementation";
 }
 
 /** The last HISTORY_MAX meaningful events as a résumé, oldest first. */
@@ -2792,14 +2838,43 @@ export function history(live: LiveState | undefined): HistoryEntry[] | undefined
   if (!live || live.recentMeaningful.length === 0) {
     return undefined;
   }
-  return live.recentMeaningful.slice(-HISTORY_MAX).map((entry) => ({ time: formatTime(entry.ts), who: whoFor(entry, live), description: describeForOverview(entry) }));
+  const shown = displayableTimeline(live);
+  return shown.length > 0 ? shown.slice(-HISTORY_MAX) : undefined;
 }
 
 /**
- * The Output Channel keeps the engine's words (`SEND_BACK — range handling`);
- * the Overview shows the same event with the human word in front.
+ * Session announcements say nothing a person acts on (the id and model
+ * belong in Technical details): never shown as Last activity or in Recent
+ * events, though `live.recentMeaningful` itself keeps them for staleness
+ * and timing, which read the fold directly and are unaffected by this
+ * display-only filter.
+ */
+function isDisplayableMeaningful(entry: MeaningfulEvent): boolean {
+  return entry.event !== "session.observed";
+}
+
+/** The meaningful-event fold as a résumé for people, oldest first, with session announcements left out. */
+function displayableTimeline(live: LiveState): HistoryEntry[] {
+  return live.recentMeaningful.filter(isDisplayableMeaningful).map((entry) => ({
+    time: formatTime(entry.ts),
+    who: whoFor(entry, live),
+    description: describeForOverview(entry),
+  }));
+}
+
+/**
+ * The Output Channel keeps the engine's words (`SEND_BACK — range handling`,
+ * `turn resumed`); the Overview shows the same fact addressed to the person
+ * reading it, never the engine's noun for it.
  */
 function describeForOverview(entry: MeaningfulEvent): string {
+  if (entry.event === "turn.started") {
+    return entry.description === "turn resumed" ? "resumed work" : "started work";
+  }
+  if (entry.event === "command.finished") {
+    const failed = /^command exited (\d+)$/.exec(entry.description);
+    return failed ? `a command failed (exit ${failed[1]})` : "finished running a command";
+  }
   if (entry.event !== "verdict") {
     return entry.description;
   }
@@ -2822,6 +2897,46 @@ export function shortenId(id: string | undefined | null, keep = 8): string | und
     return undefined;
   }
   return trimmed.length > keep ? `${trimmed.slice(0, keep)}…` : trimmed;
+}
+
+/** The verdict badge word for the Latest sparring result card; unlisted actions fall back to {@link actionWord}. */
+const SPARRING_BADGE_WORDS: Partial<Record<RoutingAction, string>> = {
+  READY: "Approved",
+  SEND_BACK: "Changes requested",
+  NEEDS_YOU: "Needs you",
+  ESCALATE: "Escalated",
+};
+
+/** `outcome.findings` verbatim, or undefined when the reviewer recorded nothing worth reading. */
+function sparringReport(outcome: SparringOutcome): string | undefined {
+  const text = outcome.findings?.trim();
+  return text && text !== "(none recorded)" ? text : undefined;
+}
+
+/**
+ * The Latest sparring result card: a verdict badge addressed to the person
+ * reading it, the reviewer's own one-line summary (or nothing, when
+ * sparring.md recorded none), and the full report for "Read feedback".
+ *
+ * A recorded `NEEDS_YOU`/`ESCALATE` whose turn has since resumed (the
+ * reviewer's hand-back panel is gone; see `actionRequired`, present only
+ * "with no turn in progress") is not shown as still needing you: the
+ * person's answer was accepted and work is back under way, which is a
+ * different fact from the one sparring.md still literally records until
+ * the next verdict overwrites it.
+ */
+function sparringResultView(outcome: SparringOutcome, presentation: StagePresentation): NonNullable<OverviewModel["lastSparring"]> {
+  const report = sparringReport(outcome);
+  if ((outcome.action === "NEEDS_YOU" || outcome.action === "ESCALATE") && presentation.kind === "working") {
+    return { action: outcome.action, badge: "Your input was accepted", summary: "Your answer was received; work has resumed.", reason: outcome.needsYouReason, report };
+  }
+  return {
+    action: outcome.action,
+    badge: SPARRING_BADGE_WORDS[outcome.action] ?? actionWord(outcome.action),
+    summary: outcome.summary?.trim() || undefined,
+    reason: outcome.needsYouReason,
+    report,
+  };
 }
 
 /**
@@ -2849,19 +2964,33 @@ function manifestView(run: RunSnapshot, artifacts: OverviewArtifacts): ManifestV
 }
 
 /**
- * The one-paragraph description of what this stage is for: the brief's
- * `## Goal`, else the brief's own opening description, else the plan
- * section's opening paragraph. When none of those exist the Overview says
- * nothing — a brief without a `## Goal` heading is a fact for diagnostics,
- * not a complaint to show someone who came here to answer a review.
+ * The one-paragraph description of what this stage is for: the brief's own
+ * explicit `## Goal` when intake wrote one (current briefs always do), else
+ * the plan document's own structured section summary, else — only for a
+ * brief with no plan document to fall back to — the brief's opening
+ * description. When none of those exist the Overview says nothing — a
+ * brief without a `## Goal` heading is a fact for diagnostics, not a
+ * complaint to show someone who came here to answer a review.
+ *
+ * The plan's own structured summary is preferred over re-reading the
+ * brief's prose for an older brief that predates `## Goal`: a plan-intake
+ * brief carries its own non-content sections (`# Plan context`,
+ * `# Intake scoping`) that are never a stage description, and the plan
+ * document itself is the more reliable structured source of what a stage
+ * is for. `parseBriefOpening` stays as the last resort for a hand-written
+ * brief with no associated plan document at all.
  */
 function goal(artifacts: OverviewArtifacts, plan: PlanContext | undefined): string | undefined {
-  const fromBrief = artifacts.brief ? (parseBriefGoal(artifacts.briefText) ?? parseBriefOpening(artifacts.briefText)) : undefined;
-  if (fromBrief) {
-    return fromBrief;
+  const explicit = artifacts.brief ? parseBriefGoal(artifacts.briefText) : undefined;
+  if (explicit) {
+    return explicit;
   }
   const document = plan?.source === "managed" ? artifacts.planText : artifacts.associatedPlan?.text;
-  return document && plan?.currentLine ? sectionSummary(document, plan.currentLine) : undefined;
+  const structured = document && plan?.currentLine ? sectionSummary(document, plan.currentLine) : undefined;
+  if (structured) {
+    return structured;
+  }
+  return artifacts.brief ? parseBriefOpening(artifacts.briefText) : undefined;
 }
 
 function timeline(run: PlanRunSnapshot, manifest: ManifestView | undefined): Pick<OverviewModel, "timeline" | "timelineNote"> {
@@ -3271,11 +3400,13 @@ function facts(
   presentation: StagePresentation,
   associated: AssociatedPlan | undefined,
   siblings: DeclaredRepository[] | undefined,
+  live: LiveState | undefined,
 ): { label: string; value: string }[] {
   const out: { label: string; value: string }[] = [{ label: "Repository", value: run.location.folderName }];
   if (run.kind === "plan") {
     out.push({ label: "Plan", value: run.state.status });
     out.push({ label: "Expected branch", value: run.state.expectedBranch });
+    out.push({ label: "Run key", value: run.runKey });
   } else if (associated) {
     out.push({ label: "Plan", value: `${basename(associated.path)} (associated in VS Code)` });
   }
@@ -3284,6 +3415,9 @@ function facts(
     out.push({ label: "Checked out", value: [git.branch ?? "(detached)", head ? `@ ${head}` : ""].filter(Boolean).join(" ") });
   }
   if (stage.exists) {
+    // `presentation.raw` already carries the routing action verbatim while
+    // one is recorded (`working · SEND_BACK`, `working · READY`, …), so the
+    // raw routing state is here rather than duplicated as its own row.
     out.push({ label: "Engine state", value: presentation.raw });
   }
   if (stage.state?.baseSha) {
@@ -3297,6 +3431,12 @@ function facts(
   }
   if (stage.state?.sparringSessionId) {
     out.push({ label: "Sparring thread", value: shortenId(stage.state.sparringSessionId, 12) ?? "" });
+  }
+  if (live?.stage.provider || live?.stage.model) {
+    out.push({ label: "Stage provider", value: [live.stage.provider, live.stage.model].filter(Boolean).join(" · ") });
+  }
+  if (live?.sparrer.provider || live?.sparrer.model) {
+    out.push({ label: "Sparrer provider", value: [live.sparrer.provider, live.sparrer.model].filter(Boolean).join(" · ") });
   }
   out.push(...siblingFacts(stage.state?.repositories ?? [], siblings ?? []));
   return out;

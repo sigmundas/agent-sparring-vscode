@@ -267,13 +267,15 @@ describe("a live refresh does not close what the person opened", () => {
   });
 
   it("5+6. the gate panel's demoted layers survive an update too, each under its own key", async () => {
-    // A NEEDS_YOU panel carries the three disclosures the report names
-    // besides the actor cards: the technical details, the evidence already
-    // recorded, and the feedback already sent.
+    // A NEEDS_YOU panel carries the disclosures the report names besides
+    // the actor cards: the panel's own technical details, the evidence
+    // already recorded, the feedback already sent, and the run's own
+    // Technical details at the foot of the page (still rendered: it is not
+    // part of the Action required hand-back the NEEDS_YOU panel replaces).
     const { html } = await gatePanel();
     assert.deepEqual(
       keys(html).filter((key) => /technical|previous-evidence|feedback-sent/.test(key)).sort(),
-      [`:${GATE_STAGE}/feedback-sent`, `:${GATE_STAGE}/previous-evidence`, `:${GATE_STAGE}/technical`].map((key) => keys(html).find((candidate) => candidate.endsWith(key)) ?? key).sort(),
+      [`:${GATE_STAGE}/feedback-sent`, `:${GATE_STAGE}/previous-evidence`, `:${GATE_STAGE}/technical`, `:${GATE_STAGE}/technical-details`].map((key) => keys(html).find((candidate) => candidate.endsWith(key)) ?? key).sort(),
       "each demoted layer is its own key, scoped to the stage",
     );
 
@@ -286,7 +288,7 @@ describe("a live refresh does not close what the person opened", () => {
     }
 
     const second = runWebviewScript(html, "n", state);
-    for (const key of ["technical", "previous-evidence", "feedback-sent"]) {
+    for (const key of ["technical", "previous-evidence", "feedback-sent", "technical-details"]) {
       assert.equal(
         second.document.disclosures.find((node) => node.getAttribute("data-disclose")?.endsWith(`:${GATE_STAGE}/${key}`))?.open,
         true,

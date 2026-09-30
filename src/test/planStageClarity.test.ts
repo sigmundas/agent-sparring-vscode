@@ -335,11 +335,14 @@ describe("a historical stage of a managed plan run", () => {
     assert.deepEqual(
       [model.actions?.brief, model.actions?.handoff, model.actions?.sparring, Boolean(model.actions?.diff)],
       [true, true, true, true],
-      "Brief, Handoff, Sparring report and Diff stay available",
+      "Brief, Handoff, sparring (for Latest sparring result) and Diff stay available",
     );
-    for (const label of ["Brief", "Handoff", "Sparring report", "Diff", "Log"]) {
+    // Sparring report is no longer a top-row button; opening sparring.md
+    // lives inside Latest sparring result instead.
+    for (const label of ["Brief", "Handoff", "Diff", "Log"]) {
       assert.ok(html.includes(`>${label}</button>`), `${label} is still offered`);
     }
+    assert.ok(!html.includes(">Sparring report</button>"));
   });
 });
 
