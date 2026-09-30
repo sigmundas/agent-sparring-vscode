@@ -349,6 +349,38 @@ describe("active duration", () => {
     assert.equal(live.sparrer.commandBusy, false, "an unmatched finish never goes negative");
   });
 
+  it("a new turn starts with no command running, whatever a killed runner left open", () => {
+    const live = emptyLiveState();
+    // A runner killed mid-command: no finish, no turn.failed.
+    applyEvent(live, { v: 1, ts: at(0), actor: "stage", event: "turn.started", provider: "claude-cli" });
+    applyEvent(live, { v: 1, ts: at(1), actor: "stage", event: "command.started", tool: "Bash", tool_use_id: "toolu_old" });
+    applyEvent(live, { v: 1, ts: at(2), actor: "sparrer", event: "sparring.started", provider: "codex-cli" });
+    applyEvent(live, { v: 1, ts: at(3), actor: "sparrer", event: "command.started", tool: "shell" });
+    assert.equal(live.stage.commandBusy, true);
+    assert.equal(live.sparrer.commandBusy, true);
+    // resume-plan starts new turns.
+    applyEvent(live, { v: 1, ts: at(60), actor: "stage", event: "turn.started", provider: "claude-cli", resumed: true });
+    assert.equal(live.stage.commandBusy, false, "the old tool_use_id can never finish now");
+    assert.equal(live.stage.commandSince, undefined);
+    assert.equal(live.sparrer.commandBusy, true, "the other actor's turn is its own");
+    applyEvent(live, { v: 1, ts: at(61), actor: "sparrer", event: "sparring.started", provider: "codex-cli", resumed: true });
+    assert.equal(live.sparrer.commandBusy, false, "a leftover Codex start does not keep the count up");
+  });
+
+  it("one agent's tool use does not make the other agent's card look active", async () => {
+    const ws = await Workspace.create();
+    await ws.writeStage("hotfix-1", { status: "working" });
+    const selection = selectRun((await discoverRuns([ws.location])).runs);
+    const live = emptyLiveState();
+    applyEvent(live, { v: 1, ts: at(0), actor: "stage", event: "turn.started", provider: "claude-cli" });
+    applyEvent(live, { v: 1, ts: at(1), actor: "sparrer", event: "sparring.started", provider: "codex-cli" });
+    applyEvent(live, { v: 1, ts: at(20 * 60), actor: "sparrer", event: "tool.call", tool: "web_search" });
+    const running: ExecutionRecord = { id: "e", runId: selection.selected!.id, kind: "run-loop", source: "launched", state: "running", startedAtMs: T0 - 1000 };
+    const model = buildOverviewModel(selection, live, ALL, T0 + 21 * 60_000, running);
+    assert.equal(model.sparrer?.quietFor, undefined, "the reviewer used a tool a minute ago");
+    assert.ok(model.stageAgent?.quietFor, "the stage agent has been silent for 21 minutes");
+  });
+
   it("a subagent's tool calls count as activity, though they earn no Output line", async () => {
     const ws = await Workspace.create();
     await ws.writeStage("hotfix-1", { status: "working" });

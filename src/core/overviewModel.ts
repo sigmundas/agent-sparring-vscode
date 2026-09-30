@@ -2734,7 +2734,7 @@ function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveSt
     // a fact this very panel already has.
     // A tool call (a subagent reading files, say) is activity too, though it
     // earns no Output line (liveState.ts: quietSince).
-    const since = live ? quietSince(live, actor.lastEventTs) : actor.lastEventTs;
+    const since = live ? quietSince(live, actor, actor.lastEventTs) : actor.lastEventTs;
     const age = since ? nowMs - Date.parse(since) : NaN;
     if (!actor.commandBusy && Number.isFinite(age) && age > QUIET_AFTER_MS) {
       quietFor = formatAge(age);

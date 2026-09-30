@@ -178,7 +178,7 @@ function liveSuffix(live: LiveState | undefined, nowMs: number, tooltipLines: st
   if (suffix && running) {
     tooltipLines.push("Running a command");
   }
-  const since = quietSince(live, live.lastEventTs);
+  const since = quietSince(live, live.sparrer.busy && !live.stage.busy ? live.sparrer : live.stage, live.lastEventTs);
   if (since) {
     const age = nowMs - Date.parse(since);
     if (suffix && !running && age > QUIET_AFTER_MS) {

@@ -85,6 +85,15 @@ export interface ActorLive {
    * start. A finish that matches nothing changes nothing.
    */
   openCommands?: { id?: string; ts: string }[];
+  /**
+   * When this actor last reported using a tool (a tool call, a subagent
+   * starting, a command starting or finishing, a file edit), whether or not
+   * it earned an Output line. A tool in use is activity: a subagent that
+   * only reads files emits nothing but tool calls, and must not read as a
+   * silent turn. Per actor, so the reviewer's tool use never makes the
+   * stage agent look active. See {@link quietSince}.
+   */
+  lastToolTs?: string;
 }
 
 /** The last event that would earn a line in the Output Channel. */
@@ -113,14 +122,6 @@ export interface LiveState {
   currentCycle?: number;
   /** Last event that passes the shared Output filter; suppressed noise never lands here. */
   lastMeaningful?: MeaningfulEvent;
-  /**
-   * When an actor last reported using a tool (a tool call, a subagent
-   * starting, a command starting or finishing, a file edit), whether or not
-   * it earned an Output line. A tool in use is activity: a subagent that
-   * only reads files emits nothing but tool calls, and must not read as a
-   * silent turn. See {@link quietSince}.
-   */
-  lastToolTs?: string;
   /**
    * The most recent meaningful events, oldest first, capped at
    * RECENT_MEANINGFUL_MAX; consecutive repeats (same actor and description,
@@ -202,13 +203,17 @@ export function applyEvent(state: LiveState, event: ActivityEvent): LiveState {
   }
 
   if (actor && TOOL_EVENTS.has(event.event)) {
-    state.lastToolTs = event.ts;
+    actor.lastToolTs = event.ts;
   }
 
   switch (event.event) {
     case "turn.started":
+      // A new turn has run nothing yet. Whatever an earlier runner left open
+      // (killed mid-command, with no turn.failed) can never finish now: its
+      // tool_use_id belongs to a session that is gone.
       state.stage.busy = true;
       state.stage.busySince = event.ts;
+      clearCommands(state.stage);
       break;
     case "turn.finished":
     case "turn.failed":
@@ -218,6 +223,7 @@ export function applyEvent(state: LiveState, event: ActivityEvent): LiveState {
     case "sparring.started":
       state.sparrer.busy = true;
       state.sparrer.busySince = event.ts;
+      clearCommands(state.sparrer);
       break;
     case "sparring.failed":
       idle(state.sparrer);
@@ -277,6 +283,10 @@ export function applyEvent(state: LiveState, event: ActivityEvent): LiveState {
 function idle(actor: ActorLive): void {
   actor.busy = false;
   actor.busySince = undefined;
+  clearCommands(actor);
+}
+
+function clearCommands(actor: ActorLive): void {
   actor.openCommands = undefined;
   syncCommand(actor);
 }
@@ -292,12 +302,12 @@ const TOOL_EVENTS = new Set(["tool.call", "subagent.started", "command.started",
 
 /**
  * The moment a busy turn's silence is measured from: the later of the last
- * Output-worthy event and the last tool use. Hidden bookkeeping (usage
+ * Output-worthy event and `actor`'s last tool use. Hidden bookkeeping (usage
  * dials, session notices) still does not make a turn look lively, but a
  * tool in use does. `fallback` is used when neither has happened.
  */
-export function quietSince(live: LiveState, fallback?: string): string | undefined {
-  const candidates = [live.lastMeaningful?.ts, live.lastToolTs].filter((ts): ts is string => typeof ts === "string" && Number.isFinite(Date.parse(ts)));
+export function quietSince(live: LiveState, actor: ActorLive | undefined, fallback?: string): string | undefined {
+  const candidates = [live.lastMeaningful?.ts, actor?.lastToolTs].filter((ts): ts is string => typeof ts === "string" && Number.isFinite(Date.parse(ts)));
   if (candidates.length === 0) {
     return fallback;
   }
