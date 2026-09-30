@@ -159,9 +159,15 @@ export class TerminalPool implements vscode.Disposable {
       entry.leased = true;
       this.log(`terminal reused: ${entry.terminal.name}`);
     } else {
-      // One stable name per worktree. Numbered or operation-specific names
-      // made every extra terminal look like a separate thing worth keeping.
-      const name = runnerTerminalName(cwd);
+      // One stable name per worktree — the reload-adoption path and the
+      // busy-worktree refusal both keep it that way, so the common case
+      // never needed a number. But a terminal the person occupied with
+      // something of their own still forces a second, concurrent terminal
+      // for the same worktree (see the module doc above), and that one
+      // needs a name of its own or the two are indistinguishable to anyone
+      // reading the pool, including reuse and cleanup.
+      const sameWorktree = this.entries.filter((candidate) => candidate.key === key && !candidate.dedicated).length;
+      const name = sameWorktree > 0 ? `${runnerTerminalName(cwd)} (${sameWorktree + 1})` : runnerTerminalName(cwd);
       const terminal = vscode.window.createTerminal({ name, cwd, iconPath: new vscode.ThemeIcon("debug-alt") });
       this.log(explainCreation(choice.because, name, cwd));
       entry = { terminal, cwd, key, dedicated: false, leased: true, active: new Set(), observable: terminal.shellIntegration !== undefined };
