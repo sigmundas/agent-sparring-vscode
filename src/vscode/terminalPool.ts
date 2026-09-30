@@ -45,7 +45,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { descendantsOf, processExists, type ProcessInfo } from "../core/processTree";
 import { listProcesses, processProbeSupported } from "./processProbe";
-import { chooseOwnedTerminal, distinctTerminalName, explainCreation, redundantTerminals, terminalKey, unavailability, type OwnedTerminalState } from "../core/terminalOccupancy";
+import { chooseOwnedTerminal, distinctTerminalName, explainCreation, isDistinctTerminalName, redundantTerminals, terminalKey, unavailability, type OwnedTerminalState } from "../core/terminalOccupancy";
 
 /** The name prefix of every terminal this extension creates. */
 export const RUNNER_TERMINAL_PREFIX = "Agent Sparring — ";
@@ -512,12 +512,13 @@ function openedFor(terminal: vscode.Terminal): string | undefined {
 
 /**
  * Opened for this worktree: by its creation options, or — when a restored
- * terminal no longer carries them — by its stable name together with the
- * working directory its shell reports.
+ * terminal no longer carries them — by its name (plain or numbered, see
+ * `distinctTerminalName`) together with the working directory its shell
+ * reports.
  */
 function openedHere(terminal: vscode.Terminal, cwd: string, key: string): boolean {
   const opened = openedFor(terminal);
-  return opened !== undefined ? opened === key : terminal.name === runnerTerminalName(cwd) && reportedCwd(terminal) === key;
+  return opened !== undefined ? opened === key : isDistinctTerminalName(terminal.name, runnerTerminalName(cwd)) && reportedCwd(terminal) === key;
 }
 
 /** The worktree its shell says it is in, when shell integration reports one. */

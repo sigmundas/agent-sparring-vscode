@@ -53,6 +53,23 @@ export function distinctTerminalName(base: string, taken: Iterable<string>): str
 }
 
 /**
+ * Whether `name` is one `distinctTerminalName(base, …)` could have given:
+ * `base` itself or `base (n)` for n >= 2. Recognising a restored terminal
+ * by name has to accept the numbered form too, or a numbered terminal is
+ * never reused after the next reload and one more piles up each time.
+ */
+export function isDistinctTerminalName(name: string, base: string): boolean {
+  if (name === base) {
+    return true;
+  }
+  if (!name.startsWith(`${base} (`) || !name.endsWith(")")) {
+    return false;
+  }
+  const number = name.slice(base.length + 2, -1);
+  return /^[1-9]\d*$/.test(number) && Number(number) >= 2;
+}
+
+/**
  * The repository/worktree identity a terminal is kept for: the resolved real
  * path in the same canonical form repository selection compares, so
  * `/tmp/x` and `/private/tmp/x`, or two spellings differing in case on

@@ -15,7 +15,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { chooseOwnedTerminal, distinctTerminalName, explainCreation, unavailability, type OwnedTerminalState } from "../core/terminalOccupancy";
+import { chooseOwnedTerminal, distinctTerminalName, explainCreation, isDistinctTerminalName, unavailability, type OwnedTerminalState } from "../core/terminalOccupancy";
 
 const PROJECT = "/Users/someone/Code/sporely-py";
 const OTHER = "/Users/someone/Code/sporely-web";
@@ -101,5 +101,20 @@ describe("distinct terminal names", () => {
     // Two terminals open, but (2) is the one that was closed.
     assert.equal(distinctTerminalName(X, [X, `${X} (3)`]), `${X} (2)`);
     assert.equal(distinctTerminalName(X, [`${X} (2)`, X, "zsh"]), `${X} (3)`);
+  });
+});
+
+describe("recognising a runner terminal by name", () => {
+  const X = "Agent Sparring — sporely-py";
+  it("accepts the plain and every numbered name distinctTerminalName can give", () => {
+    assert.equal(isDistinctTerminalName(X, X), true);
+    assert.equal(isDistinctTerminalName(`${X} (2)`, X), true);
+    assert.equal(isDistinctTerminalName(`${X} (13)`, X), true);
+    assert.equal(isDistinctTerminalName(distinctTerminalName(X, [X, `${X} (2)`]), X), true);
+  });
+  it("rejects anything else", () => {
+    for (const name of [`${X} (1)`, `${X} (0)`, `${X} (02)`, `${X} (2b)`, `${X} ()`, `${X}-web`, `${X}-web (2)`, `${X} (2) (3)`, "zsh"]) {
+      assert.equal(isDistinctTerminalName(name, X), false, name);
+    }
   });
 });

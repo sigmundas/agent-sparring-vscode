@@ -259,6 +259,32 @@ describe("one reusable terminal per worktree", () => {
     }
   });
 
+  it("after a reload a numbered terminal restored without creation options is still adopted", async () => {
+    // VS Code restores some terminals without their creation options; then
+    // only the name and the cwd the shell reports say whose it is.
+    const old = new FakeTerminal(`Agent Sparring — ${path.basename(py)} (2)`, 5101);
+    old.shellIntegration = new FakeShellIntegration(old);
+    (old.shellIntegration as unknown as { cwd: { fsPath: string } }).cwd = { fsPath: py };
+    stub.window.terminals.push(old);
+    restoredTerminals.add(old);
+    const lookalike = new FakeTerminal(`Agent Sparring — ${path.basename(py)} (2b)`, 5102);
+    lookalike.shellIntegration = new FakeShellIntegration(lookalike);
+    (lookalike.shellIntegration as unknown as { cwd: { fsPath: string } }).cwd = { fsPath: py };
+    stub.window.terminals.push(lookalike);
+    restoredTerminals.add(lookalike);
+    const h = host(() => [
+      { pid: 5101, ppid: 1, command: "-zsh" },
+      { pid: 5102, ppid: 1, command: "-zsh" },
+    ]);
+    try {
+      const first = await complete(run(h, py, "prepare-plan"));
+      assert.equal(first.terminal, old, "its shell is proven idle: adopted, not joined by another");
+      assert.equal(stub.window.created.length, 0);
+    } finally {
+      h.dispose();
+    }
+  });
+
   it("a concurrent terminal takes the lowest name no open terminal uses, never a duplicate", async () => {
     const h = host();
     const occupy = (terminal: FakeTerminal) => {
