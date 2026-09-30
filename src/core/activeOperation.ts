@@ -134,7 +134,8 @@ export function operationTitle(record: Pick<OperationRecord, "subcommand" | "lab
     case "run-sparring":
       return stage ? `Reviewing ${stage}` : "Reviewing stage";
     default:
-      return `Running ${record.subcommand}`;
+      // The engine's subcommand is shown under Technical details.
+      return "Running an Agent Sparring command";
   }
 }
 
@@ -251,7 +252,18 @@ export function workingFor(view: Pick<ActiveOperationView, "startedAtMs">, nowMs
 }
 
 /** "prepare-plan succeeded at 19:14:32, after 4m 26s" — the last settled operation, never rendered as active. */
-export function settledOperationLine(record: SettledOperationRecord | undefined): { liveness: OperationLiveness; text: string } | undefined {
+/**
+ * The last operation, for the person: what happened in plain words and
+ * when. The engine's own command line and exit code go in `technical`,
+ * which is shown only under Technical details.
+ */
+export interface SettledOperationLine {
+  liveness: OperationLiveness;
+  text: string;
+  technical?: string[];
+}
+
+export function settledOperationLine(record: SettledOperationRecord | undefined): SettledOperationLine | undefined {
   if (!record) {
     return undefined;
   }
@@ -262,8 +274,30 @@ export function settledOperationLine(record: SettledOperationRecord | undefined)
   const at = new Date(record.endedAtMs);
   const clock = [at.getHours(), at.getMinutes(), at.getSeconds()].map((part) => String(part).padStart(2, "0")).join(":");
   const took = formatElapsed(record.endedAtMs - record.submittedAtMs);
+  const target = displayTarget(record);
   return {
     liveness,
-    text: `${record.subcommand} ${liveness === "succeeded" ? "succeeded" : `failed (exit ${record.exitCode})`} at ${clock}, after ${took}`,
+    text: `${liveness === "succeeded" ? settledTitle(record) : `${operationTitle(record)} failed`} at ${clock}, after ${took}`,
+    technical: [[record.subcommand, ...(target ? [target] : [])].join(" "), `exit code ${record.exitCode}`],
   };
+}
+
+/** What a finished operation did, in the past tense. */
+function settledTitle(record: Pick<OperationRecord, "subcommand" | "label" | "stageId">): string {
+  const stage = stageName(record);
+  switch (record.subcommand) {
+    case "prepare-plan":
+      return "Updated intake prepared";
+    case "approve-plan":
+      return stage ? `${stage} approved` : "Plan stage approved";
+    case "run-plan":
+    case "resume-plan":
+    case "run-loop":
+    case "resume-loop":
+      return stage ? `Run of ${stage} finished` : "Plan run finished";
+    case "run-sparring":
+      return stage ? `Review of ${stage} finished` : "Review finished";
+    default:
+      return "Agent Sparring command finished";
+  }
 }

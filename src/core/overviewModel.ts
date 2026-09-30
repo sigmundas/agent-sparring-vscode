@@ -18,7 +18,7 @@
  * tooltips and the footer.
  */
 
-import type { ActiveOperationView, OperationLiveness } from "./activeOperation";
+import type { ActiveOperationView, SettledOperationLine } from "./activeOperation";
 import { describeRepositoryContext, emptyStateLines, emptyStateTitle, SELECT_RUN_LABEL, type RepositoryContextView } from "./activeRepository";
 import { SETUP_NOT_IGNORED, SETUP_OBSOLETE_AGENT_SETTING, agentConfigView, providerLabel, withStagePin, type AgentConfigView, type ConfigRole, type EffectiveConfig } from "./effectiveConfig";
 import { parseBriefGoal, parseBriefOpening } from "./brief";
@@ -284,7 +284,7 @@ export interface OverviewArtifacts {
    */
   activeOperation?: ActiveOperationView;
   /** The last operation that ended there in this window, when its exit code is known. */
-  lastOperation?: { liveness: OperationLiveness; text: string };
+  lastOperation?: SettledOperationLine;
   /** For the intake screen: the source plan changed since this intake read it. */
   intakeRecovery?: IntakeRecovery;
   handoff: boolean;
@@ -1002,7 +1002,7 @@ export function setupNotice(config: EffectiveConfig | undefined): SetupNotice | 
 export interface OverviewModel {
   /** What Agent Sparring is running in this repository right now; see {@link OverviewArtifacts.activeOperation}. */
   activeOperation?: ActiveOperationView;
-  lastOperation?: { liveness: OperationLiveness; text: string };
+  lastOperation?: SettledOperationLine;
   /** A fixable setup problem of this repository; see {@link SetupNotice}. */
   setup?: SetupNotice;
   /** The slice on screen needs a feature branch; see {@link BranchNotice}. */

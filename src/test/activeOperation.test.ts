@@ -50,6 +50,11 @@ async function preparedIntake(): Promise<{ root: string; intake: DiscoveredIntak
   return { root, intake: discovery.intakes![0] };
 }
 
+/** What a person reads: the text, not tag names or attributes. */
+function visibleText(html: string): string {
+  return html.replace(/<[^>]*>/g, "");
+}
+
 function record(over: Partial<OperationRecord> = {}): OperationRecord {
   return {
     id: "operation-1",
@@ -92,8 +97,12 @@ describe("the active operation on the Overview", () => {
     assert.match(html, /Preparing updated intake/);
     const start = html.indexOf('<section class="active-operation"');
     const banner = html.slice(start, html.indexOf("</section>", start));
-    assert.match(banner, /prepare-plan/);
     assert.doesNotMatch(banner, /approve-plan/, "approve-plan never appears as the current operation");
+    // The engine's command line is kept, but only under Technical details.
+    const bannerTechnical = banner.indexOf("<summary>Technical details</summary>");
+    assert.ok(bannerTechnical > 0, "the banner has a Technical details fold");
+    assert.doesNotMatch(visibleText(banner.slice(0, bannerTechnical)), /prepare-plan|docs\/plan\.md/, "no subcommand or target outside Technical details");
+    assert.match(banner.slice(bannerTechnical), /<pre class="command">prepare-plan docs\/plan\.md<\/pre>/);
     const technical = html.slice(html.indexOf('<details class="intake-technical">'));
     assert.match(technical, /not what is running now/);
     assert.ok(technical.includes("approve-plan"), "only under Technical details");
@@ -121,6 +130,7 @@ describe("the active operation on the Overview", () => {
     assert.equal(operationTitle({ subcommand: "prepare-plan", label: "Prepare x" }), "Preparing updated intake");
     assert.equal(operationTitle({ subcommand: "approve-plan", label: "Approve Stage 3R" }), "Approving Stage 3R");
     assert.equal(operationTitle({ subcommand: "run-plan", label: "Run Stage 3R" }), "Running Stage 3R");
+    assert.equal(operationTitle({ subcommand: "freeze-candidate", label: "x" }), "Running an Agent Sparring command", "never the raw subcommand");
   });
 
   it("liveness states are explicit, and nothing is claimed about the model", () => {
@@ -149,11 +159,19 @@ describe("the active operation on the Overview", () => {
     assert.equal(activeOperationView([]), undefined);
     const ok = settledOperationLine({ label: "p", subcommand: "prepare-plan", repoRoot: "/r", cwd: "/r", submittedAtMs: 0, endedAtMs: 266_000, exitCode: 0 })!;
     assert.equal(ok.liveness, "succeeded");
-    assert.match(ok.text, /^prepare-plan succeeded at \d\d:\d\d:\d\d, after 4m 26s$/);
-    assert.equal(settledOperationLine({ label: "p", subcommand: "approve-plan", repoRoot: "/r", cwd: "/r", submittedAtMs: 0, endedAtMs: 1, exitCode: 1 })!.liveness, "failed");
-    const html = renderOverviewHtml({ kind: "empty", title: "app", lastOperation: ok }, "n", "c");
+    assert.match(ok.text, /^Updated intake prepared at \d\d:\d\d:\d\d, after 4m 26s$/);
+    const failed = settledOperationLine({ label: "Approve Stage 3W", subcommand: "approve-plan", repoRoot: "/r", cwd: "/r", target: "/r/.sparring/intake/i1#run_3w_web", submittedAtMs: 0, endedAtMs: 1, exitCode: 1 })!;
+    assert.equal(failed.liveness, "failed");
+    assert.match(failed.text, /^Approving Stage 3W failed at \d\d:\d\d:\d\d, after 0s$/);
+    assert.deepEqual(failed.technical, [".sparring/intake/i1 --run run_3w_web".replace(/^/, "approve-plan "), "exit code 1"]);
+    assert.match(settledOperationLine({ label: "Approve Stage 3W", subcommand: "approve-plan", repoRoot: "/r", cwd: "/r", submittedAtMs: 0, endedAtMs: 1, exitCode: 0 })!.text, /^Stage 3W approved at /);
+    const html = renderOverviewHtml({ kind: "empty", title: "app", lastOperation: failed }, "n", "c");
     assert.doesNotMatch(html, /class="active-operation"/);
-    assert.match(html, /Last operation: prepare-plan succeeded/);
+    assert.match(html, /Last operation: Approving Stage 3W failed at/);
+    const technical = html.indexOf("<summary>Technical details</summary>");
+    assert.ok(technical > 0);
+    assert.doesNotMatch(visibleText(html.slice(0, technical)), /approve-plan|run_3w_web|exit code/, "engine wording only under Technical details");
+    assert.match(html.slice(technical), /<pre class="command">approve-plan \.sparring\/intake\/i1 --run run_3w_web\nexit code 1<\/pre>/);
   });
 
   it("an approve-plan running from a slice's own repository is relevant to the intake on screen", () => {

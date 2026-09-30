@@ -1972,7 +1972,11 @@ function renderOperation(model: OverviewModel): string {
   const active = model.activeOperation;
   if (!active) {
     const last = model.lastOperation;
-    return last ? `<p class="muted small last-operation">${icon(last.liveness === "failed" ? "warn" : "check", last.liveness === "failed" ? "escalate" : "")}Last operation: ${escapeHtml(last.text)}</p>` : "";
+    if (!last) {
+      return "";
+    }
+    const line = `<p class="muted small last-operation">${icon(last.liveness === "failed" ? "warn" : "check", last.liveness === "failed" ? "escalate" : "")}Last operation: ${escapeHtml(last.text)}</p>`;
+    return last.technical && last.technical.length > 0 ? `${line}\n${operationTechnical(model, "last-operation", last.technical)}` : line;
   }
   const elapsed = workingFor(active, Date.now());
   const meta = [...active.meta.map(escapeHtml), ...(elapsed ? [`<span data-started-ms="${active.startedAtMs}">${escapeHtml(elapsed)}</span>`] : [])];
@@ -1980,10 +1984,15 @@ function renderOperation(model: OverviewModel): string {
 <div class="op-title">${icon(active.liveness === "liveness_unknown" ? "warn" : "pulse", active.liveness === "liveness_unknown" ? "escalate" : "")}<strong>${escapeHtml(active.title)}</strong></div>
 ${meta.length > 0 ? `<div class="muted small">${meta.join(" · ")}</div>` : ""}
 ${active.note ? `<div class="muted small">${escapeHtml(active.note)}</div>` : ""}
-<pre class="command">${active.command.map(escapeHtml).join("\n")}</pre>
 ${active.activity.length > 0 ? `<div class="small">Activity:<ul class="op-activity">${active.activity.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul></div>` : ""}
 <div class="actions">${button("showLog", "Show activity")}${active.terminalName ? button("showTerminal", "Show terminal") : ""}</div>
+${operationTechnical(model, "active-operation", [active.command.join(" ")])}
 </section>`;
+}
+
+/** The engine's command line for an operation, folded away under Technical details. */
+function operationTechnical(model: OverviewModel, which: string, lines: readonly string[]): string {
+  return `<details class="tech"${disclose(discloseScope(model), which, "technical")}><summary>Technical details</summary><pre class="command">${lines.map(escapeHtml).join("\n")}</pre></details>`;
 }
 
 function button(action: OverviewAction, label: string, enabled = true, title?: string, cls = ""): string {
