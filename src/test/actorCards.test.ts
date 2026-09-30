@@ -145,13 +145,14 @@ describe("each actor card is its own configuration surface", () => {
     const html = renderOverviewHtml(buildOverviewModel(await planSelection(), undefined, artifacts(parsed()), NOW), "n", "c");
 
     const stage = card(html, "Stage agent");
-    assert.match(stage, /<div class="agentconfig-effective" data-effective="model">Model: opus · Your preference<\/div>/);
+    assert.match(stage, /<details class="setup-technical agentconfig-technical"[^>]*><summary>Technical details<\/summary><pre class="engineerror">[^<]*Configured model: opus\nModel source: user\n/);
+    assert.doesNotMatch(stage, /agentconfig-effective/, "no static Model line beside the dropdown");
     assert.match(stage, /data-role="stage"[^>]*data-field="model"/);
     assert.match(stage, /data-role="stage"[^>]*data-field="effort"/);
     assert.doesNotMatch(stage, /data-role="sparring"/, "the stage card configures the stage role only");
 
     const sparrer = card(html, "Sparrer");
-    assert.match(sparrer, /<div class="agentconfig-effective" data-effective="model">Model: gpt-5\.6-terra · Your preference<\/div>/);
+    assert.match(sparrer, /Configured model: gpt-5\.6-terra\nModel source: user\n/);
     assert.match(sparrer, /data-role="sparring"[^>]*data-field="effort"/);
     assert.doesNotMatch(sparrer, /data-role="stage"/);
 
@@ -165,7 +166,7 @@ describe("each actor card is its own configuration surface", () => {
       );
     }
     for (const model of ["opus", "gpt-5.6-terra"]) {
-      assert.equal((html.match(new RegExp(`>Model: ${model.replace(".", "\\.")} ·`, "g")) ?? []).length, 1, `${model} is stated once`);
+      assert.equal((html.match(new RegExp(`Configured model: ${model.replace(".", "\\.")}\\n`, "g")) ?? []).length, 1, `${model} is stated once`);
     }
   });
 
@@ -184,14 +185,16 @@ describe("each actor card is its own configuration surface", () => {
     const html = renderOverviewHtml(buildOverviewModel(await planSelection(), undefined, artifacts(exotic), NOW), "n", "c");
 
     const stage = card(html, "Stage agent");
-    assert.match(stage, />Model: some-model-2031-preview · Your preference</, "whatever the engine resolved, stated verbatim");
+    assert.match(stage, /Configured model: some-model-2031-preview\nModel source: user\n/, "whatever the engine resolved, stated verbatim");
     assert.match(stage, /<option value="some-model-2031-preview" selected>some-model-2031-preview<\/option>/, "and selected, though nothing suggested it");
     assert.match(stage, /<option value="[^"]*" data-custom="1">Other exact model…<\/option>/, "an exact id can always be entered");
     assert.doesNotMatch(stage, /<input[^>]*data-field="model"/, "no free-text box that would post per keystroke");
 
     // No preference is the words for that, quietly, and never a model name.
     const sparrer = card(html, "Sparrer");
-    assert.match(sparrer, new RegExp(`<div class="agentconfig-effective novalue" data-effective="model">Model: ${PROVIDER_DEFAULT_LABEL}</div>`));
+    assert.match(sparrer, /Configured model: none \(the provider chooses\)\n/);
+    assert.match(sparrer, /<select data-role="sparring"[^>]*data-field="model"[^>]*><option value="" selected>Provider default<\/option>/, "the dropdown itself shows Provider default");
+    assert.doesNotMatch(sparrer, /agentconfig-effective/);
     assert.doesNotMatch(sparrer, /data-runtime-model/, "no runtime model is claimed when the provider stated none");
   });
 
@@ -205,7 +208,7 @@ describe("each actor card is its own configuration surface", () => {
     assert.equal(model.sparrer?.runtimeModel, undefined, "the sparrer's provider stated nothing");
     const html = renderOverviewHtml(model, "n", "c");
     const stage = card(html, "Stage agent");
-    assert.match(stage, />Model: opus · Your preference</, "the configured model is unchanged by what ran");
+    assert.match(stage, /<option value="opus" selected>opus<\/option>/, "the configured model is unchanged by what ran");
     assert.match(stage, /<div class="agentconfig-runtime muted" data-runtime-model="claude-opus-5-5-20260901">Provider reported running claude-opus-5-5-20260901<\/div>/);
     const technical = /<details class="setup-technical agentconfig-technical"[^>]*><summary>Technical details<\/summary><pre class="engineerror">([\s\S]*?)<\/pre>/.exec(stage)?.[1] ?? "";
     assert.match(technical, /Role: stage/);
@@ -430,7 +433,7 @@ describe("the cards before anything is running", () => {
     assert.equal(model.sparrer?.sessionLabel, undefined);
 
     const html = renderOverviewHtml(model, "n", "c");
-    assert.match(card(html, "Stage agent"), /data-effective="model">Model: /);
+    assert.match(card(html, "Stage agent"), /Configured model: /);
     assert.match(card(html, "Sparrer"), /data-role="sparring"[^>]*data-field="effort"/);
     assert.doesNotMatch(html, /class="statepill/, "no Working/Idle word for a run that does not exist");
     assert.doesNotMatch(html, /class="statenote/);

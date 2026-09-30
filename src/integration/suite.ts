@@ -1271,10 +1271,10 @@ async function actorCardControlAssertions(): Promise<void> {
         var providerLine = card.querySelector('.provider');
         var cardBox = card.getBoundingClientRect();
         var effortBox = effort.getBoundingClientRect();
-        // The model as the page actually renders it: the configured value in
-        // words, and a dropdown (not a text box) to change the preference.
+        // The model as the page actually renders it: a dropdown (not a text
+        // box) showing the configured value, with no static line repeating it.
         var modelSelect = card.querySelector('select[data-field="model"]');
-        var modelEffective = card.querySelector('.agentconfig-effective[data-effective="model"]');
+        var modelEffective = card.querySelector('.agentconfig-effective');
         var modelBox = modelSelect.getBoundingClientRect();
         var size = function (node) { return parseFloat(getComputedStyle(node).fontSize); };
         __api.postMessage({
@@ -1296,6 +1296,7 @@ async function actorCardControlAssertions(): Promise<void> {
           modelValue: modelSelect.value,
           modelOptions: Array.prototype.map.call(modelSelect.options, function (option) { return [option.value, option.hasAttribute('data-custom')]; }),
           modelEffective: modelEffective ? modelEffective.textContent : null,
+          modelSelected: modelSelect.value,
           modelEditable: card.querySelectorAll('input[data-field], [contenteditable]').length,
           // Both dropdowns start on the same column.
           modelAlignsWithEffort: Math.abs(modelBox.left - effortBox.left) < 1,
@@ -1335,7 +1336,8 @@ async function actorCardControlAssertions(): Promise<void> {
       [["", false], ["a-model", false], [CUSTOM_MODEL_VALUE, true]],
       "Provider default, the configured model although nothing suggested it, and Other exact model…",
     );
-    assert.equal(seen["modelEffective"], "Model: a-model · Your preference", "the exact configured model and where it came from, in words");
+    assert.equal(seen["modelEffective"], null, "no static Model line repeats the dropdown");
+    assert.equal(seen["modelSelected"], "a-model", "the dropdown itself shows the configured model");
     assert.equal(seen["modelEditable"], 0, "and nothing on the card can be typed into");
     assert.equal(seen["modelAlignsWithEffort"], true, "the two dropdowns start on the same column");
     // The reported bug: opening one actor's instructions moved the other

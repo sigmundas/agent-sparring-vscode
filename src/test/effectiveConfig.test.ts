@@ -323,7 +323,8 @@ describe("the Overview shows the configuration and offers Settings", () => {
     const model = buildOverviewModel(await planSelection(), undefined, artifacts(parsed()), NOW);
     const html = renderOverviewHtml(model, "nonce", "csp:");
     assert.match(html, /data-action="openSettings"/);
-    assert.match(html, /<div class="agentconfig-effective" data-effective="model">Model: claude-opus-5-5 · Your preference<\/div>/, "the exact model and where it came from, stated");
+    assert.doesNotMatch(html, /agentconfig-effective/, "the dropdown shows the choice; no static line repeats it");
+    assert.match(html, /Configured model: claude-opus-5-5\nModel source: user\n/, "where it came from stays under Technical details");
     assert.match(html, /<select data-role="stage"[^>]*data-field="model"/, "and a dropdown to change it");
     assert.match(html, /<select data-role="stage"[^>]*data-field="effort"/);
     assert.match(html, /<select data-role="sparring"[^>]*data-field="effort"/);
