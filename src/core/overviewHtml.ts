@@ -1282,7 +1282,6 @@ function stageActionButton(action: StageRunAction, stageId: string | undefined, 
 }
 
 function renderStageCard(model: OverviewModel): string {
-  const scope = discloseScope(model);
   const accepted = model.whatsNext !== undefined;
   const handedOver = model.actionRequired !== undefined;
   // Once accepted, the header pill already says Accepted: the card line
@@ -1365,23 +1364,14 @@ function renderStageCard(model: OverviewModel): string {
   // someone who came here to answer a review. The Brief button already says
   // whether there is a brief at all.
   const goal = model.goal ? `<div class="block"><h3>${icon("target", "accent")}Goal</h3><p class="goal">${escapeHtml(model.goal)}</p></div>` : "";
-  let sparring = `<div class="block"><h3>${icon("chat")}Latest sparring result</h3><p class="muted">No routing outcome recorded yet.</p></div>`;
-  if (handedOver) {
-    sparring = ""; // the Action required panel is the latest sparring result
-  } else if (model.lastSparring) {
-    const result = model.lastSparring;
-    const reason = result.reason ? ` <span class="muted">(${escapeHtml(result.reason)})</span>` : "";
-    const iconName = result.action === "READY" ? "check" : "warn";
-    const summary = result.summary ? `<p>${escapeHtml(result.summary)}</p>` : "";
-    // "Read feedback" expands the reviewer's full written report inline
-    // (rendered Markdown, verbatim); "Open full report" still opens
-    // sparring.md itself in the editor, unchanged.
-    const feedback = result.report
-      ? `<details class="report"${disclose(scope, "sparring-report")}><summary>Read feedback</summary><div class="reportbody">${renderReportMarkdown(result.report)}</div>${button("openSparring", "Open full report", model.actions?.sparring !== false, "Open sparring.md")}</details>`
-      : "";
-    sparring = `<div class="block"><h3>${icon(iconName, result.action.toLowerCase())}Latest sparring result</h3>
-<p><span class="verdict ${escapeHtml(result.action.toLowerCase())}" title="${escapeHtml(`Routing action: ${result.action}`)}">${escapeHtml(result.badge)}</span>${reason}</p>
-${summary}${feedback}</div>`;
+  // The sparring result is the sparrer's own conclusion, so it is read on the
+  // Sparrer card, where it stays in view for the whole stage. Only a page with
+  // no Sparrer card to put it on keeps it here.
+  let sparring = "";
+  if (!handedOver && !model.sparrer) {
+    sparring = model.lastSparring
+      ? `<div class="block"><h3>${icon(model.lastSparring.action === "READY" ? "check" : "warn", model.lastSparring.action.toLowerCase())}Latest sparring result</h3>${renderSparringVerdict(model.lastSparring)}</div>`
+      : `<div class="block"><h3>${icon("chat")}Latest sparring result</h3><p class="muted">No routing outcome recorded yet.</p></div>`;
   }
   const planPlace = renderPlanPlace(model);
 
@@ -1433,6 +1423,39 @@ ${right}
 </div>
 </div>
 </section>`;
+}
+
+/**
+ * The sparrer's latest verdict and the plain summary under it. The routing
+ * action itself is only a tooltip: the badge is the words for it.
+ */
+function renderSparringVerdict(result: NonNullable<OverviewModel["lastSparring"]>): string {
+  const reason = result.reason ? ` <span class="muted">(${escapeHtml(result.reason)})</span>` : "";
+  const summary = result.summary ? `<p class="sparsummary">${escapeHtml(result.summary)}</p>` : "";
+  return `<p class="sparverdict"><span class="verdict ${escapeHtml(result.action.toLowerCase())}" title="${escapeHtml(`Routing action: ${result.action}`)}">${escapeHtml(result.badge)}</span>${reason}</p>${summary}`;
+}
+
+/** The id the Sparrer card's Read feedback toggle points at. */
+const FEEDBACK_PANEL_ID = "feedback-sparrer";
+const READ_FEEDBACK = "Read feedback";
+const HIDE_FEEDBACK = "Hide feedback";
+
+/**
+ * The reviewer's full written report, as a panel below both cards: it is
+ * one of the Sparrer card's tabs, next to its instructions, and is read at
+ * the width of the page rather than squeezed into a half-width card.
+ * "Open full report" still opens sparring.md itself in the editor.
+ */
+function renderFeedbackPanel(model: OverviewModel, scope: string): string {
+  const result = model.lastSparring;
+  if (!result?.report || model.actionRequired !== undefined) {
+    return "";
+  }
+  const who = whoClass(model.sparrer?.provider ?? "");
+  return `<div class="instrpanel ${who}" id="${FEEDBACK_PANEL_ID}" data-instrpanel="feedback"${disclose(scope, "sparring-report")} hidden>
+<div class="instrhead ${who}">Sparrer <span class="muted">· feedback</span></div>
+<div class="reportbody">${renderReportMarkdown(result.report)}</div>
+<div class="actions feedbackactions">${button("openSparring", "Open full report", model.actions?.sparring !== false, "Open sparring.md")}</div></div>`;
 }
 
 const CHOOSE_PLAN_TITLE = "Pick the Markdown plan this stage belongs to (kept in VS Code only; the engine is not told)";
@@ -1597,14 +1620,20 @@ function renderActors(model: OverviewModel, scope: string): string {
   const controlsFor = (role: ConfigRole): AgentRoleControls | undefined =>
     configScope ? config?.controls.find((entry) => entry.role === role) : undefined;
   const actors = [model.stageAgent, model.sparrer].filter((card): card is ActorCard => card !== undefined);
-  const cards = actors.map((card) => renderActor(card, controlsFor(card.configRole), configScope)).join("");
+  const sparring = model.actionRequired === undefined ? model.lastSparring : undefined;
+  const feedback = renderFeedbackPanel(model, scope);
+  const cards = actors
+    .map((card) =>
+      renderActor(card, controlsFor(card.configRole), configScope, actorRole(card) === "sparrer" ? { sparring, feedback: feedback !== "" } : {}),
+    )
+    .join("");
   // Every panel is laid out after every card, so the cards keep their row
   // whichever of them is open, and an opened panel appears below both of
   // them at the width of the rest of the page rather than in a half-width
   // column. They behave as a tab strip: at most one is open, each names the
   // actor it belongs to and carries that actor's colour, and the card it
   // came from is marked while it is open.
-  const panels = actors.map((card) => renderInstructionsPanel(card, scope)).join("");
+  const panels = `${actors.map((card) => renderInstructionsPanel(card, scope)).join("")}${feedback}`;
   const section = cards ? `<section class="actors">${cards}${panels}</section>` : "";
   return `${section}${config ? renderAgentsBar(config, cards !== "") : ""}`;
 }
@@ -1624,7 +1653,12 @@ function renderActors(model: OverviewModel, scope: string): string {
  * around the card -- a summary activates on click, and an effort dropdown
  * inside one would collapse the card it is in as often as not.
  */
-function renderActor(card: ActorCard, controls: AgentRoleControls | undefined, configScope: string | undefined): string {
+function renderActor(
+  card: ActorCard,
+  controls: AgentRoleControls | undefined,
+  configScope: string | undefined,
+  extra: { sparring?: OverviewModel["lastSparring"]; feedback?: boolean } = {},
+): string {
   const busy = card.activity === "Working" || card.activity === "Sparring";
   const duration = card.duration ? ` for ${escapeHtml(card.duration)}` : "";
   // Read on their own line under the state, so neither carries the leading
@@ -1664,25 +1698,38 @@ function renderActor(card: ActorCard, controls: AgentRoleControls | undefined, c
   const statenote = notes ? `<div class="statenote">${notes}</div>` : "";
   const identity = `<div class="identity"><span class="avatar ${who}">${avatarGlyph(role)}</span>
 <div class="who"><div class="rolename ${who}">${escapeHtml(card.role)}</div><div class="provider muted">${escapeHtml(card.provider)}</div></div>${activity}</div>${statenote}`;
-  const dials = renderGauges(card.gauges);
+  // The model the provider reported running is read under the dials, as a
+  // plain name: it is a fact about the session, like what the dials show,
+  // and not a setting.
+  const runtime = card.runtimeModel
+    ? `<div class="runtimemodel muted" data-runtime-model="${escapeHtml(card.runtimeModel)}" title="The model the provider reported running">${escapeHtml(card.runtimeModel)}</div>`
+    : "";
+  const gauges = renderGauges(card.gauges);
+  const dials = gauges || runtime ? `<div class="dialcol">${gauges}${runtime}</div>` : "";
   // The dials sit beside Model and Effort rather than under them, and they
   // are drawn even where there is nothing to configure: what a provider is
   // spending is worth seeing on a card that offers no controls too.
-  const settings = controls && configScope ? renderRoleControls(controls, configScope, dials, card.runtimeModel) : dials ? `<div class="agentconfig-block">${dials}</div>` : "";
-  const body = `${identity}${settings}`;
+  const role_ = controls && configScope ? renderRoleControls(controls, configScope, dials, card.runtimeModel) : undefined;
+  const settings = role_ ? role_.block : dials ? `<div class="agentconfig-block">${dials}</div>` : "";
+  const verdict = extra.sparring ? `<div class="sparresult">${renderSparringVerdict(extra.sparring)}</div>` : "";
+  // One footer line: the card's tabs on the left (its instructions, and on
+  // the Sparrer card its written feedback), Technical details on the right.
   // No captured prompt means the engine has not run a turn for this actor
-  // since prompt capture existed. An ordinary state, so the card simply
-  // stays a card rather than offering a disclosure that would open on
-  // nothing.
-  if (!card.prompt) {
-    return `<div class="card actor ${who}" data-role="${role}">${body}</div>`;
-  }
-  // The toggle stays on the card; what it opens is rendered after both cards
-  // (see `renderActors`), so opening one actor's instructions never moves the
-  // other actor's card. `aria-controls` is the only thing tying the two
-  // together in the document, and the script relies on the same pairing.
-  return `<div class="card actor ${who}" data-role="${role}">${body}
-<button type="button" class="showinstr" data-instr="${role}" aria-controls="${instrPanelId(role)}" aria-expanded="false" data-show="${SHOW_INSTRUCTIONS}" data-hide="${HIDE_INSTRUCTIONS}">${SHOW_INSTRUCTIONS}</button></div>`;
+  // since prompt capture existed, so there is no instructions tab to offer.
+  // The panels a tab opens are rendered after both cards (see
+  // `renderActors`), so opening one never moves the other actor's card;
+  // `aria-controls` is the only thing tying a tab to its panel.
+  const tabs = [
+    card.prompt
+      ? `<button type="button" class="showinstr" data-instr="${role}" aria-controls="${instrPanelId(role)}" aria-expanded="false" data-show="${SHOW_INSTRUCTIONS}" data-hide="${HIDE_INSTRUCTIONS}">${SHOW_INSTRUCTIONS}</button>`
+      : "",
+    extra.feedback
+      ? `<button type="button" class="showinstr" data-instr="feedback" aria-controls="${FEEDBACK_PANEL_ID}" aria-expanded="false" data-show="${READ_FEEDBACK}" data-hide="${HIDE_FEEDBACK}">${READ_FEEDBACK}</button>`
+      : "",
+  ].join("");
+  const technical = role_?.technical ?? "";
+  const foot = tabs || technical ? `<div class="cardfoot">${tabs}${technical}</div>` : "";
+  return `<div class="card actor ${who}" data-role="${role}">${identity}${verdict}${settings}${foot}</div>`;
 }
 
 /**
@@ -1848,14 +1895,11 @@ function whoClass(name: string): string {
  * self-describing and the host never has to infer which repository or
  * provider a change was meant for from whatever is selected when it arrives.
  */
-function renderRoleControls(role: AgentRoleControls, scope: string, dials = "", runtimeModel?: string): string {
+function renderRoleControls(role: AgentRoleControls, scope: string, dials = "", runtimeModel?: string): { block: string; technical: string } {
   const attrs = `data-role="${escapeHtml(role.role)}" data-scope="${escapeHtml(scope)}" data-provider="${escapeHtml(role.provider.value)}"`;
   const items = [...(role.provider.options ? [role.provider] : []), role.model, ...(role.effort ? [role.effort] : [])];
   const rows = items.map((item) => field(item.label, control(item, attrs))).join("");
   const pin = role.stagePin ? `<div class="agentconfig-pin" data-stage-pin="${escapeHtml(role.role)}">${escapeHtml(role.stagePin)}</div>` : "";
-  const runtime = runtimeModel
-    ? `<div class="agentconfig-runtime muted" data-runtime-model="${escapeHtml(runtimeModel)}">Provider reported running ${escapeHtml(runtimeModel)}</div>`
-    : "";
   const technical = [...role.technical, { label: "Runtime-reported model", value: runtimeModel ?? "not stated by the provider" }]
     .map((entry) => `${escapeHtml(entry.label)}: ${escapeHtml(entry.value)}`)
     .join("\n");
@@ -1863,7 +1907,7 @@ function renderRoleControls(role: AgentRoleControls, scope: string, dials = "", 
   // Fields left, dials right. The fields column is what gives way when the
   // card is narrow, because a truncated dropdown is still usable and a
   // squashed dial is not readable at all.
-  return `<div class="agentconfig-block"><div class="agentconfig-fields">${pin}${runtime}${rows}${details}</div>${dials}</div>`;
+  return { block: `<div class="agentconfig-block"><div class="agentconfig-fields">${pin}${rows}</div>${dials}</div>`, technical: details };
 }
 
 /**
@@ -2189,7 +2233,18 @@ pre.engineerror { margin: 6px 0 0; padding: 6px 8px; max-height: 9em; overflow: 
 /* The absence of an override is not a value, so it never borrows a value's
    weight. */
 .agentconfig-pin { font-size: 0.9em; margin-top: 2px; overflow-wrap: anywhere; }
-.agentconfig-runtime { font-size: 0.9em; margin-top: 2px; overflow-wrap: anywhere; }
+.dialcol { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.runtimemodel { font-size: 0.82em; text-align: center; overflow-wrap: anywhere; max-width: 12em; }
+.sparresult { margin: 8px 0 2px; }
+.sparresult p { margin: 0 0 4px; }
+/* One line under the settings: the card's tabs left, Technical details right.
+   Opened, Technical details takes the card's whole width on its own row. */
+.cardfoot { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; margin-top: 8px; }
+.cardfoot > .agentconfig-technical { margin-left: auto; margin-top: 0; }
+.cardfoot > .agentconfig-technical > summary { text-align: right; }
+.cardfoot > .agentconfig-technical[open] { flex-basis: 100%; }
+.feedbackactions { padding: 0 12px 12px; }
+.instrpanel > .reportbody { margin: 8px 12px; }
 .agentconfig-technical { margin-top: 6px; font-size: 0.9em; }
 .agentconfig-fixed.novalue { font-weight: 400; font-style: italic; color: var(--vscode-descriptionForeground); }
 
@@ -2327,9 +2382,6 @@ p { margin: 0 0 4px; line-height: 1.45; }
 .dur { font-weight: 600; }
 /* The reviewer's full report, rendered inline and scrollable once it runs
    long, rather than pushing the rest of the card down. */
-details.report { margin-top: 6px; }
-details.report > summary { cursor: pointer; color: var(--vscode-descriptionForeground); width: fit-content; }
-details.report > summary:hover { color: var(--vscode-foreground); }
 .reportbody { margin: 6px 0; padding: 8px 10px; max-height: 22em; overflow-y: auto; border-left: 2px solid var(--vscode-panel-border); background: var(--vscode-textBlockQuote-background); }
 .reportbody p, .reportbody ul, .reportbody ol { margin: 0 0 6px; }
 .reportbody :last-child { margin-bottom: 0; }
@@ -2376,7 +2428,7 @@ details.report > summary:hover { color: var(--vscode-foreground); }
    not want. The card is the tab and the panel is what the tab opens, so the
    prompt is also read at the width of the rest of the page. */
 .showinstr {
-  display: block; margin: 6px -12px -10px; padding: 4px 12px 8px; width: calc(100% + 24px);
+  display: inline; margin: 0; padding: 0;
   font: inherit; font-size: 0.85em; text-align: left; cursor: pointer;
   color: var(--vscode-textLink-foreground); background: none; border: none;
 }
@@ -2388,7 +2440,7 @@ details.report > summary:hover { color: var(--vscode-foreground); }
    rounding there so the two read as one surface. The colour is painted
    inside the existing border rather than widening it, so selecting a tab
    cannot change the height of the card it is on. */
-.card.actor:has(> .showinstr[aria-expanded="true"]) { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+.card.actor:has(.showinstr[aria-expanded="true"]) { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
 .card.actor.claude:has(> .showinstr[aria-expanded="true"]) { box-shadow: inset 0 -2px 0 var(--claude); }
 .card.actor.codex:has(> .showinstr[aria-expanded="true"]) { box-shadow: inset 0 -2px 0 var(--codex); }
 
@@ -2411,7 +2463,7 @@ details.report > summary:hover { color: var(--vscode-foreground); }
   transform: rotate(45deg);
 }
 .instrpanel[data-instrpanel="stage"]::before { left: 25%; }
-.instrpanel[data-instrpanel="sparrer"]::before { left: 75%; }
+.instrpanel[data-instrpanel="sparrer"]::before, .instrpanel[data-instrpanel="feedback"]::before { left: 75%; }
 
 .instructions { padding: 0 12px 12px; }
 .turnline { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 0; font-size: 1.02em; }

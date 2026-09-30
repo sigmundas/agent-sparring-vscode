@@ -175,8 +175,15 @@ describe("overview view model", () => {
     const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
     assert.equal(model.lastSparring?.report, "Long findings that must never reach the status bar.");
     const html = renderOverviewHtml(model, "n", "c");
-    assert.match(html, /<details class="report"[^>]*><summary>Read feedback<\/summary><div class="reportbody"><p>Long findings that must never reach the status bar\.<\/p><\/div>/);
-    assert.match(html, /<button type="button" data-action="openSparring" title="Open sparring.md">Open full report<\/button><\/details>/);
+    // The verdict is on the Sparrer card, not in the stage card.
+    const stageCard = html.slice(html.indexOf('<section class="card stage">'), html.indexOf('<section class="actors">'));
+    assert.ok(!stageCard.includes("Latest sparring result") && !stageCard.includes("sparverdict"), "the stage card no longer carries the result");
+    const sparrerCard = /<div class="card actor [^"]*" data-role="sparrer">[\s\S]*?<div class="cardfoot">[\s\S]*?<\/div><\/div>/.exec(html)?.[0] ?? "";
+    assert.match(sparrerCard, /<div class="sparresult"><p class="sparverdict"><span class="verdict send_back"[^>]*>Changes requested<\/span>/);
+    // Read feedback is a tab on the Sparrer card's footer line; the report opens below both cards.
+    assert.match(sparrerCard, /<button type="button" class="showinstr" data-instr="feedback" aria-controls="feedback-sparrer" aria-expanded="false" data-show="Read feedback" data-hide="Hide feedback">Read feedback<\/button>/);
+    assert.match(html, /<div class="instrpanel [^"]*" id="feedback-sparrer" data-instrpanel="feedback"[^>]* hidden>[\s\S]*?<div class="reportbody"><p>Long findings that must never reach the status bar\.<\/p><\/div>/);
+    assert.match(html, /<button type="button" data-action="openSparring" title="Open sparring.md">Open full report<\/button>/);
   });
 
   it("no report to read: Read feedback is not offered, only the verdict and summary", async () => {
@@ -390,7 +397,14 @@ describe("overview HTML", () => {
     // The same raw facts never leak into the primary card above it (the
     // run key does still appear in the stage heading's tooltip, one of the
     // established advanced surfaces alongside Technical details itself).
-    const beforeTechnical = html.slice(0, html.indexOf('<details class="tech facts"'));
+    // The one exception is the model name the provider reported, read as a
+    // plain name under the stage agent's dials.
+    const beforeTechnical = html
+      .slice(0, html.indexOf('<details class="tech facts"'))
+      .replace(/<div class="runtimemodel[^>]*>[^<]*<\/div>/g, "")
+      .replace(/data-runtime-model="[^"]*"/g, "")
+      .replace(/<details class="setup-technical agentconfig-technical"[\s\S]*?<\/details>/g, "");
+    assert.match(html, /<div class="runtimemodel muted" data-runtime-model="claude-opus-5-5"/);
     assert.ok(!beforeTechnical.includes("claude-opus-5-5"));
     assert.ok(!beforeTechnical.includes("82ab1234"));
   });

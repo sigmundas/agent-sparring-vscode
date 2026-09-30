@@ -209,7 +209,8 @@ describe("each actor card is its own configuration surface", () => {
     const html = renderOverviewHtml(model, "n", "c");
     const stage = card(html, "Stage agent");
     assert.match(stage, /<option value="opus" selected>opus<\/option>/, "the configured model is unchanged by what ran");
-    assert.match(stage, /<div class="agentconfig-runtime muted" data-runtime-model="claude-opus-5-5-20260901">Provider reported running claude-opus-5-5-20260901<\/div>/);
+    assert.match(stage, /<div class="dialcol"><div class="gauges">[\s\S]*?<\/div><div class="runtimemodel muted" data-runtime-model="claude-opus-5-5-20260901"[^>]*>claude-opus-5-5-20260901<\/div><\/div>/, "the reported model is a plain name under the dials");
+    assert.doesNotMatch(stage, /Provider reported running/);
     const technical = /<details class="setup-technical agentconfig-technical"[^>]*><summary>Technical details<\/summary><pre class="engineerror">([\s\S]*?)<\/pre>/.exec(stage)?.[1] ?? "";
     assert.match(technical, /Role: stage/);
     assert.match(technical, /Configured model: opus/);
