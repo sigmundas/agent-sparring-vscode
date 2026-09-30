@@ -4055,8 +4055,11 @@ async function cleanUpRunnerTerminalsCommand(controller: SparringController): Pr
     // VS Code offers no way to ask a restored terminal whether it is running
     // anything, so only a person can decide these.
     const answer = await vscode.window.showWarningMessage(
-      `${count} old Agent Sparring terminal${count === 1 ? " has" : "s have"} unknown liveness after reload. Close ${count === 1 ? "it" : "them"}?`,
-      { modal: true, detail: "Agent Sparring cannot tell whether anything is still running in them. Closing a terminal ends what runs in its shell." },
+      `Agent Sparring cannot tell whether ${count === 1 ? "an old terminal is" : `${count} old terminals are`} still in use. Close ${count === 1 ? "it" : "them"}?`,
+      {
+        modal: true,
+        detail: `Nothing shows ${count === 1 ? "it" : "them"} running a command, but VS Code cannot confirm ${count === 1 ? "its shell is" : "their shells are"} idle. Terminals known to be busy are kept and are not in this list. Closing a terminal ends whatever runs in its shell.`,
+      },
       "Close",
     );
     if (answer === "Close") {

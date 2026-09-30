@@ -259,9 +259,11 @@ export class TerminalPool implements vscode.Disposable {
    *  - Idle redundant — another idle pooled terminal, or an orphan whose
    *    shell `ps` proves idle and no operation claims: closed;
    *  - Ended — its process has exited: closed;
-   *  - Unknown — liveness cannot be established (no process table on this
-   *    platform, no shell integration, a pid an operation still claims):
-   *    never closed here, returned in `unknown` for the caller to ask about.
+   *  - Known busy — an orphan with a command seen running, or whose pid an
+   *    operation still claims: kept, whether or not `ps` is available;
+   *  - Unknown — liveness cannot be established and nothing says it is busy
+   *    (no process table on this platform, no shell integration): never
+   *    closed here, returned in `unknown` for the caller to ask about.
    *
    * A person's own terminals are never looked at.
    */
@@ -300,9 +302,20 @@ export class TerminalPool implements vscode.Disposable {
         continue;
       }
       const pid = await terminal.processId;
-      const seen = this.orphans.get(terminal)?.active.size ?? 0;
-      if (table && pid !== undefined && pid > 0 && !claimedPids.has(pid) && processExists(table, pid)) {
-        if (descendantsOf(table, pid).length > 0 || seen > 0) {
+      // Known busy is never "unknown": a command seen starting and not
+      // ending, or a pid a live operation claims, keeps the terminal
+      // whatever the process table can or cannot say. Only terminals nothing
+      // is known about are left for a person to decide.
+      if ((this.orphans.get(terminal)?.active.size ?? 0) > 0) {
+        result.kept.push({ name: terminal.name, reason: "a command is running in it" });
+        continue;
+      }
+      if (pid !== undefined && pid > 0 && claimedPids.has(pid)) {
+        result.kept.push({ name: terminal.name, reason: "an Agent Sparring operation is still running in it" });
+        continue;
+      }
+      if (table && pid !== undefined && pid > 0 && processExists(table, pid)) {
+        if (descendantsOf(table, pid).length > 0) {
           result.kept.push({ name: terminal.name, reason: "a process is running in it" });
           continue;
         }

@@ -286,13 +286,43 @@ describe("one reusable terminal per worktree", () => {
       assert.equal(busyOrphan.exitStatus, undefined, "a process is running in it: never closed");
       assert.equal(current.terminal.exitStatus, undefined, "the current reusable terminal is kept");
       assert.ok(result.kept.some((entry) => entry.reason === "current reusable terminal for its worktree"));
-      assert.deepEqual(new Set(result.unknown), new Set([claimed, noIntegration]), "unknown liveness is listed, not closed");
+      // A pid an operation still claims is known to be busy: kept, never
+      // offered for closing alongside the genuinely unknown ones.
+      assert.ok(result.kept.some((entry) => entry.name === claimed.name && entry.reason === "an Agent Sparring operation is still running in it"));
+      assert.deepEqual(result.unknown, [noIntegration], "only unknown liveness is listed, not closed");
       assert.equal(claimed.exitStatus, undefined);
       assert.equal(noIntegration.exitStatus, undefined);
-      assert.deepEqual(h.pool.closeConfirmed(result.unknown).length, 2, "closed only once a person confirms");
-      assert.equal((claimed.exitStatus as { code?: number } | undefined)?.code, 0);
+      assert.deepEqual(h.pool.closeConfirmed(result.unknown).length, 1, "closed only once a person confirms");
+      assert.equal(claimed.exitStatus, undefined, "confirming the unknown ones never closes the claimed one");
+      assert.equal((noIntegration.exitStatus as { code?: number } | undefined)?.code, 0);
     } finally {
       h.dispose();
+    }
+  });
+
+  it("a terminal seen running a command is kept, even without a process table or with a claimed pid", async () => {
+    const busyNoTable = restored(py, 8101);
+    const busyClaimed = restored(web, 8102);
+    const quiet = restored(web, 8103);
+    const logged: string[] = [];
+    const pool = new TerminalPool((m) => logged.push(m), async () => [], false);
+    try {
+      for (const terminal of [busyNoTable, busyClaimed]) {
+        const execution = terminal.shellIntegration!.executeCommand("npm", ["test"]);
+        stub.window.startEmitter.fire({ terminal, shellIntegration: terminal.shellIntegration!, execution });
+      }
+      const result = await pool.cleanUp(new Set([8102]));
+      assert.deepEqual(result.closed, []);
+      assert.deepEqual(result.unknown, [quiet], "only the one nothing is known about is offered");
+      assert.deepEqual(
+        result.kept.map((entry) => [entry.name, entry.reason]),
+        [
+          [busyNoTable.name, "a command is running in it"],
+          [busyClaimed.name, "a command is running in it"],
+        ],
+      );
+    } finally {
+      pool.dispose();
     }
   });
 
