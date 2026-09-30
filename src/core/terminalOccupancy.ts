@@ -35,6 +35,24 @@ import * as fs from "node:fs";
 import { canonicalPath } from "./discovery";
 
 /**
+ * The name for a new terminal: `base`, or else `base (n)` for the lowest
+ * n >= 2 that no open terminal already has. Counting terminals would repeat
+ * a name as soon as the first of them was closed, and showing a terminal by
+ * name could then land on a different one.
+ */
+export function distinctTerminalName(base: string, taken: Iterable<string>): string {
+  const used = new Set(taken);
+  if (!used.has(base)) {
+    return base;
+  }
+  let n = 2;
+  while (used.has(`${base} (${n})`)) {
+    n++;
+  }
+  return `${base} (${n})`;
+}
+
+/**
  * The repository/worktree identity a terminal is kept for: the resolved real
  * path in the same canonical form repository selection compares, so
  * `/tmp/x` and `/private/tmp/x`, or two spellings differing in case on

@@ -16,7 +16,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { before, beforeEach, describe, it } from "node:test";
-import { FakeShellIntegration, FakeTerminal, install, reset, until } from "./vscodeStub";
+import { FakeExecution, FakeShellIntegration, FakeTerminal, install, reset, until } from "./vscodeStub";
 
 const stub = install();
 
@@ -254,6 +254,33 @@ describe("one reusable terminal per worktree", () => {
       assert.equal(h.pool.reveal(web), true);
       assert.equal(b.terminal.shown, 1);
       assert.equal(a.terminal.shown, 0);
+    } finally {
+      h.dispose();
+    }
+  });
+
+  it("a concurrent terminal takes the lowest name no open terminal uses, never a duplicate", async () => {
+    const h = host();
+    const occupy = (terminal: FakeTerminal) => {
+      // Typed by the person, so not one of the executions this suite plays.
+      const execution = new FakeExecution("vim", terminal);
+      stub.window.startEmitter.fire({ terminal, shellIntegration: terminal.shellIntegration!, execution });
+    };
+    try {
+      const base = `Agent Sparring — sporely-py`;
+      const a = await complete(run(h, py, "prepare-plan"));
+      assert.equal(a.terminal.name, base);
+      occupy(a.terminal); // the person runs something of their own in it
+      const b = await complete(run(h, py, "approve-plan"));
+      assert.equal(b.terminal.name, `${base} (2)`);
+      // The person closes the first one, then occupies the second.
+      a.terminal.close();
+      occupy(b.terminal);
+      const c = await complete(run(h, py, "freeze-candidate"));
+      assert.notEqual(c.terminal, b.terminal);
+      const open = stub.window.terminals.filter((terminal) => terminal.exitStatus === undefined).map((terminal) => terminal.name);
+      assert.equal(new Set(open).size, open.length, `no two open terminals share a name, got ${JSON.stringify(open)}`);
+      assert.equal(c.terminal.name, base, "the lowest free name is reused");
     } finally {
       h.dispose();
     }

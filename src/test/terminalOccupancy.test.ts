@@ -15,7 +15,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { chooseOwnedTerminal, explainCreation, unavailability, type OwnedTerminalState } from "../core/terminalOccupancy";
+import { chooseOwnedTerminal, distinctTerminalName, explainCreation, unavailability, type OwnedTerminalState } from "../core/terminalOccupancy";
 
 const PROJECT = "/Users/someone/Code/sporely-py";
 const OTHER = "/Users/someone/Code/sporely-web";
@@ -86,5 +86,20 @@ describe("whether an owned terminal may be sent a command", () => {
     assert.match(message, /nothing was written into it/);
     assert.match(explainCreation("unobservable", "Agent Sparring — sporely-py (2)", PROJECT), /cannot be established/);
     assert.match(explainCreation(undefined, "Agent Sparring — sporely-py", PROJECT), /opened the terminal/);
+  });
+});
+
+describe("distinct terminal names", () => {
+  const X = "Agent Sparring — sporely-py";
+  it("uses the plain name when no open terminal has it", () => {
+    assert.equal(distinctTerminalName(X, []), X);
+    assert.equal(distinctTerminalName(X, [`${X} (2)`]), X, "the first was closed: its name is free again");
+  });
+  it("takes the lowest number no open terminal uses, not a count", () => {
+    assert.equal(distinctTerminalName(X, [X]), `${X} (2)`);
+    assert.equal(distinctTerminalName(X, [X, `${X} (2)`]), `${X} (3)`);
+    // Two terminals open, but (2) is the one that was closed.
+    assert.equal(distinctTerminalName(X, [X, `${X} (3)`]), `${X} (2)`);
+    assert.equal(distinctTerminalName(X, [`${X} (2)`, X, "zsh"]), `${X} (3)`);
   });
 });

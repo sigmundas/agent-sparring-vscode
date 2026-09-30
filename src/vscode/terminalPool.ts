@@ -45,7 +45,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { descendantsOf, processExists, type ProcessInfo } from "../core/processTree";
 import { listProcesses, processProbeSupported } from "./processProbe";
-import { chooseOwnedTerminal, explainCreation, redundantTerminals, terminalKey, unavailability, type OwnedTerminalState } from "../core/terminalOccupancy";
+import { chooseOwnedTerminal, distinctTerminalName, explainCreation, redundantTerminals, terminalKey, unavailability, type OwnedTerminalState } from "../core/terminalOccupancy";
 
 /** The name prefix of every terminal this extension creates. */
 export const RUNNER_TERMINAL_PREFIX = "Agent Sparring — ";
@@ -165,9 +165,13 @@ export class TerminalPool implements vscode.Disposable {
       // something of their own still forces a second, concurrent terminal
       // for the same worktree (see the module doc above), and that one
       // needs a name of its own or the two are indistinguishable to anyone
-      // reading the pool, including reuse and cleanup.
-      const sameWorktree = this.entries.filter((candidate) => candidate.key === key && !candidate.dedicated).length;
-      const name = sameWorktree > 0 ? `${runnerTerminalName(cwd)} (${sameWorktree + 1})` : runnerTerminalName(cwd);
+      // reading the pool, including reuse, cleanup and "Show terminal". The
+      // lowest number no open terminal has, not a count, so closing the
+      // first of several never lets the next one repeat a name.
+      const taken = [...vscode.window.terminals, ...this.entries.map((candidate) => candidate.terminal)]
+        .filter((terminal) => terminal.exitStatus === undefined)
+        .map((terminal) => terminal.name);
+      const name = distinctTerminalName(runnerTerminalName(cwd), taken);
       const terminal = vscode.window.createTerminal({ name, cwd, iconPath: new vscode.ThemeIcon("debug-alt") });
       this.log(explainCreation(choice.because, name, cwd));
       entry = { terminal, cwd, key, dedicated: false, leased: true, active: new Set(), observable: terminal.shellIntegration !== undefined };
