@@ -129,6 +129,8 @@ export class Workspace {
       push_authorization?: Record<string, unknown> | null;
       /** The deferred-obligation ledger (deferred_gate.py: `DeferredObligation`), verbatim. */
       deferred_human_checks?: Record<string, unknown>[];
+      /** The engine's recorded provider pause (`provider_pause`), verbatim. */
+      provider_pause?: Record<string, unknown>;
     },
   ): Promise<string> {
     const dir = path.join(this.sparringDir, "plans");
@@ -151,6 +153,7 @@ export class Workspace {
       // Same rule as the two above: omitted unless the caller asks for it, so
       // a run recorded before deferred verification existed is reproducible.
       ...(state.deferred_human_checks !== undefined ? { deferred_human_checks: state.deferred_human_checks } : {}),
+      ...(state.provider_pause !== undefined ? { provider_pause: state.provider_pause } : {}),
     };
     await fs.writeFile(file, JSON.stringify(payload, null, 2) + "\n");
     return file;

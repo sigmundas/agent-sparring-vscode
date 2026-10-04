@@ -13,7 +13,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { acceptStage, type AcceptStageResult } from "../core/acceptance";
-import { buildReopenStageArgs, buildResumePlanArgs, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, readGitBranch, type DeferredResultAnswer } from "../core/cli";
+import { buildReopenStageArgs, buildResumePlanArgs, roleOverrideArgs, type FreshSessionRequest, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, readGitBranch, type DeferredResultAnswer } from "../core/cli";
 import {
   BINDING_VERSION,
   adoptionGaps,
@@ -83,7 +83,10 @@ import { manifestSupport } from "./engineProbe";
 import { openCandidateDiff } from "./overview/gitDiff";
 import { configuredExecutable } from "./engineExecutable";
 import { settingsTarget } from "../core/settingsTarget";
-import { fixSetup, readEffectiveConfig, resetModelChoicesCache } from "./configProbe";
+import { fixSetup, readEffectiveConfig, readModelChoices, readOverriddenConfig, resetModelChoicesCache } from "./configProbe";
+import { describeAgent, freshSessionConfirmation, roleNoun, type ResolvedAgent } from "../core/freshSession";
+import type { SessionRole } from "../core/engineFormats";
+import { CUSTOM_MODEL_LABEL, exactModelProblem } from "../core/effectiveConfig";
 import { OverviewPanelManager } from "./overview/overviewPanel";
 
 export function registerCommands(context: vscode.ExtensionContext, controller: SparringController): void {
@@ -1026,6 +1029,11 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       return runPlanCommand(controller, overview);
     case "resumePlan":
       await resumePlanCommand(controller, run?.kind === "plan" ? run : undefined);
+      await overview.update();
+      return;
+    case "freshSparrer":
+    case "freshStageAgent":
+      await startFreshSessionCommand(controller, run?.kind === "plan" ? run : undefined, action === "freshSparrer" ? "sparring" : "stage");
       await overview.update();
       return;
     case "runStage":
@@ -2660,6 +2668,140 @@ async function resumePlanCommand(controller: SparringController, preselected?: P
     return;
   }
   await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, manifestArgumentOf(input));
+}
+
+/**
+ * Start a fresh reviewer or implementation agent for the paused plan run on
+ * screen: `resume-plan --fresh-sparrer | --fresh-stage-agent`.
+ *
+ * Only the role's conversation is replaced. The engine decides which actor
+ * runs next and refuses a combination it does not allow; nothing here picks
+ * a turn, writes a file or reads a reason from output.
+ */
+async function startFreshSessionCommand(controller: SparringController, run: PlanRunSnapshot | undefined, role: SessionRole): Promise<void> {
+  if (!run || run.state.status !== "paused" || run.currentStage.state?.status === "accepted" || !run.currentStage.state?.sessions) {
+    void vscode.window.showInformationMessage("Agent Sparring: a fresh conversation can only be started for a paused plan run.");
+    return;
+  }
+  if (controller.livenessFor(run.id).state === "running") {
+    void vscode.window.showInformationMessage(`Agent Sparring: a runner is alive for ${run.state.plan}.`);
+    return;
+  }
+  const noun = roleNoun(role);
+  const current = await resolvedAgent(run, role, []);
+  if (!current) {
+    return;
+  }
+  const picked = await vscode.window.showQuickPick(
+    [
+      { label: `Use current preference (${describeAgent(current)})`, other: false },
+      { label: "Choose another model/provider\u2026", other: true },
+    ],
+    { title: `Agent Sparring: start fresh ${noun}`, placeHolder: `Which configuration should the new ${noun} use?` },
+  );
+  if (!picked) {
+    return;
+  }
+  const request: FreshSessionRequest = { role };
+  let agent = current;
+  if (picked.other) {
+    const chosen = await chooseFreshAgent(run, role);
+    if (!chosen) {
+      return;
+    }
+    Object.assign(request, chosen);
+    const resolved = await resolvedAgent(run, role, roleOverrideArgs(request));
+    if (!resolved) {
+      return;
+    }
+    agent = resolved;
+  }
+  const confirmation = freshSessionConfirmation(role, agent);
+  const answer = await vscode.window.showWarningMessage(confirmation.message, { modal: true, detail: confirmation.detail }, `Start fresh ${noun}`);
+  if (answer !== `Start fresh ${noun}`) {
+    return;
+  }
+  const expectedBranch = await resolveExpectedBranch(run.location, run.state.expectedBranch);
+  if (!expectedBranch) {
+    return;
+  }
+  const input = await planInvocationFor(controller, run);
+  if (!input) {
+    return;
+  }
+  if (await blockedByObsoleteSettings(controller, run.location)) {
+    return;
+  }
+  const args = buildResumePlanArgs({ ...input, repoRoot: run.location.repoRoot, expectedBranch, sparringDir: run.location.sparringDir, fresh: request });
+  controller.log(`Start fresh ${noun}: resume-plan ${role === "sparring" ? "--fresh-sparrer" : "--fresh-stage-agent"} for ${run.currentStage.stageId}`);
+  await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, manifestArgumentOf(input));
+}
+
+/** What `show-config` says the role would run with, given these overrides; undefined (after saying why) when it cannot say. */
+async function resolvedAgent(run: PlanRunSnapshot, role: SessionRole, overrides: readonly string[]): Promise<ResolvedAgent | undefined> {
+  const config = overrides.length > 0
+    ? await readOverriddenConfig(configuredExecutable(), run.location.projectDir, run.location.sparringDir, overrides)
+    : await readEffectiveConfig(configuredExecutable(), run.location.projectDir, run.location.sparringDir, true);
+  const report = config.kind === "report" ? config.report : undefined;
+  const entry = report?.[role];
+  if (!entry) {
+    void vscode.window.showErrorMessage(`Agent Sparring: ${config.kind === "unavailable" ? config.reason : report?.error ?? "the engine did not report this role's configuration."}`);
+    return undefined;
+  }
+  return { provider: entry.provider_display_name ?? entry.provider, model: entry.model, effort: entry.effort };
+}
+
+/** Provider, model and effort for the fresh conversation, from the engine's own choices. */
+async function chooseFreshAgent(run: PlanRunSnapshot, role: SessionRole): Promise<Pick<FreshSessionRequest, "provider" | "model" | "effort"> | undefined> {
+  const config = await readEffectiveConfig(configuredExecutable(), run.location.projectDir, run.location.sparringDir);
+  const entry = config.kind === "report" ? config.report[role] : undefined;
+  const providers = entry?.provider_choices ?? [];
+  let provider = entry?.provider;
+  if (providers.length > 1) {
+    const pick = await vscode.window.showQuickPick(
+      providers.map((choice) => ({ label: choice.display_name ?? choice.provider, description: choice.provider === entry?.provider ? "current" : undefined, choice })),
+      { title: "Provider for the fresh conversation" },
+    );
+    if (!pick) {
+      return undefined;
+    }
+    provider = pick.choice.provider;
+  }
+  if (!provider) {
+    return undefined;
+  }
+  const [choices] = await readModelChoices(configuredExecutable(), run.location.projectDir, run.location.sparringDir, [{ role, provider }]);
+  const DEFAULT = "\u0000default";
+  const OTHER = "\u0000other";
+  const modelPick = await vscode.window.showQuickPick(
+    [
+      { label: "Your preference for this provider", value: DEFAULT },
+      ...(choices?.choices ?? []).map((choice) => ({ label: choice.display_name ?? choice.model, description: choice.model, value: choice.model })),
+      { label: CUSTOM_MODEL_LABEL, value: OTHER },
+    ],
+    { title: "Model for the fresh conversation" },
+  );
+  if (!modelPick) {
+    return undefined;
+  }
+  let model: string | undefined = modelPick.value === DEFAULT ? undefined : modelPick.value;
+  if (modelPick.value === OTHER) {
+    model = await vscode.window.showInputBox({ title: "Exact model name", ignoreFocusOut: true, validateInput: (text) => exactModelProblem(text) });
+    if (!model) {
+      return undefined;
+    }
+  }
+  const capability = providers.find((choice) => choice.provider === provider);
+  const levels = capability?.effort_supported === false ? [] : capability?.effort_levels ?? entry?.effort_levels ?? [];
+  let effort: string | undefined;
+  if (levels.length > 0) {
+    const effortPick = await vscode.window.showQuickPick([{ label: "Your preference for this provider", value: "" }, ...levels.map((level) => ({ label: level, value: level }))], { title: "Effort for the fresh conversation" });
+    if (!effortPick) {
+      return undefined;
+    }
+    effort = effortPick.value || undefined;
+  }
+  return { provider: provider === entry?.provider ? undefined : provider, model, effort };
 }
 
 function describeEntry(entry: StageEntry): string {

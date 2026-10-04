@@ -37,6 +37,7 @@ import { proposeNextStage, type NextStageProposal } from "./nextStage";
 import { buildPromptView, latestCapture, type CaptureEntry, type PromptView } from "./promptInspector";
 import { briefMentionedStages, buildStageIndex, locateStage, parsePlanHeadings, planTitle, sectionSummary, type HeadingRef, type MatchSource, type PlanHeading } from "./planAssociation";
 import { actionWord, presentStage, stageDisplayName, type StagePresentation } from "./presentation";
+import { freshSessionOffers, generationLabel, providerPauseCard, type FreshSessionOffer, type ProviderPauseCard } from "./freshSession";
 import { hasSessions, planAction, stageActions, type PlanAction, type StageRunAction } from "./runner";
 import { branchNotice, branchStateLabel, reportFor, type BranchNotice, type SliceBranchReport } from "./sliceBranch";
 import { QUIET_AFTER_MS, formatAge } from "./status";
@@ -125,6 +126,8 @@ export interface ActorCard {
    * absent means the provider did not say, never that it runs the default.
    */
   runtimeModel?: string;
+  /** `generation 2 · fresh: <reason>`, from the engine's `sessions`, when the conversation is not the first. */
+  generation?: string;
   /**
    * What this actor was actually told, built from the engine's captured
    * prompt for its latest turn. Absent for a stage that has not run a turn
@@ -1056,6 +1059,10 @@ export interface OverviewModel {
   secondaryAction?: StageRunAction;
   /** Resume plan / Continue plan for a managed plan run. */
   planAction?: PlanAction;
+  /** Start a fresh reviewer / implementation agent: a paused plan run on an engine that records sessions. */
+  freshSession?: FreshSessionOffer[];
+  /** The engine's recorded `provider_pause` for the current stage. */
+  providerPause?: ProviderPauseCard;
   /**
    * Hand the whole plan to the engine (automatic mode). Present only when
    * `agentSparring.planContinuation` is `automatic`, a plan is known and
@@ -1698,6 +1705,11 @@ function buildScreen(
       model.secondaryAction = actions.secondary;
     } else {
       model.planAction = planAction(run, liveness);
+      const offers = freshSessionOffers(run.state.status, stage.state);
+      if (offers.length > 0) {
+        model.freshSession = offers;
+      }
+      model.providerPause = providerPauseCard(run.state.providerPause, run.state.currentStage, offers.length > 0);
     }
   }
   model.branchGuard = branchGuard;
@@ -1782,6 +1794,7 @@ function buildScreen(
     // into the same refusal.
     delete model.continueAutomatically;
     delete model.planAction;
+    delete model.freshSession;
     delete model.banner;
     return model;
   }
@@ -2715,6 +2728,10 @@ function isHalted(run: RunSnapshot): boolean {
   return run.stage.state?.status === "accepted";
 }
 
+function withGeneration(generation: string | undefined): { generation?: string } {
+  return generation ? { generation } : {};
+}
+
 function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveState | undefined, halted: boolean, nowMs: number, uncertain: boolean, captures: CapturedPrompt[] | undefined): ActorCard {
   const actor = live?.[role];
   const persisted = role === "stage" ? stage.state?.implementationSessionId : stage.state?.sparringSessionId;
@@ -2752,6 +2769,7 @@ function actorCard(role: "stage" | "sparrer", stage: StageSnapshot, live: LiveSt
     quietFor,
     uncertain: activity === "Working" || activity === "Sparring" ? uncertain : undefined,
     ...(actor?.model ? { runtimeModel: actor.model } : {}),
+    ...withGeneration(generationLabel(stage.state?.sessions, role === "stage" ? "stage" : "sparring")),
     // Built here so "this turn" versus "the last turn" rests on exactly the
     // liveness that decided the Working/Waiting word above, and the two can
     // never contradict each other on the same card.

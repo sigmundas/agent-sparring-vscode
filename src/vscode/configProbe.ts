@@ -74,11 +74,24 @@ async function fileStamp(file: string): Promise<string> {
   }
 }
 
-function probe(file: string, cwd: string, sparringDir: string): Promise<EffectiveConfig> {
+/**
+ * What the roles would resolve to with role-scoped overrides
+ * (`show-config --json --stage-model …`). Never cached: it answers one
+ * confirmation, and the engine is the one that resolves it.
+ */
+export async function readOverriddenConfig(configured: string | undefined, projectDir: string, sparringDir: string, overrides: readonly string[]): Promise<EffectiveConfig> {
+  const planned = await planExecutable(configured, hostEnv(projectDir), false);
+  if (!planned.ok || planned.plan.kind === "shell") {
+    return { kind: "unavailable", reason: "The sparring CLI could not be resolved from this window." };
+  }
+  return probe(planned.plan.path, projectDir, sparringDir, overrides);
+}
+
+function probe(file: string, cwd: string, sparringDir: string, overrides: readonly string[] = []): Promise<EffectiveConfig> {
   return new Promise((resolve) => {
     execFile(
       file,
-      ["--sparring-dir", sparringDir, "show-config", "--json"],
+      ["--sparring-dir", sparringDir, "show-config", "--json", ...overrides],
       { cwd, timeout: 10_000, maxBuffer: 1024 * 1024, windowsHide: true },
       (error, stdout, stderr) => {
         // show-config exits non-zero for an invalid configuration and still

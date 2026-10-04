@@ -72,6 +72,40 @@ export interface PlanRunState {
    * reading of "this run owes nothing".
    */
   deferredHumanChecks: DeferredObligation[];
+  /**
+   * Why the engine stopped on a provider rather than on a verdict
+   * (`provider_pause`). Descriptive only: absent on older engines and
+   * whenever the run is not stopped on such a reason, and never inferred
+   * from activity or output.
+   */
+  providerPause?: ProviderPause;
+}
+
+/** The roles a provider pause or a session history names. */
+export type SessionRole = "stage" | "sparring";
+
+/** `provider_pause` of the plan-run state, verbatim. */
+export interface ProviderPause {
+  kind: "session-unresumable" | "provider-unavailable";
+  role: SessionRole;
+  stageId: string;
+  /** False: the role has no conversation to replace, so only a retry is offered. */
+  hasSession: boolean;
+  recordedAt: string | null;
+}
+
+/** `provider_pause`, or undefined when absent or not a shape this extension knows. */
+function parseProviderPause(raw: unknown): ProviderPause | undefined {
+  if (!isRecord(raw)) {
+    return undefined;
+  }
+  const kind = raw["kind"];
+  const role = raw["role"];
+  const stageId = raw["stage_id"];
+  if ((kind !== "session-unresumable" && kind !== "provider-unavailable") || (role !== "stage" && role !== "sparring") || typeof stageId !== "string" || !stageId) {
+    return undefined;
+  }
+  return { kind, role, stageId, hasSession: raw["has_session"] === true, recordedAt: typeof raw["recorded_at"] === "string" ? raw["recorded_at"] : null };
 }
 
 /** `deferred_gate.py`: the one outcome vocabulary, shared with human gates. */
@@ -225,6 +259,7 @@ export function parsePlanRunState(text: string): PlanRunState {
     awaiting: parseAwaiting(payload["awaiting"]),
     pushAuthorization: parsePushAuthorization(payload["push_authorization"]),
     deferredHumanChecks: parseDeferredObligations(payload["deferred_human_checks"]),
+    providerPause: parseProviderPause(payload["provider_pause"]),
   };
 }
 
@@ -398,6 +433,66 @@ export interface StageState {
    * stage has not pinned anything yet. Data to display only.
    */
   agents: Record<string, StageAgentPin> | null;
+  /**
+   * Each role's conversation history (`sessions`), oldest first. `null` on
+   * an engine that does not record it, which hides every fresh-session
+   * control. Descriptive only.
+   */
+  sessions: Record<string, StageSession[]> | null;
+  /** Which actor the engine runs next (`next_turn`), when it says. Never chosen here. */
+  nextTurn: string | null;
+}
+
+/** One conversation of one role (`sessions[role][i]`). */
+export interface StageSession {
+  generation: number;
+  sessionId: string | null;
+  provider: string | null;
+  model: string | null;
+  effort: string | null;
+  startedAt: string | null;
+  startReason: string | null;
+  endedAt: string | null;
+  endReason: string | null;
+}
+
+/** `sessions`, tolerantly: a malformed entry is dropped, a non-object is no history. */
+function stageSessions(raw: unknown): Record<string, StageSession[]> | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return null;
+  }
+  const text = (value: unknown): string | null => (typeof value === "string" && value.trim() !== "" ? value : null);
+  const out: Record<string, StageSession[]> = {};
+  for (const [role, list] of Object.entries(raw as Record<string, unknown>)) {
+    if (!Array.isArray(list)) {
+      continue;
+    }
+    const entries: StageSession[] = [];
+    for (const value of list) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        continue;
+      }
+      const entry = value as Record<string, unknown>;
+      const generation = entry["generation"];
+      if (typeof generation !== "number" || !Number.isInteger(generation) || generation < 1) {
+        continue;
+      }
+      const agent = entry["agent"] && typeof entry["agent"] === "object" ? (entry["agent"] as Record<string, unknown>) : {};
+      entries.push({
+        generation,
+        sessionId: text(entry["session_id"]),
+        provider: text(agent["provider"]),
+        model: text(agent["model"]),
+        effort: text(agent["effort"]),
+        startedAt: text(entry["started_at"]),
+        startReason: text(entry["start_reason"]),
+        endedAt: text(entry["ended_at"]),
+        endReason: text(entry["end_reason"]),
+      });
+    }
+    out[role] = entries;
+  }
+  return out;
 }
 
 /** One role's pinned configuration for one stage (stage.py `PinnedAgent`). */
@@ -453,6 +548,8 @@ export function parseStageState(text: string): StageState {
     // execution. Reading it as the owning run is what it meant.
     run: optionalString(payload, "run") ?? optionalString(payload, "plan"),
     agents: stageAgents(payload["agents"]),
+    sessions: stageSessions(payload["sessions"]),
+    nextTurn: optionalString(payload, "next_turn"),
   };
 }
 

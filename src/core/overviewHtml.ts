@@ -31,6 +31,7 @@ import {
 import { CHECK_OUTCOMES, isCheckKey, isDraftKey, type CheckItem, type CheckOutcome } from "./humanChecks";
 import { checkName, humanTask, splitPassCriteria } from "./humanTask";
 import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type AgentConfigSection, type BranchGuard, type ActorCard, type BudgetGauge, type HistoryEntry, type OverviewModel, type PushAuthorization, type TimelineItem, type WhatsNext } from "./overviewModel";
+import type { ProviderPauseCard } from "./freshSession";
 import type { MatchSource } from "./planAssociation";
 import type { PromptView, PromptViewSection } from "./promptInspector";
 import { renderReportMarkdown } from "./reportMarkdown";
@@ -54,6 +55,8 @@ export type OverviewAction =
   | "followActiveEditor"
   | "runPlan"
   | "resumePlan"
+  | "freshSparrer"
+  | "freshStageAgent"
   | "runStage"
   | "acceptStage"
   | "associatePlan"
@@ -367,6 +370,8 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "followActiveEditor",
   "runPlan",
   "resumePlan",
+  "freshSparrer",
+  "freshStageAgent",
   "runStage",
   "acceptStage",
   "associatePlan",
@@ -595,6 +600,9 @@ ${intake.command ? `<details class="intake-command"><summary>Engine command</sum
       `<details class="deferrednote"${disclose(scope, "deferred-owed")}><summary title="${escapeHtml(model.deferredNote.detail)}">${icon("check", "good")}${escapeHtml(model.deferredNote.label)}</summary><ul class="owed">${entries}</ul></details>`,
     );
   }
+  if (model.providerPause && !model.pushAuthorization) {
+    parts.push(renderProviderPause(model.providerPause));
+  }
   if (model.pushAuthorization) {
     parts.push(renderPushAuthorization(model.pushAuthorization, scope));
   } else if (model.actionRequired) {
@@ -795,6 +803,29 @@ function renderBranchGuard(guard: BranchGuard): string {
  * reachability — stay out of the normal layer entirely and live in the
  * details disclosure, where they belong.
  */
+function freshAction(role: "stage" | "sparring"): OverviewAction {
+  return role === "sparring" ? "freshSparrer" : "freshStageAgent";
+}
+
+/** The engine's recorded provider pause: what stopped, and the ways on. */
+function renderProviderPause(card: ProviderPauseCard): string {
+  const buttons: string[] = [];
+  if (card.retry) {
+    buttons.push(button("resumePlan", "Retry", true, "Resume the plan run as it is.", "primary"));
+  }
+  if (card.fresh) {
+    buttons.push(button(freshAction(card.fresh.role), card.fresh.label, true, undefined, card.retry ? "" : "primary"));
+  }
+  if (card.kind === "session-unresumable") {
+    buttons.push(button("showLog", "Details", true, "Show the Agent Sparring output", "quiet"));
+  }
+  return `<section class="card action providerpause" data-pause="${escapeHtml(card.kind)}" data-pause-role="${escapeHtml(card.role)}">
+<div class="actionhead"><h2>${icon("warn", "needs_you")}${escapeHtml(card.title)}</h2>
+<p class="summary">${escapeHtml(card.detail)}</p></div>
+<div class="actions">${buttons.join("")}</div>
+</section>`;
+}
+
 function renderPushAuthorization(panel: PushAuthorization, scope: string): string {
   const toggle = `<label class="toggle" title="${escapeHtml(panel.autoPush.detail)}"><input type="checkbox" data-autopush="run"${panel.autoPush.checked ? " checked" : ""}> ${escapeHtml(panel.autoPush.label)}</label>`;
   // The same demoted layer, the same markup, as every other panel's: the
@@ -1316,6 +1347,9 @@ function renderStageCard(model: OverviewModel): string {
     // For an accepted stage the plan action is the primary button of What's next instead.
     buttons.push(button("resumePlan", model.planAction.label, true, model.planAction.detail, model.planAction.primary && !auto ? "primary" : ""));
   }
+  for (const offer of model.freshSession ?? []) {
+    buttons.push(button(freshAction(offer.role), offer.label, true, `Replace the ${offer.role === "sparring" ? "reviewer" : "implementation agent"}'s conversation. Same stage and candidate; previous history is preserved.`, "quiet"));
+  }
   if (model.accepting) {
     buttons.push(`<span class="busy accepting" title="${escapeHtml(model.accepting.detail)}">${icon("dot", "dot")}${escapeHtml(model.accepting.label)}</span>`);
   }
@@ -1664,7 +1698,7 @@ function renderActor(card: ActorCard, controls: AgentRoleControls | undefined, c
   // header sized by its longest caveat put the role name on two lines.
   const statenote = notes ? `<div class="statenote">${notes}</div>` : "";
   const identity = `<div class="identity"><span class="avatar ${who}">${avatarGlyph(role)}</span>
-<div class="who"><div class="rolename ${who}">${escapeHtml(card.role)}</div><div class="provider muted">${escapeHtml(card.provider)}</div></div>${activity}</div>${statenote}`;
+<div class="who"><div class="rolename ${who}">${escapeHtml(card.role)}</div><div class="provider muted">${escapeHtml(card.provider)}</div>${card.generation ? `<div class="generation muted small">${escapeHtml(card.generation)}</div>` : ""}</div>${activity}</div>${statenote}`;
   const dials = renderGauges(card.gauges);
   // The dials sit beside Model and Effort rather than under them, and they
   // are drawn even where there is nothing to configure: what a provider is

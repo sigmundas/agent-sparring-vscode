@@ -171,6 +171,12 @@ export interface ResumePlanInvocation extends PlanInvocation {
    */
   source: PlanRunSource;
   evidence?: string;
+  /**
+   * Replace one role's conversation (`--fresh-sparrer` /
+   * `--fresh-stage-agent`). Only the conversation: the engine still decides
+   * which actor runs next and refuses combinations it does not allow.
+   */
+  fresh?: FreshSessionRequest;
   /** Present only when the person has just allowed a push; see `PushAuthorizationRequest`. */
   allowPush?: PushAuthorizationRequest;
   /**
@@ -214,6 +220,9 @@ export function buildResumePlanArgs(invocation: ResumePlanInvocation): string[] 
     const ref = `${answer.gateInstanceId}:${answer.checkId}`;
     args.push("--deferred-result", note ? `${ref}=${answer.outcome}=${note}` : `${ref}=${answer.outcome}`);
   }
+  if (invocation.fresh) {
+    args.push(...freshSessionArgs(invocation.fresh));
+  }
   if (invocation.allowPush) {
     args.push("--allow-push-candidate", invocation.allowPush.candidateSha);
     if (invocation.allowPush.forRun) {
@@ -221,6 +230,39 @@ export function buildResumePlanArgs(invocation: ResumePlanInvocation): string[] 
     }
   }
   return args;
+}
+
+/** A request to start one role's conversation afresh. Overrides are emitted only when set. */
+export interface FreshSessionRequest {
+  role: "stage" | "sparring";
+  reason?: string;
+  provider?: string;
+  model?: string;
+  effort?: string;
+}
+
+/**
+ * The role-scoped overrides a fresh request carries, as `show-config` and
+ * `resume-plan` both spell them (`--stage-model`, `--sparring-effort`, …).
+ */
+export function roleOverrideArgs(request: Pick<FreshSessionRequest, "role" | "provider" | "model" | "effort">): string[] {
+  const args: string[] = [];
+  for (const field of ["provider", "model", "effort"] as const) {
+    const value = request[field]?.trim();
+    if (value) {
+      args.push(`--${request.role}-${field}`, value);
+    }
+  }
+  return args;
+}
+
+function freshSessionArgs(request: FreshSessionRequest): string[] {
+  const args = [request.role === "sparring" ? "--fresh-sparrer" : "--fresh-stage-agent"];
+  const reason = request.reason?.trim().replace(/\s+/g, " ");
+  if (reason) {
+    args.push("--fresh-reason", reason);
+  }
+  return [...args, ...roleOverrideArgs(request)];
 }
 
 /** Reopen the run's current stage to repair a deferred check that failed. */
