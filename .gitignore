@@ -4,3 +4,8 @@ out/
 *.vsix
 .vscode-test/
 .DS_Store
+
+# Agent Sparring workflow state
+.sparring/stages/
+.sparring/plans/
+.sparring/intake/
