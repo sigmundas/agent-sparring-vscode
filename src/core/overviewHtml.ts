@@ -57,6 +57,8 @@ export type OverviewAction =
   | "resumePlan"
   | "freshSparrer"
   | "freshStageAgent"
+  | "freshSparrerOtherProvider"
+  | "freshStageAgentOtherProvider"
   | "runStage"
   | "acceptStage"
   | "associatePlan"
@@ -372,6 +374,8 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "resumePlan",
   "freshSparrer",
   "freshStageAgent",
+  "freshSparrerOtherProvider",
+  "freshStageAgentOtherProvider",
   "runStage",
   "acceptStage",
   "associatePlan",
@@ -803,7 +807,10 @@ function renderBranchGuard(guard: BranchGuard): string {
  * reachability — stay out of the normal layer entirely and live in the
  * details disclosure, where they belong.
  */
-function freshAction(role: "stage" | "sparring"): OverviewAction {
+function freshAction(role: "stage" | "sparring", otherProvider = false): OverviewAction {
+  if (otherProvider) {
+    return role === "sparring" ? "freshSparrerOtherProvider" : "freshStageAgentOtherProvider";
+  }
   return role === "sparring" ? "freshSparrer" : "freshStageAgent";
 }
 
@@ -814,7 +821,7 @@ function renderProviderPause(card: ProviderPauseCard): string {
     buttons.push(button("resumePlan", "Retry", true, "Resume the plan run as it is.", "primary"));
   }
   if (card.fresh) {
-    buttons.push(button(freshAction(card.fresh.role), card.fresh.label, true, undefined, card.retry ? "" : "primary"));
+    buttons.push(button(freshAction(card.fresh.role, card.fresh.otherProvider), card.fresh.label, true, undefined, card.retry ? "" : "primary"));
   }
   if (card.kind === "session-unresumable") {
     buttons.push(button("showLog", "Details", true, "Show the Agent Sparring output", "quiet"));

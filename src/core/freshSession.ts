@@ -15,6 +15,8 @@ export interface FreshSessionOffer {
   role: SessionRole;
   /** `Start fresh reviewer…` / `Start fresh implementation agent…`. */
   label: string;
+  /** The provider-unavailable recovery: the new conversation must run on a different provider. */
+  otherProvider?: boolean;
 }
 
 /** The card shown when the engine recorded a provider pause for the current stage. */
@@ -45,11 +47,19 @@ export function freshOffer(role: SessionRole, ellipsis = true): FreshSessionOffe
  * history for: an engine that records no `sessions` cannot take the flags,
  * and an accepted stage has no conversation left to replace.
  */
-export function freshSessionOffers(runStatus: string, stage: StageState | undefined | null): FreshSessionOffer[] {
-  if (runStatus !== "paused" || !stage || stage.status === "accepted" || stage.sessions === null) {
+export function freshSessionOffers(runStatus: string, stage: StageState | undefined | null, pause?: ProviderPause, currentStageId?: string): FreshSessionOffer[] {
+  if (runStatus !== "paused" || !stage || stage.status === "accepted" || stage.sessions === null || freshRefusedByPause(pause, currentStageId)) {
     return [];
   }
   return [freshOffer("sparring"), freshOffer("stage")];
+}
+
+/**
+ * The engine recorded a pause for this stage with no session to replace
+ * (`has_session: false`): only a retry is offered, anywhere on screen.
+ */
+export function freshRefusedByPause(pause: ProviderPause | undefined, currentStageId: string | undefined): boolean {
+  return pause !== undefined && pause.stageId === currentStageId && !pause.hasSession;
 }
 
 /** The provider-pause card for the current stage, or undefined when none is recorded for it. */
@@ -76,7 +86,7 @@ export function providerPauseCard(pause: ProviderPause | undefined, currentStage
     title: "Provider unavailable (quota / rate limit)",
     detail: "The candidate is safe and unchanged.",
     retry: true,
-    fresh: fresh ? { role: fresh.role, label: `${fresh.label} on another provider` } : undefined,
+    fresh: fresh ? { role: fresh.role, label: `${fresh.label} on another provider`, otherProvider: true } : undefined,
   };
 }
 
@@ -117,4 +127,88 @@ export function freshSessionConfirmation(role: SessionRole, agent: ResolvedAgent
       `Effort: ${agent.effort ?? "provider default"}`,
     ].join("\n"),
   };
+}
+
+/** One provider a role could use, as `show-config` enumerates it. */
+export interface ProviderOption {
+  provider: string;
+  label: string;
+}
+
+/** What the person chose for the new conversation. */
+export type FreshChoice = { provider?: string; model?: string; effort?: string };
+
+/**
+ * The editor surface the fresh-session flow asks through. Every method
+ * returns undefined when the person cancels, and the flow then does nothing.
+ */
+export interface FreshSessionUi {
+  /** What the role resolves to with these role-scoped overrides (`show-config`). */
+  resolve(overrides: FreshChoice): Promise<ResolvedAgent | undefined>;
+  /** `true` to keep the current preference, `false` to choose; undefined on cancel. */
+  pickCurrentOrOther(current: ResolvedAgent): Promise<boolean | undefined>;
+  /** Choose provider (from `providers`), model and effort; undefined on cancel. */
+  chooseAgent(providers: readonly ProviderOption[], requireProvider: boolean): Promise<FreshChoice | undefined>;
+  /** The role's current provider id and the providers the engine offers it. */
+  providers(): Promise<{ current: string; options: ProviderOption[] } | undefined>;
+  confirm(message: string, detail: string, confirmLabel: string): Promise<boolean>;
+  /** Tell the person why nothing is offered. */
+  notify(text: string): void;
+}
+
+/**
+ * Ask for the fresh conversation's configuration and its confirmation.
+ *
+ * The result is the request to put on `resume-plan`, or undefined when the
+ * person cancelled or nothing can be offered. `otherProvider` is the
+ * provider-unavailable recovery: the current preference is not offered, the
+ * current provider is not listed, and the chosen provider is always passed
+ * as an override.
+ */
+export async function askFreshSession(role: SessionRole, otherProvider: boolean, ui: FreshSessionUi): Promise<FreshChoice | undefined> {
+  let choice: FreshChoice = {};
+  if (otherProvider) {
+    const known = await ui.providers();
+    if (!known) {
+      return undefined;
+    }
+    const others = known.options.filter((option) => option.provider !== known.current);
+    if (others.length === 0) {
+      ui.notify(`No other provider is available for the ${roleNoun(role)}.`);
+      return undefined;
+    }
+    const chosen = await ui.chooseAgent(others, true);
+    if (!chosen?.provider || chosen.provider === known.current) {
+      return undefined;
+    }
+    choice = chosen;
+  } else {
+    const current = await ui.resolve({});
+    if (!current) {
+      return undefined;
+    }
+    const keep = await ui.pickCurrentOrOther(current);
+    if (keep === undefined) {
+      return undefined;
+    }
+    if (!keep) {
+      const known = await ui.providers();
+      if (!known) {
+        return undefined;
+      }
+      const chosen = await ui.chooseAgent(known.options, false);
+      if (!chosen) {
+        return undefined;
+      }
+      // The current provider needs no override: the engine resolves it anyway.
+      choice = { ...chosen, provider: chosen.provider === known.current ? undefined : chosen.provider };
+    }
+  }
+  const agent = await ui.resolve(choice);
+  if (!agent) {
+    return undefined;
+  }
+  const confirmation = freshSessionConfirmation(role, agent);
+  const label = `Start fresh ${roleNoun(role)}`;
+  return (await ui.confirm(confirmation.message, confirmation.detail, label)) ? choice : undefined;
 }

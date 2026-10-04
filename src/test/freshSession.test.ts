@@ -15,7 +15,7 @@ import { describe, it } from "node:test";
 import { buildResumePlanArgs } from "../core/cli";
 import { discoverRuns, selectRun } from "../core/discovery";
 import { parsePlanRunState, parseStageState } from "../core/engineFormats";
-import { freshSessionConfirmation } from "../core/freshSession";
+import { askFreshSession, freshSessionConfirmation, type FreshChoice, type FreshSessionUi, type ResolvedAgent } from "../core/freshSession";
 import type { ExecutionRecord } from "../core/liveness";
 import { renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel, type OverviewArtifacts } from "../core/overviewModel";
@@ -167,7 +167,8 @@ describe("provider pause card", () => {
       assert.equal(model.providerPause?.title, "Provider unavailable (quota / rate limit)");
       const card = html.slice(html.indexOf("providerpause"), html.indexOf("</section>", html.indexOf("providerpause")));
       assert.match(card, /data-action="resumePlan"[^>]*>Retry/);
-      assert.match(card, new RegExp(`data-action="${action}"[^>]*>Start fresh [^<]* on another provider`));
+      assert.match(card, new RegExp(`data-action="${action}OtherProvider"[^>]*>Start fresh [^<]* on another provider`));
+      assert.doesNotMatch(card, new RegExp(`data-action="${action}"`));
     });
 
     it(`has_session false offers only Retry for ${role}`, async () => {
@@ -175,8 +176,10 @@ describe("provider pause card", () => {
         const { model, html } = await screen({ pause: pause(kind, role, false) });
         assert.equal(model.providerPause?.fresh, undefined);
         assert.equal(model.providerPause?.retry, true);
-        const card = html.slice(html.indexOf("providerpause"), html.indexOf("</section>", html.indexOf("providerpause")));
-        assert.doesNotMatch(card, /data-action="fresh/);
+        // The whole screen, not only the card: no fresh action anywhere.
+        assert.equal(model.freshSession, undefined, kind);
+        assert.doesNotMatch(html, /data-action="fresh/, kind);
+        assert.match(html, /data-action="resumePlan"[^>]*>Retry/, kind);
       }
     });
   }
@@ -208,5 +211,68 @@ describe("no .sparring writes", () => {
     const end = commands.indexOf("function describeEntry", start);
     assert.ok(start > 0 && end > start);
     assert.doesNotMatch(commands.slice(start, end), /writeFile|appendFile|mkdir|rename\(|unlink|writeAgentConfig/);
+  });
+});
+
+describe("fresh-session flow", () => {
+  const CURRENT: ResolvedAgent = { provider: "Claude", model: "opus", effort: "high" };
+
+  /** A scripted UI: each answer is consumed in order; the log records what was asked. */
+  function ui(answers: { keep?: boolean; choose?: FreshChoice; confirm?: boolean }, log: string[] = []): FreshSessionUi {
+    return {
+      async resolve(choice) {
+        log.push(`resolve ${JSON.stringify(choice)}`);
+        return choice.provider ? { provider: choice.provider, model: choice.model ?? null, effort: choice.effort ?? null } : CURRENT;
+      },
+      async pickCurrentOrOther() {
+        log.push("pick");
+        return answers.keep;
+      },
+      async providers() {
+        return { current: "claude-cli", options: [{ provider: "claude-cli", label: "Claude" }, { provider: "codex-cli", label: "Codex" }] };
+      },
+      async chooseAgent(providers, requireProvider) {
+        log.push(`choose ${providers.map((option) => option.provider).join(",")} ${requireProvider}`);
+        return answers.choose;
+      },
+      async confirm(_message, detail) {
+        log.push(`confirm ${detail.split("\n").join(" | ")}`);
+        return answers.confirm ?? false;
+      },
+      notify(text) {
+        log.push(`notify ${text}`);
+      },
+    };
+  }
+
+  it("on another provider: no current-preference offer, current provider not listed, override emitted", async () => {
+    const log: string[] = [];
+    const choice = await askFreshSession("stage", true, ui({ choose: { provider: "codex-cli", model: "gpt-5" }, confirm: true }, log));
+    assert.ok(!log.includes("pick"), log.join("\n"));
+    assert.ok(log.includes("choose codex-cli true"), log.join("\n"));
+    assert.ok(log.some((line) => line.startsWith("confirm") && line.includes("Provider: codex-cli") && line.includes("Model: gpt-5")), log.join("\n"));
+    assert.deepEqual(choice, { provider: "codex-cli", model: "gpt-5" });
+    const args = buildResumePlanArgs({ ...BASE, fresh: { role: "stage", ...choice } });
+    assert.deepEqual(args.slice(args.indexOf("--fresh-stage-agent")), ["--fresh-stage-agent", "--stage-provider", "codex-cli", "--stage-model", "gpt-5"]);
+  });
+
+  it("on another provider: a choice of the current provider, or no provider, launches nothing", async () => {
+    assert.equal(await askFreshSession("sparring", true, ui({ choose: { provider: "claude-cli" }, confirm: true })), undefined);
+    assert.equal(await askFreshSession("sparring", true, ui({ choose: { model: "x" }, confirm: true })), undefined);
+  });
+
+  it("cancelling at any step launches nothing", async () => {
+    assert.equal(await askFreshSession("sparring", false, ui({ keep: undefined, confirm: true })), undefined);
+    assert.equal(await askFreshSession("sparring", false, ui({ keep: false, choose: undefined, confirm: true })), undefined);
+    assert.equal(await askFreshSession("sparring", false, ui({ keep: true, confirm: false })), undefined);
+    assert.equal(await askFreshSession("sparring", true, ui({ choose: undefined, confirm: true })), undefined);
+    assert.equal(await askFreshSession("sparring", true, ui({ choose: { provider: "codex-cli" }, confirm: false })), undefined);
+  });
+
+  it("current preference passes no override", async () => {
+    const choice = await askFreshSession("sparring", false, ui({ keep: true, confirm: true }));
+    assert.deepEqual(choice, {});
+    const args = buildResumePlanArgs({ ...BASE, fresh: { role: "sparring", ...choice } });
+    assert.deepEqual(args.slice(args.indexOf("--fresh-sparrer")), ["--fresh-sparrer"]);
   });
 });

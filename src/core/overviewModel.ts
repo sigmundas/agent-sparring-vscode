@@ -1705,7 +1705,7 @@ function buildScreen(
       model.secondaryAction = actions.secondary;
     } else {
       model.planAction = planAction(run, liveness);
-      const offers = freshSessionOffers(run.state.status, stage.state);
+      const offers = freshSessionOffers(run.state.status, stage.state, run.state.providerPause, run.state.currentStage);
       if (offers.length > 0) {
         model.freshSession = offers;
       }
