@@ -15,7 +15,7 @@ import { describe, it } from "node:test";
 import { buildResumePlanArgs } from "../core/cli";
 import { discoverRuns, selectRun } from "../core/discovery";
 import { parsePlanRunState, parseStageState } from "../core/engineFormats";
-import { askFreshSession, freshSessionConfirmation, type FreshChoice, type FreshSessionUi, type ResolvedAgent } from "../core/freshSession";
+import { askFreshSession, freshSessionConfirmation, otherAgentLabel, providerPauseCard, type FreshChoice, type FreshSessionUi, type ResolvedAgent } from "../core/freshSession";
 import type { ExecutionRecord } from "../core/liveness";
 import { renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel, type OverviewArtifacts } from "../core/overviewModel";
@@ -33,7 +33,7 @@ const SESSIONS = {
 };
 
 interface Setup {
-  status?: "paused" | "running";
+  status?: "paused" | "running" | "complete";
   stageStatus?: "working" | "accepted";
   sessions?: unknown;
   pause?: Record<string, unknown>;
@@ -167,7 +167,7 @@ describe("provider pause card", () => {
       assert.equal(model.providerPause?.title, "Provider unavailable (quota / rate limit)");
       const card = html.slice(html.indexOf("providerpause"), html.indexOf("</section>", html.indexOf("providerpause")));
       assert.match(card, /data-action="resumePlan"[^>]*>Retry/);
-      assert.match(card, new RegExp(`data-action="${action}OtherProvider"[^>]*>Start fresh [^<]* on another provider`));
+      assert.match(card, new RegExp(`data-action="${action}OtherProvider"[^>]*>Start fresh [^<]* with another model/provider`));
       assert.doesNotMatch(card, new RegExp(`data-action="${action}"`));
     });
 
@@ -183,6 +183,38 @@ describe("provider pause card", () => {
       }
     });
   }
+
+  it("is shown only while the run is paused: not for a complete or failed run", async () => {
+    const { model, html } = await screen({ status: "complete", pause: pause("provider-unavailable", "stage") });
+    assert.equal(model.providerPause, undefined);
+    assert.doesNotMatch(html, /providerpause/);
+    const known = { kind: "provider-unavailable" as const, role: "stage" as const, stageId: FOO_STAGE_IDS[0], hasSession: true, recordedAt: null };
+    for (const status of ["complete", "failed", "running"]) {
+      assert.equal(providerPauseCard(known, status, FOO_STAGE_IDS[0], true), undefined, status);
+    }
+    assert.ok(providerPauseCard(known, "paused", FOO_STAGE_IDS[0], true));
+  });
+
+  it("labels the provider-unavailable recovery for both roles", async () => {
+    for (const [role, noun] of [["sparring", "reviewer"], ["stage", "implementation agent"]] as const) {
+      const { model } = await screen({ pause: pause("provider-unavailable", role) });
+      assert.deepEqual(model.providerPause?.fresh, { role, label: `Start fresh ${noun} with another model/provider`, otherProvider: true });
+    }
+  });
+
+  it("drops a malformed provider_pause: unknown kind or role, empty stage_id", async () => {
+    for (const bad of [
+      { ...pause("quota-exceeded", "stage") },
+      { ...pause("provider-unavailable", "planner") },
+      { ...pause("provider-unavailable", "stage"), stage_id: "" },
+    ]) {
+      const { model, html } = await screen({ pause: bad });
+      assert.equal(model.providerPause, undefined, JSON.stringify(bad));
+      assert.doesNotMatch(html, /providerpause/);
+      // The ordinary fresh actions are still the engine's to offer.
+      assert.equal(model.freshSession?.length, 2);
+    }
+  });
 
   it("is not shown for a pause recorded for another stage", async () => {
     const { model } = await screen({ pause: { ...pause("provider-unavailable", "stage"), stage_id: "other-stage" } });
@@ -218,7 +250,8 @@ describe("fresh-session flow", () => {
   const CURRENT: ResolvedAgent = { provider: "Claude", model: "opus", effort: "high" };
 
   /** A scripted UI: each answer is consumed in order; the log records what was asked. */
-  function ui(answers: { keep?: boolean; choose?: FreshChoice; confirm?: boolean }, log: string[] = []): FreshSessionUi {
+  const TWO = [{ provider: "claude-cli", label: "Claude" }, { provider: "codex-cli", label: "Codex" }];
+  function ui(answers: { keep?: boolean; choose?: FreshChoice; confirm?: boolean; options?: { provider: string; label: string }[] }, log: string[] = []): FreshSessionUi {
     return {
       async resolve(choice) {
         log.push(`resolve ${JSON.stringify(choice)}`);
@@ -229,7 +262,7 @@ describe("fresh-session flow", () => {
         return answers.keep;
       },
       async providers() {
-        return { current: "claude-cli", options: [{ provider: "claude-cli", label: "Claude" }, { provider: "codex-cli", label: "Codex" }] };
+        return { current: "claude-cli", options: answers.options ?? TWO };
       },
       async chooseAgent(providers, requireProvider) {
         log.push(`choose ${providers.map((option) => option.provider).join(",")} ${requireProvider}`);
@@ -259,6 +292,28 @@ describe("fresh-session flow", () => {
   it("on another provider: a choice of the current provider, or no provider, launches nothing", async () => {
     assert.equal(await askFreshSession("sparring", true, ui({ choose: { provider: "claude-cli" }, confirm: true })), undefined);
     assert.equal(await askFreshSession("sparring", true, ui({ choose: { model: "x" }, confirm: true })), undefined);
+  });
+
+  it("on another provider with only the role's own provider: a different model on it, never another provider", async () => {
+    const own = [{ provider: "claude-cli", label: "Claude" }];
+    const log: string[] = [];
+    const choice = await askFreshSession("stage", true, ui({ options: own, choose: { provider: "claude-cli", model: "sonnet" }, confirm: true }, log));
+    assert.ok(!log.includes("pick"), log.join("\n"));
+    assert.ok(log.includes("choose claude-cli false"), log.join("\n"));
+    assert.deepEqual(choice, { model: "sonnet", effort: undefined });
+    const args = buildResumePlanArgs({ ...BASE, fresh: { role: "stage", ...choice } });
+    assert.deepEqual(args.slice(args.indexOf("--fresh-stage-agent")), ["--fresh-stage-agent", "--stage-model", "sonnet"]);
+    // The same model, or the provider's preference, is not a recovery.
+    for (const same of [{ model: "opus" }, {}]) {
+      const notes: string[] = [];
+      assert.equal(await askFreshSession("stage", true, ui({ options: own, choose: same, confirm: true }, notes)), undefined);
+      assert.ok(notes.some((line) => line.startsWith("notify")), notes.join("\n"));
+    }
+  });
+
+  it("labels the other-configuration choice by how many providers the engine lists", () => {
+    assert.equal(otherAgentLabel(1), "Choose another model\u2026");
+    assert.equal(otherAgentLabel(2), "Choose another model/provider\u2026");
   });
 
   it("cancelling at any step launches nothing", async () => {

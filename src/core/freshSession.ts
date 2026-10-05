@@ -62,9 +62,13 @@ export function freshRefusedByPause(pause: ProviderPause | undefined, currentSta
   return pause !== undefined && pause.stageId === currentStageId && !pause.hasSession;
 }
 
-/** The provider-pause card for the current stage, or undefined when none is recorded for it. */
-export function providerPauseCard(pause: ProviderPause | undefined, currentStageId: string, offersFresh: boolean): ProviderPauseCard | undefined {
-  if (!pause || pause.stageId !== currentStageId) {
+/**
+ * The provider-pause card for the current stage, or undefined when none is
+ * recorded for it. Shown only while the engine reports the run paused: a
+ * leftover record on a complete or failed run is not a pause to recover.
+ */
+export function providerPauseCard(pause: ProviderPause | undefined, runStatus: string, currentStageId: string, offersFresh: boolean): ProviderPauseCard | undefined {
+  if (!pause || runStatus !== "paused" || pause.stageId !== currentStageId) {
     return undefined;
   }
   const fresh = pause.hasSession && offersFresh ? freshOffer(pause.role, false) : undefined;
@@ -86,7 +90,7 @@ export function providerPauseCard(pause: ProviderPause | undefined, currentStage
     title: "Provider unavailable (quota / rate limit)",
     detail: "The candidate is safe and unchanged.",
     retry: true,
-    fresh: fresh ? { role: fresh.role, label: `${fresh.label} on another provider`, otherProvider: true } : undefined,
+    fresh: fresh ? { role: fresh.role, label: `${fresh.label} with another model/provider`, otherProvider: true } : undefined,
   };
 }
 
@@ -135,6 +139,15 @@ export interface ProviderOption {
   label: string;
 }
 
+/**
+ * The quick-pick entry for not keeping the current preference. The engine
+ * enumerates the providers a role supports; with only one there is only a
+ * model to choose.
+ */
+export function otherAgentLabel(providerCount: number): string {
+  return providerCount > 1 ? "Choose another model/provider\u2026" : "Choose another model\u2026";
+}
+
 /** What the person chose for the new conversation. */
 export type FreshChoice = { provider?: string; model?: string; effort?: string };
 
@@ -161,9 +174,11 @@ export interface FreshSessionUi {
  *
  * The result is the request to put on `resume-plan`, or undefined when the
  * person cancelled or nothing can be offered. `otherProvider` is the
- * provider-unavailable recovery: the current preference is not offered, the
- * current provider is not listed, and the chosen provider is always passed
- * as an override.
+ * provider-unavailable recovery: the current preference is not offered.
+ * Where the engine reports another provider for the role, the current one
+ * is not listed and the chosen provider is always passed as an override;
+ * where the role has only its current provider, a different model on it
+ * must be chosen. Only providers the engine lists for the role are offered.
  */
 export async function askFreshSession(role: SessionRole, otherProvider: boolean, ui: FreshSessionUi): Promise<FreshChoice | undefined> {
   let choice: FreshChoice = {};
@@ -173,15 +188,29 @@ export async function askFreshSession(role: SessionRole, otherProvider: boolean,
       return undefined;
     }
     const others = known.options.filter((option) => option.provider !== known.current);
-    if (others.length === 0) {
-      ui.notify(`No other provider is available for the ${roleNoun(role)}.`);
-      return undefined;
+    if (others.length > 0) {
+      const chosen = await ui.chooseAgent(others, true);
+      if (!chosen?.provider || chosen.provider === known.current) {
+        return undefined;
+      }
+      choice = chosen;
+    } else {
+      const current = await ui.resolve({});
+      const own = known.options.filter((option) => option.provider === known.current);
+      if (!current || own.length === 0) {
+        return undefined;
+      }
+      const chosen = await ui.chooseAgent(own, false);
+      if (!chosen) {
+        return undefined;
+      }
+      if (!chosen.model || chosen.model === current.model) {
+        ui.notify(`The ${roleNoun(role)} has no other provider; choose a different model to start it on.`);
+        return undefined;
+      }
+      // The current provider needs no override: the engine resolves it anyway.
+      choice = { model: chosen.model, effort: chosen.effort };
     }
-    const chosen = await ui.chooseAgent(others, true);
-    if (!chosen?.provider || chosen.provider === known.current) {
-      return undefined;
-    }
-    choice = chosen;
   } else {
     const current = await ui.resolve({});
     if (!current) {

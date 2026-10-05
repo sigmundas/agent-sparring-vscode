@@ -84,7 +84,7 @@ import { openCandidateDiff } from "./overview/gitDiff";
 import { configuredExecutable } from "./engineExecutable";
 import { settingsTarget } from "../core/settingsTarget";
 import { fixSetup, readEffectiveConfig, readModelChoices, readOverriddenConfig, resetModelChoicesCache } from "./configProbe";
-import { askFreshSession, describeAgent, freshRefusedByPause, roleNoun, type FreshSessionUi } from "../core/freshSession";
+import { askFreshSession, describeAgent, freshRefusedByPause, otherAgentLabel, roleNoun, type FreshSessionUi } from "../core/freshSession";
 import type { SessionRole } from "../core/engineFormats";
 import { CUSTOM_MODEL_LABEL, exactModelProblem } from "../core/effectiveConfig";
 import { OverviewPanelManager } from "./overview/overviewPanel";
@@ -2722,6 +2722,17 @@ async function startFreshSessionCommand(controller: SparringController, run: Pla
 function freshSessionUi(run: PlanRunSnapshot, role: SessionRole): FreshSessionUi {
   const { projectDir, sparringDir } = run.location;
   const noun = roleNoun(role);
+  // Only the providers the engine enumerates for this role: never one it would refuse.
+  const providers: FreshSessionUi["providers"] = async () => {
+    const config = await readEffectiveConfig(configuredExecutable(), projectDir, sparringDir, true);
+    const entry = config.kind === "report" ? config.report[role] : undefined;
+    if (!entry) {
+      void vscode.window.showErrorMessage("Agent Sparring: the engine did not report this role's providers.");
+      return undefined;
+    }
+    const options = (entry.provider_choices ?? []).map((choice) => ({ provider: choice.provider, label: choice.display_name ?? choice.provider }));
+    return { current: entry.provider, options: options.length > 0 ? options : [{ provider: entry.provider, label: entry.provider_display_name ?? entry.provider }] };
+  };
   return {
     async resolve(choice) {
       const overrides = roleOverrideArgs({ role, ...choice });
@@ -2737,25 +2748,20 @@ function freshSessionUi(run: PlanRunSnapshot, role: SessionRole): FreshSessionUi
       return { provider: entry.provider_display_name ?? entry.provider, model: entry.model, effort: entry.effort };
     },
     async pickCurrentOrOther(current) {
+      const known = await providers();
+      if (!known) {
+        return undefined;
+      }
       const picked = await vscode.window.showQuickPick(
         [
           { label: `Use current preference (${describeAgent(current)})`, other: false },
-          { label: "Choose another model/provider\u2026", other: true },
+          { label: otherAgentLabel(known.options.length), other: true },
         ],
         { title: `Agent Sparring: start fresh ${noun}`, placeHolder: `Which configuration should the new ${noun} use?` },
       );
       return picked ? !picked.other : undefined;
     },
-    async providers() {
-      const config = await readEffectiveConfig(configuredExecutable(), projectDir, sparringDir, true);
-      const entry = config.kind === "report" ? config.report[role] : undefined;
-      if (!entry) {
-        void vscode.window.showErrorMessage("Agent Sparring: the engine did not report this role's providers.");
-        return undefined;
-      }
-      const options = (entry.provider_choices ?? []).map((choice) => ({ provider: choice.provider, label: choice.display_name ?? choice.provider }));
-      return { current: entry.provider, options: options.length > 0 ? options : [{ provider: entry.provider, label: entry.provider_display_name ?? entry.provider }] };
-    },
+    providers,
     async chooseAgent(providers, requireProvider) {
       let provider = providers[0]?.provider;
       if (requireProvider || providers.length > 1) {

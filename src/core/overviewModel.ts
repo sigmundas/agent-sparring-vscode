@@ -1709,7 +1709,7 @@ function buildScreen(
       if (offers.length > 0) {
         model.freshSession = offers;
       }
-      model.providerPause = providerPauseCard(run.state.providerPause, run.state.currentStage, offers.length > 0);
+      model.providerPause = providerPauseCard(run.state.providerPause, run.state.status, run.state.currentStage, offers.length > 0);
     }
   }
   model.branchGuard = branchGuard;

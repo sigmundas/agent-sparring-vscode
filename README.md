@@ -483,6 +483,42 @@ continues it instead of starting a second one.
 unchanged, for when you want to look before every provider turn. In automatic
 mode those actions are still there, just no longer the obvious path.
 
+#### Starting a fresh reviewer or implementation agent
+
+For a **paused** plan run whose current stage is not accepted, the Overview
+offers **Start fresh reviewer…** and **Start fresh implementation agent…**.
+Each replaces only that role's conversation, through the engine's own
+`resume-plan --fresh-sparrer` / `--fresh-stage-agent`: same stage, same
+candidate, previous review history preserved. The engine still decides whose
+turn runs next; the extension never picks one. The flow asks whether to keep
+the current preference or choose another, shows the resolved provider, model
+and effort from `show-config`, and launches only after a modal confirmation.
+Only the providers the engine lists for the role are offered — today one per
+role, so the choice reads **Choose another model…** — and a role override is
+passed only when it differs from the preference. The actions are absent while
+a runner is alive, for an accepted stage, and on an older engine that records
+no `sessions`. A role's actor card shows `generation N · fresh: <reason>` once
+it is past its first conversation. This is not **reset-stage**, which
+archives the attempt and restarts the stage from the preceding candidate.
+
+**Pause cards.** When the engine paused the run because a provider failed, the
+Overview shows a card for the current stage:
+
+- *Reviewer / Implementation-agent session cannot be resumed* — the candidate
+  is safe; the action is **Start fresh …** for that role. There is nothing to
+  retry.
+- *Provider unavailable (quota / rate limit)* — **Retry** (plain
+  `resume-plan`) or **Start fresh … with another model/provider**, which never
+  offers the current preference: another provider the engine lists for the
+  role, or, where it lists only one, a different model on it.
+
+When the engine records that the role has no session to replace
+(`has_session: false`), only **Retry** is offered, anywhere on the screen.
+Source of truth: the card comes only from the plan run's `provider_pause`
+record, for the current stage, while the run's own status is `paused`. A
+record of an unknown kind or role, or with no stage id, is not shown; nothing
+is inferred from terminal output, prose or a process exit.
+
 ## When a deferred check fails
 
 At the plan's verification checkpoint every stage is already accepted, and
