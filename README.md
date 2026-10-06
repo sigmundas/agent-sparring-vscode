@@ -11,15 +11,19 @@ navigates.
    describes: `sparring` on your shell's `PATH`, with the `claude` and `codex`
    CLIs signed in.
 2. Install this extension (see [Install locally](#install-locally)).
-3. Open the repository and run **Agent Sparring: Run Plan**. A repository
+3. Get a staged plan. Audit the repository first, then use Claude or Codex
+   with the Agent Sparring planning skill (`/agent-sparring:sparring-plan`
+   in Claude Code) to turn it into a staged plan. Review the generated plan.
+   **Run Plan only executes an existing plan.** It does not write one.
+4. Open the repository and run **Agent Sparring: Run Plan**. A repository
    without any `.sparring` state yet is fine. Running any Agent Sparring
    command activates the extension, and **Open Project Settings** →
    **Create project settings** runs the engine's `init-config`.
-4. In the Overview's **Agents** section, pick your model and effort. They
+5. In the Overview's **Agents** section, pick your model and effort. They
    are your own preferences, shared by every repository that uses the same
    provider for that role, and they are never written to the repository.
    Leave them at **Provider default** to let each provider choose.
-5. After that, the **Overview** is where you continue a paused run, answer
+6. After that, the **Overview** is where you continue a paused run, answer
    checks, accept stages and apply setup fixes. Every one of those is an
    engine command.
 

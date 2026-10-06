@@ -330,6 +330,7 @@ describe("switching the active repository switches the cockpit", () => {
     assert.match(lines[0], /no \.sparring plan run or stage on disk/);
     assert.match(lines[0], /Nothing has been started or created/, "the wrapper does not offer to invent a run");
     assert.match(lines[1], /1 in sporely-py-reported-statistics/, "what exists elsewhere is named, not just counted");
+    assert.match(lines.at(-1) ?? "", /Run Plan only executes an existing plan/, "a new user is told where a plan comes from");
 
     const view = deriveStatus(selection, undefined, NOW);
     assert.equal(view.text, "$(circle-outline) Agent Sparring: No run for sporely-py-inaturalist-republish-media");

@@ -51,6 +51,7 @@
  */
 
 import { canonicalPath, isInsidePath, repositoryDisplayName, samePath, type RunSelection, type RunSnapshot } from "./discovery";
+import { GETTING_STARTED } from "./gettingStarted";
 import { pathDepth } from "./launchRepositories";
 
 export interface ActiveRepositorySignal {
@@ -588,6 +589,7 @@ export function emptyStateLines(selection: RunSelection): string[] {
   if (unattributed) {
     lines.push(unattributed);
   }
+  lines.push(GETTING_STARTED);
   return lines;
 }
 

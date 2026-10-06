@@ -57,6 +57,7 @@ import { checkedOutBranch, checkRepositoryMapping } from "../core/repositoryMapp
 import { stageScopeOf } from "../core/stageScope";
 import { CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
+import { GETTING_STARTED, NOT_A_PLAN_TITLE, notAPlanDetail } from "../core/gettingStarted";
 import { DEFERRED_VERIFICATION_REQUIRED, parseHandoffBranch, parsePlanStages, type PlanRunSource } from "../core/engineFormats";
 import { appendHumanEvidence, OUTCOME_WORDS, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
 import { blocksLaunch } from "../core/liveness";
@@ -2358,7 +2359,12 @@ async function pickPlanDocument(location: SparringLocation): Promise<string | un
   plans.sort((a, b) => a.description.localeCompare(b.description));
   const picked = await vscode.window.showQuickPick(
     [...plans, { label: "$(folder-opened) Browse…", description: "choose another Markdown file", file: "" }],
-    { placeHolder: "Which reviewed plan should run? (plans are Markdown files with '## Stage <n> — <title>' headings)" },
+    {
+      placeHolder:
+        plans.length > 0
+          ? "Which reviewed plan should run? (plans are Markdown files with '## Stage <n> — <title>' headings)"
+          : `No staged plan in ${location.folderName}. ${GETTING_STARTED}`,
+    },
   );
   if (!picked) {
     return undefined;
@@ -2666,6 +2672,17 @@ async function runPlanCommand(controller: SparringController, overview: Overview
       return;
     }
     await beginStartPlan(controller, overview, { location, planPath, label, expectedBranch }, {});
+    return;
+  }
+  // Without start-plan nothing on this path can compile prose into stages,
+  // so a document with none is refused here, with where a plan comes from.
+  // (start-plan routes such a document through the engine's intake instead.)
+  if (!(await looksLikePlan(planPath))) {
+    controller.log(`Run plan: refused — ${path.basename(planPath)} has no '## Stage <n> — <title>' sections.`);
+    const choice = await vscode.window.showWarningMessage(NOT_A_PLAN_TITLE, { modal: true, detail: notAPlanDetail(path.basename(planPath)) }, "Open file");
+    if (choice === "Open file") {
+      await openDocument(planPath, `${path.basename(planPath)} is missing.`, overview.documentColumn);
+    }
     return;
   }
   // Minted here, before anything is written: this run's identity, which its
