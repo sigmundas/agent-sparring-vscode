@@ -163,11 +163,14 @@ export const DEFERRED_VERIFICATION_REQUIRED = "deferred_verification_required";
  * {@link PlanRunState.deferredHumanChecks}, which is the one authority for
  * their content. `reason` says which checkpoint stopped the run —
  * `plan_completion` for the ordinary end-of-plan checkpoint,
- * `promoted` for an obligation a later reviewer said could not wait.
+ * `promoted` for an obligation a later reviewer said could not wait,
+ * `before_stage` for a plan-declared gate between two stages. Only
+ * `plan_completion` ends the plan when answered; after the others the
+ * engine resumes and the next stage's agents run.
  */
 export interface DeferredVerificationRequired {
   kind: typeof DEFERRED_VERIFICATION_REQUIRED;
-  reason: "plan_completion" | "promoted";
+  reason: "plan_completion" | "promoted" | "before_stage";
   instanceIds: string[];
 }
 
@@ -339,7 +342,12 @@ function parseAwaiting(raw: unknown): PushAuthorizationRequired | DeferredVerifi
     if (ids.length === 0) {
       return undefined; // a checkpoint that names no asking is not one
     }
-    const reason = raw["reason"] === "promoted" ? "promoted" : "plan_completion";
+    // The engine writes `plan_completion` when it records no reason. Any
+    // other value is a checkpoint after which the run goes on, and reading
+    // it as completion would promise a person the plan ends when answering
+    // in fact starts more implementation.
+    const given = raw["reason"];
+    const reason = given === undefined || given === null || given === "" || given === "plan_completion" ? "plan_completion" : given === "promoted" ? "promoted" : "before_stage";
     return { kind: DEFERRED_VERIFICATION_REQUIRED, reason, instanceIds: ids };
   }
   if (raw["kind"] !== PUSH_AUTHORIZATION_REQUIRED) {

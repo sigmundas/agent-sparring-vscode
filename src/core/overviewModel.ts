@@ -2061,6 +2061,9 @@ function deferredVerification(
     ? { label: "Submitting…", detail: "Your results are with the engine. Nothing is cleared until it finishes; if it fails, everything you entered is still here." }
     : undefined;
 
+  // Only the end-of-plan checkpoint finishes anything; after the others the
+  // engine resumes and the next stage's agents run.
+  const finishes = awaiting.reason === "plan_completion";
   const outstanding = view.required.filter((item) => !item.record?.outcome);
   let submitEnabled = false;
   let submitDetail: string;
@@ -2071,7 +2074,7 @@ function deferredVerification(
   } else if (!view.ready) {
     const names = checkNameList(outstanding);
     const which = names ? `the remaining ${outstanding.length === 1 ? "check" : "checks"} (${names})` : outstanding.length === 1 ? "the remaining check" : `all ${outstanding.length} remaining checks`;
-    submitDetail = `Record a result for ${which} first. The plan finishes when every deferred check has been answered, so the results go together.`;
+    submitDetail = `Record a result for ${which} first. The ${finishes ? "plan finishes" : "run continues"} when every deferred check has been answered, so the results go together.`;
   } else if (submitting) {
     submitDetail = submitting.detail;
   } else if (blocked(model)) {
@@ -2079,14 +2082,16 @@ function deferredVerification(
   } else {
     submitEnabled = true;
     submitDetail =
-      "Records each result against the asking it answers (sparring resume-plan --deferred-result) and lets the engine finish the plan. A Pass resolves its check; a Fail keeps the plan open and is written into the stage that raised it; Can't test records that no result could be obtained, which resolves nothing.";
+      `Records each result against the asking it answers (sparring resume-plan --deferred-result) and ${finishes ? "lets the engine finish the plan" : "resumes the plan: once every check passes, the next stage starts and its agents run"}. A Pass resolves its check; a Fail keeps the plan open and is written into the stage that raised it; Can't test records that no result could be obtained, which resolves nothing.`;
   }
 
   const headline = total === 1 ? "Manual verification required" : `Manual verification required — ${total} deferred checks`;
   const subtitle =
     awaiting.reason === "promoted"
       ? `A later review decided ${stages.size === 1 ? "this check" : "these checks"} can wait no longer. The run stopped before the next stage.`
-      : `${total} deferred ${total === 1 ? "check" : "checks"} from ${stages.size} earlier ${stages.size === 1 ? "stage" : "stages"}, owed ${checkpointWord(obligations)}. Every stage is accepted; this is the verification the reviewers judged safe to leave until now.`;
+      : awaiting.reason === "before_stage"
+        ? `The plan requires ${total === 1 ? "this check" : `these ${total} checks`} before its next stage. The run stopped there; answering resumes it.`
+        : `${total} deferred ${total === 1 ? "check" : "checks"} from ${stages.size} earlier ${stages.size === 1 ? "stage" : "stages"}, owed ${checkpointWord(obligations)}. Every stage is accepted; this is the verification the reviewers judged safe to leave until now.`;
 
   return {
     ...view,
@@ -2101,9 +2106,9 @@ function deferredVerification(
     technical: [
       { label: "Engine state", value: `awaiting.kind = ${awaiting.kind}, reason = ${awaiting.reason}` },
       ...groups.map((group) => ({ label: `Gate instance (${group.stageId})`, value: group.instanceId })),
-      { label: "What submitting does", value: "sparring resume-plan … --deferred-result '<gate instance>:<check id>=<pass|fail|blocked>[=note]'. The engine records it in its own ledger and in the originating stage's notes.md; the plan completes only once every obligation passes." },
+      { label: "What submitting does", value: `sparring resume-plan … --deferred-result '<gate instance>:<check id>=<pass|fail|blocked>[=note]'. The engine records it in its own ledger and in the originating stage's notes.md; ${finishes ? "the plan completes only once every obligation passes" : "once every obligation passes, the run continues with the next stage"}.` },
     ],
-    submit: { label: "Submit verification and finish", enabled: submitEnabled, detail: submitDetail },
+    submit: { label: finishes ? "Submit verification and finish" : "Submit verification and continue", enabled: submitEnabled, detail: submitDetail },
     repair: repairOffer(run, obligations, { branchGuard, submitting, model }),
     feedback: {
       draft: artifacts.humanFeedback?.trim() ? artifacts.humanFeedback : undefined,
@@ -3354,7 +3359,9 @@ function currentLine(
           stageLine:
             run.state.awaiting.reason === "promoted"
               ? "A later review decided a deferred check can wait no longer. Record the result and the plan continues."
-              : "Every stage is accepted. The plan finishes once the deferred manual checks are answered.",
+              : run.state.awaiting.reason === "before_stage"
+                ? "The plan requires manual checks before its next stage. Record the results and the plan continues."
+                : "Every stage is accepted. The plan finishes once the deferred manual checks are answered.",
           banner: { kind: "warn", text: `Verification owed — ${owed} deferred ${owed === 1 ? "check" : "checks"}` },
         };
       }

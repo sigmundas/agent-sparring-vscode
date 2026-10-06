@@ -57,7 +57,7 @@ import { checkedOutBranch, checkRepositoryMapping } from "../core/repositoryMapp
 import { stageScopeOf } from "../core/stageScope";
 import { CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
-import { parseHandoffBranch, parsePlanStages, type PlanRunSource } from "../core/engineFormats";
+import { DEFERRED_VERIFICATION_REQUIRED, parseHandoffBranch, parsePlanStages, type PlanRunSource } from "../core/engineFormats";
 import { appendHumanEvidence, OUTCOME_WORDS, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
 import { blocksLaunch } from "../core/liveness";
 import type { OverviewAction } from "../core/overviewHtml";
@@ -166,6 +166,8 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     // What a window reload would find: the launches recorded in workspaceState,
     // including the ones already known to have ended.
     vscode.commands.registerCommand("agentSparring._test.persistedLaunches", () => controller.persistedLaunches()),
+    // The worktrees outside the workspace that discovery probes as their own projects.
+    vscode.commands.registerCommand("agentSparring._test.externalProjects", () => controller.externalProjects()),
     // The terminal-ownership boundary: which terminals the extension owns,
     // which of them may be written to, and where a run's runner actually is.
     vscode.commands.registerCommand("agentSparring._test.ownedTerminals", () => controller.ownedTerminals()),
@@ -1609,9 +1611,14 @@ async function submitDeferredVerification(
   // shown to identify the answer, not to be re-read in full, and the whole
   // note is what `answers` carries to the engine.
   const confirmSummary = dialogQuote(summary);
+  // Only the end-of-plan checkpoint completes the plan. At any other the
+  // engine resumes execution, which starts the next stage's agents.
+  const finishes = run.state.awaiting?.kind === DEFERRED_VERIFICATION_REQUIRED && run.state.awaiting.reason === "plan_completion";
   const consequence =
     failing === 0
-      ? "Every deferred check passes, so the engine completes the plan. Nothing already accepted is re-run."
+      ? finishes
+        ? "Every deferred check passes, so the engine completes the plan. Nothing already accepted is re-run."
+        : "Every deferred check passes, so the engine resumes the plan: the next stage starts and its agents run. Nothing already accepted is re-run."
       : `${failing} of them ${failing === 1 ? "is not a pass" : "are not passes"}, so the plan stays open. A Fail is written into the stage that raised the check, where that stage's agents read it; Can't test records that no result could be obtained.`;
   const choice = await vscode.window.showInformationMessage(
     "Submit deferred verification?",

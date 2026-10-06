@@ -3,7 +3,10 @@
  * sibling worktree that is NOT part of the workspace, and runs
  * ./worktreeRunsSuite.ts inside it: the run must be found through
  * `git worktree list`, shown in the Runs view, never selected on its own,
- * and — with the proposed chat sessions API enabled for this extension and
+ * and — opened through a symlink to the repository, as git never reports it
+ * — not have the workspace's own directory rediscovered as a second,
+ * external project. With the proposed chat sessions API enabled for this
+ * extension and
  * the experimental setting on — listed as an agent session.
  */
 
@@ -44,13 +47,16 @@ async function main(): Promise<void> {
   const stage = path.join(sibling, ".sparring", "stages", "tidy-1-stage-2-cards");
   await fs.mkdir(stage, { recursive: true });
   await fs.writeFile(path.join(stage, "state.json"), JSON.stringify({ status: "working", run: "tidy-1", next_turn: "sparring", base_sha: null, candidate_sha: null, implementation_session_id: null, sparring_session_id: null }, null, 2));
+  // The window opens the repository through this alias; git lists it by its real path.
+  const alias = path.join(base, "app-alias");
+  await fs.symlink(app, alias, "dir");
   process.env.AGENT_SPARRING_TEST_SIBLING = sibling;
   try {
     await runTests({
       extensionDevelopmentPath: path.resolve(__dirname, "..", ".."),
       extensionTestsPath: path.resolve(__dirname, "worktreeRunsSuite"),
       extensionTestsEnv: { AGENT_SPARRING_TEST_SIBLING: sibling },
-      launchArgs: [app, "--disable-extensions", "--disable-workspace-trust", "--enable-proposed-api", "sintef.agent-sparring-vscode"],
+      launchArgs: [alias, "--disable-extensions", "--disable-workspace-trust", "--enable-proposed-api", "sintef.agent-sparring-vscode"],
     });
   } catch (error) {
     console.error("worktree runs integration test failed", error);

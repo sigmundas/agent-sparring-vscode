@@ -43,6 +43,14 @@ export async function run(): Promise<void> {
   assert.ok(facts.some((fact) => fact.startsWith("Worktree: app-agent-run")), `and where it lives: ${facts.join(" | ")}`);
 
   assert.equal(await vscode.commands.executeCommand<string | undefined>("agentSparring._test.selectedRun"), undefined, "an external run is never selected automatically");
+  // The window opened `app` through a symlink, and git lists it by its real
+  // path. That is the same directory, not a worktree outside the workspace;
+  // probing it again would show every run of it twice under two identities.
+  assert.deepEqual(
+    await vscode.commands.executeCommand<string[]>("agentSparring._test.externalProjects"),
+    [sibling],
+    "only the sibling worktree is external; the workspace's own real path is not",
+  );
   console.log("worktree runs: a run in a worktree outside the workspace was discovered, listed under Open with stage, next actor and worktree, and not auto-selected");
 
   const proposed = typeof (vscode as unknown as { chat?: { createChatSessionItemController?: unknown } }).chat?.createChatSessionItemController === "function";

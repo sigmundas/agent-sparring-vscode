@@ -349,10 +349,15 @@ export class SparringController implements vscode.Disposable {
     const roots = [...(this.activeRepository.knownRepoRoots ?? []), ...this.locations.map((location) => location.repoRoot)];
     const lists = await this.worktreeProbe.list(roots);
     this.repositoryFamily = familyResolver(lists);
+    // Git lists worktrees by their real path, while a workspace opened
+    // through a symlink keeps the alias. Both spellings, so the workspace's
+    // own directory is not rediscovered as an external worktree and the same
+    // run shown twice under two identities.
+    const withRealPaths = async (paths: string[]): Promise<string[]> => [...paths, ...(await Promise.all(paths.map((target) => this.realPaths.of(target))))];
     const candidates = externalWorktrees(
       lists,
-      this.fileFolders().map((folder) => folder.uri.fsPath),
-      this.locations.map((location) => location.projectDir),
+      await withRealPaths(this.fileFolders().map((folder) => folder.uri.fsPath)),
+      await withRealPaths(this.locations.map((location) => location.projectDir)),
     );
     const found = (await Promise.all(candidates.map((candidate) => locateExternalWorktree(candidate)))).filter((location): location is SparringLocation => location !== undefined);
     const before = this.externalLocations.map((location) => location.sparringDir).join("\0");
@@ -367,6 +372,11 @@ export class SparringController implements vscode.Disposable {
     if (changed || (found.length > 0 && this.externalWatcherDisposables.length === 0)) {
       this.watchExternal();
     }
+  }
+
+  /** The project directories of the worktrees discovered outside the workspace. */
+  externalProjects(): string[] {
+    return this.externalLocations.map((location) => location.projectDir);
   }
 
   /** Workspace projects first, then worktrees outside the workspace. */

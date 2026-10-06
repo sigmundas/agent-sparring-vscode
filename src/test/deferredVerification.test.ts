@@ -122,7 +122,7 @@ async function midPlanWith(results: unknown[]) {
 }
 
 /** The plan's verification checkpoint: every stage accepted, two obligations owed. */
-async function atCheckpoint(options: { results?: unknown[]; reason?: "plan_completion" | "promoted"; drafts?: OverviewArtifacts["humanChecks"] } = {}) {
+async function atCheckpoint(options: { results?: unknown[]; reason?: string; drafts?: OverviewArtifacts["humanChecks"] } = {}) {
   const ws = await Workspace.create();
   await ws.writePlan(FOO_PLAN_LABEL, FOO_PLAN_MARKDOWN);
   await ws.writePlanRun(FOO_PLAN_KEY, {
@@ -393,6 +393,32 @@ describe("the plan's verification checkpoint", () => {
     const { model } = await atCheckpoint({ reason: "promoted" });
     assert.match(model.actionRequired!.subtitle ?? "", /can wait no longer/);
     assert.match(model.stageLine ?? "", /can wait no longer/);
+  });
+
+  it("a gate before the next stage never promises completion: submitting resumes the run", async () => {
+    const { model } = await atCheckpoint({ reason: "before_stage" });
+    const panel = model.actionRequired!;
+    assert.equal(panel.submit.label, "Submit verification and continue");
+    assert.match(panel.subtitle ?? "", /before its next stage/);
+    assert.match(model.stageLine ?? "", /plan continues/);
+    for (const text of [panel.subtitle, panel.submit.detail, model.stageLine, ...panel.technical.map((row) => row.value)]) {
+      assert.doesNotMatch(text ?? "", /finish(es)? the plan|plan finishes|plan completes|Every stage is accepted/);
+    }
+  });
+
+  it("a promoted obligation, too, continues rather than finishes", async () => {
+    const { model } = await atCheckpoint({ reason: "promoted" });
+    assert.equal(model.actionRequired!.submit.label, "Submit verification and continue");
+  });
+
+  it("a checkpoint reason this version does not know is read as continuing, never as completion", async () => {
+    const { model } = await atCheckpoint({ reason: "some_later_checkpoint" });
+    assert.equal(model.actionRequired!.submit.label, "Submit verification and continue");
+  });
+
+  it("only the end-of-plan checkpoint offers to finish", async () => {
+    const { model } = await atCheckpoint();
+    assert.equal(model.actionRequired!.submit.label, "Submit verification and finish");
   });
 
   it("offers no freeform feedback channel: there is no candidate under review to send it about", async () => {
