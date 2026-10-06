@@ -34,6 +34,7 @@ import { RUN_KIND, TIMELINE_STATE_WORD, shortStageLabel, timelineGroups, type Ac
 import type { ProviderPauseCard } from "./freshSession";
 import type { MatchSource } from "./planAssociation";
 import type { PromptView, PromptViewSection } from "./promptInspector";
+import type { AmbiguousRunRow } from "./runPick";
 import { renderReportMarkdown } from "./reportMarkdown";
 import type { StageRunAction } from "./runner";
 
@@ -256,6 +257,17 @@ export function isStartPlanMessage(message: unknown): message is StartPlanMessag
     return typeof record["token"] === "string" && record["token"] !== "";
   }
   return action === "openReport" || action === "retry" || action === "dismiss";
+}
+
+/** A row on the ambiguity screen was chosen: pin this run, if it is still one of those offered. */
+export interface ChooseRunMessage {
+  type: "chooseRun";
+  runId: string;
+}
+
+export function isChooseRunMessage(message: unknown): message is ChooseRunMessage {
+  const record = asRecord(message);
+  return record !== undefined && record["type"] === "chooseRun" && typeof record["runId"] === "string" && record["runId"] !== "";
 }
 
 export function isIntakeActionMessage(message: unknown): message is IntakeActionMessage {
@@ -597,9 +609,9 @@ ${intake.command ? `<details class="intake-command"><summary>Engine command</sum
   if (model.kind === "ambiguous") {
     return `${renderRepositoryContext(model)}${renderOperation(model)}
 <header class="top"><h1>Agent Sparring</h1></header>
-<p>${escapeHtml(model.title)}:</p>
-<ul>${(model.choices ?? []).map((choice) => `<li>${escapeHtml(choice)}</li>`).join("")}</ul>
-<div class="actions">${button("showLog", "Show log")}</div>`;
+<h2>${escapeHtml(model.title)}</h2>
+<ul class="runchoices">${(model.runChoices ?? []).map(renderRunChoice).join("")}</ul>
+<div class="actions">${button("showLog", "Show log", true, undefined, "quiet")}</div>`;
   }
 
   // One identity for every disclosure on this page (see `disclose`).
@@ -2129,6 +2141,18 @@ ${view.command ? `<details class="start-command"><summary>Engine command</summar
 <p class="muted small">${escapeHtml(view.planLabel)}</p>`;
 }
 
+/**
+ * One open run on the ambiguity screen, as a button. It carries only the run
+ * id; the host pins it only if that id is still one of the runs offered.
+ * A running run is marked as likely, and is never chosen for the person.
+ */
+function renderRunChoice(row: AmbiguousRunRow): string {
+  const lead = row.stage ? `${row.status} · ${row.stage}` : row.status;
+  return `<li><button type="button" class="runchoice${row.likely ? " likely" : ""}" data-choose-run="${escapeHtml(row.runId)}" title="Follow this run (${escapeHtml(row.folderName)})"><strong class="status">${escapeHtml(lead)}</strong> <span class="plan">${escapeHtml(row.plan)}</span> <code class="runkey">${escapeHtml(row.runKey)}</code>${
+    row.likely ? ` <span class="muted small">likely</span>` : ""
+  }</button></li>`;
+}
+
 function button(action: OverviewAction, label: string, enabled = true, title?: string, cls = ""): string {
   const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
   const classAttr = cls ? ` class="${cls}"` : "";
@@ -2589,6 +2613,10 @@ button.primary { background: var(--vscode-button-background); color: var(--vscod
 button.primary:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
 button.danger { color: var(--warn); border-color: var(--warn); }
 button.quiet { background: transparent; color: var(--vscode-descriptionForeground); }
+ul.runchoices { list-style: none; padding: 0; margin: 8px 0 12px; display: flex; flex-direction: column; gap: 6px; }
+button.runchoice { width: 100%; text-align: left; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; background: var(--vscode-list-hoverBackground, transparent); color: var(--vscode-foreground); border: 1px solid var(--vscode-panel-border, transparent); }
+button.runchoice.likely { border-color: var(--vscode-focusBorder); }
+button.runchoice .runkey { color: var(--vscode-descriptionForeground); }
 .busy { display: inline-flex; align-items: center; padding: 4px 11px; border: 1px solid var(--good); border-radius: 6px; font-size: 0.92em; color: var(--good); font-weight: 600; cursor: help; }
 .busy.unknown { border-color: var(--warn); color: var(--warn); }
 .busy.accepting { border-color: var(--info); color: var(--info); }
@@ -2860,6 +2888,11 @@ const SCRIPT = `
       } else {
         vscode.postMessage({ type: 'startPlan', action: startAction });
       }
+      return;
+    }
+    var chooseRun = element ? element.closest('button[data-choose-run]') : null;
+    if (chooseRun && !chooseRun.disabled) {
+      vscode.postMessage({ type: 'chooseRun', runId: chooseRun.getAttribute('data-choose-run') });
       return;
     }
     var intakeTarget = element ? element.closest('button[data-intake]') : null;

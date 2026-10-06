@@ -38,6 +38,7 @@ import { buildPromptView, latestCapture, type CaptureEntry, type PromptView } fr
 import { briefMentionedStages, buildStageIndex, locateStage, parsePlanHeadings, planTitle, sectionSummary, type HeadingRef, type MatchSource, type PlanHeading } from "./planAssociation";
 import { actionWord, presentStage, stageDisplayName, type StagePresentation } from "./presentation";
 import { freshSessionOffers, generationLabel, providerPauseCard, type FreshSessionOffer, type ProviderPauseCard } from "./freshSession";
+import { ambiguousRunRows, type AmbiguousRunRow } from "./runPick";
 import { hasSessions, planAction, stageActions, type PlanAction, type StageRunAction } from "./runner";
 import { branchNotice, branchStateLabel, reportFor, type BranchNotice, type SliceBranchReport } from "./sliceBranch";
 import { QUIET_AFTER_MS, formatAge } from "./status";
@@ -1121,7 +1122,8 @@ export interface OverviewModel {
   /** Runner liveness as derived; the status bar and tests read it too. */
   liveness?: { state: LivenessState; source: RunnerLiveness["source"]; detail: string };
   /** For ambiguous: the candidate labels. */
-  choices?: string[];
+  /** For ambiguous: one selectable row per open run, running first. Nothing is pre-selected. */
+  runChoices?: AmbiguousRunRow[];
   /**
    * Which repository the cockpit is in, and whether it got there by following
    * this window or by an explicit pin.
@@ -1555,6 +1557,9 @@ export function buildOverviewModel(
   };
 }
 
+/** The ambiguity screen's heading: several open runs, none chosen, and nothing guessed. */
+export const AMBIGUOUS_TITLE = "Multiple open runs found — choose one to follow";
+
 function buildScreen(
   selection: RunSelection,
   rawLive: LiveState | undefined,
@@ -1574,8 +1579,8 @@ function buildScreen(
     if (selection.ambiguous.length > 0) {
       return {
         kind: "ambiguous",
-        title: "Several runs look active",
-        choices: selection.ambiguous.map((run) => `${run.location.folderName}: ${runLabel(run)}`),
+        title: AMBIGUOUS_TITLE,
+        runChoices: ambiguousRunRows(selection.ambiguous),
         repositoryContext,
       };
     }

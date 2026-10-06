@@ -16,7 +16,9 @@
  * No dependency on the vscode API.
  */
 
-import { currentStageOf, isOpenRun, totalStagesOf, type RunSnapshot } from "./discovery";
+import { currentStageOf, isOpenRun, samePath, totalStagesOf, type RunSelection, type RunSnapshot } from "./discovery";
+import type { RunIndex, RunIndexEntry } from "./runIndex";
+import { formatWhen, stagePositionText, summarizeRun } from "./runSummary";
 import { planRunDisplayName, type PlanMembership } from "./planMembership";
 import { presentRunStage, stageDisplayName } from "./presentation";
 
@@ -137,4 +139,110 @@ export function buildRunPickGroups(runs: RunSnapshot[], options: RunPickOptions 
 /** The same rows as one flat list, in group order; for callers that cannot show separators. */
 export function buildRunPickItems(runs: RunSnapshot[], selectedId?: string, memberships?: ReadonlyMap<string, PlanMembership>): RunPickItem[] {
   return buildRunPickGroups(runs, { selectedId, memberships }).flatMap((group) => group.items);
+}
+
+// ---------------------------------------------------------------- open runs first
+
+/** Text that marks the pinned row in addition to its tick, so it never reads as the keyboard highlight. */
+export const PINNED_MARK = "pinned";
+
+export interface RunQuickPickSection {
+  title: string;
+  items: RunPickItem[];
+}
+
+export interface RunQuickPickOptions {
+  /** The run the user pinned, if any: ticked and marked `pinned`. */
+  pinnedId?: string;
+  nowMs: number;
+}
+
+/**
+ * The quick pick's run rows, from the shared run index (core/runIndex.ts):
+ * OPEN, RECENT, then one section per other repository. Each label leads with
+ * the status, so a long title can never truncate it away; the run key and the
+ * worktree are secondary, in `detail`.
+ */
+export function buildRunQuickPickSections(index: RunIndex, options: RunQuickPickOptions): RunQuickPickSection[] {
+  const row = ({ run, summary }: RunIndexEntry): RunPickItem => {
+    const pinned = run.id === options.pinnedId;
+    const where = summary.repository.external ? `${summary.repository.name} (worktree outside this workspace)` : summary.repository.name;
+    return {
+      label: `${pinned ? "$(check) " : ""}${summary.statusWord}  ${summary.title}`,
+      description: [pinned ? PINNED_MARK : undefined, stagePositionText(summary), formatWhen(summary.updatedAtMs, options.nowMs)].filter(Boolean).join(" · "),
+      detail: `${where} · ${summary.runKey}`,
+      run,
+    };
+  };
+  return [
+    { title: "OPEN", items: index.open.map(row) },
+    { title: "RECENT", items: index.recent.map(row) },
+    ...index.other.map((repository) => ({ title: `OTHER REPOSITORY · ${repository.name}`, items: repository.entries.map(row) })),
+  ].filter((section) => section.items.length > 0);
+}
+
+/**
+ * Which run the quick pick should highlight first: the pinned run; else the
+ * run on screen when it is in the followed repository; else the one running
+ * run in the followed repository, when there is exactly one; else nothing.
+ * A run from another repository is never highlighted while a different one
+ * is followed — Enter would silently move the cockpit there.
+ */
+export function initialRunFocus(runs: readonly RunSnapshot[], pinnedId: string | undefined, followedRoot: string | undefined, shownId?: string): RunSnapshot | undefined {
+  const pinned = pinnedId ? runs.find((run) => run.id === pinnedId) : undefined;
+  if (pinned) {
+    return pinned;
+  }
+  if (!followedRoot) {
+    return undefined;
+  }
+  const shown = shownId ? runs.find((run) => run.id === shownId && samePath(run.location.repoRoot, followedRoot)) : undefined;
+  if (shown) {
+    return shown;
+  }
+  const running = runs.filter((run) => run.kind === "plan" && run.state.status === "running" && samePath(run.location.repoRoot, followedRoot));
+  return running.length === 1 ? running[0] : undefined;
+}
+
+// ---------------------------------------------------------------- ambiguity rows
+
+/** One open run the overview offers when several are open and none is chosen. */
+export interface AmbiguousRunRow {
+  /** The discovered run id; the only thing the webview sends back. */
+  runId: string;
+  status: string;
+  stage?: string;
+  runKey: string;
+  /** The plan document's title, or a stage's display name. */
+  plan: string;
+  folderName: string;
+  /** Running, so probably what the person wants — shown, never acted on. */
+  likely: boolean;
+}
+
+export function ambiguousRunRows(runs: readonly RunSnapshot[], memberships?: ReadonlyMap<string, PlanMembership>): AmbiguousRunRow[] {
+  const entries = runs.map((run) => ({ run, summary: summarizeRun(run, memberships) }));
+  const order: Record<string, number> = { running: 0, "needs-you": 1, paused: 2, open: 3, complete: 4 };
+  entries.sort((a, b) => order[a.summary.phase] - order[b.summary.phase] || b.summary.updatedAtMs - a.summary.updatedAtMs);
+  return entries.map(({ run, summary }) => ({
+    runId: run.id,
+    status: summary.statusWord,
+    ...(stagePositionText(summary) ? { stage: stagePositionText(summary) } : {}),
+    runKey: summary.runKey,
+    plan: summary.title,
+    folderName: run.location.folderName,
+    likely: summary.phase === "running",
+  }));
+}
+
+/**
+ * The run an ambiguity row's click names, or undefined when that id is not
+ * one of the runs currently offered. A webview message is untrusted input:
+ * only an id from the present ambiguous set may be pinned.
+ */
+export function resolveAmbiguousChoice(selection: Pick<RunSelection, "selected" | "ambiguous">, runId: unknown): RunSnapshot | undefined {
+  if (selection.selected || typeof runId !== "string" || runId === "") {
+    return undefined;
+  }
+  return selection.ambiguous.find((run) => run.id === runId);
 }

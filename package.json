@@ -27,7 +27,8 @@
     "workspaceContains:.sparring/project.toml",
     "workspaceContains:.sparring/plans/*.json",
     "workspaceContains:**/.sparring/project.toml",
-    "workspaceContains:**/.sparring/stages/*/state.json"
+    "workspaceContains:**/.sparring/stages/*/state.json",
+    "onView:agentSparring.runs"
   ],
   "contributes": {
     "commands": [
@@ -155,6 +156,39 @@
         "command": "agentSparring.chooseExecutable",
         "title": "Choose sparring Executable…",
         "category": "Agent Sparring"
+      },
+      {
+        "command": "agentSparring.runs.follow",
+        "title": "Show in Overview",
+        "category": "Agent Sparring",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "agentSparring.runs.openWorktree",
+        "title": "Open Worktree in New Window",
+        "category": "Agent Sparring",
+        "icon": "$(empty-window)"
+      },
+      {
+        "command": "agentSparring.runs.copyRunId",
+        "title": "Copy Run Key",
+        "category": "Agent Sparring"
+      },
+      {
+        "command": "agentSparring.runs.refresh",
+        "title": "Refresh Runs",
+        "category": "Agent Sparring",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "agentSparring.runs.showOlder",
+        "title": "Show Older Runs",
+        "category": "Agent Sparring"
+      },
+      {
+        "command": "agentSparring.runs.showRecent",
+        "title": "Show Recent Runs Only",
+        "category": "Agent Sparring"
       }
     ],
     "configuration": {
@@ -192,6 +226,82 @@
           "markdownDescription": "How many directory levels below each workspace folder are searched for nested projects with their own `.sparring` (for example a git worktree or a monorepo package checked out under a parent folder). `0` probes only the workspace folders themselves. Hidden and dependency/build directories are never entered."
         }
       }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agentSparring",
+          "title": "Agent Sparring",
+          "icon": "$(comment-discussion)"
+        }
+      ]
+    },
+    "views": {
+      "agentSparring": [
+        {
+          "id": "agentSparring.runs",
+          "name": "Runs",
+          "contextualTitle": "Agent Sparring"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "agentSparring.runs.refresh",
+          "when": "view == agentSparring.runs",
+          "group": "navigation"
+        },
+        {
+          "command": "agentSparring.selectRun",
+          "when": "view == agentSparring.runs",
+          "group": "navigation@1"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "agentSparring.runs.follow",
+          "when": "view == agentSparring.runs && viewItem =~ /^run/",
+          "group": "inline"
+        },
+        {
+          "command": "agentSparring.runs.follow",
+          "when": "view == agentSparring.runs && viewItem =~ /^run/",
+          "group": "1_open@1"
+        },
+        {
+          "command": "agentSparring.runs.openWorktree",
+          "when": "view == agentSparring.runs && viewItem =~ /^run\\.external/",
+          "group": "1_open@2"
+        },
+        {
+          "command": "agentSparring.runs.copyRunId",
+          "when": "view == agentSparring.runs && viewItem =~ /^run/",
+          "group": "2_copy"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "agentSparring.runs.follow",
+          "when": "false"
+        },
+        {
+          "command": "agentSparring.runs.openWorktree",
+          "when": "false"
+        },
+        {
+          "command": "agentSparring.runs.copyRunId",
+          "when": "false"
+        },
+        {
+          "command": "agentSparring.runs.showOlder",
+          "when": "false"
+        },
+        {
+          "command": "agentSparring.runs.showRecent",
+          "when": "false"
+        }
+      ]
     }
   },
   "scripts": {

@@ -20,6 +20,7 @@ import {
   intentForChoosing,
   isNestedLocation,
   locateAll,
+  locateExternalWorktree,
   runLabel,
   samePath,
   selectRun,
@@ -40,6 +41,8 @@ import {
 } from "../core/discovery";
 import { type ManifestStageIdentity } from "../core/manifest";
 import { launchRepositories, type LaunchRepository } from "../core/launchRepositories";
+import { externalWorktrees, familyResolver } from "../core/worktrees";
+import { WorktreeProbe } from "./worktreeProbe";
 import { resolveMemberships, stageOwnership, type PlanMembership } from "../core/planMembership";
 import { deriveLiveness, type ExecutionRecord, type RunnerLiveness } from "../core/liveness";
 import { applyEvent, emptyLiveState, type LiveState } from "../core/liveState";
@@ -150,6 +153,16 @@ export class SparringController implements vscode.Disposable {
   private readonly disposables: vscode.Disposable[] = [];
 
   private locations: SparringLocation[] = [];
+  /**
+   * Projects in worktrees of known repositories that no workspace folder
+   * contains (core/worktrees.ts). Discovered, watched and shown like any
+   * other, but never selected automatically and never offered as a place to
+   * launch: nobody asked this window to follow those directories.
+   */
+  private externalLocations: SparringLocation[] = [];
+  private readonly worktreeProbe: WorktreeProbe;
+  private repositoryFamily: (root: string) => string = (root) => root;
+  private externalWatcherDisposables: vscode.Disposable[] = [];
   private discovery: Discovery = { locations: [], runs: [], problems: [] };
   private selection: RunSelection = { ambiguous: [] };
   private live: LiveState | undefined;
@@ -207,7 +220,7 @@ export class SparringController implements vscode.Disposable {
     this.tracker = new ExecutionTracker(
       context,
       (message) => this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} ${message}`),
-      () => this.locations,
+      () => this.allLocations(),
       this.terminals,
       this.submissions,
     );
@@ -218,6 +231,7 @@ export class SparringController implements vscode.Disposable {
     // Moving to another repository re-decides which run the cockpit follows,
     // so it is a rediscovery like any other authoritative change.
     this.activeRepository = new ActiveRepositoryTracker((message) => this.log(message));
+    this.worktreeProbe = new WorktreeProbe((message) => this.log(message));
     this.disposables.push(this.activeRepository, this.activeRepository.onDidChange(() => this.scheduleRefresh()));
     this.disposables.push(
       this.tracker,
@@ -323,6 +337,52 @@ export class SparringController implements vscode.Disposable {
     if (nestedBefore.join("\0") !== nestedNow.join("\0")) {
       this.output.appendLine(`${now()}  ${"Extension".padEnd(15)} nested projects with .sparring: ${nestedNow.length === 0 ? "none" : nestedNow.join(", ")}`);
     }
+    await this.relocateWorktrees();
+  }
+
+  /**
+   * Every worktree of every repository this window knows, so a run an agent
+   * started in a worktree it created is found without anyone adding that
+   * worktree to the workspace. Read-only: `git worktree list` only.
+   */
+  private async relocateWorktrees(): Promise<void> {
+    const roots = [...(this.activeRepository.knownRepoRoots ?? []), ...this.locations.map((location) => location.repoRoot)];
+    const lists = await this.worktreeProbe.list(roots);
+    this.repositoryFamily = familyResolver(lists);
+    const candidates = externalWorktrees(
+      lists,
+      this.fileFolders().map((folder) => folder.uri.fsPath),
+      this.locations.map((location) => location.projectDir),
+    );
+    const found = (await Promise.all(candidates.map((candidate) => locateExternalWorktree(candidate)))).filter((location): location is SparringLocation => location !== undefined);
+    const before = this.externalLocations.map((location) => location.sparringDir).join("\0");
+    this.externalLocations = found;
+    const changed = found.map((location) => location.sparringDir).join("\0") !== before;
+    if (changed) {
+      this.output.appendLine(
+        `${now()}  ${"Extension".padEnd(15)} worktrees outside the workspace with .sparring: ${found.length === 0 ? "none" : found.map((location) => location.projectDir).join(", ")}`,
+      );
+    }
+    // Also after start() disposed every watcher while the set stayed the same.
+    if (changed || (found.length > 0 && this.externalWatcherDisposables.length === 0)) {
+      this.watchExternal();
+    }
+  }
+
+  /** Workspace projects first, then worktrees outside the workspace. */
+  private allLocations(): SparringLocation[] {
+    return [...this.locations, ...this.externalLocations];
+  }
+
+  /** The repository family of a root: the same for every worktree of one repository (core/worktrees.ts). */
+  familyOf(root: string): string {
+    return this.repositoryFamily(root);
+  }
+
+  /** Ask git for worktrees again on the next refresh instead of reusing its recent answer. */
+  async rediscoverWorktrees(): Promise<void> {
+    this.worktreeProbe.invalidate();
+    await this.refresh();
   }
 
   private locateOptions(): LocateOptions {
@@ -407,23 +467,53 @@ export class SparringController implements vscode.Disposable {
       this.watcherDisposables.push(watcher);
     }
     const activity = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(folder, "**/.sparring/stages/*/activity.jsonl"));
-    const onActivity = (uri: vscode.Uri) => {
-      if (this.tailer && path.resolve(uri.fsPath) === path.resolve(this.tailer.path)) {
-        this.schedulePoll();
-      } else if (!this.selection.selected) {
-        // A run started externally may write telemetry before we noticed its state file.
-        this.scheduleRefresh();
-      }
-    };
+    const onActivity = (uri: vscode.Uri) => this.onActivityFile(uri);
     activity.onDidCreate(onActivity);
     activity.onDidChange(onActivity);
     activity.onDidDelete(onActivity);
     this.watcherDisposables.push(activity);
   }
 
+  private onActivityFile(uri: vscode.Uri): void {
+    if (this.tailer && path.resolve(uri.fsPath) === path.resolve(this.tailer.path)) {
+      this.schedulePoll();
+    } else if (!this.selection.selected) {
+      // A run started externally may write telemetry before we noticed its state file.
+      this.scheduleRefresh();
+    }
+  }
+
   private disposeWatchers(): void {
-    for (const disposable of this.watcherDisposables.splice(0)) {
+    for (const disposable of [...this.watcherDisposables.splice(0), ...this.externalWatcherDisposables.splice(0)]) {
       disposable.dispose();
+    }
+  }
+
+  /**
+   * The same authoritative files and activity stream as {@link watch}, for
+   * each `.sparring` in a worktree outside the workspace, rooted at that
+   * directory so nothing else on disk is watched.
+   */
+  private watchExternal(): void {
+    for (const disposable of this.externalWatcherDisposables.splice(0)) {
+      disposable.dispose();
+    }
+    for (const location of this.externalLocations) {
+      const base = vscode.Uri.file(location.sparringDir);
+      for (const glob of ["plans/*.json", "stages/*/state.json", "stages/*/sparring.md", "intake/*/intake.json", "intake/*/runs/*/approval.json", "intake/registry/*.json"]) {
+        const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(base, glob));
+        const onChange = () => this.scheduleRefresh();
+        watcher.onDidCreate(onChange);
+        watcher.onDidChange(onChange);
+        watcher.onDidDelete(onChange);
+        this.externalWatcherDisposables.push(watcher);
+      }
+      const activity = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(base, "stages/*/activity.jsonl"));
+      const onActivity = (uri: vscode.Uri) => this.onActivityFile(uri);
+      activity.onDidCreate(onActivity);
+      activity.onDidChange(onActivity);
+      activity.onDidDelete(onActivity);
+      this.externalWatcherDisposables.push(activity);
     }
   }
 
@@ -448,7 +538,7 @@ export class SparringController implements vscode.Disposable {
   async refresh(): Promise<void> {
     this.refreshTimer = undefined;
     await this.relocate();
-    this.discovery = await discoverRuns(this.locations);
+    this.discovery = await discoverRuns(this.allLocations());
     await this.reconcileStartedRuns();
     await this.migrateDeclarationScopes();
     await this.migrateStageScopedState();
@@ -458,7 +548,11 @@ export class SparringController implements vscode.Disposable {
     // is the guessing that made unrelated stages look like a plan's history.
     const ownership = stageOwnership(await this.planMemberships());
     await this.settleStartingPin();
-    this.selection = selectRun(this.discovery.runs, this.preference(), sticky, await this.repositoryScope(), ownership, this.locations, this.discovery.intakes);
+    // A run in a worktree outside the workspace is shown only when a person
+    // chose it; automatic selection keeps to the projects this window opened.
+    const preference = this.preference();
+    const selectable = this.discovery.runs.filter((run) => !run.location.external || run.id === preference?.id);
+    this.selection = selectRun(selectable, preference, sticky, await this.repositoryScope(), ownership, this.allLocations(), this.discovery.intakes);
     if (this.selection.released) {
       await this.retireReleasedPin(this.selection.released);
     }

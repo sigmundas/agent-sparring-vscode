@@ -297,7 +297,15 @@ describe("overview view model", () => {
     await ws.writePlanRun("bar-00000000", { plan: "docs/plans/bar.md", status: "paused", current_stage_index: 0, current_stage: "bar-00000000-stage-1-only" });
     const model = buildOverviewModel(await selection(ws), undefined, NONE, NOW);
     assert.equal(model.kind, "ambiguous");
-    assert.deepEqual(model.choices, ["repo: docs/plans/bar.md", "repo: docs/plans/foo.md"]);
+    assert.equal(model.title, "Multiple open runs found — choose one to follow");
+    // Running first, status leading; nothing chosen on the person's behalf.
+    assert.deepEqual(
+      model.runChoices?.map((row) => [row.status, row.stage, row.runKey, row.likely]),
+      [
+        ["Running", "Stage 1 of 3", FOO_PLAN_KEY, true],
+        ["Paused", "Stage 1 of 1", "bar-00000000", false],
+      ],
+    );
   });
 
   it("READY on a working stage presents as Review complete", async () => {
@@ -425,14 +433,20 @@ describe("overview HTML", () => {
     const html = renderOverviewHtml(
       {
         kind: "ambiguous",
-        title: "Several runs look active",
-        choices: ["a.md", "<b>.md"],
+        title: "Multiple open runs found — choose one to follow",
+        runChoices: [
+          { runId: "p|plan:a", status: "Running", stage: "Stage 1", runKey: "fix2", plan: "a.md", folderName: "beta", likely: true },
+          { runId: "p|plan:<b>", status: "Paused", stage: "Stage 3", runKey: "s1", plan: "<b>.md", folderName: "beta", likely: false },
+        ],
         repositoryContext: describeRepositoryContext({ ambiguous: [], scope: { repoRoot: "/code/beta", name: "beta" } }),
       },
       "n",
       "c",
     );
-    assert.match(html, /<li>&lt;b&gt;.md<\/li>/);
+    assert.match(html, /<h2>Multiple open runs found — choose one to follow<\/h2>/);
+    assert.match(html, /data-choose-run="p\|plan:a"[^>]*><strong class="status">Running · Stage 1<\/strong> <span class="plan">a.md<\/span> <code class="runkey">fix2<\/code>/);
+    assert.match(html, /data-choose-run="p\|plan:&lt;b&gt;"[^>]*><strong class="status">Paused · Stage 3<\/strong>/);
+    assert.match(html, /data-action="showLog"/);
     assert.match(html, /data-action="selectRun"/);
     assert.ok(html.includes('Following repository:</span><button type="button" class="name chooser" data-action="chooseRepository" title="Choose repository to follow" aria-haspopup="listbox">beta'));
   });
