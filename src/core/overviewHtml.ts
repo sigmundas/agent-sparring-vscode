@@ -619,7 +619,10 @@ ${intake.command ? `<details class="intake-command"><summary>Engine command</sum
   const parts: string[] = [];
   parts.push(renderRepositoryContext(model));
   parts.push(renderOperation(model));
-  parts.push(renderHeader(model));
+  // The banner below states the run's state in full ("Plan complete — 2
+  // stages accepted"); when it is shown, the header does not say it again.
+  const bannerShown = !model.pushAuthorization && !model.actionRequired && model.banner !== undefined;
+  parts.push(renderHeader(model, bannerShown));
   if (model.branchGuard) {
     parts.push(renderBranchGuard(model.branchGuard));
   }
@@ -773,7 +776,7 @@ function contextLine(headline: string, repository: string | undefined, pinned: b
   return `<div class="line"><span class="headline">${pinned ? icon("pin", "pin") : ""}${escapeHtml(headline)}:</span>${shown}</div>`;
 }
 
-function renderHeader(model: OverviewModel): string {
+function renderHeader(model: OverviewModel, bannerShown = false): string {
   // Passive facts, styled as text rather than as controls. The breadcrumb
   // already names the plan and the stage, so neither is repeated here; a plan
   // run is the ordinary case and needs no label, while a historical or
@@ -786,7 +789,7 @@ function renderHeader(model: OverviewModel): string {
       : "A stage that was run on its own; no managed plan run claims it.";
     pills.push(`<span class="hpill${historical ? " history" : ""}" title="${escapeHtml(explain)}">${escapeHtml(model.runKind)}</span>`);
   }
-  if (model.status) {
+  if (model.status && !bannerShown) {
     pills.push(`<span class="hpill ${model.status.tone}">${icon("dot", "dot")}${escapeHtml(model.status.label)}</span>`);
   }
   if (model.branchGuard) {
