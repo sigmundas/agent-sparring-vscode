@@ -55,7 +55,7 @@ describe("multi-root workspaces", () => {
     assert.equal(selection.selected, undefined);
     assert.equal(selection.ambiguous.length, 2);
     const model = buildOverviewModel(selection, undefined, undefined, NOW);
-    assert.deepEqual(model.choices, ["alpha: hotfix-1", "beta: hotfix-1"]);
+    assert.deepEqual(model.runChoices?.map((row) => `${row.folderName}: ${row.runKey}`).sort(), ["alpha: hotfix-1", "beta: hotfix-1"]);
     // Each run tails its own repository's activity file.
     assert.ok((runs[1] as StandaloneStageSnapshot).stage.dir.startsWith(b.root));
   });

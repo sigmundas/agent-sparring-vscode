@@ -227,7 +227,8 @@ describe("a stage is called what the plan calls it", () => {
     assert.equal(model.stageHeading, "Stage 3D — Snapshot v2 and attachment/export/import transport");
     assert.equal(model.positionNote, "6 of 8");
     assert.equal(model.position, "Stage 6 of 8", "the ordinal is still recorded, for the tooltip");
-    assert.match(html, /<span class="hpill" title="Stage 6 of 8">Stage 3D<\/span>/);
+    assert.ok(!/<span class="hpill"[^>]*>Stage 3D<\/span>/.test(html), "the breadcrumb names the stage; no pill repeats it");
+    assert.match(html, /<span class="sep">›<\/span><span title="Stage 6 of 8">Stage 3D — /);
     assert.match(html, /<h2 [^>]*>.*?<\/svg>Stage 3D — Snapshot v2 and attachment\/export\/import transport<\/h2>/);
     assert.match(html, /<div class="substatus"><span class="muted" title="Stage 6 of 8">6 of 8<\/span>/);
     assert.ok(!/Stage 6 — /.test(normalUi(html)), "the manifest ordinal never wears the stage's name");
@@ -316,7 +317,7 @@ describe("the Goal never complains about Markdown", () => {
     const brief = ["# Stage brief: stage-3d-snapshot-v2-and-attachment-export-import-transport", "", "Stage 3D from plan `reported-statistics.md`. Implement only this section; the other stages are separate.", "", "## Stage 3D — Snapshot v2 and attachment/export/import transport", "", "Owns the frozen-evidence representation of enhanced content and the gates that protect old readers.", "", "- A bullet is not a description.", ""].join("\n");
     const { model, html } = await managedStage3d({ brief });
     assert.equal(model.goal, "Owns the frozen-evidence representation of enhanced content and the gates that protect old readers.", "the embedded plan section, not the provenance line");
-    assert.match(html, /Goal<\/h3><p class="goal">Owns the frozen-evidence/);
+    assert.match(html, /<summary>About this stage<\/summary><div class="reportbody"><p>Owns the frozen-evidence/, "section text is a description to open, not the Goal");
     assert.ok(!html.includes("## Goal"));
   });
 
@@ -328,13 +329,14 @@ describe("the Goal never complains about Markdown", () => {
 });
 
 describe("warning colours come from the theme, not from a chart palette", () => {
-  it("the warn tokens are semantic VS Code variables, and the pill pairs a tinted ground with ordinary text", () => {
+  it("the warn tokens are semantic VS Code variables, and the header status is ordinary text with a warning dot", () => {
     const html = renderOverviewHtml({ kind: "run", title: "x" }, "n", "c");
     const style = /<style nonce="n">([\s\S]*?)<\/style>/.exec(html)?.[1] ?? "";
     assert.match(style, /--warn: var\(--vscode-notificationsWarningIcon-foreground, var\(--vscode-editorWarning-foreground, var\(--vscode-charts-orange\)\)\);/);
     assert.match(style, /--warn-surface: var\(--vscode-inputValidation-warningBackground, transparent\);/);
     assert.match(style, /--warn-border: var\(--vscode-inputValidation-warningBorder, var\(--warn\)\);/);
-    assert.match(style, /\.hpill\.warn \{ color: var\(--vscode-foreground\); border-color: var\(--warn-border\); background: var\(--warn-surface\);/);
+    assert.match(style, /\.hpill\.warn \{ color: var\(--vscode-foreground\); font-weight: 600; \}/);
+    assert.ok(!/\.hpill \{[^}]*border:/.test(style), "a header fact has no border: it is not a button");
     assert.match(style, /\.hpill\.warn \.icon \{ color: var\(--warn\); \}/);
     // Nothing in the sheet is a fixed colour: every value resolves through the theme.
     assert.ok(!/#[0-9a-fA-F]{3,8}\b/.test(style), "no hard-coded hex colour");

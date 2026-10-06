@@ -175,8 +175,15 @@ describe("overview view model", () => {
     const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
     assert.equal(model.lastSparring?.report, "Long findings that must never reach the status bar.");
     const html = renderOverviewHtml(model, "n", "c");
-    assert.match(html, /<details class="report"[^>]*><summary>Read feedback<\/summary><div class="reportbody"><p>Long findings that must never reach the status bar\.<\/p><\/div>/);
-    assert.match(html, /<button type="button" data-action="openSparring" title="Open sparring.md">Open full report<\/button><\/details>/);
+    // The verdict is on the Sparrer card, not in the stage card.
+    const stageCard = html.slice(html.indexOf('<section class="card stage">'), html.indexOf('<section class="actors">'));
+    assert.ok(!stageCard.includes("Latest sparring result") && !stageCard.includes("sparverdict"), "the stage card no longer carries the result");
+    const sparrerCard = /<div class="card actor [^"]*" data-role="sparrer">[\s\S]*?<div class="cardfoot">[\s\S]*?<\/div><\/div>/.exec(html)?.[0] ?? "";
+    assert.match(sparrerCard, /<div class="sparresult"><p class="sparverdict"><span class="verdict send_back"[^>]*>Changes requested<\/span>/);
+    // Read feedback is a tab on the Sparrer card's footer line; the report opens below both cards.
+    assert.match(sparrerCard, /<button type="button" class="showinstr" data-instr="feedback" aria-controls="feedback-sparrer" aria-expanded="false" data-show="Read feedback" data-hide="Hide feedback">Read feedback<\/button>/);
+    assert.match(html, /<div class="instrpanel [^"]*" id="feedback-sparrer" data-instrpanel="feedback"[^>]* hidden>[\s\S]*?<div class="reportbody"><p>Long findings that must never reach the status bar\.<\/p><\/div>/);
+    assert.match(html, /<button type="button" data-action="openSparring" title="Open sparring.md">Open full report<\/button>/);
   });
 
   it("no report to read: Read feedback is not offered, only the verdict and summary", async () => {
@@ -297,7 +304,15 @@ describe("overview view model", () => {
     await ws.writePlanRun("bar-00000000", { plan: "docs/plans/bar.md", status: "paused", current_stage_index: 0, current_stage: "bar-00000000-stage-1-only" });
     const model = buildOverviewModel(await selection(ws), undefined, NONE, NOW);
     assert.equal(model.kind, "ambiguous");
-    assert.deepEqual(model.choices, ["repo: docs/plans/bar.md", "repo: docs/plans/foo.md"]);
+    assert.equal(model.title, "Multiple open runs found — choose one to follow");
+    // Running first, status leading; nothing chosen on the person's behalf.
+    assert.deepEqual(
+      model.runChoices?.map((row) => [row.status, row.stage, row.runKey, row.likely]),
+      [
+        ["Running", "Stage 1 of 3", FOO_PLAN_KEY, true],
+        ["Paused", "Stage 1 of 1", "bar-00000000", false],
+      ],
+    );
   });
 
   it("READY on a working stage presents as Review complete", async () => {
@@ -390,7 +405,14 @@ describe("overview HTML", () => {
     // The same raw facts never leak into the primary card above it (the
     // run key does still appear in the stage heading's tooltip, one of the
     // established advanced surfaces alongside Technical details itself).
-    const beforeTechnical = html.slice(0, html.indexOf('<details class="tech facts"'));
+    // The one exception is the model name the provider reported, read as a
+    // plain name under the stage agent's dials.
+    const beforeTechnical = html
+      .slice(0, html.indexOf('<details class="tech facts"'))
+      .replace(/<div class="runtimemodel[^>]*>[^<]*<\/div>/g, "")
+      .replace(/data-runtime-model="[^"]*"/g, "")
+      .replace(/<details class="setup-technical agentconfig-technical"[\s\S]*?<\/details>/g, "");
+    assert.match(html, /<div class="runtimemodel muted" data-runtime-model="claude-opus-5-5"/);
     assert.ok(!beforeTechnical.includes("claude-opus-5-5"));
     assert.ok(!beforeTechnical.includes("82ab1234"));
   });
@@ -401,7 +423,9 @@ describe("overview HTML", () => {
     assert.match(html, /<ol class="journey"><li class="step accepted" title="Stage 1 — Contract \(Accepted\) · 1 of 3"><span class="node"><svg class="icon " [^>]*>.*?<\/svg><\/span><span class="num">1<\/span><span class="name">Contract<\/span><span class="state"><svg[^>]*>.*?<\/svg>Accepted<\/span><\/li>/);
     assert.match(html, /<li class="step paused current" [^>]*>.*?<span class="name">Schema &amp; API<\/span><span class="state">Paused<\/span><\/li>/);
     assert.match(html, /<li class="step future" [^>]*><span class="node">3<\/span>.*?<span class="state">Pending<\/span><\/li>/);
-    assert.match(html, /<span class="hpill" title="The whole job[^"]*">Plan run<\/span><span class="hpill">Stage 2 \/ 3<\/span><span class="hpill warn"><svg[^>]*>.*?<\/svg>Needs you<\/span>/);
+    // The breadcrumb names the plan and the stage; the header adds only the status, as text.
+    assert.match(html, /<div class="pills"><span class="hpill warn"><svg[^>]*>.*?<\/svg>Needs you<\/span><\/div>/);
+    assert.ok(!html.includes(">Plan run<"), "a plan run is the ordinary case and is not labelled");
     assert.match(html, /<h2 [^>]*><svg class="icon accent needs_you"[^>]*>.*?<\/svg>Stage 2 — Schema &amp; API<\/h2>/);
     assert.ok(!/<span class="status needs_you"/.test(html), "the card does not repeat the header pill's Needs you");
     assert.equal((html.match(/<div class="card actor [a-z]+" data-role="/g) ?? []).length, 2);
@@ -416,7 +440,7 @@ describe("overview HTML", () => {
     assert.match(html, /data-action="openSparring"[^>]*>Open detailed review</);
     assert.match(html, /<details class="more"[^>]*><summary[^>]*>…<\/summary><div class="actions"><button type="button" class="quiet" data-action="resumePlan"[^>]*>Resume plan \(implementation\)</);
     assert.ok(!html.includes("Latest sparring result"), "the panel is the latest sparring result");
-    assert.match(html, /<div class="run muted" title="[^"]*"><span class="plan">docs\/plans\/foo.md<\/span><span class="sep">›<\/span><span>Stage 2 — Schema &amp; API<\/span><\/div>/, "the header names the plan (its label when the document is not read), then the stage");
+    assert.match(html, /<div class="run muted" title="[^"]*"><span class="plan">docs\/plans\/foo.md<\/span><span class="sep">›<\/span><span title="Stage 2 of 3">Stage 2 — Schema &amp; API<\/span><\/div>/, "the header names the plan (its label when the document is not read), then the stage");
   });
 
   it("ambiguous model lists the choices, names the repository and offers selection", () => {
@@ -425,14 +449,20 @@ describe("overview HTML", () => {
     const html = renderOverviewHtml(
       {
         kind: "ambiguous",
-        title: "Several runs look active",
-        choices: ["a.md", "<b>.md"],
+        title: "Multiple open runs found — choose one to follow",
+        runChoices: [
+          { runId: "p|plan:a", status: "Running", stage: "Stage 1", runKey: "fix2", plan: "a.md", folderName: "beta", likely: true },
+          { runId: "p|plan:<b>", status: "Paused", stage: "Stage 3", runKey: "s1", plan: "<b>.md", folderName: "beta", likely: false },
+        ],
         repositoryContext: describeRepositoryContext({ ambiguous: [], scope: { repoRoot: "/code/beta", name: "beta" } }),
       },
       "n",
       "c",
     );
-    assert.match(html, /<li>&lt;b&gt;.md<\/li>/);
+    assert.match(html, /<h2>Multiple open runs found — choose one to follow<\/h2>/);
+    assert.match(html, /data-choose-run="p\|plan:a"[^>]*><strong class="status">Running · Stage 1<\/strong> <span class="plan">a.md<\/span> <code class="runkey">fix2<\/code>/);
+    assert.match(html, /data-choose-run="p\|plan:&lt;b&gt;"[^>]*><strong class="status">Paused · Stage 3<\/strong>/);
+    assert.match(html, /data-action="showLog"/);
     assert.match(html, /data-action="selectRun"/);
     assert.ok(html.includes('Following repository:</span><button type="button" class="name chooser" data-action="chooseRepository" title="Choose repository to follow" aria-haspopup="listbox">beta'));
   });

@@ -21,8 +21,8 @@ import {
   CONFIG_FIELDS,
   CONFIG_ROLES,
   CUSTOM_MODEL_VALUE,
-  PROVIDER_DEFAULT_LABEL,
   PROVIDER_DEFAULT_VALUE,
+  runtimeRepeatsSelection,
   type AgentFieldControl,
   type AgentRoleControls,
   type ConfigField,
@@ -34,6 +34,7 @@ import { RUN_KIND, TIMELINE_STATE_WORD, shortStageLabel, timelineGroups, type Ac
 import type { ProviderPauseCard } from "./freshSession";
 import type { MatchSource } from "./planAssociation";
 import type { PromptView, PromptViewSection } from "./promptInspector";
+import type { AmbiguousRunRow } from "./runPick";
 import { renderReportMarkdown } from "./reportMarkdown";
 import type { StageRunAction } from "./runner";
 
@@ -256,6 +257,17 @@ export function isStartPlanMessage(message: unknown): message is StartPlanMessag
     return typeof record["token"] === "string" && record["token"] !== "";
   }
   return action === "openReport" || action === "retry" || action === "dismiss";
+}
+
+/** A row on the ambiguity screen was chosen: pin this run, if it is still one of those offered. */
+export interface ChooseRunMessage {
+  type: "chooseRun";
+  runId: string;
+}
+
+export function isChooseRunMessage(message: unknown): message is ChooseRunMessage {
+  const record = asRecord(message);
+  return record !== undefined && record["type"] === "chooseRun" && typeof record["runId"] === "string" && record["runId"] !== "";
 }
 
 export function isIntakeActionMessage(message: unknown): message is IntakeActionMessage {
@@ -597,9 +609,9 @@ ${intake.command ? `<details class="intake-command"><summary>Engine command</sum
   if (model.kind === "ambiguous") {
     return `${renderRepositoryContext(model)}${renderOperation(model)}
 <header class="top"><h1>Agent Sparring</h1></header>
-<p>${escapeHtml(model.title)}:</p>
-<ul>${(model.choices ?? []).map((choice) => `<li>${escapeHtml(choice)}</li>`).join("")}</ul>
-<div class="actions">${button("showLog", "Show log")}</div>`;
+<h2>${escapeHtml(model.title)}</h2>
+<ul class="runchoices">${(model.runChoices ?? []).map(renderRunChoice).join("")}</ul>
+<div class="actions">${button("showLog", "Show log", true, undefined, "quiet")}</div>`;
   }
 
   // One identity for every disclosure on this page (see `disclose`).
@@ -762,25 +774,17 @@ function contextLine(headline: string, repository: string | undefined, pinned: b
 }
 
 function renderHeader(model: OverviewModel): string {
+  // Passive facts, styled as text rather than as controls. The breadcrumb
+  // already names the plan and the stage, so neither is repeated here; a plan
+  // run is the ordinary case and needs no label, while a historical or
+  // standalone stage says so, because that changes what the page is.
   const pills: string[] = [];
-  if (model.runKind) {
-    // The kind pill is the first thing read, and the three kinds must not look
-    // alike: a historical stage is toned down and says, in the pill itself,
-    // that the whole job lives elsewhere.
+  if (model.runKind && model.runKind !== RUN_KIND.plan) {
     const historical = model.runKind === RUN_KIND.historicalStage;
     const explain = historical
       ? "One finished stage of a managed plan run, shown on its own. Back to plan run shows the whole job and its timeline."
-      : model.runKind === RUN_KIND.plan
-        ? "The whole job: the engine sequences its stages and records where it is."
-        : "A stage that was run on its own; no managed plan run claims it.";
+      : "A stage that was run on its own; no managed plan run claims it.";
     pills.push(`<span class="hpill${historical ? " history" : ""}" title="${escapeHtml(explain)}">${escapeHtml(model.runKind)}</span>`);
-  }
-  if (model.stageLabel) {
-    // What a person calls this stage. Where it sits in the run is secondary
-    // metadata, on the stage card and in this pill's tooltip.
-    pills.push(`<span class="hpill" title="${escapeHtml(model.position ?? "")}">${escapeHtml(model.stageLabel)}</span>`);
-  } else if (model.position) {
-    pills.push(`<span class="hpill">${escapeHtml(model.position.replace(/^Stage (\d+) of (\d+)$/, "Stage $1 / $2"))}</span>`);
   }
   if (model.status) {
     pills.push(`<span class="hpill ${model.status.tone}">${icon("dot", "dot")}${escapeHtml(model.status.label)}</span>`);
@@ -791,7 +795,9 @@ function renderHeader(model: OverviewModel): string {
   // The plan the stage belongs to, then the stage: the run label alone
   // (a stage id) does not say which piece of work this is part of.
   const stageName = model.plan?.current ?? model.stageHeading ?? model.title;
-  const crumb = model.planName ? `<span class="plan">${escapeHtml(model.planName)}</span><span class="sep">›</span><span>${escapeHtml(stageName)}</span>` : `<span class="id">${escapeHtml(model.title)}</span>`;
+  const crumb = model.planName
+    ? `<span class="plan">${escapeHtml(model.planName)}</span><span class="sep">›</span><span title="${escapeHtml(model.position ?? "")}">${escapeHtml(stageName)}</span>`
+    : `<span class="id">${escapeHtml(model.title)}</span>`;
   return `<header class="top">
 <div><h1>Agent Sparring</h1><div class="run muted" title="${escapeHtml(model.stageId ?? "")}">${crumb}</div></div>
 <div class="pills">${pills.join("")}</div>
@@ -1359,7 +1365,6 @@ function stageActionButton(action: StageRunAction, stageId: string | undefined, 
 }
 
 function renderStageCard(model: OverviewModel): string {
-  const scope = discloseScope(model);
   const accepted = model.whatsNext !== undefined;
   const handedOver = model.actionRequired !== undefined;
   // Once accepted, the header pill already says Accepted: the card line
@@ -1444,24 +1449,15 @@ function renderStageCard(model: OverviewModel): string {
   // the diagnostics command, not a Markdown complaint to put in front of
   // someone who came here to answer a review. The Brief button already says
   // whether there is a brief at all.
-  const goal = model.goal ? `<div class="block"><h3>${icon("target", "accent")}Goal</h3><p class="goal">${escapeHtml(model.goal)}</p></div>` : "";
-  let sparring = `<div class="block"><h3>${icon("chat")}Latest sparring result</h3><p class="muted">No routing outcome recorded yet.</p></div>`;
-  if (handedOver) {
-    sparring = ""; // the Action required panel is the latest sparring result
-  } else if (model.lastSparring) {
-    const result = model.lastSparring;
-    const reason = result.reason ? ` <span class="muted">(${escapeHtml(result.reason)})</span>` : "";
-    const iconName = result.action === "READY" ? "check" : "warn";
-    const summary = result.summary ? `<p>${escapeHtml(result.summary)}</p>` : "";
-    // "Read feedback" expands the reviewer's full written report inline
-    // (rendered Markdown, verbatim); "Open full report" still opens
-    // sparring.md itself in the editor, unchanged.
-    const feedback = result.report
-      ? `<details class="report"${disclose(scope, "sparring-report")}><summary>Read feedback</summary><div class="reportbody">${renderReportMarkdown(result.report)}</div>${button("openSparring", "Open full report", model.actions?.sparring !== false, "Open sparring.md")}</details>`
-      : "";
-    sparring = `<div class="block"><h3>${icon(iconName, result.action.toLowerCase())}Latest sparring result</h3>
-<p><span class="verdict ${escapeHtml(result.action.toLowerCase())}" title="${escapeHtml(`Routing action: ${result.action}`)}">${escapeHtml(result.badge)}</span>${reason}</p>
-${summary}${feedback}</div>`;
+  const goal = renderGoal(model);
+  // The sparring result is the sparrer's own conclusion, so it is read on the
+  // Sparrer card, where it stays in view for the whole stage. Only a page with
+  // no Sparrer card to put it on keeps it here.
+  let sparring = "";
+  if (!handedOver && !model.sparrer) {
+    sparring = model.lastSparring
+      ? `<div class="block"><h3>${icon(model.lastSparring.action === "READY" ? "check" : "warn", model.lastSparring.action.toLowerCase())}Latest sparring result</h3>${renderSparringVerdict(model.lastSparring)}</div>`
+      : `<div class="block"><h3>${icon("chat")}Latest sparring result</h3><p class="muted">No routing outcome recorded yet.</p></div>`;
   }
   const planPlace = renderPlanPlace(model);
 
@@ -1513,6 +1509,66 @@ ${right}
 </div>
 </div>
 </section>`;
+}
+
+/**
+ * What the stage is for. An explicit goal (intake's `## Goal`) is the Goal:
+ * its first sentence in view, the rest one click away. Anything else is the
+ * stage's own section text — usually the implementer's contract, file names
+ * and test lists — so it is offered as a description to open, under the
+ * stage title the card already shows, never labelled as the Goal. Nothing is
+ * reworded: what is shown is the source's text.
+ */
+function renderGoal(model: OverviewModel): string {
+  if (!model.goal) {
+    return "";
+  }
+  if (model.goalSource !== "brief") {
+    return `<details class="block stagedesc"${disclose(discloseScope(model), "stage-description")}><summary>About this stage</summary><div class="reportbody">${renderReportMarkdown(model.goal)}</div></details>`;
+  }
+  const { lead, rest } = splitLead(model.goal);
+  const more = rest ? `<details class="goalmore"><summary>More</summary><p class="goal">${escapeHtml(rest)}</p></details>` : "";
+  return `<div class="block"><h3>${icon("target", "accent")}Goal</h3><p class="goal">${escapeHtml(lead)}</p>${more}</div>`;
+}
+
+/** The first sentence of `text`, and whatever follows it. */
+export function splitLead(text: string): { lead: string; rest?: string } {
+  const trimmed = text.trim();
+  const match = /^([\s\S]{20,}?[.!?])\s+(\S[\s\S]*)$/.exec(trimmed);
+  return match ? { lead: match[1], rest: match[2] } : { lead: trimmed };
+}
+
+/**
+ * The sparrer's latest verdict and the plain summary under it. The routing
+ * action itself is only a tooltip: the badge is the words for it.
+ */
+function renderSparringVerdict(result: NonNullable<OverviewModel["lastSparring"]>): string {
+  const reason = result.reason ? ` <span class="muted">(${escapeHtml(result.reason)})</span>` : "";
+  const summary = result.summary ? `<p class="sparsummary">${escapeHtml(result.summary)}</p>` : "";
+  return `<p class="sparverdict"><span class="verdict ${escapeHtml(result.action.toLowerCase())}" title="${escapeHtml(`Routing action: ${result.action}`)}">${escapeHtml(result.badge)}</span>${reason}</p>${summary}`;
+}
+
+/** The id the Sparrer card's Read feedback toggle points at. */
+const FEEDBACK_PANEL_ID = "feedback-sparrer";
+const READ_FEEDBACK = "Read feedback";
+const HIDE_FEEDBACK = "Hide feedback";
+
+/**
+ * The reviewer's full written report, as a panel below both cards: it is
+ * one of the Sparrer card's tabs, next to its instructions, and is read at
+ * the width of the page rather than squeezed into a half-width card.
+ * "Open full report" still opens sparring.md itself in the editor.
+ */
+function renderFeedbackPanel(model: OverviewModel, scope: string): string {
+  const result = model.lastSparring;
+  if (!result?.report || model.actionRequired !== undefined) {
+    return "";
+  }
+  const who = whoClass(model.sparrer?.provider ?? "");
+  return `<div class="instrpanel ${who}" id="${FEEDBACK_PANEL_ID}" data-instrpanel="feedback"${disclose(scope, "sparring-report")} hidden>
+<div class="instrhead ${who}">Sparrer <span class="muted">· feedback</span></div>
+<div class="reportbody">${renderReportMarkdown(result.report)}</div>
+<div class="actions feedbackactions">${button("openSparring", "Open full report", model.actions?.sparring !== false, "Open sparring.md")}</div></div>`;
 }
 
 const CHOOSE_PLAN_TITLE = "Pick the Markdown plan this stage belongs to (kept in VS Code only; the engine is not told)";
@@ -1677,14 +1733,20 @@ function renderActors(model: OverviewModel, scope: string): string {
   const controlsFor = (role: ConfigRole): AgentRoleControls | undefined =>
     configScope ? config?.controls.find((entry) => entry.role === role) : undefined;
   const actors = [model.stageAgent, model.sparrer].filter((card): card is ActorCard => card !== undefined);
-  const cards = actors.map((card) => renderActor(card, controlsFor(card.configRole), configScope)).join("");
+  const sparring = model.actionRequired === undefined ? model.lastSparring : undefined;
+  const feedback = renderFeedbackPanel(model, scope);
+  const cards = actors
+    .map((card) =>
+      renderActor(card, controlsFor(card.configRole), configScope, actorRole(card) === "sparrer" ? { sparring, feedback: feedback !== "" } : {}),
+    )
+    .join("");
   // Every panel is laid out after every card, so the cards keep their row
   // whichever of them is open, and an opened panel appears below both of
   // them at the width of the rest of the page rather than in a half-width
   // column. They behave as a tab strip: at most one is open, each names the
   // actor it belongs to and carries that actor's colour, and the card it
   // came from is marked while it is open.
-  const panels = actors.map((card) => renderInstructionsPanel(card, scope)).join("");
+  const panels = `${actors.map((card) => renderInstructionsPanel(card, scope)).join("")}${feedback}`;
   const section = cards ? `<section class="actors">${cards}${panels}</section>` : "";
   return `${section}${config ? renderAgentsBar(config, cards !== "") : ""}`;
 }
@@ -1704,7 +1766,12 @@ function renderActors(model: OverviewModel, scope: string): string {
  * around the card -- a summary activates on click, and an effort dropdown
  * inside one would collapse the card it is in as often as not.
  */
-function renderActor(card: ActorCard, controls: AgentRoleControls | undefined, configScope: string | undefined): string {
+function renderActor(
+  card: ActorCard,
+  controls: AgentRoleControls | undefined,
+  configScope: string | undefined,
+  extra: { sparring?: OverviewModel["lastSparring"]; feedback?: boolean } = {},
+): string {
   const busy = card.activity === "Working" || card.activity === "Sparring";
   const duration = card.duration ? ` for ${escapeHtml(card.duration)}` : "";
   // Read on their own line under the state, so neither carries the leading
@@ -1744,25 +1811,39 @@ function renderActor(card: ActorCard, controls: AgentRoleControls | undefined, c
   const statenote = notes ? `<div class="statenote">${notes}</div>` : "";
   const identity = `<div class="identity"><span class="avatar ${who}">${avatarGlyph(role)}</span>
 <div class="who"><div class="rolename ${who}">${escapeHtml(card.role)}</div><div class="provider muted">${escapeHtml(card.provider)}</div>${card.generation ? `<div class="generation muted small">${escapeHtml(card.generation)}</div>` : ""}</div>${activity}</div>${statenote}`;
-  const dials = renderGauges(card.gauges);
+  // The model the provider reported running is read under the dials, as a
+  // plain name: it is a fact about the session, like what the dials show,
+  // and not a setting.
+  // Not when it only repeats the selected model in another spelling.
+  const runtime = card.runtimeModel && !(controls && runtimeRepeatsSelection(card.runtimeModel, controls.model))
+    ? `<div class="runtimemodel muted" data-runtime-model="${escapeHtml(card.runtimeModel)}" title="The model the provider reported running">${escapeHtml(card.runtimeModel)}</div>`
+    : "";
+  const gauges = renderGauges(card.gauges);
+  const dials = gauges || runtime ? `<div class="dialcol">${gauges}${runtime}</div>` : "";
   // The dials sit beside Model and Effort rather than under them, and they
   // are drawn even where there is nothing to configure: what a provider is
   // spending is worth seeing on a card that offers no controls too.
-  const settings = controls && configScope ? renderRoleControls(controls, configScope, dials, card.runtimeModel) : dials ? `<div class="agentconfig-block">${dials}</div>` : "";
-  const body = `${identity}${settings}`;
+  const roleControls = controls && configScope ? renderRoleControls(controls, configScope, dials, card.runtimeModel) : undefined;
+  const settings = roleControls ? roleControls.block : dials ? `<div class="agentconfig-block">${dials}</div>` : "";
+  const verdict = extra.sparring ? `<div class="sparresult">${renderSparringVerdict(extra.sparring)}</div>` : "";
+  // One footer line: the card's tabs on the left (its instructions, and on
+  // the Sparrer card its written feedback), Technical details on the right.
   // No captured prompt means the engine has not run a turn for this actor
-  // since prompt capture existed. An ordinary state, so the card simply
-  // stays a card rather than offering a disclosure that would open on
-  // nothing.
-  if (!card.prompt) {
-    return `<div class="card actor ${who}" data-role="${role}">${body}</div>`;
-  }
-  // The toggle stays on the card; what it opens is rendered after both cards
-  // (see `renderActors`), so opening one actor's instructions never moves the
-  // other actor's card. `aria-controls` is the only thing tying the two
-  // together in the document, and the script relies on the same pairing.
-  return `<div class="card actor ${who}" data-role="${role}">${body}
-<button type="button" class="showinstr" data-instr="${role}" aria-controls="${instrPanelId(role)}" aria-expanded="false" data-show="${SHOW_INSTRUCTIONS}" data-hide="${HIDE_INSTRUCTIONS}">${SHOW_INSTRUCTIONS}</button></div>`;
+  // since prompt capture existed, so there is no instructions tab to offer.
+  // The panels a tab opens are rendered after both cards (see
+  // `renderActors`), so opening one never moves the other actor's card;
+  // `aria-controls` is the only thing tying a tab to its panel.
+  const tabs = [
+    card.prompt
+      ? `<button type="button" class="showinstr" data-instr="${role}" aria-controls="${instrPanelId(role)}" aria-expanded="false" data-show="${SHOW_INSTRUCTIONS}" data-hide="${HIDE_INSTRUCTIONS}">${SHOW_INSTRUCTIONS}</button>`
+      : "",
+    extra.feedback
+      ? `<button type="button" class="showinstr" data-instr="feedback" aria-controls="${FEEDBACK_PANEL_ID}" aria-expanded="false" data-show="${READ_FEEDBACK}" data-hide="${HIDE_FEEDBACK}">${READ_FEEDBACK}</button>`
+      : "",
+  ].join("");
+  const technical = roleControls?.technical ?? "";
+  const foot = tabs || technical ? `<div class="cardfoot">${tabs}${technical}</div>` : "";
+  return `<div class="card actor ${who}" data-role="${role}">${identity}${verdict}${settings}${foot}</div>`;
 }
 
 /**
@@ -1918,10 +1999,9 @@ function whoClass(name: string): string {
  * name would be the duplication this layout exists to remove.
  *
  * Model and effort are the person's own preferences, shared by every
- * project: the dropdowns write them through `set-config`, and the lines
- * above them state what is configured in words -- an exact model and where
- * it came from, or "Provider default", which is a different fact from any
- * model. What the provider itself reported running is a third fact, shown
+ * project: the dropdowns write them through `set-config` and show the
+ * current choice, "Provider default" included. Where a configured value came
+ * from is under Technical details, not repeated beside the dropdown. What the provider itself reported running is a third fact, shown
  * only when the provider stated it, and never as the configured model.
  *
  * Every actual control carries the role, the field, the provider and the
@@ -1929,20 +2009,11 @@ function whoClass(name: string): string {
  * self-describing and the host never has to infer which repository or
  * provider a change was meant for from whatever is selected when it arrives.
  */
-function renderRoleControls(role: AgentRoleControls, scope: string, dials = "", runtimeModel?: string): string {
+function renderRoleControls(role: AgentRoleControls, scope: string, dials = "", runtimeModel?: string): { block: string; technical: string } {
   const attrs = `data-role="${escapeHtml(role.role)}" data-scope="${escapeHtml(scope)}" data-provider="${escapeHtml(role.provider.value)}"`;
   const items = [...(role.provider.options ? [role.provider] : []), role.model, ...(role.effort ? [role.effort] : [])];
   const rows = items.map((item) => field(item.label, control(item, attrs))).join("");
-  const summaries = [role.model, ...(role.effort ? [role.effort] : [])]
-    .filter((item) => item.summary !== undefined)
-    .map((item) => {
-      const quiet = item.summary === PROVIDER_DEFAULT_LABEL ? " novalue" : "";
-      return `<div class="agentconfig-effective${quiet}" data-effective="${escapeHtml(item.field)}">${escapeHtml(item.label)}: ${escapeHtml(item.summary ?? "")}</div>`;
-    });
   const pin = role.stagePin ? `<div class="agentconfig-pin" data-stage-pin="${escapeHtml(role.role)}">${escapeHtml(role.stagePin)}</div>` : "";
-  const runtime = runtimeModel
-    ? `<div class="agentconfig-runtime muted" data-runtime-model="${escapeHtml(runtimeModel)}">Provider reported running ${escapeHtml(runtimeModel)}</div>`
-    : "";
   const technical = [...role.technical, { label: "Runtime-reported model", value: runtimeModel ?? "not stated by the provider" }]
     .map((entry) => `${escapeHtml(entry.label)}: ${escapeHtml(entry.value)}`)
     .join("\n");
@@ -1950,7 +2021,7 @@ function renderRoleControls(role: AgentRoleControls, scope: string, dials = "", 
   // Fields left, dials right. The fields column is what gives way when the
   // card is narrow, because a truncated dropdown is still usable and a
   // squashed dial is not readable at all.
-  return `<div class="agentconfig-block"><div class="agentconfig-fields">${summaries.join("")}${pin}${runtime}${rows}${details}</div>${dials}</div>`;
+  return { block: `<div class="agentconfig-block"><div class="agentconfig-fields">${pin}${rows}</div>${dials}</div>`, technical: details };
 }
 
 /**
@@ -2129,6 +2200,18 @@ ${view.command ? `<details class="start-command"><summary>Engine command</summar
 <p class="muted small">${escapeHtml(view.planLabel)}</p>`;
 }
 
+/**
+ * One open run on the ambiguity screen, as a button. It carries only the run
+ * id; the host pins it only if that id is still one of the runs offered.
+ * A running run is marked as likely, and is never chosen for the person.
+ */
+function renderRunChoice(row: AmbiguousRunRow): string {
+  const lead = row.stage ? `${row.status} · ${row.stage}` : row.status;
+  return `<li><button type="button" class="runchoice${row.likely ? " likely" : ""}" data-choose-run="${escapeHtml(row.runId)}" title="Follow this run (${escapeHtml(row.folderName)})"><strong class="status">${escapeHtml(lead)}</strong> <span class="plan">${escapeHtml(row.plan)}</span> <code class="runkey">${escapeHtml(row.runKey)}</code>${
+    row.likely ? ` <span class="muted small">likely</span>` : ""
+  }</button></li>`;
+}
+
 function button(action: OverviewAction, label: string, enabled = true, title?: string, cls = ""): string {
   const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
   const classAttr = cls ? ` class="${cls}"` : "";
@@ -2198,16 +2281,17 @@ main { max-width: 880px; margin: 0 auto; padding: 14px 18px 20px; }
 header.top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 6px; }
 h1 { font-size: 1.35em; font-weight: 600; margin: 0; }
 .run { font-family: var(--vscode-editor-font-family); font-size: 0.85em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
-.pills { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
-.hpill { display: inline-flex; align-items: center; padding: 3px 10px; border: 1px solid var(--line); border-radius: 6px; font-size: 0.9em; background: var(--card); }
-.hpill.good { color: var(--good); border-color: var(--good); }
-.hpill.info { color: var(--info); border-color: var(--info); }
-/* Tinted ground + ordinary foreground: the pill stays readable in every
-   theme, and the warning tone is carried by its border and its dot. */
-.hpill.warn { color: var(--vscode-foreground); border-color: var(--warn-border); background: var(--warn-surface); font-weight: 600; }
+.pills { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; }
+/* Header facts are read, not clicked: no border, no ground, no padding that
+   would make them look like buttons. The tone is carried by the dot and,
+   for a warning, by weight. */
+.hpill { display: inline-flex; align-items: center; font-size: 0.9em; color: var(--vscode-descriptionForeground); }
+.hpill.good { color: var(--good); }
+.hpill.info { color: var(--info); }
+.hpill.warn { color: var(--vscode-foreground); font-weight: 600; }
 .hpill.warn .icon { color: var(--warn); }
-/* A historical stage is not the live thing: dashed, quiet, unmistakably a record. */
-.hpill.history { color: var(--vscode-descriptionForeground); border-style: dashed; background: none; }
+/* A historical stage is not the live thing: quiet, unmistakably a record. */
+.hpill.history { font-style: italic; }
 
 .run .plan { font-family: var(--vscode-font-family); font-weight: 600; color: var(--vscode-foreground); }
 .run .sep { margin: 0 6px; }
@@ -2216,7 +2300,7 @@ h1 { font-size: 1.35em; font-weight: 600; margin: 0; }
 .branchguard h2 { font-size: 1.1em; }
 .branchguard h2 .icon { color: var(--bad); }
 .branch { font-family: var(--vscode-editor-font-family); font-weight: 600; color: var(--vscode-foreground); }
-.hpill.bad { color: var(--bad); border-color: var(--bad); }
+.hpill.bad { color: var(--bad); font-weight: 600; }
 .hpill .icon { width: 11px; height: 11px; margin-right: 5px; }
 
 .action { padding: 12px 14px 12px; margin: 8px 0 12px; border-left: 3px solid var(--warn-border); }
@@ -2330,10 +2414,19 @@ pre.engineerror { margin: 6px 0 0; padding: 6px 8px; max-height: 9em; overflow: 
 .agentconfig-fixed { flex: 1; min-width: 0; padding: 2px 4px 2px 5px; font-size: 0.95em; font-weight: 600; overflow-wrap: anywhere; }
 /* The absence of an override is not a value, so it never borrows a value's
    weight. */
-.agentconfig-effective { font-size: 0.95em; font-weight: 600; margin-top: 2px; overflow-wrap: anywhere; }
-.agentconfig-effective.novalue { font-weight: 400; font-style: italic; color: var(--vscode-descriptionForeground); }
 .agentconfig-pin { font-size: 0.9em; margin-top: 2px; overflow-wrap: anywhere; }
-.agentconfig-runtime { font-size: 0.9em; margin-top: 2px; overflow-wrap: anywhere; }
+.dialcol { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.runtimemodel { font-size: 0.82em; text-align: center; overflow-wrap: anywhere; max-width: 12em; }
+.sparresult { margin: 8px 0 2px; }
+.sparresult p { margin: 0 0 4px; }
+/* One line under the settings: the card's tabs left, Technical details right.
+   Opened, Technical details takes the card's whole width on its own row. */
+.cardfoot { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px; margin-top: 8px; }
+.cardfoot > .agentconfig-technical { margin-left: auto; margin-top: 0; }
+.cardfoot > .agentconfig-technical > summary { text-align: right; }
+.cardfoot > .agentconfig-technical[open] { flex-basis: 100%; }
+.feedbackactions { padding: 0 12px 12px; }
+.instrpanel > .reportbody { margin: 8px 12px; }
 .agentconfig-technical { margin-top: 6px; font-size: 0.9em; }
 .agentconfig-fixed.novalue { font-weight: 400; font-style: italic; color: var(--vscode-descriptionForeground); }
 
@@ -2466,6 +2559,8 @@ h3 { display: flex; align-items: center; font-size: 0.95em; font-weight: 600; ma
 h3 .icon { width: 15px; height: 15px; }
 p { margin: 0 0 4px; line-height: 1.45; }
 .goal { color: var(--vscode-foreground); }
+details.goalmore > summary, details.stagedesc > summary { cursor: pointer; color: var(--vscode-descriptionForeground); width: fit-content; }
+details.goalmore > summary:hover, details.stagedesc > summary:hover { color: var(--vscode-foreground); }
 .verdict { font-weight: 700; letter-spacing: 0.02em; color: var(--info); }
 .verdict.ready { color: var(--good); }
 .verdict.send_back, .verdict.needs_you { color: var(--warn); }
@@ -2475,9 +2570,6 @@ p { margin: 0 0 4px; line-height: 1.45; }
 .dur { font-weight: 600; }
 /* The reviewer's full report, rendered inline and scrollable once it runs
    long, rather than pushing the rest of the card down. */
-details.report { margin-top: 6px; }
-details.report > summary { cursor: pointer; color: var(--vscode-descriptionForeground); width: fit-content; }
-details.report > summary:hover { color: var(--vscode-foreground); }
 .reportbody { margin: 6px 0; padding: 8px 10px; max-height: 22em; overflow-y: auto; border-left: 2px solid var(--vscode-panel-border); background: var(--vscode-textBlockQuote-background); }
 .reportbody p, .reportbody ul, .reportbody ol { margin: 0 0 6px; }
 .reportbody :last-child { margin-bottom: 0; }
@@ -2524,7 +2616,7 @@ details.report > summary:hover { color: var(--vscode-foreground); }
    not want. The card is the tab and the panel is what the tab opens, so the
    prompt is also read at the width of the rest of the page. */
 .showinstr {
-  display: block; margin: 6px -12px -10px; padding: 4px 12px 8px; width: calc(100% + 24px);
+  display: inline; margin: 0; padding: 0;
   font: inherit; font-size: 0.85em; text-align: left; cursor: pointer;
   color: var(--vscode-textLink-foreground); background: none; border: none;
 }
@@ -2536,9 +2628,9 @@ details.report > summary:hover { color: var(--vscode-foreground); }
    rounding there so the two read as one surface. The colour is painted
    inside the existing border rather than widening it, so selecting a tab
    cannot change the height of the card it is on. */
-.card.actor:has(> .showinstr[aria-expanded="true"]) { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
-.card.actor.claude:has(> .showinstr[aria-expanded="true"]) { box-shadow: inset 0 -2px 0 var(--claude); }
-.card.actor.codex:has(> .showinstr[aria-expanded="true"]) { box-shadow: inset 0 -2px 0 var(--codex); }
+.card.actor:has(.showinstr[aria-expanded="true"]) { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+.card.actor.claude:has(.showinstr[aria-expanded="true"]) { box-shadow: inset 0 -2px 0 var(--claude); }
+.card.actor.codex:has(.showinstr[aria-expanded="true"]) { box-shadow: inset 0 -2px 0 var(--codex); }
 
 .instrpanel {
   grid-column: 1 / -1; position: relative; margin-top: -4px;
@@ -2559,7 +2651,7 @@ details.report > summary:hover { color: var(--vscode-foreground); }
   transform: rotate(45deg);
 }
 .instrpanel[data-instrpanel="stage"]::before { left: 25%; }
-.instrpanel[data-instrpanel="sparrer"]::before { left: 75%; }
+.instrpanel[data-instrpanel="sparrer"]::before, .instrpanel[data-instrpanel="feedback"]::before { left: 75%; }
 
 .instructions { padding: 0 12px 12px; }
 .turnline { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px 0; font-size: 1.02em; }
@@ -2589,9 +2681,14 @@ button.primary { background: var(--vscode-button-background); color: var(--vscod
 button.primary:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
 button.danger { color: var(--warn); border-color: var(--warn); }
 button.quiet { background: transparent; color: var(--vscode-descriptionForeground); }
-.busy { display: inline-flex; align-items: center; padding: 4px 11px; border: 1px solid var(--good); border-radius: 6px; font-size: 0.92em; color: var(--good); font-weight: 600; cursor: help; }
-.busy.unknown { border-color: var(--warn); color: var(--warn); }
-.busy.accepting { border-color: var(--info); color: var(--info); }
+ul.runchoices { list-style: none; padding: 0; margin: 8px 0 12px; display: flex; flex-direction: column; gap: 6px; }
+button.runchoice { width: 100%; text-align: left; display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; background: var(--vscode-list-hoverBackground, transparent); color: var(--vscode-foreground); border: 1px solid var(--vscode-panel-border, transparent); }
+button.runchoice.likely { border-color: var(--vscode-focusBorder); }
+button.runchoice .runkey { color: var(--vscode-descriptionForeground); }
+/* Runner state beside the actions is a fact, not an action: text with a dot. */
+.busy { display: inline-flex; align-items: center; padding: 4px 2px; font-size: 0.92em; color: var(--good); font-weight: 600; cursor: help; }
+.busy.unknown { color: var(--warn); }
+.busy.accepting { color: var(--info); }
 .stopped, .stale, .inferred { display: flex; align-items: center; color: var(--warn); }
 .statepill.uncertain { border-color: var(--warn); color: var(--warn); }
 .statepill.uncertain .icon.dot { color: var(--warn); }
@@ -2860,6 +2957,11 @@ const SCRIPT = `
       } else {
         vscode.postMessage({ type: 'startPlan', action: startAction });
       }
+      return;
+    }
+    var chooseRun = element ? element.closest('button[data-choose-run]') : null;
+    if (chooseRun && !chooseRun.disabled) {
+      vscode.postMessage({ type: 'chooseRun', runId: chooseRun.getAttribute('data-choose-run') });
       return;
     }
     var intakeTarget = element ? element.closest('button[data-intake]') : null;

@@ -27,6 +27,8 @@ import {
   type ConfigRole,
   type EffectiveConfig,
   type EngineModelChoices,
+  runtimeRepeatsSelection,
+  sameModelName,
 } from "../core/effectiveConfig";
 import { discoverRuns, selectRun, type RunSelection } from "../core/discovery";
 import { MODEL_MAX_LENGTH, isActionMessage, isAgentConfigMessage, renderOverviewHtml } from "../core/overviewHtml";
@@ -323,7 +325,8 @@ describe("the Overview shows the configuration and offers Settings", () => {
     const model = buildOverviewModel(await planSelection(), undefined, artifacts(parsed()), NOW);
     const html = renderOverviewHtml(model, "nonce", "csp:");
     assert.match(html, /data-action="openSettings"/);
-    assert.match(html, /<div class="agentconfig-effective" data-effective="model">Model: claude-opus-5-5 · Your preference<\/div>/, "the exact model and where it came from, stated");
+    assert.doesNotMatch(html, /agentconfig-effective/, "the dropdown shows the choice; no static line repeats it");
+    assert.match(html, /Configured model: claude-opus-5-5\nModel source: user\n/, "where it came from stays under Technical details");
     assert.match(html, /<select data-role="stage"[^>]*data-field="model"/, "and a dropdown to change it");
     assert.match(html, /<select data-role="stage"[^>]*data-field="effort"/);
     assert.match(html, /<select data-role="sparring"[^>]*data-field="effort"/);
@@ -825,5 +828,21 @@ describe("the stage's pinned configuration", () => {
       const again = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, { handoff: false, sparring: false, brief: false, plan: false, agentConfig: parsed() }, NOW);
       assert.equal(again.agentConfig?.controls[0].stagePin, undefined, `no pin from ${JSON.stringify(junk)}`);
     }
+  });
+});
+
+describe("a runtime model that only repeats the selected one is not shown twice", () => {
+  const model = (value: string, label = value) => ({ field: "model" as const, label: "Model", value, detail: "", options: [{ value, label }] });
+  it("treats case, punctuation and a bracketed suffix as spelling", () => {
+    assert.ok(sameModelName("claude-opus-5-5", "Claude Opus 5.5"));
+    assert.ok(sameModelName("claude-opus-5-5[1m]", "claude-opus-5-5"));
+    assert.ok(!sameModelName("claude-opus-5-5", "claude-sonnet-5-5"));
+    assert.ok(!sameModelName("", "claude-opus-5-5"));
+  });
+  it("compares against the selected value and its option label; Provider default is never repeated", () => {
+    assert.ok(runtimeRepeatsSelection("Claude Opus 5.5", model("claude-opus-5-5")));
+    assert.ok(runtimeRepeatsSelection("claude-opus-5-5", model("opus", "Claude Opus 5.5")));
+    assert.ok(!runtimeRepeatsSelection("claude-sonnet-5-5", model("claude-opus-5-5")));
+    assert.ok(!runtimeRepeatsSelection("claude-opus-5-5", model("")), "under Provider default the runtime model is news");
   });
 });

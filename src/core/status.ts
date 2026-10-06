@@ -67,7 +67,7 @@ function deriveUnpinnedStatus(selection: RunSelection, live: LiveState | undefin
       const lines = selection.ambiguous.map((run) => `• ${run.location.folderName}: ${runLabel(run)} (${authoritativeWord(run)})`);
       return {
         text: `$(question) ${PREFIX}: ${selection.ambiguous.length} runs · select`,
-        tooltip: `Several runs look active; pick one:\n${lines.join("\n")}`,
+        tooltip: `Multiple open runs; choose one to follow:\n${lines.join("\n")}`,
         severity: "warning",
       };
     }

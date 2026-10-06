@@ -441,6 +441,32 @@ export interface AgentRoleControls {
   stagePin?: string;
 }
 
+/**
+ * Whether two spellings name the same model: `claude-opus-5-5`, `Claude Opus
+ * 5.5` and `claude-opus-5-5[1m]` do; `claude-opus-5-5` and
+ * `claude-sonnet-5-5` do not. Case, punctuation and a bracketed suffix are
+ * spelling, not a different model. For display only: it decides whether a
+ * second line would repeat what the dropdown already shows.
+ */
+export function sameModelName(a: string, b: string): boolean {
+  const norm = (text: string) => text.toLowerCase().replace(/\[[^\]]*\]/g, "").replace(/[^a-z0-9]/g, "");
+  const x = norm(a);
+  const y = norm(b);
+  return x !== "" && y !== "" && (x === y || x.endsWith(y) || y.endsWith(x));
+}
+
+/**
+ * Whether a provider-reported runtime model only repeats the model the
+ * controls already show as selected (by value or by its option label).
+ */
+export function runtimeRepeatsSelection(runtimeModel: string, model: AgentFieldControl): boolean {
+  if (model.value === PROVIDER_DEFAULT_VALUE) {
+    return false; // "Provider default" names no model; the runtime one is news
+  }
+  const label = model.options?.find((option) => option.value === model.value)?.label;
+  return sameModelName(runtimeModel, model.value) || (label !== undefined && sameModelName(runtimeModel, label));
+}
+
 /** The role's pin, as the engine recorded it in the stage's state.json. */
 export interface RolePin {
   provider: string;

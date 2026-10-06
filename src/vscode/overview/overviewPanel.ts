@@ -20,6 +20,7 @@ import { planRunDisplayName } from "../../core/planMembership";
 import {
   isActionMessage,
   isIntakeActionMessage,
+  isChooseRunMessage,
   isStartPlanMessage,
   isAutoPushMessage,
   isCopyMessage,
@@ -37,6 +38,7 @@ import {
   type HumanCheckMessage,
   type HumanFeedbackMessage,
   type IntakeActionMessage,
+  type ChooseRunMessage,
   type StartPlanMessage,
   type OpenPromptSourceMessage,
   type OverviewAction,
@@ -73,6 +75,7 @@ export class OverviewPanelManager implements vscode.Disposable {
     private readonly onAction: (action: OverviewAction) => Promise<void>,
     private readonly onIntakeAction: (message: IntakeActionMessage) => Promise<void> = async () => undefined,
     private readonly onStartPlan: (message: StartPlanMessage) => Promise<void> = async () => undefined,
+    private readonly onChooseRun: (message: ChooseRunMessage) => Promise<void> = async () => undefined,
   ) {
     this.subscriptions.push(controller.onDidChange(() => this.scheduleUpdate()));
   }
@@ -105,6 +108,8 @@ export class OverviewPanelManager implements vscode.Disposable {
         void this.onIntakeAction(message);
       } else if (isStartPlanMessage(message)) {
         void this.onStartPlan(message);
+      } else if (isChooseRunMessage(message)) {
+        void this.onChooseRun(message);
       } else if (isHumanCheckMessage(message)) {
         void this.recordHumanCheck(message);
       } else if (isHumanFeedbackMessage(message)) {

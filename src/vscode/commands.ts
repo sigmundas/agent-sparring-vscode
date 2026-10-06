@@ -66,7 +66,8 @@ import { createStage, proposeNextStage, renderNextStageBrief, type NewStageResul
 import { buildStageIndex, locateStage, parsePlanHeadings, sectionSummary, type HeadingRef, type PlanHeading, type StageEntry } from "../core/planAssociation";
 import { stageBelongsToPlan, type PlanScope, type StageOrigin } from "../core/planMembership";
 import { stageMatchRows, type StageMatchRow, type StageToMatch } from "../core/stageMatches";
-import { buildRunPickGroups, describeRun } from "../core/runPick";
+import { buildRunQuickPickSections, describeRun, initialRunFocus, resolveAmbiguousChoice } from "../core/runPick";
+import { buildRunIndex } from "../core/runIndex";
 import { dialogQuote, humanizeStageId, stageDisplayName } from "../core/presentation";
 import { stageActions, stageRunAction } from "../core/runner";
 import { newRunKey, planKey, planLabel, planRunId, type SparringSubcommand } from "../core/sparringCommand";
@@ -92,6 +93,8 @@ import { buildStartPlanArgs } from "../core/startPlan";
 import type { StartPlanSession } from "../core/overviewModel";
 import type { StartPlanMessage } from "../core/overviewHtml";
 import { OverviewPanelManager } from "./overview/overviewPanel";
+import { registerRunsView } from "./runsView";
+import { registerAgentSessionsAdapter } from "./agentSessionsAdapter";
 
 export function registerCommands(context: vscode.ExtensionContext, controller: SparringController): void {
   const overview: OverviewPanelManager = new OverviewPanelManager(
@@ -99,8 +102,11 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     (action) => handleOverviewAction(controller, overview, action),
     (message) => handleIntakeAction(controller, overview, message),
     (message) => handleStartPlanMessage(controller, overview, message),
+    (message) => chooseAmbiguousRun(controller, overview, message.runId),
   );
   launchOverview = overview;
+  registerRunsView(context, controller, () => openOverviewCommand(controller, overview));
+  registerAgentSessionsAdapter(context, controller);
   context.subscriptions.push(
     overview,
     vscode.commands.registerCommand("agentSparring.showLog", () => controller.showLog()),
@@ -419,14 +425,19 @@ async function blockedByObsoleteSettings(controller: SparringController, locatio
 interface RunItem extends vscode.QuickPickItem {
   run?: RunSnapshot;
   intake?: DiscoveredIntake;
+  /** The "Show older runs…" row: reopen the picker with the full history. */
+  older?: boolean;
 }
 
-async function selectRunCommand(controller: SparringController): Promise<void> {
+/** How many plan intakes the picker lists before "Show older runs…". */
+const RECENT_INTAKES = 5;
+
+async function selectRunCommand(controller: SparringController, showOlder = false): Promise<void> {
   const runs = controller.currentDiscovery.runs;
   const intakes = controller.currentDiscovery.intakes ?? [];
   if (runs.length === 0 && intakes.length === 0) {
     const choice = await vscode.window.showInformationMessage(
-      "Agent Sparring: no recorded plan runs or stages in this workspace.",
+      "Agent Sparring: no recorded plan runs or stages in this workspace or its repositories' worktrees.",
       "Diagnose Discovery",
     );
     if (choice === "Diagnose Discovery") {
@@ -434,24 +445,33 @@ async function selectRunCommand(controller: SparringController): Promise<void> {
     }
     return;
   }
-  // Grouped, because the two kinds answer different questions: a plan run is
-  // the whole job with its timeline, a standalone stage is one old stage to
-  // inspect. They used to sit in one dense list, which is how a completed
-  // plan's own history came to look like the thing to pick.
-  const groups = buildRunPickGroups(runs, { selectedId: controller.currentSelection.selected?.id, memberships: await controller.planMemberships() });
+  // This repository (and every worktree of it) first: open runs, running
+  // before anything waiting, then a bounded recent history; other
+  // repositories after, each on its own. The same grouping as the Runs view.
+  const selection = controller.currentSelection;
+  const pinnedId = selection.pinned ? selection.selected?.id : undefined;
+  const index = buildRunIndex(runs, {
+    followedRoot: selection.scope?.repoRoot,
+    familyOf: (root) => controller.familyOf(root),
+    memberships: await controller.planMemberships(),
+    showOlder,
+    keepIds: [pinnedId, selection.selected?.id].filter((id): id is string => id !== undefined),
+  });
   const items: RunItem[] = [];
-  for (const group of groups) {
-    items.push({ label: group.title, kind: vscode.QuickPickItemKind.Separator });
-    for (const item of group.items) {
+  for (const section of buildRunQuickPickSections(index, { pinnedId, nowMs: Date.now() })) {
+    items.push({ label: section.title, kind: vscode.QuickPickItemKind.Separator });
+    for (const item of section.items) {
       items.push({ label: item.label, description: item.description, detail: item.detail, run: item.run });
     }
   }
-  if (intakes.length > 0) {
+  const sortedIntakes = intakes.slice().sort((a, b) => (b.record.createdAtMs ?? 0) - (a.record.createdAtMs ?? 0));
+  const shownIntakes = showOlder ? sortedIntakes : sortedIntakes.filter((intake, i) => i < RECENT_INTAKES || selection.intake?.dir === intake.dir);
+  if (shownIntakes.length > 0) {
     // Plan intakes, newest first, whatever their state: an intake can be
     // pinned and kept on screen like any run.
     items.push({ label: "PLAN INTAKES", kind: vscode.QuickPickItemKind.Separator });
-    for (const intake of intakes.slice().sort((a, b) => (b.record.createdAtMs ?? 0) - (a.record.createdAtMs ?? 0))) {
-      const shown = controller.currentSelection.intake?.dir === intake.dir;
+    for (const intake of shownIntakes) {
+      const shown = selection.intake?.dir === intake.dir;
       items.push({
         label: `${shown ? "$(eye) " : ""}${intake.record.planLabel}`,
         description: `${intake.location.folderName} · ${intakeStateLabel(intake.state)}`,
@@ -460,11 +480,14 @@ async function selectRunCommand(controller: SparringController): Promise<void> {
       });
     }
   }
+  const hidden = index.hidden + (sortedIntakes.length - shownIntakes.length);
+  if (hidden > 0) {
+    items.push({ label: "$(history) Show older runs…", description: `${hidden} more`, older: true });
+  }
   // Picking a row *pins* it: it is kept even when this window moves to
   // another repository, which is the point of opening history there. The way
   // back is the same list, so the two modes are named next to each other
   // rather than one of them being a command you have to already know about.
-  const selection = controller.currentSelection;
   const context = describeRepositoryContext(selection);
   items.push({ label: "REPOSITORY CONTEXT", kind: vscode.QuickPickItemKind.Separator });
   items.push({
@@ -473,10 +496,33 @@ async function selectRunCommand(controller: SparringController): Promise<void> {
     detail: context.mode === "pinned" ? "Releases the pin above." : context.mode === "attached" ? "Goes back to following now." : "Already following; every row above pins instead.",
     run: undefined,
   });
-  const picked = await vscode.window.showQuickPick(items, {
-    placeHolder: `Pin a run, or follow the active repository. ${context.text}`,
+  // createQuickPick rather than showQuickPick, because only it can set the
+  // initial highlight: without one, focus lands on the first row, which may
+  // be a run this window is not following.
+  const focusRun = initialRunFocus(runs, pinnedId, selection.scope?.repoRoot, selection.selected?.id, (root) => controller.familyOf(root));
+  const picker = vscode.window.createQuickPick<RunItem>();
+  picker.items = items;
+  picker.placeholder = `Pin a run, or follow the active repository. ${context.text}`;
+  picker.matchOnDescription = true;
+  picker.matchOnDetail = true;
+  const focusItem = focusRun ? items.find((item) => item.run === focusRun) : undefined;
+  if (focusItem) {
+    picker.activeItems = [focusItem];
+  }
+  const picked = await new Promise<RunItem | undefined>((resolve) => {
+    picker.onDidAccept(() => {
+      resolve(picker.selectedItems[0]);
+      picker.hide();
+    });
+    picker.onDidHide(() => resolve(undefined));
+    picker.show();
   });
+  picker.dispose();
   if (!picked) {
+    return;
+  }
+  if (picked.older) {
+    await selectRunCommand(controller, true);
     return;
   }
   if (picked.intake) {
@@ -484,6 +530,23 @@ async function selectRunCommand(controller: SparringController): Promise<void> {
     return;
   }
   await controller.chooseRun(picked.run, "explicit");
+}
+
+/**
+ * A row on the overview's ambiguity screen was clicked. The id is the
+ * webview's and therefore untrusted: it is pinned only when it names one of
+ * the runs the current selection is offering, and then through exactly the
+ * path the quick pick uses, so a choice made here is remembered the same way.
+ */
+async function chooseAmbiguousRun(controller: SparringController, overview: OverviewPanelManager, runId: string): Promise<void> {
+  const run = resolveAmbiguousChoice(controller.currentSelection, runId);
+  if (!run) {
+    controller.log(`ignored a run choice from the overview: ${runId} is not one of the open runs currently offered.`);
+    await overview.update();
+    return;
+  }
+  await controller.chooseRun(run, "explicit");
+  await overview.update();
 }
 
 // ---------------------------------------------------------------- overview
@@ -2853,6 +2916,13 @@ async function resumePlanCommand(controller: SparringController, preselected?: P
   if (!expectedBranch) {
     return;
   }
+  // What the run resumes from is settled before anything is asked: a person
+  // who typed evidence must never lose it to a resume that could not have
+  // started, and a refusal is said in a dialog, not a passing toast.
+  const input = await planInvocationFor(controller, run);
+  if (!input) {
+    return;
+  }
   const continuing = run.currentStage.state?.status === "accepted";
   let evidence: string | undefined = "";
   if (!continuing) {
@@ -2864,10 +2934,6 @@ async function resumePlanCommand(controller: SparringController, preselected?: P
     if (evidence === undefined) {
       return;
     }
-  }
-  const input = await planInvocationFor(controller, run);
-  if (!input) {
-    return;
   }
   const args = buildResumePlanArgs({
     ...input,
@@ -3324,14 +3390,25 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
     if (!run.intake) {
       void vscode.window.showWarningMessage(
         `Agent Sparring: this run was started from an approved plan intake, and its approved manifest could not be found${run.planError ? ` (${run.planError})` : ""}. Nothing was started.`,
+        { modal: true },
       );
       return undefined;
     }
     return { intakeManifest: run.intake.manifestPath, source: "intake-manifest", runKey: run.runKey };
   }
+  // The manifest this run was started from, when this window still holds it
+  // bound to the run: its digest is the run's recorded `plan_digest`, so it
+  // is exactly what the engine will accept. Resuming from it needs neither
+  // the plan document nor anything remembered about it, which is what a
+  // resume after a restart (or from another worktree) has to rely on. A
+  // rebuild could only reproduce it or be refused.
+  const held = await controller.boundManifestFile(run);
+  if ("file" in held) {
+    return { manifest: held.file, source: "manifest", runKey: run.runKey };
+  }
   const markdown = await readOptional(run.planPath);
   if (markdown === undefined) {
-    void vscode.window.showWarningMessage(`Agent Sparring: this run was started from an execution manifest built from ${path.basename(run.planPath)}, which can no longer be read. Restore it, then continue.`);
+    void vscode.window.showWarningMessage(`Agent Sparring: this run was started from an execution manifest built from ${path.basename(run.planPath)}. That plan can no longer be read, and no stored manifest matches the run (${held.refusal}). Restore the plan, then continue.`, { modal: true });
     return undefined;
   }
   const built = buildManifest({
@@ -3347,14 +3424,14 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
     ...declarationsFor(controller, run.planKey, run.location),
   });
   if (!built.ok) {
-    void vscode.window.showWarningMessage(`Agent Sparring: the execution manifest for ${path.basename(run.planPath)} could not be rebuilt: ${built.problems[0]?.reason ?? "the plan changed."}`);
+    void vscode.window.showWarningMessage(`Agent Sparring: no stored manifest matches this run (${held.refusal}), and the execution manifest for ${path.basename(run.planPath)} could not be rebuilt: ${built.problems[0]?.reason ?? "the plan changed."} Nothing was started.`, { modal: true });
     return undefined;
   }
   try {
     await controller.manifestDirectory();
     return { manifest: await writeManifestFile(controller, run, built.manifest), source: "manifest", runKey: run.runKey };
   } catch (error) {
-    void vscode.window.showErrorMessage(`Agent Sparring: could not write the execution manifest: ${(error as Error).message}. Nothing was started.`);
+    void vscode.window.showErrorMessage(`Agent Sparring: could not write the execution manifest: ${(error as Error).message}. Nothing was started.`, { modal: true });
     return undefined;
   }
 }

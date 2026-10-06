@@ -161,3 +161,25 @@ describe("what the Overview says will run", () => {
     }
   });
 });
+
+describe("resuming a manifest run after a restart", () => {
+  it("resumes from the stored manifest bound to the run before considering a rebuild from the plan", async () => {
+    const body = fn(await commandsSource(), "planInvocationFor");
+    const held = body.indexOf("await controller.boundManifestFile(run)");
+    assert.ok(held > 0, "the bound manifest is looked up");
+    assert.ok(held < body.indexOf("await readOptional(run.planPath)"), "before the plan document is read");
+    assert.ok(held < body.indexOf("buildManifest("), "and before any rebuild");
+    assert.match(body, /if \("file" in held\) \{\n\s*return \{ manifest: held\.file, source: "manifest", runKey: run\.runKey \};/);
+  });
+
+  it("every refusal to resume is a dialog that names why, and evidence is asked for only once the input is settled", async () => {
+    const source = await commandsSource();
+    const body = fn(source, "planInvocationFor");
+    const refusals = body.match(/show(Warning|Error)Message\(/g) ?? [];
+    assert.ok(refusals.length >= 4);
+    assert.equal((body.match(/\{ modal: true \}/g) ?? []).length, refusals.length, "no refusal is a passing toast");
+    assert.match(body, /no stored manifest matches this run \(\$\{held\.refusal\}\)/);
+    const resume = fn(source, "resumePlanCommand");
+    assert.ok(resume.indexOf("await planInvocationFor(controller, run)") < resume.indexOf("showInputBox("), "a typed answer is never lost to a resume that could not start");
+  });
+});

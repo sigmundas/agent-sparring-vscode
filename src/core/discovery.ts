@@ -61,6 +61,14 @@ export interface SparringLocation {
    * project the name of its directory (what the Explorer shows as the node).
    */
   folderName: string;
+  /**
+   * Present when the project is a git worktree found through
+   * `git worktree list` of a repository this window knows, outside every
+   * workspace folder (see core/worktrees.ts). Its runs are as authoritative
+   * as any other; they are only never selected automatically, because
+   * nobody asked this window to follow that directory.
+   */
+  external?: { siblingOf: string; branch?: string };
 }
 
 /** A plan intake's selection id, in the same `<projectDir>|<kind>:<key>` space as runs. */
@@ -329,6 +337,17 @@ async function listSearchableSubdirs(dir: string): Promise<string[]> {
 export async function locateAll(folders: { path: string; name?: string }[], options: LocateOptions = {}): Promise<SparringLocation[]> {
   const found = await Promise.all(folders.map((folder) => locateSparringDirs(folder.path, folder.name, options)));
   return found.flat();
+}
+
+/**
+ * Probe one worktree outside the workspace for a `.sparring` at its root (no
+ * nested search: a worktree is a repository root, and its own project is what
+ * a run there uses). `workspaceFolder` is the worktree itself, since no
+ * workspace folder contains it.
+ */
+export async function locateExternalWorktree(worktree: { path: string; siblingOf: string; branch?: string }): Promise<SparringLocation | undefined> {
+  const location = await locationAt(worktree.path, worktree.path, path.basename(worktree.path));
+  return location ? { ...location, external: { siblingOf: worktree.siblingOf, ...(worktree.branch ? { branch: worktree.branch } : {}) } } : undefined;
 }
 
 /** Resolve a recorded plan label (plan.py: plan_label) back to an absolute path. */

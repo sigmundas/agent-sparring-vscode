@@ -418,7 +418,8 @@ describe("following the active repository", () => {
     const explicit = calls.filter((call) => call.endsWith('"explicit"'));
     const action = calls.filter((call) => call.endsWith('"action"'));
     assert.equal(explicit.length + action.length, calls.length, "every call states its origin");
-    assert.equal(explicit.length, 2, "the picker and the test hook");
+    assert.equal(explicit.length, 3, "the picker, the overview's ambiguity rows and the test hook");
     assert.ok(/await controller\.chooseRun\(picked\.run, "explicit"\)/.test(source));
+    assert.ok(/await controller\.chooseRun\(run, "explicit"\)/.test(source), "an ambiguity row pins through the picker's own path");
   });
 });
