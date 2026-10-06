@@ -854,6 +854,19 @@ export class SparringController implements vscode.Disposable {
     return bound.binding.ok ? bound.binding.identity.stages : undefined;
   }
 
+  /**
+   * The manifest file a `source=manifest` run executes, when this window
+   * holds one bound to it: its executable digest equals the `plan_digest`
+   * the engine recorded, so it is exactly the input a resume must name.
+   * Otherwise why not, for the person.
+   */
+  async boundManifestFile(run: PlanRunSnapshot): Promise<{ file: string } | { refusal: string }> {
+    const peers = this.discovery.runs.filter((candidate): candidate is PlanRunSnapshot => candidate.kind === "plan" && candidate.state.source === "manifest");
+    const bound = await this.manifests.readBound(this.manifestDirectoryPath, run, peers);
+    this.reportManifestBinding(run, bound);
+    return bound.binding.ok ? { file: path.join(this.manifestDirectoryPath, bound.file) } : { refusal: bound.binding.detail };
+  }
+
   /** Say what was decided the first time, and again whenever it changes; never once per render. */
   private reportManifestBinding(run: PlanRunSnapshot, bound: BoundManifest): void {
     const key = `${run.id} ${bound.file}`;

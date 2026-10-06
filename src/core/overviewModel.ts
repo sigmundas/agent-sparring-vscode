@@ -1166,7 +1166,15 @@ export interface OverviewModel {
   stageLine?: string;
   /** Current loop cycle when telemetry has reported one. */
   cycle?: number;
+  /** What the stage is for, verbatim from its source; see {@link goalSource}. */
   goal?: string;
+  /**
+   * Where {@link goal} came from. Only `brief` is a stage goal someone wrote
+   * as one (intake's `## Goal`); `plan` and `brief-opening` are the stage's
+   * own section text, often the implementer's contract, so the cockpit shows
+   * them as a description to open rather than as the Goal.
+   */
+  goalSource?: "brief" | "plan" | "brief-opening";
   activity?: ActivityLine;
   /** The last few meaningful events, oldest first; omitted without telemetry. */
   history?: HistoryEntry[];
@@ -1630,7 +1638,7 @@ function buildScreen(
     },
     agentConfig: agentConfigSection(artifacts.agentConfig, stageInProgress(stage, halted, liveness), stage),
     facts: facts(run, stage, artifacts.git, presentation, artifacts.associatedPlan, artifacts.siblingRepositories, live),
-    goal: goal(artifacts, plan),
+    ...goal(artifacts, plan),
     activity: activityLine(live, halted, nowMs, uncertain),
     history: history(live),
     runKind: runKindWord(run, artifacts),
@@ -3016,17 +3024,18 @@ function manifestView(run: RunSnapshot, artifacts: OverviewArtifacts): ManifestV
  * is for. `parseBriefOpening` stays as the last resort for a hand-written
  * brief with no associated plan document at all.
  */
-function goal(artifacts: OverviewArtifacts, plan: PlanContext | undefined): string | undefined {
+function goal(artifacts: OverviewArtifacts, plan: PlanContext | undefined): Pick<OverviewModel, "goal" | "goalSource"> {
   const explicit = artifacts.brief ? parseBriefGoal(artifacts.briefText) : undefined;
   if (explicit) {
-    return explicit;
+    return { goal: explicit, goalSource: "brief" };
   }
   const document = plan?.source === "managed" ? artifacts.planText : artifacts.associatedPlan?.text;
   const structured = document && plan?.currentLine ? sectionSummary(document, plan.currentLine) : undefined;
   if (structured) {
-    return structured;
+    return { goal: structured, goalSource: "plan" };
   }
-  return artifacts.brief ? parseBriefOpening(artifacts.briefText) : undefined;
+  const opening = artifacts.brief ? parseBriefOpening(artifacts.briefText) : undefined;
+  return opening ? { goal: opening, goalSource: "brief-opening" } : {};
 }
 
 function timeline(run: PlanRunSnapshot, manifest: ManifestView | undefined): Pick<OverviewModel, "timeline" | "timelineNote"> {

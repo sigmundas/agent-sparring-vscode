@@ -2914,6 +2914,13 @@ async function resumePlanCommand(controller: SparringController, preselected?: P
   if (!expectedBranch) {
     return;
   }
+  // What the run resumes from is settled before anything is asked: a person
+  // who typed evidence must never lose it to a resume that could not have
+  // started, and a refusal is said in a dialog, not a passing toast.
+  const input = await planInvocationFor(controller, run);
+  if (!input) {
+    return;
+  }
   const continuing = run.currentStage.state?.status === "accepted";
   let evidence: string | undefined = "";
   if (!continuing) {
@@ -2925,10 +2932,6 @@ async function resumePlanCommand(controller: SparringController, preselected?: P
     if (evidence === undefined) {
       return;
     }
-  }
-  const input = await planInvocationFor(controller, run);
-  if (!input) {
-    return;
   }
   const args = buildResumePlanArgs({
     ...input,
@@ -3385,14 +3388,25 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
     if (!run.intake) {
       void vscode.window.showWarningMessage(
         `Agent Sparring: this run was started from an approved plan intake, and its approved manifest could not be found${run.planError ? ` (${run.planError})` : ""}. Nothing was started.`,
+        { modal: true },
       );
       return undefined;
     }
     return { intakeManifest: run.intake.manifestPath, source: "intake-manifest", runKey: run.runKey };
   }
+  // The manifest this run was started from, when this window still holds it
+  // bound to the run: its digest is the run's recorded `plan_digest`, so it
+  // is exactly what the engine will accept. Resuming from it needs neither
+  // the plan document nor anything remembered about it, which is what a
+  // resume after a restart (or from another worktree) has to rely on. A
+  // rebuild could only reproduce it or be refused.
+  const held = await controller.boundManifestFile(run);
+  if ("file" in held) {
+    return { manifest: held.file, source: "manifest", runKey: run.runKey };
+  }
   const markdown = await readOptional(run.planPath);
   if (markdown === undefined) {
-    void vscode.window.showWarningMessage(`Agent Sparring: this run was started from an execution manifest built from ${path.basename(run.planPath)}, which can no longer be read. Restore it, then continue.`);
+    void vscode.window.showWarningMessage(`Agent Sparring: this run was started from an execution manifest built from ${path.basename(run.planPath)}. That plan can no longer be read, and no stored manifest matches the run (${held.refusal}). Restore the plan, then continue.`, { modal: true });
     return undefined;
   }
   const built = buildManifest({
@@ -3408,14 +3422,14 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
     ...declarationsFor(controller, run.planKey, run.location),
   });
   if (!built.ok) {
-    void vscode.window.showWarningMessage(`Agent Sparring: the execution manifest for ${path.basename(run.planPath)} could not be rebuilt: ${built.problems[0]?.reason ?? "the plan changed."}`);
+    void vscode.window.showWarningMessage(`Agent Sparring: no stored manifest matches this run (${held.refusal}), and the execution manifest for ${path.basename(run.planPath)} could not be rebuilt: ${built.problems[0]?.reason ?? "the plan changed."} Nothing was started.`, { modal: true });
     return undefined;
   }
   try {
     await controller.manifestDirectory();
     return { manifest: await writeManifestFile(controller, run, built.manifest), source: "manifest", runKey: run.runKey };
   } catch (error) {
-    void vscode.window.showErrorMessage(`Agent Sparring: could not write the execution manifest: ${(error as Error).message}. Nothing was started.`);
+    void vscode.window.showErrorMessage(`Agent Sparring: could not write the execution manifest: ${(error as Error).message}. Nothing was started.`, { modal: true });
     return undefined;
   }
 }

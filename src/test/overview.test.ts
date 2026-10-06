@@ -175,8 +175,15 @@ describe("overview view model", () => {
     const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
     assert.equal(model.lastSparring?.report, "Long findings that must never reach the status bar.");
     const html = renderOverviewHtml(model, "n", "c");
-    assert.match(html, /<details class="report"[^>]*><summary>Read feedback<\/summary><div class="reportbody"><p>Long findings that must never reach the status bar\.<\/p><\/div>/);
-    assert.match(html, /<button type="button" data-action="openSparring" title="Open sparring.md">Open full report<\/button><\/details>/);
+    // The verdict is on the Sparrer card, not in the stage card.
+    const stageCard = html.slice(html.indexOf('<section class="card stage">'), html.indexOf('<section class="actors">'));
+    assert.ok(!stageCard.includes("Latest sparring result") && !stageCard.includes("sparverdict"), "the stage card no longer carries the result");
+    const sparrerCard = /<div class="card actor [^"]*" data-role="sparrer">[\s\S]*?<div class="cardfoot">[\s\S]*?<\/div><\/div>/.exec(html)?.[0] ?? "";
+    assert.match(sparrerCard, /<div class="sparresult"><p class="sparverdict"><span class="verdict send_back"[^>]*>Changes requested<\/span>/);
+    // Read feedback is a tab on the Sparrer card's footer line; the report opens below both cards.
+    assert.match(sparrerCard, /<button type="button" class="showinstr" data-instr="feedback" aria-controls="feedback-sparrer" aria-expanded="false" data-show="Read feedback" data-hide="Hide feedback">Read feedback<\/button>/);
+    assert.match(html, /<div class="instrpanel [^"]*" id="feedback-sparrer" data-instrpanel="feedback"[^>]* hidden>[\s\S]*?<div class="reportbody"><p>Long findings that must never reach the status bar\.<\/p><\/div>/);
+    assert.match(html, /<button type="button" data-action="openSparring" title="Open sparring.md">Open full report<\/button>/);
   });
 
   it("no report to read: Read feedback is not offered, only the verdict and summary", async () => {
@@ -398,7 +405,14 @@ describe("overview HTML", () => {
     // The same raw facts never leak into the primary card above it (the
     // run key does still appear in the stage heading's tooltip, one of the
     // established advanced surfaces alongside Technical details itself).
-    const beforeTechnical = html.slice(0, html.indexOf('<details class="tech facts"'));
+    // The one exception is the model name the provider reported, read as a
+    // plain name under the stage agent's dials.
+    const beforeTechnical = html
+      .slice(0, html.indexOf('<details class="tech facts"'))
+      .replace(/<div class="runtimemodel[^>]*>[^<]*<\/div>/g, "")
+      .replace(/data-runtime-model="[^"]*"/g, "")
+      .replace(/<details class="setup-technical agentconfig-technical"[\s\S]*?<\/details>/g, "");
+    assert.match(html, /<div class="runtimemodel muted" data-runtime-model="claude-opus-5-5"/);
     assert.ok(!beforeTechnical.includes("claude-opus-5-5"));
     assert.ok(!beforeTechnical.includes("82ab1234"));
   });
@@ -409,7 +423,9 @@ describe("overview HTML", () => {
     assert.match(html, /<ol class="journey"><li class="step accepted" title="Stage 1 — Contract \(Accepted\) · 1 of 3"><span class="node"><svg class="icon " [^>]*>.*?<\/svg><\/span><span class="num">1<\/span><span class="name">Contract<\/span><span class="state"><svg[^>]*>.*?<\/svg>Accepted<\/span><\/li>/);
     assert.match(html, /<li class="step paused current" [^>]*>.*?<span class="name">Schema &amp; API<\/span><span class="state">Paused<\/span><\/li>/);
     assert.match(html, /<li class="step future" [^>]*><span class="node">3<\/span>.*?<span class="state">Pending<\/span><\/li>/);
-    assert.match(html, /<span class="hpill" title="The whole job[^"]*">Plan run<\/span><span class="hpill">Stage 2 \/ 3<\/span><span class="hpill warn"><svg[^>]*>.*?<\/svg>Needs you<\/span>/);
+    // The breadcrumb names the plan and the stage; the header adds only the status, as text.
+    assert.match(html, /<div class="pills"><span class="hpill warn"><svg[^>]*>.*?<\/svg>Needs you<\/span><\/div>/);
+    assert.ok(!html.includes(">Plan run<"), "a plan run is the ordinary case and is not labelled");
     assert.match(html, /<h2 [^>]*><svg class="icon accent needs_you"[^>]*>.*?<\/svg>Stage 2 — Schema &amp; API<\/h2>/);
     assert.ok(!/<span class="status needs_you"/.test(html), "the card does not repeat the header pill's Needs you");
     assert.equal((html.match(/<div class="card actor [a-z]+" data-role="/g) ?? []).length, 2);
@@ -424,7 +440,7 @@ describe("overview HTML", () => {
     assert.match(html, /data-action="openSparring"[^>]*>Open detailed review</);
     assert.match(html, /<details class="more"[^>]*><summary[^>]*>…<\/summary><div class="actions"><button type="button" class="quiet" data-action="resumePlan"[^>]*>Resume plan \(implementation\)</);
     assert.ok(!html.includes("Latest sparring result"), "the panel is the latest sparring result");
-    assert.match(html, /<div class="run muted" title="[^"]*"><span class="plan">docs\/plans\/foo.md<\/span><span class="sep">›<\/span><span>Stage 2 — Schema &amp; API<\/span><\/div>/, "the header names the plan (its label when the document is not read), then the stage");
+    assert.match(html, /<div class="run muted" title="[^"]*"><span class="plan">docs\/plans\/foo.md<\/span><span class="sep">›<\/span><span title="Stage 2 of 3">Stage 2 — Schema &amp; API<\/span><\/div>/, "the header names the plan (its label when the document is not read), then the stage");
   });
 
   it("ambiguous model lists the choices, names the repository and offers selection", () => {

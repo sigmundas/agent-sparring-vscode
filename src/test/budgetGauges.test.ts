@@ -335,6 +335,6 @@ describe("the markup a person actually sees", () => {
 
   it("puts the dials beside the fields rather than under them", async () => {
     const html = await page([]);
-    assert.match(html, /<div class="agentconfig-block"><div class="agentconfig-fields">[\s\S]*?<\/div><div class="gauges">/);
+    assert.match(html, /<div class="agentconfig-block"><div class="agentconfig-fields">[\s\S]*?<\/div><div class="dialcol"><div class="gauges">/);
   });
 });

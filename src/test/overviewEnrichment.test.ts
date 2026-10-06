@@ -7,7 +7,7 @@ import { RECENT_MEANINGFUL_MAX, activeDurationMs, applyEvent, emptyLiveState, fo
 import type { ExecutionRecord } from "../core/liveness";
 import { LogRenderer } from "../core/logFormat";
 import { HISTORY_MAX, activityLine, buildOverviewModel, history, timelineState, type OverviewArtifacts } from "../core/overviewModel";
-import { renderOverviewHtml } from "../core/overviewHtml";
+import { renderOverviewHtml, splitLead } from "../core/overviewHtml";
 import { FOO_PLAN_KEY, FOO_PLAN_LABEL, FOO_PLAN_MARKDOWN, FOO_STAGE_IDS, Workspace, event, sparringMarkdown } from "./fixtures";
 
 const ALL: OverviewArtifacts = { handoff: true, sparring: true, brief: true, plan: true };
@@ -54,9 +54,14 @@ describe("goal extraction from brief.md", () => {
     assert.equal(withGoal.goal, "Fix it.");
     assert.equal(opening.goal, "Stop the crash on open.");
     assert.equal(nothing.goal, undefined);
-    assert.deepEqual({ ...withGoal, goal: undefined }, { ...nothing, goal: undefined });
+    assert.deepEqual({ ...withGoal, goal: undefined, goalSource: undefined }, { ...nothing, goal: undefined, goalSource: undefined });
     assert.equal(buildOverviewModel(selection, undefined, { ...ALL, brief: false, briefText: "## Goal\nstale\n" }, T0).goal, undefined, "no brief → no goal");
     assert.match(renderOverviewHtml(withGoal, "n", "c"), /Goal<\/h3><p class="goal">Fix it.<\/p>/);
+    assert.equal(withGoal.goalSource, "brief");
+    assert.equal(opening.goalSource, "brief-opening");
+    // A description that is not an explicit goal is offered, not labelled Goal.
+    assert.match(renderOverviewHtml(opening, "n", "c"), /<details class="block stagedesc"[^>]*><summary>About this stage<\/summary><div class="reportbody"><p>Stop the crash on open.<\/p>/);
+    assert.ok(!/Goal<\/h3>/.test(renderOverviewHtml(opening, "n", "c")));
     assert.ok(!/Goal<\/h3>/.test(renderOverviewHtml(nothing, "n", "c")), "nothing to say about the goal: no section, and no complaint");
     assert.ok(!/has no ## Goal/.test(renderOverviewHtml(nothing, "n", "c")));
   });
@@ -515,5 +520,15 @@ describe("standalone-stage degradation", () => {
     assert.match(html, /<span class="hpill" [^>]*>Standalone stage<\/span>/);
     assert.match(html, /<span class="verdict ready" title="Routing action: READY">Approved<\/span>/);
     assert.equal(model.status?.label, "Review complete");
+  });
+});
+
+describe("an explicit goal keeps its first sentence in view", () => {
+  it("splits after the first sentence and keeps the rest under More", () => {
+    assert.deepEqual(splitLead("Make the cockpit readable. Then remove the duplicate labels."), { lead: "Make the cockpit readable.", rest: "Then remove the duplicate labels." });
+    assert.deepEqual(splitLead("One sentence only."), { lead: "One sentence only." });
+    assert.deepEqual(splitLead("e.g. short. Rest"), { lead: "e.g. short. Rest" }, "too short a lead is not split");
+    const html = renderOverviewHtml({ kind: "run", title: "x", goal: "Make the cockpit readable. Then remove the duplicate labels.", goalSource: "brief" }, "n", "c");
+    assert.match(html, /Goal<\/h3><p class="goal">Make the cockpit readable.<\/p><details class="goalmore"><summary>More<\/summary><p class="goal">Then remove the duplicate labels.<\/p><\/details>/);
   });
 });
