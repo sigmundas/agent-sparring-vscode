@@ -84,6 +84,11 @@ export interface IntakeRecord {
    */
   findings?: IntakeFindingCounts;
   /**
+   * `stages[<stage id>].plan_stage_label`: the human plan's stage label each
+   * manifest node was compiled from. Display only (Overview grouping).
+   */
+  planStageLabels?: Record<string, string>;
+  /**
    * `approval_requirements`: per run slice, what approve-plan will ask for,
    * from the same engine code that writes the report's "Next step". Display
    * metadata, never an input to approval. Absent from older intakes.
@@ -221,9 +226,21 @@ export function parseIntakeRecord(text: string): IntakeRecord {
     runKeys,
     repositories: recordedRepositories(payload["repositories"]),
     findings: findingCounts(payload["findings"]),
+    planStageLabels: planStageLabels(payload["stages"]),
     requirements: sliceRequirements(payload["approval_requirements"]),
     ...(typeof payload["completion_marker"] === "string" && payload["completion_marker"] ? { completionMarker: payload["completion_marker"] } : {}),
   };
+}
+
+function planStageLabels(value: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [stageId, contract] of Object.entries(recordOf(value) ?? {})) {
+    const label = recordOf(contract)?.["plan_stage_label"];
+    if (typeof label === "string" && label.trim()) {
+      out[stageId] = label.trim();
+    }
+  }
+  return out;
 }
 
 function recordOf(value: unknown): Record<string, unknown> | undefined {
@@ -470,7 +487,16 @@ export async function resolveIntakeRun(sparringDir: string, runKey: string): Pro
   if (envelope.runKey !== runKey || envelope.runId !== approval.runId) {
     throw new EngineFormatError(`intake manifest ${manifestPath} is for run ${envelope.runKey} (slice ${envelope.runId}), not this run`);
   }
-  return { manifestPath, intakeDir, runId: approval.runId, sourcePath: approval.sourcePath, stages: envelope.stages };
+  // Which human-plan stage each node came from, for grouping only: an
+  // unreadable intake.json costs the grouping, never the stage list.
+  let labels: Record<string, string> = {};
+  try {
+    labels = parseIntakeRecord(await fs.readFile(path.join(intakeDir, INTAKE_RECORD_FILENAME), "utf8")).planStageLabels ?? {};
+  } catch {
+    labels = {};
+  }
+  const stages = envelope.stages.map((stage) => (labels[stage.stageId] ? { ...stage, planStageLabel: labels[stage.stageId] } : stage));
+  return { manifestPath, intakeDir, runId: approval.runId, sourcePath: approval.sourcePath, stages };
 }
 
 // ---------------------------------------------------------------------------

@@ -79,14 +79,17 @@ import type { EngineFailure, LaunchProblem, LaunchResult } from "./executionTrac
 import type { OperationView } from "./operationRegistry";
 import { outputTail } from "./terminalOutput";
 import { currentBranch, knownRepositories, pendingChanges } from "./git";
-import { manifestSupport } from "./engineProbe";
+import { evaluateStartPlan, manifestSupport, resetManifestSupportCache, startPlanSupport } from "./engineProbe";
 import { openCandidateDiff } from "./overview/gitDiff";
 import { configuredExecutable } from "./engineExecutable";
 import { settingsTarget } from "../core/settingsTarget";
 import { fixSetup, readEffectiveConfig, readModelChoices, readOverriddenConfig, resetModelChoicesCache } from "./configProbe";
 import { askFreshSession, describeAgent, freshRefusedByPause, otherAgentLabel, roleNoun, type FreshSessionUi } from "../core/freshSession";
 import type { SessionRole } from "../core/engineFormats";
-import { CUSTOM_MODEL_LABEL, exactModelProblem } from "../core/effectiveConfig";
+import { CUSTOM_MODEL_LABEL, describeRole, exactModelProblem } from "../core/effectiveConfig";
+import { buildStartPlanArgs } from "../core/startPlan";
+import type { StartPlanSession } from "../core/overviewModel";
+import type { StartPlanMessage } from "../core/overviewHtml";
 import { OverviewPanelManager } from "./overview/overviewPanel";
 
 export function registerCommands(context: vscode.ExtensionContext, controller: SparringController): void {
@@ -94,6 +97,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     controller,
     (action) => handleOverviewAction(controller, overview, action),
     (message) => handleIntakeAction(controller, overview, message),
+    (message) => handleStartPlanMessage(controller, overview, message),
   );
   launchOverview = overview;
   context.subscriptions.push(
@@ -318,6 +322,25 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     // The webview's own actions, as the Overview's buttons deliver them.
     vscode.commands.registerCommand("agentSparring._test.overviewAction", (action: OverviewAction) => handleOverviewAction(controller, overview, action)),
     vscode.commands.registerCommand("agentSparring._test.intakeAction", (message: IntakeActionMessage) => handleIntakeAction(controller, overview, message)),
+    // Run Plan through start-plan without the pickers: the same capability
+    // check and evaluation Run Plan performs, for a given project and plan.
+    vscode.commands.registerCommand("agentSparring._test.startPlan", async (projectDir: string, planPath: string, expectedBranch: string) => {
+      const location = controller.currentDiscovery.locations.find((candidate) => samePath(candidate.projectDir, projectDir));
+      if (!location) {
+        return undefined;
+      }
+      resetManifestSupportCache(); // the suite switches the fake engine's capability
+      const support = await startPlanSupport(configuredExecutable(), location.repoRoot);
+      if (support !== "supported") {
+        return { support };
+      }
+      await beginStartPlan(controller, overview, { location, planPath, label: planLabel(planPath, location.repoRoot), expectedBranch }, {});
+      return { support, session: overview.startPlanSession };
+    }),
+    vscode.commands.registerCommand("agentSparring._test.startPlanMessage", async (message: StartPlanMessage) => {
+      await handleStartPlanMessage(controller, overview, message);
+      return overview.startPlanSession;
+    }),
     vscode.commands.registerCommand("agentSparring._test.recordHumanCheck", async (key: string, outcome: "pass" | "fail" | "blocked", note?: string) => {
       const run = controller.currentSelection.selected;
       if (!run) {
@@ -2562,6 +2585,17 @@ async function runPlanCommand(controller: SparringController, overview: Overview
   if (!expectedBranch) {
     return;
   }
+  // The engine's own one-command start, when it has one: it interprets the
+  // plan (directly, or through a compile intake), asks the person its
+  // decisions, and runs exactly what it showed once confirmed. The manifest
+  // built below stays only for engines that predate start-plan.
+  if ((await startPlanSupport(configuredExecutable(), location.repoRoot)) === "supported") {
+    if (await blockedByObsoleteSettings(controller, location)) {
+      return;
+    }
+    await beginStartPlan(controller, overview, { location, planPath, label, expectedBranch }, {});
+    return;
+  }
   // Minted here, before anything is written: this run's identity, which its
   // stage ids, its manifest file and the terminal tracking all derive from.
   const runKey = newRunKey(label);
@@ -2586,6 +2620,141 @@ async function runPlanCommand(controller: SparringController, overview: Overview
   const result = await launch(controller, location, args, "run-plan", planPath, runId);
   if (result.ok) {
     await controller.showStartedRun(runId);
+  }
+}
+
+// ---------------------------------------------------------------- Run Plan through start-plan
+
+interface StartPlanContext {
+  location: SparringLocation;
+  planPath: string;
+  label: string;
+  expectedBranch: string;
+}
+
+/** What the Run Plan on screen was started with; paired with the Overview's session. */
+let startPlanContext: StartPlanContext | undefined;
+
+/** The roles as the engine's `show-config` reports them, for the summary; nothing when it gave no report. */
+async function startPlanModels(location: SparringLocation): Promise<StartPlanSession["models"]> {
+  try {
+    const config = await readEffectiveConfig(configuredExecutable(), location.projectDir, location.sparringDir);
+    if (config.kind !== "report") {
+      return undefined;
+    }
+    return [config.report.stage, config.report.sparring].filter((role) => role !== undefined).map((role) => {
+      const line = describeRole(role);
+      return { role: line.role, text: line.text };
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Ask the engine `start-plan --json` with these answers and show what it
+ * said. The answers are only ever the engine's recorded ones plus the
+ * person's own choices; nothing here picks an option.
+ */
+async function beginStartPlan(controller: SparringController, overview: OverviewPanelManager, context: StartPlanContext, answers: Record<string, string>): Promise<void> {
+  const { location, planPath, label, expectedBranch } = context;
+  const args = buildStartPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir, answers, json: true });
+  const session: StartPlanSession = {
+    planName: path.basename(planPath),
+    planLabel: label,
+    planPath,
+    expectedBranch,
+    phase: "preparing",
+    answers,
+    models: await startPlanModels(location),
+    command: `sparring ${args.join(" ")}`,
+  };
+  startPlanContext = context;
+  overview.setStartPlanSession(session);
+  await overview.show();
+  controller.log(`Run plan: sparring ${args.join(" ")}`);
+  const result = await evaluateStartPlan(configuredExecutable(), args, location.repoRoot);
+  if (overview.startPlanSession !== session) {
+    return; // closed, or replaced by another Run Plan, while the engine worked
+  }
+  if (result.status) {
+    controller.log(`Run plan: start-plan reported ${result.status.status}${result.status.error ? ` — ${result.status.error}` : ""}`);
+  } else {
+    controller.log(`Run plan: start-plan reported no status — ${result.output}`);
+  }
+  overview.setStartPlanSession({ ...session, phase: "shown", ...(result.status ? { status: result.status } : { failure: result.output }) });
+}
+
+async function handleStartPlanMessage(controller: SparringController, overview: OverviewPanelManager, message: StartPlanMessage): Promise<void> {
+  const session = overview.startPlanSession;
+  const context = startPlanContext;
+  if (!session || !context || session.phase === "preparing") {
+    return;
+  }
+  switch (message.action) {
+    case "dismiss":
+      startPlanContext = undefined;
+      overview.setStartPlanSession(undefined);
+      return;
+    case "openReport": {
+      const report = session.status?.intake?.report;
+      if (report) {
+        await openDocument(report, `The intake report ${report} is missing.`, overview.documentColumn);
+      }
+      return;
+    }
+    case "retry":
+      await beginStartPlan(controller, overview, context, session.answers);
+      return;
+    case "answer": {
+      const status = session.status;
+      if (session.phase !== "shown" || status?.status !== "needs_decision") {
+        return;
+      }
+      // Every decision the engine asked needs the person's own choice of one
+      // of the options it offered; nothing is filled in for them.
+      const unanswered = status.decisions.filter((decision) => !decision.options.some((option) => option.id === message.answers[decision.id]));
+      const unknown = Object.keys(message.answers).filter((id) => !status.decisions.some((decision) => decision.id === id));
+      if (unanswered.length > 0 || unknown.length > 0) {
+        void vscode.window.showWarningMessage(
+          unknown.length > 0
+            ? "Agent Sparring: the answers do not match the decisions the engine asked. Nothing was run."
+            : `Agent Sparring: choose an option for every decision first (${unanswered.map((decision) => decision.id).join(", ")}). Nothing was run.`,
+        );
+        return;
+      }
+      await beginStartPlan(controller, overview, context, { ...(status.intake?.answers ?? {}), ...message.answers });
+      return;
+    }
+    case "start": {
+      const status = session.status;
+      // Only the token the engine printed last, and only once.
+      if (session.phase !== "shown" || status?.status !== "ready" || !status.confirmToken || message.token !== status.confirmToken) {
+        controller.log("Run plan: Start not done — the token pressed is not the engine's current one for this screen.");
+        void vscode.window.showWarningMessage("Agent Sparring: this Run Plan screen changed since it was drawn. Nothing was started.");
+        return;
+      }
+      overview.setStartPlanSession({ ...session, phase: "started" });
+      const { location, planPath, expectedBranch, label } = context;
+      const args = buildStartPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir, answers: session.answers, confirm: status.confirmToken });
+      // An intake slice's run key is known now; a direct route's is minted by
+      // the run, so its operation is filed under the plan document's key.
+      const runKey = status.slice?.runKey ?? undefined;
+      const runId = planRunId(location, runKey ?? planKey(label));
+      controller.log(`Run plan: sparring ${args.join(" ")}`);
+      const result = await controller.launch({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: `start-plan: ${path.basename(planPath)}`, runId, kind: "start-plan", planPath, reveal: false });
+      await explainLaunch(controller, result);
+      if (result.ok) {
+        if (overview.startPlanSession?.status === status) {
+          startPlanContext = undefined;
+          overview.setStartPlanSession(undefined);
+        }
+        if (runKey) {
+          await controller.showStartedRun(runId);
+        }
+      }
+      return;
+    }
   }
 }
 

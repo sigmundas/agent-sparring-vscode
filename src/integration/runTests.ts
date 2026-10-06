@@ -145,6 +145,26 @@ async function buildFixture(): Promise<{ root: string; workspaceFile: string }> 
       'sparring_dir=',
       'while [ $# -gt 0 ]; do case "$1" in --sparring-dir) sparring_dir="$2"; shift 2 ;; *) break ;; esac; done',
       'sub="$1"',
+      // start-plan, answered only when the suite enables it: otherwise the
+      // engine "predates" it, so every other section keeps Run Plan's
+      // manifest fallback. It asks one decision; answered split=yes it is
+      // ready with a fixed token; --confirm records the call and exits.
+      String.raw`if [ "$sub" = "start-plan" ]; then
+  enabled="$(dirname "$0")/../fake-start-plan.enabled"
+  case " $* " in *" --help "*)
+    if [ -f "$enabled" ]; then echo "usage: sparring start-plan [-h] [--json] [--answer DECISION=OPTION] [--confirm TOKEN]"; exit 0; fi
+    echo "sparring: error: argument command: invalid choice: 'start-plan' (choose from 'run-plan')" >&2; exit 2 ;;
+  esac
+  case " $* " in *" --confirm "*) echo "fake sparring: start-plan confirmed"; exit 0 ;; esac
+  answered=no; case " $* " in *" --answer split=yes "*) answered=yes ;; esac
+  head='{"schema_version": 1, "plan": {"path": "'"$2"'", "label": "plans/start-plan-demo.md"}, "expected_branch": "feature/x", "execution": {"sparring_dir": "fake", "permission_mode": "acceptEdits", "claude_executable": "claude", "codex_executable": "codex", "max_send_back_cycles": 5}, "intake": {"id": "fake-intake", "directory": "/nonexistent/fake-intake", "report": "/nonexistent/fake-intake/report.md", "mode": "compile", "reused": false, "answers": {}}, "later_slices": [], "findings": [], "error": null'
+  if [ "$answered" = yes ]; then
+    printf '%s, "status": "ready", "route": "intake", "slice": {"run_id": "web", "run_key": "fake-run-key", "manifest_version": 2, "stages": [{"stage_id": "s1", "label": "Stage 1", "title": "Schema", "mode": "implementation", "plan_stage_label": "3", "gates_before": [{"id": "g1", "title": "Device check", "kind": "manual", "reason": "eyes"}]}], "completion_gates": []}, "decisions": [], "confirm_token": "fake-token-1"}\n' "$head"
+    exit 0
+  fi
+  printf '%s, "status": "needs_decision", "route": "intake", "slice": null, "decisions": [{"id": "split", "question": "Split it?", "why": "two repos", "options": [{"id": "yes", "label": "Split", "consequence": "two"}, {"id": "no", "label": "Keep", "consequence": "one"}], "stages": ["3"], "finding": "D1"}], "confirm_token": null}\n' "$head"
+  exit 2
+fi`,
       'stage="$2"',
       '[ $# -gt 0 ] && shift; [ $# -gt 0 ] && shift',
       'root=; brief_file=; brief_flag=; set_key=; set_val=; for_provider=',

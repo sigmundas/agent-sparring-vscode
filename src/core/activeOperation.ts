@@ -127,6 +127,7 @@ export function operationTitle(record: Pick<OperationRecord, "subcommand" | "lab
     case "approve-plan":
       return stage ? `Approving ${stage}` : "Approving plan stage";
     case "run-plan":
+    case "start-plan":
     case "resume-plan":
     case "run-loop":
     case "resume-loop":
@@ -291,6 +292,7 @@ function settledTitle(record: Pick<OperationRecord, "subcommand" | "label" | "st
     case "approve-plan":
       return stage ? `${stage} approved` : "Plan stage approved";
     case "run-plan":
+    case "start-plan":
     case "resume-plan":
     case "run-loop":
     case "resume-loop":

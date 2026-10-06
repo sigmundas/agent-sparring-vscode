@@ -3,7 +3,7 @@
  * do not edit by hand; run scripts/generate-manifest-pins.js against a live
  * engine instead, and review the diff.
  *
- * Engine: agent-sparring c42c7ec
+ * Engine: agent-sparring 7c4817e
  * Interpreter: 3.14.3
  */
 
@@ -112,13 +112,13 @@ export const MANIFEST_PARITY_PINS: ManifestVectorResult[] = [
   },
   {
     "name": "version-true",
-    "accepted": true,
-    "digest": "5c8f282a473eb91f97908110caef7941ce40255500c348b07a1d06a39ac131b2"
+    "accepted": false,
+    "error": "ManifestError: unsupported manifest version True; this engine reads versions 1, 2"
   },
   {
     "name": "version-false",
     "accepted": false,
-    "error": "ManifestError: unsupported manifest version False; this engine reads version 1"
+    "error": "ManifestError: unsupported manifest version False; this engine reads versions 1, 2"
   },
   {
     "name": "version-float-one",
@@ -128,27 +128,32 @@ export const MANIFEST_PARITY_PINS: ManifestVectorResult[] = [
   {
     "name": "version-string-one",
     "accepted": false,
-    "error": "ManifestError: unsupported manifest version '1'; this engine reads version 1"
+    "error": "ManifestError: unsupported manifest version '1'; this engine reads versions 1, 2"
   },
   {
     "name": "version-zero",
     "accepted": false,
-    "error": "ManifestError: unsupported manifest version 0; this engine reads version 1"
+    "error": "ManifestError: unsupported manifest version 0; this engine reads versions 1, 2"
   },
   {
     "name": "version-two",
     "accepted": false,
-    "error": "ManifestError: unsupported manifest version 2; this engine reads version 1"
+    "error": "ManifestError: a version 2 manifest must declare at least one gate (gates_before or completion_gates); a manifest without gates is written as version 1"
+  },
+  {
+    "name": "version-three",
+    "accepted": false,
+    "error": "ManifestError: unsupported manifest version 3; this engine reads versions 1, 2"
   },
   {
     "name": "version-null",
     "accepted": false,
-    "error": "ManifestError: unsupported manifest version None; this engine reads version 1"
+    "error": "ManifestError: unsupported manifest version None; this engine reads versions 1, 2"
   },
   {
     "name": "version-absent",
     "accepted": false,
-    "error": "ManifestError: unsupported manifest version None; this engine reads version 1"
+    "error": "ManifestError: unsupported manifest version None; this engine reads versions 1, 2"
   },
   {
     "name": "mode-absent",
@@ -309,5 +314,75 @@ export const MANIFEST_PARITY_PINS: ManifestVectorResult[] = [
     "name": "brief-missing",
     "accepted": false,
     "error": "ManifestError: manifest stage 1 (stage-1-contract) must carry a non-empty 'brief'; a stage with nothing to implement from is not executable"
+  },
+  {
+    "name": "v2-gate-before",
+    "accepted": true,
+    "digest": "97a788d20a74a90381582d52c4bd884bda47ef105df90455a2df2e5981c65e29"
+  },
+  {
+    "name": "v2-completion-gate",
+    "accepted": true,
+    "digest": "5510239d7136205f7d9c3a044134e0c7a3cb88f70378fea1472dc33941c58ce7"
+  },
+  {
+    "name": "v2-gate-moved-to-completion",
+    "accepted": true,
+    "digest": "5510239d7136205f7d9c3a044134e0c7a3cb88f70378fea1472dc33941c58ce7"
+  },
+  {
+    "name": "v2-float-version",
+    "accepted": true,
+    "digest": "97a788d20a74a90381582d52c4bd884bda47ef105df90455a2df2e5981c65e29"
+  },
+  {
+    "name": "v2-gate-null-lists",
+    "accepted": false,
+    "error": "ManifestError: a version 2 manifest must declare at least one gate (gates_before or completion_gates); a manifest without gates is written as version 1"
+  },
+  {
+    "name": "v2-gate-whitespace",
+    "accepted": true,
+    "digest": "97a788d20a74a90381582d52c4bd884bda47ef105df90455a2df2e5981c65e29"
+  },
+  {
+    "name": "v2-gate-unknown-key",
+    "accepted": false,
+    "error": "ManifestError: manifest stage 1 (stage-1-contract) gates_before gate carries unknown field(s) ['extra']; refusing to half-read a manifest written against a different contract"
+  },
+  {
+    "name": "v2-gate-empty-reason",
+    "accepted": false,
+    "error": "ManifestError: manifest stage 1 (stage-1-contract) gates_before gate field 'reason' must be a non-empty string"
+  },
+  {
+    "name": "v2-gate-duplicate-ids",
+    "accepted": false,
+    "error": "ManifestError: manifest gate ids must be unique; repeated: ['manual-check']"
+  },
+  {
+    "name": "v2-gate-id-too-long",
+    "accepted": false,
+    "error": "ManifestError: manifest stage 1 (stage-1-contract) gates_before: gate id is longer than 128 characters"
+  },
+  {
+    "name": "v2-gate-id-128",
+    "accepted": true,
+    "digest": "680fd000907b5ba7f16dbdd320abc20acdef042fb35ddedcb28e5394c155d6ec"
+  },
+  {
+    "name": "v2-gates-not-an-array",
+    "accepted": false,
+    "error": "ManifestError: manifest completion_gates must be an array or null"
+  },
+  {
+    "name": "v1-with-gates-before",
+    "accepted": false,
+    "error": "ManifestError: manifest stage 1 carries unknown field(s) ['gates_before']; refusing to half-read a manifest written against a different contract"
+  },
+  {
+    "name": "v1-with-completion-gates",
+    "accepted": false,
+    "error": "ManifestError: manifest carries unknown field(s) ['completion_gates']; refusing to half-read a manifest written against a different contract"
   }
 ];

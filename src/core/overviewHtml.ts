@@ -30,7 +30,7 @@ import {
 } from "./effectiveConfig";
 import { CHECK_OUTCOMES, isCheckKey, isDraftKey, type CheckItem, type CheckOutcome } from "./humanChecks";
 import { checkName, humanTask, splitPassCriteria } from "./humanTask";
-import { RUN_KIND, TIMELINE_STATE_WORD, type ActionRequired, type AgentConfigSection, type BranchGuard, type ActorCard, type BudgetGauge, type HistoryEntry, type OverviewModel, type PushAuthorization, type TimelineItem, type WhatsNext } from "./overviewModel";
+import { RUN_KIND, TIMELINE_STATE_WORD, shortStageLabel, timelineGroups, type ActionRequired, type AgentConfigSection, type BranchGuard, type ActorCard, type BudgetGauge, type HistoryEntry, type OverviewModel, type PushAuthorization, type StartPlanView, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { ProviderPauseCard } from "./freshSession";
 import type { MatchSource } from "./planAssociation";
 import type { PromptView, PromptViewSection } from "./promptInspector";
@@ -234,6 +234,28 @@ export interface IntakeActionMessage {
   action: "approve" | "start" | "prepare";
   intakeDir: string;
   runId: string;
+}
+
+/** Run Plan through start-plan: the person's answers, Start with the token on screen, or a navigation. */
+export type StartPlanMessage =
+  | { type: "startPlan"; action: "answer"; answers: Record<string, string> }
+  | { type: "startPlan"; action: "start"; token: string }
+  | { type: "startPlan"; action: "openReport" | "retry" | "dismiss" };
+
+export function isStartPlanMessage(message: unknown): message is StartPlanMessage {
+  const record = asRecord(message);
+  if (!record || record["type"] !== "startPlan") {
+    return false;
+  }
+  const action = record["action"];
+  if (action === "answer") {
+    const answers = asRecord(record["answers"]);
+    return answers !== undefined && Object.values(answers).every((value) => typeof value === "string" && value !== "");
+  }
+  if (action === "start") {
+    return typeof record["token"] === "string" && record["token"] !== "";
+  }
+  return action === "openReport" || action === "retry" || action === "dismiss";
 }
 
 export function isIntakeActionMessage(message: unknown): message is IntakeActionMessage {
@@ -568,6 +590,9 @@ ${intake.command ? `<details class="intake-command"><summary>Engine command</sum
   )
   .join("")}</ul></details>
 <p class="muted small">Intake ${escapeHtml(intake.intakeId)} · ${escapeHtml(intake.planLabel)}</p>`;
+  }
+  if (model.kind === "startPlan" && model.startPlan) {
+    return `${renderRepositoryContext(model)}${renderOperation(model)}${renderStartPlan(model.startPlan)}`;
   }
   if (model.kind === "ambiguous") {
     return `${renderRepositoryContext(model)}${renderOperation(model)}
@@ -1307,7 +1332,20 @@ function renderJourney(items: TimelineItem[]): string {
     const state = item.state === "accepted" ? `<span class="state">${icon("check")}${escapeHtml(word)}</span>` : `<span class="state">${escapeHtml(word)}</span>`;
     return `<li class="${cls}" title="${escapeHtml(label)}"><span class="node">${node}</span><span class="num">${escapeHtml(item.label ?? String(item.number))}</span><span class="name">${escapeHtml(item.title)}</span>${state}</li>`;
   });
-  return `<ol class="journey">${cells.join("")}</ol>`;
+  const groups = timelineGroups(items);
+  if (!groups.some((group) => group.label !== undefined && group.items.length > 1)) {
+    return `<ol class="journey">${cells.join("")}</ol>`;
+  }
+  // Nodes compiled from one human-plan stage sit under that stage's label,
+  // in execution order; the nodes themselves are unchanged.
+  let at = 0;
+  const sections = groups.map((group) => {
+    const own = cells.slice(at, at + group.items.length).join("");
+    at += group.items.length;
+    const heading = group.label !== undefined ? `<span class="journey-group-label">${escapeHtml(`Plan stage ${shortStageLabel(group.label)}`)}</span>` : "";
+    return `<li class="journey-group">${heading}<ol class="journey">${own}</ol></li>`;
+  });
+  return `<ol class="journey-groups">${sections.join("")}</ol>`;
 }
 
 /** The stage action a button triggers: Accept stage is the two-step acceptance, everything else launches the loop. */
@@ -2036,6 +2074,61 @@ function operationTechnical(model: OverviewModel, which: string, lines: readonly
   return `<details class="tech"${disclose(discloseScope(model), which, "technical")}><summary>Technical details</summary><pre class="command">${lines.map(escapeHtml).join("\n")}</pre></details>`;
 }
 
+/**
+ * Run Plan through `sparring start-plan`. Every decision, finding, gate and
+ * refusal is the engine's, shown as it reported them; the page offers the
+ * person's answers and the one Start, and decides nothing itself.
+ */
+function renderStartPlan(view: StartPlanView): string {
+  const decisions = view.decisions
+    .map(
+      (decision) => `<fieldset class="start-decision" data-decision="${escapeHtml(decision.id)}"><legend>${escapeHtml(decision.question)}</legend>
+${decision.why ? `<p class="muted">${escapeHtml(decision.why)}</p>` : ""}${decision.stages.length > 0 ? `<p class="muted small">Stages: ${escapeHtml(decision.stages.join(", "))}</p>` : ""}
+${decision.options
+  .map(
+    (option) =>
+      `<label class="start-option"><input type="radio" name="decision-${escapeHtml(decision.id)}" value="${escapeHtml(option.id)}"${view.canAnswer ? "" : " disabled"}> <strong>${escapeHtml(option.label)}</strong>${option.consequence ? ` <span class="muted">— ${escapeHtml(option.consequence)}</span>` : ""}</label>`,
+  )
+  .join("")}</fieldset>`,
+    )
+    .join("\n");
+  const findings =
+    view.findings.length > 0
+      ? `<details class="start-findings"${view.decisions.length > 0 || view.refusal ? " open" : ""}><summary>Findings (${view.findings.length})</summary><ul>${view.findings
+          .map((finding) => `<li><strong>${escapeHtml(finding.severity)}</strong> <code>${escapeHtml(finding.code)}</code> ${escapeHtml(finding.message)}${finding.stages.length > 0 ? ` <span class="muted">(${escapeHtml(finding.stages.join(", "))})</span>` : ""}</li>`)
+          .join("")}</ul></details>`
+      : "";
+  const summary = view.summary
+    ? `<section class="start-summary"><h2>What will run</h2><ul>${view.summary.lines.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul>
+<ol class="start-stages">${view.summary.stages
+        .map(
+          (stage) =>
+            `${stage.gatesBefore.map((gate) => `<li class="start-gate">Pause for ${escapeHtml(gate)}</li>`).join("")}<li><strong>${escapeHtml(stage.label)}</strong> — ${escapeHtml(stage.title)}${stage.mode ? ` <span class="muted">(${escapeHtml(stage.mode)})</span>` : ""}${stage.group ? ` <span class="muted small">plan stage ${escapeHtml(stage.group)}</span>` : ""}</li>`,
+        )
+        .join("")}${view.summary.completionGates.map((gate) => `<li class="start-gate">Pause before completion for ${escapeHtml(gate)}</li>`).join("")}</ol>
+${view.summary.laterSlices.map((line) => `<p class="muted">${escapeHtml(line)}</p>`).join("")}</section>`
+    : "";
+  const buttons = [
+    view.start ? `<button type="button" class="primary" data-startplan="start" data-token="${escapeHtml(view.start.token)}" title="${escapeHtml(view.start.detail)}">${escapeHtml(view.start.label)}</button>` : "",
+    view.decisions.length > 0 ? `<button type="button" class="primary" data-startplan="answer"${view.canAnswer ? "" : " disabled"} title="Reruns start-plan with your answers as --answer. Nothing is approved or run.">Answer and prepare again</button>` : "",
+    view.intake ? `<button type="button" data-startplan="openReport">Open intake report</button>` : "",
+    !view.preparing && !view.start && view.decisions.length === 0 ? `<button type="button" data-startplan="retry">Check again</button>` : "",
+    `<button type="button" data-startplan="dismiss"${view.preparing ? " disabled" : ""}>Close</button>`,
+  ].join("");
+  return `<header class="top"><div><h1>${escapeHtml(view.planName)}</h1><div class="run muted">Run plan · ${escapeHtml(view.stateLabel)}</div></div></header>
+<p class="muted start-notice">${escapeHtml(view.providerTurnNotice)}</p>
+${view.preparing ? `<p class="start-preparing">${icon("sync")}The engine is preparing the plan…</p>` : ""}
+${view.intake ? `<p>${escapeHtml(view.intake.line)}</p>` : view.route === "direct" ? "<p>Direct route: the plan's own stages run as written.</p>" : ""}
+${view.refusal ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}Refused by the engine. Nothing was approved or run.</p><pre class="engineerror">${escapeHtml(view.refusal)}</pre></div>` : ""}
+${view.failure ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}start-plan did not report a status.</p><pre class="engineerror">${escapeHtml(view.failure)}</pre></div>` : ""}
+${decisions}
+${findings}
+${summary}
+<div class="actions">${buttons}</div>
+${view.command ? `<details class="start-command"><summary>Engine command</summary><pre class="command">${escapeHtml(view.command)}</pre></details>` : ""}
+<p class="muted small">${escapeHtml(view.planLabel)}</p>`;
+}
+
 function button(action: OverviewAction, label: string, enabled = true, title?: string, cls = ""): string {
   const titleAttr = title ? ` title="${escapeHtml(title)}"` : "";
   const classAttr = cls ? ` class="${cls}"` : "";
@@ -2314,6 +2407,10 @@ details.more .actions { margin-top: 6px; }
 .note { margin: 6px 0 10px; }
 
 .journey { list-style: none; display: flex; align-items: flex-start; margin: 14px 0 16px; padding: 0; overflow-x: auto; }
+.journey-groups { list-style: none; display: flex; align-items: flex-start; gap: 12px; margin: 14px 0 16px; padding: 0; overflow-x: auto; }
+.journey-group { display: flex; flex-direction: column; }
+.journey-group > .journey { margin: 4px 0 0; }
+.journey-group-label { font-size: 0.85em; opacity: 0.8; border-bottom: 1px solid var(--vscode-panel-border, transparent); padding-bottom: 2px; }
 .step { position: relative; display: flex; flex-direction: column; align-items: center; flex: 1 1 0; min-width: 72px; text-align: center; }
 .step:not(:last-child)::after { content: ""; position: absolute; top: 13px; left: 50%; width: 100%; border-top: 2px solid var(--line); z-index: 0; }
 .step.accepted:not(:last-child)::after { border-top-color: var(--good); }
@@ -2744,6 +2841,25 @@ const SCRIPT = `
     var copyPrompt = element ? element.closest('button[data-copyprompt]') : null;
     if (copyPrompt && !copyPrompt.disabled) {
       vscode.postMessage({ type: 'copyPrompt', role: copyPrompt.getAttribute('data-copyprompt') });
+      return;
+    }
+    var startPlan = element ? element.closest('button[data-startplan]') : null;
+    if (startPlan && !startPlan.disabled) {
+      var startAction = startPlan.getAttribute('data-startplan');
+      if (startAction === 'answer') {
+        // The person's own choices, one per decision on screen; the host
+        // checks each against what the engine asked.
+        var answers = {};
+        document.querySelectorAll('fieldset[data-decision]').forEach(function (set) {
+          var picked = set.querySelector('input[type=radio]:checked');
+          if (picked) { answers[set.getAttribute('data-decision')] = picked.value; }
+        });
+        vscode.postMessage({ type: 'startPlan', action: 'answer', answers: answers });
+      } else if (startAction === 'start') {
+        vscode.postMessage({ type: 'startPlan', action: 'start', token: startPlan.getAttribute('data-token') });
+      } else {
+        vscode.postMessage({ type: 'startPlan', action: startAction });
+      }
       return;
     }
     var intakeTarget = element ? element.closest('button[data-intake]') : null;

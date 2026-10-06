@@ -101,6 +101,7 @@ export async function run(): Promise<void> {
     ["outlives", () => directExecutionOutlivesTheWindowAssertions()],
     ["settings", () => settingsAssertions(report, reportedRepo)],
     ["agentconfig", () => agentConfigAssertions(report, reportedRepo, fixtureRoot)],
+    ["startplan", () => startPlanAssertions(reportedRepo, fixtureRoot)],
   ];
   const only = (process.env.AGENT_SPARRING_IT_ONLY ?? "").split(",").map((name) => name.trim()).filter(Boolean);
   for (const [name, section] of sections) {
@@ -3994,4 +3995,76 @@ async function agentConfigAssertions(report: DiscoveryDiagnostic, reportedRepo: 
   await fs.rm(prefsPath, { force: true });
   await vscode.commands.executeCommand("agentSparring.refresh");
   console.log("integration: the Agents controls offered the engine's model suggestions per role and provider plus an exact custom id, every change ran set-config for the global preference and left the repository clean, a repository switch showed the same preference, a stale or refused change was never applied, a pinned stage said what it runs with and that changes apply from the next stage, and obsolete project keys blocked Run stage before any launch and were removed by fix-config");
+}
+
+// ---------------------------------------------------------------- Run Plan through start-plan (stubbed engine)
+
+interface StartPlanSessionShape {
+  phase: string;
+  answers: Record<string, string>;
+  status?: { status: string; confirmToken?: string; decisions: { id: string }[] };
+}
+
+async function startPlanAssertions(reportedRepo: string, fixtureRoot: string): Promise<void> {
+  const enabled = path.join(fixtureRoot, "fake-start-plan.enabled");
+  const argvLog = path.join(fixtureRoot, "fake-argv-start-plan.log");
+  const plan = path.join(reportedRepo, "plans", "start-plan-demo.md");
+  await fs.mkdir(path.dirname(plan), { recursive: true });
+  await fs.writeFile(plan, "# Demo\n\nNot a stage plan.\n");
+  const message = (body: Record<string, unknown>) => vscode.commands.executeCommand<StartPlanSessionShape | undefined>("agentSparring._test.startPlanMessage", { type: "startPlan", ...body });
+  try {
+    // An engine without start-plan: Run Plan keeps its manifest path.
+    await fs.rm(enabled, { force: true });
+    const old = await vscode.commands.executeCommand<{ support: string }>("agentSparring._test.startPlan", reportedRepo, plan, "feature/x");
+    assert.equal(old?.support, "missing", "an engine whose CLI rejects start-plan is detected, and Run Plan falls back");
+
+    await fs.writeFile(enabled, "");
+    const first = await vscode.commands.executeCommand<{ support: string; session?: StartPlanSessionShape }>("agentSparring._test.startPlan", reportedRepo, plan, "feature/x");
+    assert.equal(first?.support, "supported");
+    assert.equal(first?.session?.status?.status, "needs_decision", "the engine's decision is shown");
+    assert.equal(first?.session?.status?.confirmToken, undefined, "no token before the engine says ready");
+
+    // A Start not carrying the engine's token does nothing.
+    const invented = await message({ action: "start", token: "invented" });
+    assert.equal(invented?.phase, "shown");
+    assert.equal(invented?.status?.status, "needs_decision");
+
+    // An answer that is not one of the options is refused before anything runs.
+    const wrong = await message({ action: "answer", answers: { split: "maybe" } });
+    assert.equal(wrong?.status?.status, "needs_decision");
+
+    const answered = await message({ action: "answer", answers: { split: "yes" } });
+    assert.equal(answered?.status?.status, "ready");
+    assert.equal(answered?.status?.confirmToken, "fake-token-1");
+    const evaluated = await fs.readFile(argvLog, "utf8");
+    assert.match(evaluated, /<--answer>\n<split=yes>\n<--json>/, "the rerun carries the person's answer");
+
+    const model = await vscode.commands.executeCommand<{ kind: string; startPlan?: { start?: { token: string }; summary?: { stages: { gatesBefore: string[] }[] } } }>("agentSparring._test.overviewModel");
+    assert.equal(model?.kind, "startPlan");
+    assert.equal(model?.startPlan?.start?.token, "fake-token-1");
+    assert.deepEqual(model?.startPlan?.summary?.stages[0].gatesBefore, ["manual gate g1: Device check — eyes"]);
+
+    await message({ action: "start", token: "fake-token-1" });
+    const deadline = Date.now() + 20_000;
+    let confirmed = "";
+    while (Date.now() < deadline) {
+      confirmed = await fs.readFile(argvLog, "utf8").catch(() => "");
+      if (confirmed.includes("<--confirm>") && confirmed.includes("[end]")) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    assert.match(confirmed, /<start-plan>\n<[^>]*start-plan-demo\.md>/, "the same command");
+    assert.match(confirmed, /<--answer>\n<split=yes>\n<--confirm>\n<fake-token-1>/, "with the same answers and exactly the engine's token");
+    assert.ok(!confirmed.includes("<--json>"), "the confirmation runs, it does not ask again");
+
+    // The token is spent: pressing Start again cannot rerun it.
+    const again = await message({ action: "start", token: "fake-token-1" });
+    assert.ok(again === undefined || again.phase !== "shown", "a spent token is never offered or accepted again");
+  } finally {
+    await Promise.resolve(message({ action: "dismiss" })).catch(() => undefined);
+    await fs.rm(enabled, { force: true });
+    await fs.rm(plan, { force: true });
+  }
+  console.log("integration: Run Plan through start-plan (decision, answer, confirm with the engine's token) and the fallback verified");
 }

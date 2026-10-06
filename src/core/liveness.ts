@@ -61,7 +61,7 @@ export interface ExecutionRecord {
   id: string;
   /** The discovered run this execution belongs to (see discovery.runIdFor). */
   runId: string;
-  kind: "run-loop" | "run-sparring" | "run-plan" | "resume-plan";
+  kind: "run-loop" | "run-sparring" | "run-plan" | "resume-plan" | "start-plan";
   source: ExecutionSource;
   state: ExecutionState;
   startedAtMs: number;

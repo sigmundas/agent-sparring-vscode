@@ -61,6 +61,7 @@ export interface ManifestVectorResult {
 }
 
 const STAGE = { stage_id: "stage-1-contract", label: "Stage 1", title: "Contract", brief: "Do the thing.\n" };
+const GATE = { id: "manual-check", title: "Manual check", kind: "manual", reason: "A person verifies the build." };
 const TOP = { version: 1, plan_label: "docs/plans/foo.md", source_digest: "sha256:abc" };
 
 /** One manifest, with `top` and `stage` merged over the minimal valid shape. */
@@ -178,7 +179,7 @@ export const MANIFEST_VECTORS: ManifestVector[] = [
   },
 
   // ------------------------------------------------------------- version
-  { name: "version-true", why: "Python's `version != 1` accepts True, because True == 1; `!== 1` refused it", json: one({ version: true }) },
+  { name: "version-true", why: "the engine once accepted True because True == 1; it now refuses booleans explicitly, and so must this side", json: one({ version: true }) },
   { name: "version-false", why: "False != 1, so the engine refuses it — both sides must", json: one({ version: false }) },
   {
     name: "version-float-one",
@@ -187,7 +188,8 @@ export const MANIFEST_VECTORS: ManifestVector[] = [
   },
   { name: "version-string-one", why: '"1" != 1: refused by both', json: one({ version: "1" }) },
   { name: "version-zero", why: "0 != 1: refused", json: one({ version: 0 }) },
-  { name: "version-two", why: "a future version is refused rather than half-read", json: one({ version: 2 }) },
+  { name: "version-two", why: "a v2 manifest that declares no gate is refused: one without gates is written as v1", json: one({ version: 2 }) },
+  { name: "version-three", why: "a future version is refused rather than half-read", json: one({ version: 3 }) },
   { name: "version-null", why: "null != 1: refused", json: one({ version: null }) },
   { name: "version-absent", why: "an absent version is None, and None != 1: refused", json: JSON.stringify({ plan_label: "docs/plans/foo.md", source_digest: "sha256:abc", stages: [STAGE] }) },
 
@@ -298,4 +300,24 @@ export const MANIFEST_VECTORS: ManifestVector[] = [
   { name: "stage-id-dotdot", why: "traversal segments are refused", json: one({}, { stage_id: ".." }) },
   { name: "label-empty", why: "label must be a non-empty string", json: one({}, { label: "   " }) },
   { name: "brief-missing", why: "a stage with nothing to implement from is not executable", json: one({}, { brief: undefined }) },
+
+  // ------------------------------------------------------------- v2 gates
+  { name: "v2-gate-before", why: "a v2 stage's gates_before is marked, counted and digested", json: one({ version: 2 }, { gates_before: [GATE] }) },
+  { name: "v2-completion-gate", why: "completion_gates digest after every stage, with their own marker", json: one({ version: 2, completion_gates: [GATE] }) },
+  {
+    name: "v2-gate-moved-to-completion",
+    why: "the same gate before stage 1 and at completion must digest differently",
+    json: JSON.stringify({ ...TOP, version: 2, stages: [{ ...STAGE, gates_before: [] }], completion_gates: [GATE] }),
+  },
+  { name: "v2-float-version", why: "2.0 == 2 on both sides", json: raw(`{"version":2.0,"plan_label":"docs/plans/foo.md","source_digest":"sha256:abc","stages":[{"stage_id":"stage-1-contract","label":"Stage 1","title":"Contract","brief":"Do the thing.\\n","gates_before":[${JSON.stringify(GATE)}]}]}`) },
+  { name: "v2-gate-null-lists", why: "null gate lists are none, so a v2 file with only nulls declares no gate and is refused", json: one({ version: 2, completion_gates: null }, { gates_before: null }) },
+  { name: "v2-gate-whitespace", why: "gate fields are Python-stripped before digesting", json: one({ version: 2 }, { gates_before: [{ ...GATE, title: "  Manual check \u0085" }] }) },
+  { name: "v2-gate-unknown-key", why: "an unknown gate key is refused", json: one({ version: 2 }, { gates_before: [{ ...GATE, extra: 1 }] }) },
+  { name: "v2-gate-empty-reason", why: "every gate field must be a non-empty string", json: one({ version: 2 }, { gates_before: [{ ...GATE, reason: " " }] }) },
+  { name: "v2-gate-duplicate-ids", why: "gate ids are unique across the whole manifest", json: one({ version: 2, completion_gates: [GATE] }, { gates_before: [GATE] }) },
+  { name: "v2-gate-id-too-long", why: "a gate id longer than 128 characters is refused", json: one({ version: 2 }, { gates_before: [{ ...GATE, id: "g".repeat(129) }] }) },
+  { name: "v2-gate-id-128", why: "exactly 128 characters is accepted", json: one({ version: 2 }, { gates_before: [{ ...GATE, id: "g".repeat(128) }] }) },
+  { name: "v2-gates-not-an-array", why: "gates must be an array or null", json: one({ version: 2, completion_gates: {} }) },
+  { name: "v1-with-gates-before", why: "a v1 manifest carrying gates_before is an unknown field", json: one({}, { gates_before: [GATE] }) },
+  { name: "v1-with-completion-gates", why: "a v1 manifest carrying completion_gates is an unknown field", json: one({ completion_gates: [GATE] }) },
 ];
