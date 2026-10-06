@@ -38,6 +38,11 @@
         "category": "Agent Sparring"
       },
       {
+        "command": "agentSparring.makePlan",
+        "title": "Make Plan…",
+        "category": "Agent Sparring"
+      },
+      {
         "command": "agentSparring.resumePlan",
         "title": "Resume Plan",
         "category": "Agent Sparring"

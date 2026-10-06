@@ -16,6 +16,7 @@
  */
 
 import { formatElapsed } from "./activeOperation";
+import { MAKE_PLAN_FROM_THIS, MAKE_PLAN_TITLE, NOT_A_PLAN_TITLE, PLANNING_INPUT_ADVICE } from "./gettingStarted";
 import { ACTIVE_CONTEXT_HEADLINE, CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, SELECT_RUN_LABEL } from "./activeRepository";
 import {
   CONFIG_FIELDS,
@@ -55,6 +56,8 @@ export type OverviewAction =
   | "sliceBranch"
   | "followActiveEditor"
   | "runPlan"
+  | "makePlan"
+  | "makePlanFromThis"
   | "resumePlan"
   | "freshSparrer"
   | "freshStageAgent"
@@ -405,6 +408,8 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "sliceBranch",
   "followActiveEditor",
   "runPlan",
+  "makePlan",
+  "makePlanFromThis",
   "resumePlan",
   "freshSparrer",
   "freshStageAgent",
@@ -561,7 +566,7 @@ function renderBody(model: OverviewModel): string {
 <header class="top"><div><h1>Agent Sparring</h1><div class="run muted">${escapeHtml(model.title)}</div></div></header>
 ${(model.emptyLines ?? []).map((line) => `<p class="muted">${escapeHtml(line)}</p>`).join("\n")}
 ${renderActors(model, discloseScope(model))}
-<div class="actions">${button("runPlan", "Run plan…")}${button("showLog", "Show log")}</div>`;
+<div class="actions">${button("makePlan", "Make Plan…", true, MAKE_PLAN_TITLE)}${button("runPlan", "Run plan…")}${button("showLog", "Show log")}</div>`;
   }
   if (model.kind === "intake" && model.intake) {
     const intake = model.intake;
@@ -758,6 +763,7 @@ function renderRepositoryLine(model: OverviewModel): string {
   }
   const controls = [
     button("runPlan", "Run Plan", true, "Choose a repository and a plan document, and start a new run of it"),
+    button("makePlan", "Make Plan…", true, MAKE_PLAN_TITLE, "quiet"),
     button("selectRun", SELECT_RUN_LABEL, true, "Pin a recorded run — including a finished one — to inspect it", "quiet"),
     releasable ? button("followActiveRepository", FOLLOW_ACTIVE_LABEL, true, context.explanation) : "",
     context.chosen ? button("followActiveEditor", FOLLOW_EDITOR_LABEL, true, "Follow the repository of the active editor or Source Control focus again", "quiet") : "",
@@ -2151,6 +2157,20 @@ function operationTechnical(model: OverviewModel, which: string, lines: readonly
 }
 
 /**
+ * A refused document with no stage sections is planning input: say what to
+ * do with it, with the way to do it, and keep the engine's refusal one click
+ * away. The engine's validation decided; this only explains it.
+ */
+function renderPlanningInput(refusal: string): string {
+  return `<section class="card planning-input">
+<h2>${escapeHtml(NOT_A_PLAN_TITLE)}</h2>
+<p>${escapeHtml(PLANNING_INPUT_ADVICE)} Nothing was approved or run.</p>
+<div class="actions">${button("makePlanFromThis", MAKE_PLAN_FROM_THIS, true, MAKE_PLAN_TITLE)}</div>
+<details class="tech"><summary>Technical details</summary><p class="muted small">Refused by the engine:</p><pre class="engineerror">${escapeHtml(refusal)}</pre></details>
+</section>`;
+}
+
+/**
  * Run Plan through `sparring start-plan`. Every decision, finding, gate and
  * refusal is the engine's, shown as it reported them; the page offers the
  * person's answers and the one Start, and decides nothing itself.
@@ -2195,7 +2215,7 @@ ${view.summary.laterSlices.map((line) => `<p class="muted">${escapeHtml(line)}</
 <p class="muted start-notice">${escapeHtml(view.providerTurnNotice)}</p>
 ${view.preparing ? `<p class="start-preparing">${icon("sync")}The engine is preparing the plan…</p>` : ""}
 ${view.intake ? `<p>${escapeHtml(view.intake.line)}</p>` : view.route === "direct" ? "<p>Direct route: the plan's own stages run as written.</p>" : ""}
-${view.refusal ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}Refused by the engine. Nothing was approved or run.</p><pre class="engineerror">${escapeHtml(view.refusal)}</pre></div>` : ""}
+${view.refusal && view.planningInput ? renderPlanningInput(view.refusal) : view.refusal ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}Refused by the engine. Nothing was approved or run.</p><pre class="engineerror">${escapeHtml(view.refusal)}</pre></div>` : ""}
 ${view.failure ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}start-plan did not report a status.</p><pre class="engineerror">${escapeHtml(view.failure)}</pre></div>` : ""}
 ${decisions}
 ${findings}
