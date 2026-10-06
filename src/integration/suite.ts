@@ -4009,6 +4009,8 @@ async function startPlanAssertions(reportedRepo: string, fixtureRoot: string): P
   const enabled = path.join(fixtureRoot, "fake-start-plan.enabled");
   const argvLog = path.join(fixtureRoot, "fake-argv-start-plan.log");
   const plan = path.join(reportedRepo, "plans", "start-plan-demo.md");
+  const direct = path.join(reportedRepo, "plans", "start-plan-direct-demo.md");
+  const MINTED = "start-plan-direct-demo-0badf00d";
   await fs.mkdir(path.dirname(plan), { recursive: true });
   await fs.writeFile(plan, "# Demo\n\nNot a stage plan.\n");
   const message = (body: Record<string, unknown>) => vscode.commands.executeCommand<StartPlanSessionShape | undefined>("agentSparring._test.startPlanMessage", { type: "startPlan", ...body });
@@ -4061,10 +4063,62 @@ async function startPlanAssertions(reportedRepo: string, fixtureRoot: string): P
     // The token is spent: pressing Start again cannot rerun it.
     const again = await message({ action: "start", token: "fake-token-1" });
     assert.ok(again === undefined || again.phase !== "shown", "a spent token is never offered or accepted again");
+
+    // ---- one preparation per worktree, claimed before anything awaits ----
+    const count = path.join(fixtureRoot, "fake-start-plan-json.count");
+    const delay = path.join(fixtureRoot, "fake-start-plan.delay");
+    await fs.rm(count, { force: true });
+    await fs.writeFile(delay, "3");
+    const slow = vscode.commands.executeCommand("agentSparring._test.startPlan", reportedRepo, plan, "feature/x");
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    // A second Run Plan of the same worktree and an answer while preparing both find the claim.
+    await vscode.commands.executeCommand("agentSparring._test.startPlan", reportedRepo, plan, "feature/x");
+    const during = await message({ action: "answer", answers: { split: "yes" } });
+    assert.equal(during?.phase, "preparing", "nothing is answered while the engine is preparing");
+    await slow;
+    await fs.rm(delay, { force: true });
+    const evaluations = (await fs.readFile(count, "utf8")).trim().split("\n").length;
+    assert.equal(evaluations, 1, "exactly one start-plan --json ran for three overlapping requests");
+    // Two answers clicked back to back: the second finds the first's claim.
+    await fs.writeFile(delay, "2");
+    await fs.rm(count, { force: true });
+    const firstAnswer = message({ action: "answer", answers: { split: "yes" } });
+    const secondAnswer = message({ action: "answer", answers: { split: "yes" } });
+    await Promise.all([firstAnswer, secondAnswer]);
+    await fs.rm(delay, { force: true });
+    assert.equal((await fs.readFile(count, "utf8")).trim().split("\n").length, 1, "a repeated answer does not prepare twice");
+    await message({ action: "dismiss" });
+
+    // ---- a direct route: the run the engine mints is the run on screen ----
+    await fs.writeFile(direct, "# Direct\n\n## Stage 1 — Only\n\nDo it.\n");
+    const ready = await vscode.commands.executeCommand<{ support: string; session?: StartPlanSessionShape }>("agentSparring._test.startPlan", reportedRepo, direct, "feature/x");
+    assert.equal(ready?.session?.status?.confirmToken, "fake-direct-token");
+    await message({ action: "start", token: "fake-direct-token" });
+    let selected: string | undefined;
+    const until = Date.now() + 20_000;
+    while (Date.now() < until) {
+      await vscode.commands.executeCommand("agentSparring.refresh");
+      selected = await vscode.commands.executeCommand<string | undefined>("agentSparring._test.selectedRun");
+      const live = selected ? await vscode.commands.executeCommand<{ execution?: { state: string } }>("agentSparring._test.liveness", selected) : undefined;
+      if (selected?.endsWith(MINTED) && live?.execution?.state === "running") {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    assert.ok(selected?.endsWith(MINTED), `the engine-minted run is selected (${selected})`);
+    const liveness = await vscode.commands.executeCommand<{ state: string; execution?: { state: string } }>("agentSparring._test.liveness", selected);
+    assert.equal(liveness?.execution?.state, "running", "its execution is the confirmation this window launched");
+    assert.ok(await vscode.commands.executeCommand<string | undefined>("agentSparring._test.hostingTerminal", selected), "its terminal is known");
+    const stopped = await vscode.commands.executeCommand<{ requested: boolean }>("agentSparring._test.stop", selected);
+    assert.equal(stopped?.requested, true, "Stop reaches the exact execution");
   } finally {
     await Promise.resolve(message({ action: "dismiss" })).catch(() => undefined);
     await fs.rm(enabled, { force: true });
     await fs.rm(plan, { force: true });
+    await fs.rm(direct, { force: true });
+    await fs.rm(path.join(reportedRepo, ".sparring", "plans", `${MINTED}.json`), { force: true });
+    await fs.rm(path.join(reportedRepo, ".sparring", "stages", `${MINTED}-stage-1`), { recursive: true, force: true });
+    await fs.rm(path.join(fixtureRoot, "fake-start-plan.delay"), { force: true });
   }
-  console.log("integration: Run Plan through start-plan (decision, answer, confirm with the engine's token) and the fallback verified");
+  console.log("integration: Run Plan through start-plan (decision, answer, confirm with the engine's token, one preparation per worktree, a direct route bound to its engine-minted run with Stop) and the fallback verified");
 }

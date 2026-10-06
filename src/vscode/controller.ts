@@ -5,6 +5,7 @@
  */
 
 
+import { START_PLAN_RUNS_KEY, bindStartedRun, readStartPlanRuns, withBinding, type PendingStartedRun, type StartPlanRuns } from "../core/startPlanBinding";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { ActivityTailer } from "../core/activityTailer";
@@ -448,6 +449,7 @@ export class SparringController implements vscode.Disposable {
     this.refreshTimer = undefined;
     await this.relocate();
     this.discovery = await discoverRuns(this.locations);
+    await this.reconcileStartedRuns();
     await this.migrateDeclarationScopes();
     await this.migrateStageScopedState();
     const sticky = this.attachedRunId ?? this.context.workspaceState.get<string>(STICKY_RUN_KEY);
@@ -617,7 +619,9 @@ export class SparringController implements vscode.Disposable {
    * "interrupted" instead of "running".
    */
   async launch(options: LaunchOptions): Promise<LaunchResult> {
-    const result = await this.tracker.launch(options);
+    // A run started by a start-plan confirmation keeps the identity its
+    // execution and guard were filed under, so the duplicate guard sees it.
+    const result = await this.tracker.launch({ ...options, runId: this.trackedId(options.runId) });
     if (result.ok) {
       // The engine writes its state before the first provider turn; pick it up promptly.
       setTimeout(() => void this.refresh(), 1500);
@@ -1155,7 +1159,72 @@ export class SparringController implements vscode.Disposable {
 
   /** The latest runner execution observed for a run (running, unknown after a reload, or ended). */
   executionFor(runId: string | undefined): ExecutionRecord | undefined {
-    return this.tracker.executionFor(runId);
+    if (runId === undefined) {
+      return this.tracker.executionFor(undefined);
+    }
+    // A bound start-plan run's execution is filed under its provisional id;
+    // it is presented as the run's own, which is what it is.
+    const tracked = this.trackedId(runId);
+    const record = this.tracker.executionFor(tracked);
+    return record && tracked !== runId ? { ...record, runId } : record;
+  }
+
+  // ---------------------------------------------------------------- start-plan run identity
+
+  private startPlanRuns(): StartPlanRuns {
+    return readStartPlanRuns(this.context.workspaceState.get(START_PLAN_RUNS_KEY));
+  }
+
+  /**
+   * The id this window tracks a run's executions and guard under: the
+   * provisional id of the start-plan confirmation that started it, once
+   * bound (see core/startPlanBinding.ts), else the run's own.
+   */
+  trackedId(runId: string): string {
+    return trackedRunId(this.context, runId);
+  }
+
+  /** A start-plan confirmation was launched under `pending.provisionalRunId`; bind it to its run when the engine records one. */
+  async expectStartedRun(pending: PendingStartedRun): Promise<void> {
+    const state = this.startPlanRuns();
+    await this.context.workspaceState.update(START_PLAN_RUNS_KEY, { ...state, pending: [...state.pending.filter((entry) => entry.provisionalRunId !== pending.provisionalRunId), pending] });
+  }
+
+  /**
+   * Bind each pending start-plan confirmation to the run the engine
+   * recorded for it, from discovered engine state alone. A confirmation
+   * whose execution has ended with no run recorded produced none (the
+   * engine refused it), and stops waiting; an ambiguous one binds nothing.
+   */
+  private async reconcileStartedRuns(): Promise<void> {
+    let state = this.startPlanRuns();
+    if (state.pending.length === 0) {
+      return;
+    }
+    let show: string | undefined;
+    for (const pending of state.pending) {
+      const outcome = bindStartedRun(pending, this.discovery.runs);
+      if (outcome.kind === "bound") {
+        state = withBinding(state, outcome.runId, pending.provisionalRunId);
+        this.log(`start-plan: the run started as ${pending.provisionalRunId} is ${outcome.runId}, the only new run of ${pending.planLabel} the engine recorded.`);
+        if (pending.show) {
+          show = outcome.runId;
+        }
+      } else if (outcome.kind === "ambiguous") {
+        state = { ...state, pending: state.pending.filter((entry) => entry !== pending) };
+        this.log(`start-plan: more than one new run of ${pending.planLabel} was recorded (${outcome.runIds.join(", ")}); none is attributed to the confirmation ${pending.provisionalRunId}.`);
+      } else if (this.tracker.executionFor(pending.provisionalRunId)?.state === "ended") {
+        state = { ...state, pending: state.pending.filter((entry) => entry !== pending) };
+        this.log(`start-plan: the confirmation ${pending.provisionalRunId} ended and the engine recorded no new run of ${pending.planLabel}.`);
+      }
+    }
+    await this.context.workspaceState.update(START_PLAN_RUNS_KEY, state);
+    if (show) {
+      await this.context.workspaceState.update(SELECTED_RUN_KEY, show);
+      await this.context.workspaceState.update(SELECTED_AT_KEY, Date.now());
+      await this.context.workspaceState.update(PIN_INTENT_KEY, "starting");
+      await this.recordPinOrigin("action");
+    }
   }
 
   /**
@@ -1170,14 +1239,14 @@ export class SparringController implements vscode.Disposable {
    * execution settles it.
    */
   async requestStop(runId: string, executionId: string): Promise<StopOutcome> {
-    const outcome = await this.tracker.requestStop(runId, executionId);
+    const outcome = await this.tracker.requestStop(this.trackedId(runId), executionId);
     this.render();
     return outcome;
   }
 
   /** What a Stop would interrupt for this run right now, if anything. */
   stopTargetFor(runId: string | undefined): StopTarget | undefined {
-    return runId ? this.tracker.stopTargetFor(runId) : undefined;
+    return runId ? this.tracker.stopTargetFor(this.trackedId(runId)) : undefined;
   }
 
   /** Runner liveness for the selected run, combining process observation with the activity fold. */
@@ -1186,7 +1255,7 @@ export class SparringController implements vscode.Disposable {
   }
 
   livenessFor(runId: string | undefined): RunnerLiveness {
-    return deriveLiveness(this.live, this.tracker.executionFor(runId), Date.now());
+    return deriveLiveness(this.live, this.executionFor(runId), Date.now());
   }
 
   /** What a window reload would find recorded about this window's launches (integration tests). */
@@ -1201,7 +1270,7 @@ export class SparringController implements vscode.Disposable {
    * action consults before submitting anything.
    */
   unresolvedSubmissionFor(runId: string | undefined): OperationView | undefined {
-    return this.submissions.pendingShellForRun(runId);
+    return this.submissions.pendingShellForRun(runId === undefined ? undefined : this.trackedId(runId));
   }
 
   /** Every unresolved submission in this window, runner and short command alike. */
@@ -1225,7 +1294,7 @@ export class SparringController implements vscode.Disposable {
    * acts on the record it was built from rather than on a later lookup.
    */
   guardFor(runId: string): OperationView | undefined {
-    return this.submissions.inFlightFor(runnerKey(runId));
+    return this.submissions.inFlightFor(runnerKey(this.trackedId(runId)));
   }
 
   /**
@@ -1268,6 +1337,7 @@ export class SparringController implements vscode.Disposable {
    *    neither marked delivered nor marked failed to make buttons work.
    */
   async confirmRunnerInactive(runId: string, executionId: string | undefined, operationId?: string): Promise<{ confirmed: boolean; reason?: "not-found" | "already-ended"; overrode: boolean; submission: boolean }> {
+    runId = trackedRunId(this.context, runId);
     // Validate the run and exact operation together before changing either
     // liveness or admission. In particular, a guard-only confirmation from
     // an old page must not claim success after a newer operation took its key.
@@ -1335,12 +1405,12 @@ export class SparringController implements vscode.Disposable {
 
   /** The operation key of a run's submission, for the override action. */
   submissionKeyForRun(runId: string): string {
-    return runnerKey(runId);
+    return runnerKey(this.trackedId(runId));
   }
 
   /** The terminal hosting this run's live execution, by name (integration tests). */
   hostingTerminal(runId: string): string | undefined {
-    return this.tracker.hostingTerminal(runId);
+    return this.tracker.hostingTerminal(this.trackedId(runId));
   }
 
   /**
@@ -1770,4 +1840,9 @@ export function releaseGuardOnConfirmedInactive(
     return { overrode: true };
   }
   return { overrode: false, untouched: result.reason === "already-resolved" ? "that operation had already been resolved" : "that operation has nothing outstanding for anyone to settle" };
+}
+
+/** See {@link SparringController.trackedId}; a function of stored state alone. */
+function trackedRunId(context: Pick<vscode.ExtensionContext, "workspaceState">, runId: string): string {
+  return readStartPlanRuns(context.workspaceState.get(START_PLAN_RUNS_KEY)).bindings[runId] ?? runId;
 }

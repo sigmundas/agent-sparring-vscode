@@ -6,6 +6,7 @@
  * a run, and the Run Overview panel and its actions.
  */
 
+import * as crypto from "node:crypto";
 import { branchNotice, sliceBranchTargetOf } from "../core/sliceBranch";
 import { changeSliceBranch, readSliceBranch } from "./sliceBranchProbe";
 import { realpathSync } from "node:fs";
@@ -142,6 +143,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
       await controller.chooseRun(controller.currentDiscovery.runs.find((run) => run.id === runId), "explicit");
       return controller.currentSelection.selected?.id;
     }),
+    vscode.commands.registerCommand("agentSparring._test.selectedRun", () => controller.currentSelection.selected?.id),
     vscode.commands.registerCommand("agentSparring._test.liveness", (runId: string) => {
       const liveness = controller.livenessFor(runId);
       return { state: liveness.state, source: liveness.source, turnActive: liveness.turnActive, interrupted: liveness.interrupted, stop: liveness.stop, detail: liveness.detail, execution: liveness.execution };
@@ -2658,32 +2660,54 @@ async function startPlanModels(location: SparringLocation): Promise<StartPlanSes
  */
 async function beginStartPlan(controller: SparringController, overview: OverviewPanelManager, context: StartPlanContext, answers: Record<string, string>): Promise<void> {
   const { location, planPath, label, expectedBranch } = context;
-  const args = buildStartPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir, answers, json: true });
-  const session: StartPlanSession = {
-    planName: path.basename(planPath),
-    planLabel: label,
-    planPath,
-    expectedBranch,
-    phase: "preparing",
-    answers,
-    models: await startPlanModels(location),
-    command: `sparring ${args.join(" ")}`,
-  };
-  startPlanContext = context;
-  overview.setStartPlanSession(session);
-  await overview.show();
-  controller.log(`Run plan: sparring ${args.join(" ")}`);
-  const result = await evaluateStartPlan(configuredExecutable(), args, location.repoRoot);
-  if (overview.startPlanSession !== session) {
-    return; // closed, or replaced by another Run Plan, while the engine worked
+  // Claimed before the first await: a preparation may spend a provider turn
+  // and writes an intake, so one worktree prepares one plan at a time, and a
+  // second click or a second Run Plan finds the claim rather than racing it.
+  const worktree = path.resolve(location.repoRoot);
+  if (preparingWorktrees.has(worktree)) {
+    controller.log(`Run plan: not prepared — a start-plan preparation is already running in ${location.repoRoot}.`);
+    void vscode.window.showInformationMessage("Agent Sparring: a plan is already being prepared in this repository. Wait for it to finish.");
+    return;
   }
-  if (result.status) {
-    controller.log(`Run plan: start-plan reported ${result.status.status}${result.status.error ? ` — ${result.status.error}` : ""}`);
-  } else {
-    controller.log(`Run plan: start-plan reported no status — ${result.output}`);
+  preparingWorktrees.add(worktree);
+  try {
+    const args = buildStartPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir, answers, json: true });
+    const preparing: StartPlanSession = {
+      planName: path.basename(planPath),
+      planLabel: label,
+      planPath,
+      expectedBranch,
+      phase: "preparing",
+      answers,
+      command: `sparring ${args.join(" ")}`,
+    };
+    startPlanContext = context;
+    overview.setStartPlanSession(preparing);
+    const models = await startPlanModels(location);
+    if (overview.startPlanSession !== preparing) {
+      return; // replaced while reading the configuration
+    }
+    const session: StartPlanSession = { ...preparing, models };
+    overview.setStartPlanSession(session);
+    await overview.show();
+    controller.log(`Run plan: sparring ${args.join(" ")}`);
+    const result = await evaluateStartPlan(configuredExecutable(), args, location.repoRoot);
+    if (overview.startPlanSession !== session) {
+      return; // closed, or replaced by another Run Plan, while the engine worked
+    }
+    if (result.status) {
+      controller.log(`Run plan: start-plan reported ${result.status.status}${result.status.error ? ` — ${result.status.error}` : ""}`);
+    } else {
+      controller.log(`Run plan: start-plan reported no status — ${result.output}`);
+    }
+    overview.setStartPlanSession({ ...session, phase: "shown", ...(result.status ? { status: result.status } : { failure: result.output }) });
+  } finally {
+    preparingWorktrees.delete(worktree);
   }
-  overview.setStartPlanSession({ ...session, phase: "shown", ...(result.status ? { status: result.status } : { failure: result.output }) });
 }
+
+/** Worktrees with a start-plan preparation running in this window. */
+const preparingWorktrees = new Set<string>();
 
 async function handleStartPlanMessage(controller: SparringController, overview: OverviewPanelManager, message: StartPlanMessage): Promise<void> {
   const session = overview.startPlanSession;
@@ -2737,10 +2761,16 @@ async function handleStartPlanMessage(controller: SparringController, overview: 
       overview.setStartPlanSession({ ...session, phase: "started" });
       const { location, planPath, expectedBranch, label } = context;
       const args = buildStartPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir, answers: session.answers, confirm: status.confirmToken });
-      // An intake slice's run key is known now; a direct route's is minted by
-      // the run, so its operation is filed under the plan document's key.
+      // An intake slice's run key is known now. A direct route's is minted by
+      // the engine, so the confirmation is filed under a provisional id of its
+      // own and bound to the run the engine records (core/startPlanBinding.ts).
       const runKey = status.slice?.runKey ?? undefined;
-      const runId = planRunId(location, runKey ?? planKey(label));
+      const runId = planRunId(location, runKey ?? `${planKey(label)}-start-${crypto.randomBytes(4).toString("hex")}`);
+      if (!runKey) {
+        await controller.refresh(); // every run recorded so far, so only a new one can bind
+        const before = controller.currentDiscovery.runs.filter((run) => run.kind === "plan" && samePath(run.location.sparringDir, location.sparringDir)).map((run) => run.id);
+        await controller.expectStartedRun({ provisionalRunId: runId, sparringDir: location.sparringDir, planLabel: label, before, launchedAtMs: Date.now(), show: true });
+      }
       controller.log(`Run plan: sparring ${args.join(" ")}`);
       const result = await controller.launch({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: `start-plan: ${path.basename(planPath)}`, runId, kind: "start-plan", planPath, reveal: false });
       await explainLaunch(controller, result);

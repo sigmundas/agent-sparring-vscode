@@ -499,7 +499,7 @@ export class OverviewPanelManager implements vscode.Disposable {
     const scope: OperationScope = {
       repoRoot: selection.selected?.location.repoRoot ?? selection.intake?.location.repoRoot ?? selection.scope?.repoRoot,
       intakeDir: selection.selected ? undefined : selection.intake?.dir,
-      runId: selection.selected?.id,
+      runId: selection.selected ? this.controller.trackedId(selection.selected.id) : undefined,
     };
     const active = activeOperationView(this.controller.activeOperations().filter((record) => relevantTo(record, scope, samePath)));
     if (active) {
