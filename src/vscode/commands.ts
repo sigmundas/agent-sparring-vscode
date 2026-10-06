@@ -94,6 +94,7 @@ import type { StartPlanSession } from "../core/overviewModel";
 import type { StartPlanMessage } from "../core/overviewHtml";
 import { OverviewPanelManager } from "./overview/overviewPanel";
 import { registerRunsView } from "./runsView";
+import { registerAgentSessionsAdapter } from "./agentSessionsAdapter";
 
 export function registerCommands(context: vscode.ExtensionContext, controller: SparringController): void {
   const overview: OverviewPanelManager = new OverviewPanelManager(
@@ -105,6 +106,7 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
   );
   launchOverview = overview;
   registerRunsView(context, controller, () => openOverviewCommand(controller, overview));
+  registerAgentSessionsAdapter(context, controller);
   context.subscriptions.push(
     overview,
     vscode.commands.registerCommand("agentSparring.showLog", () => controller.showLog()),

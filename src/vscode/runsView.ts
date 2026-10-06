@@ -249,6 +249,19 @@ export function registerRunsView(context: vscode.ExtensionContext, controller: S
     }),
     vscode.commands.registerCommand("agentSparring.runs.refresh", () => controller.rediscoverWorktrees()),
     vscode.commands.registerCommand("agentSparring.runs.showOlder", () => provider.setShowOlder(true)),
+    // Integration tests: the tree as rendered, one row per node, depth-first.
+    vscode.commands.registerCommand("agentSparring._test.runsTree", async () => {
+      const rows: { depth: number; label: string; description: string; contextValue?: string }[] = [];
+      const walk = async (node: Node | undefined, depth: number): Promise<void> => {
+        for (const child of await provider.getChildren(node)) {
+          const item = provider.getTreeItem(child);
+          rows.push({ depth, label: String(typeof item.label === "string" ? item.label : (item.label?.label ?? "")), description: String(item.description ?? ""), ...(item.contextValue ? { contextValue: item.contextValue } : {}) });
+          await walk(child, depth + 1);
+        }
+      };
+      await walk(undefined, 0);
+      return rows;
+    }),
     vscode.commands.registerCommand("agentSparring.runs.showRecent", () => provider.setShowOlder(false)),
   );
 }

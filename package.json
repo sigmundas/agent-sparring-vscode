@@ -225,6 +225,11 @@
           "minimum": 0,
           "maximum": 4,
           "markdownDescription": "How many directory levels below each workspace folder are searched for nested projects with their own `.sparring` (for example a git worktree or a monorepo package checked out under a parent folder). `0` probes only the workspace folders themselves. Hidden and dependency/build directories are never entered."
+        },
+        "agentSparring.experimental.agentSessions": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "**Experimental.** Also list Agent Sparring runs as agent sessions through VS Code's proposed chat sessions API (read-only). Takes effect only when VS Code exposes that proposed API to this extension (`--enable-proposed-api` or `enable-proposed-api` in `~/.vscode/argv.json`); in VS Code 1.140 such sessions appear in the Chat sessions list, not in the Agents window. The Runs view is unaffected."
         }
       }
     },
@@ -303,7 +308,16 @@
           "when": "false"
         }
       ]
-    }
+    },
+    "chatSessions": [
+      {
+        "type": "agent-sparring",
+        "name": "agentSparring",
+        "displayName": "Agent Sparring",
+        "description": "Agent Sparring plan runs (experimental, read-only).",
+        "when": "config.agentSparring.experimental.agentSessions"
+      }
+    ]
   },
   "scripts": {
     "build": "npm run typecheck && npm run bundle",
@@ -314,7 +328,7 @@
     "test": "npm run compile-tests && node --test \"out/test/**/*.test.js\"",
     "test:parity": "npm run compile-tests && node --test out/test/manifestParity.test.js",
     "compile-integration": "tsc -p tsconfig.integration.json",
-    "test:integration": "npm run bundle && npm run compile-integration && node out/integration/runTests.js && node out/integration/runFreshWorkspace.js",
+    "test:integration": "npm run bundle && npm run compile-integration && node out/integration/runTests.js && node out/integration/runFreshWorkspace.js && node out/integration/runWorktreeRuns.js",
     "lint": "eslint src",
     "vscode:prepublish": "npm run build",
     "package:vsix": "vsce package --no-dependencies"
@@ -335,5 +349,8 @@
     "claude",
     "codex",
     "orchestration"
+  ],
+  "enabledApiProposals": [
+    "chatSessionsProvider"
   ]
 }
