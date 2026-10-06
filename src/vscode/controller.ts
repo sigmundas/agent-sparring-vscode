@@ -5,7 +5,7 @@
  */
 
 
-import { START_PLAN_RUNS_KEY, bindStartedRun, readStartPlanRuns, withBinding, type PendingStartedRun, type StartPlanRuns } from "../core/startPlanBinding";
+import { START_PLAN_RUNS_KEY, readStartPlanRuns, reconcileStartedRuns, type PendingStartedRun, type StartPlanRuns } from "../core/startPlanBinding";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { ActivityTailer } from "../core/activityTailer";
@@ -1197,28 +1197,22 @@ export class SparringController implements vscode.Disposable {
    * engine refused it), and stops waiting; an ambiguous one binds nothing.
    */
   private async reconcileStartedRuns(): Promise<void> {
-    let state = this.startPlanRuns();
+    const state = this.startPlanRuns();
     if (state.pending.length === 0) {
       return;
     }
-    let show: string | undefined;
-    for (const pending of state.pending) {
-      const outcome = bindStartedRun(pending, this.discovery.runs);
-      if (outcome.kind === "bound") {
-        state = withBinding(state, outcome.runId, pending.provisionalRunId);
-        this.log(`start-plan: the run started as ${pending.provisionalRunId} is ${outcome.runId}, the only new run of ${pending.planLabel} the engine recorded.`);
-        if (pending.show) {
-          show = outcome.runId;
-        }
-      } else if (outcome.kind === "ambiguous") {
-        state = { ...state, pending: state.pending.filter((entry) => entry !== pending) };
-        this.log(`start-plan: more than one new run of ${pending.planLabel} was recorded (${outcome.runIds.join(", ")}); none is attributed to the confirmation ${pending.provisionalRunId}.`);
-      } else if (this.tracker.executionFor(pending.provisionalRunId)?.state === "ended") {
-        state = { ...state, pending: state.pending.filter((entry) => entry !== pending) };
-        this.log(`start-plan: the confirmation ${pending.provisionalRunId} ended and the engine recorded no new run of ${pending.planLabel}.`);
+    const result = reconcileStartedRuns(state, this.discovery.runs, (provisional) => {
+      const execution = this.tracker.executionFor(provisional);
+      if (execution) {
+        return execution.state === "ended" ? "ended" : "running";
       }
+      return this.submissions.inFlightFor(runnerKey(provisional)) ? "submitted" : "none";
+    });
+    for (const note of result.notes) {
+      this.log(`start-plan: ${note}`);
     }
-    await this.context.workspaceState.update(START_PLAN_RUNS_KEY, state);
+    await this.context.workspaceState.update(START_PLAN_RUNS_KEY, result.state);
+    const show = result.bound.find((entry) => entry.pending.show)?.runId;
     if (show) {
       await this.context.workspaceState.update(SELECTED_RUN_KEY, show);
       await this.context.workspaceState.update(SELECTED_AT_KEY, Date.now());
@@ -1337,11 +1331,14 @@ export class SparringController implements vscode.Disposable {
    *    neither marked delivered nor marked failed to make buttons work.
    */
   async confirmRunnerInactive(runId: string, executionId: string | undefined, operationId?: string): Promise<{ confirmed: boolean; reason?: "not-found" | "already-ended"; overrode: boolean; submission: boolean }> {
-    runId = trackedRunId(this.context, runId);
+    // Two identities: executions and the duplicate guard are filed under the
+    // tracking id (a bound start-plan run's provisional id); evidence
+    // submissions are filed under the engine's run id.
+    const tracked = trackedRunId(this.context, runId);
     // Validate the run and exact operation together before changing either
     // liveness or admission. In particular, a guard-only confirmation from
     // an old page must not claim success after a newer operation took its key.
-    if (operationId !== undefined && this.submissions.inFlightFor(runnerKey(runId))?.id !== operationId) {
+    if (operationId !== undefined && this.submissions.inFlightFor(runnerKey(tracked))?.id !== operationId) {
       this.render();
       return { confirmed: false, reason: "not-found", overrode: false, submission: false };
     }
@@ -1353,7 +1350,7 @@ export class SparringController implements vscode.Disposable {
     // about that guard alone. Passing an execution id that does not exist
     // would answer "not-found" and settle nothing, which is how this case
     // became a dead end.
-    const ended = executionId === undefined ? { confirmed: true as const } : this.tracker.confirmInactive(runId, executionId);
+    const ended = executionId === undefined ? { confirmed: true as const } : this.tracker.confirmInactive(tracked, executionId);
     const released = releaseGuardOnConfirmedInactive(ended, operationId, (id, note) => this.submissions.override(id, note));
     if (released.untouched) {
       this.log(`the duplicate guard was left alone: ${released.untouched}`);

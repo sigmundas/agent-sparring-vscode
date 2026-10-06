@@ -2766,13 +2766,19 @@ async function handleStartPlanMessage(controller: SparringController, overview: 
       // own and bound to the run the engine records (core/startPlanBinding.ts).
       const runKey = status.slice?.runKey ?? undefined;
       const runId = planRunId(location, runKey ?? `${planKey(label)}-start-${crypto.randomBytes(4).toString("hex")}`);
+      let before: string[] | undefined;
       if (!runKey) {
         await controller.refresh(); // every run recorded so far, so only a new one can bind
-        const before = controller.currentDiscovery.runs.filter((run) => run.kind === "plan" && samePath(run.location.sparringDir, location.sparringDir)).map((run) => run.id);
-        await controller.expectStartedRun({ provisionalRunId: runId, sparringDir: location.sparringDir, planLabel: label, before, launchedAtMs: Date.now(), show: true });
+        before = controller.currentDiscovery.runs.filter((run) => run.kind === "plan" && samePath(run.location.sparringDir, location.sparringDir)).map((run) => run.id);
       }
       controller.log(`Run plan: sparring ${args.join(" ")}`);
       const result = await controller.launch({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: `start-plan: ${path.basename(planPath)}`, runId, kind: "start-plan", planPath, reveal: false });
+      // Expected only once the confirmation was handed to a shell (or may
+      // have been): a launch refused before submission claims no run, ever.
+      if (before && (result.ok || result.problem === "unconfirmed")) {
+        await controller.expectStartedRun({ provisionalRunId: runId, sparringDir: location.sparringDir, planLabel: label, before, launchedAtMs: Date.now(), show: true });
+        await controller.refresh();
+      }
       await explainLaunch(controller, result);
       if (result.ok) {
         if (overview.startPlanSession?.status === status) {

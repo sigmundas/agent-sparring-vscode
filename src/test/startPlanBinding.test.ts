@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { RunSnapshot } from "../core/discovery";
-import { bindStartedRun, readStartPlanRuns, withBinding, type PendingStartedRun } from "../core/startPlanBinding";
+import { bindStartedRun, readStartPlanRuns, reconcileStartedRuns, withBinding, type LaunchEvidence, type PendingStartedRun } from "../core/startPlanBinding";
 
 function planRun(id: string, overrides: { sparringDir?: string; plan?: string; source?: string } = {}): RunSnapshot {
   return {
@@ -42,5 +42,46 @@ describe("start-plan run binding", () => {
     assert.deepEqual(state, { pending: [], bindings: { new: "p" } });
     assert.deepEqual(readStartPlanRuns(JSON.parse(JSON.stringify(state))), state);
     assert.deepEqual(readStartPlanRuns("garbage"), { pending: [], bindings: {} });
+  });
+});
+
+describe("reconciling pending confirmations", () => {
+  const evidence = (map: Record<string, LaunchEvidence>) => (id: string) => map[id] ?? "none";
+
+  it("a launch that was never submitted claims nothing, and a later retry binds its own run", () => {
+    const failed: PendingStartedRun = { ...PENDING, provisionalRunId: "failed" };
+    const retry: PendingStartedRun = { ...PENDING, provisionalRunId: "retry" };
+    const result = reconcileStartedRuns({ pending: [failed, retry], bindings: {} }, [planRun("old"), planRun("new")], evidence({ retry: "running" }));
+    assert.deepEqual(result.state, { pending: [], bindings: { new: "retry" } });
+    assert.deepEqual(result.bound.map((entry) => entry.pending.provisionalRunId), ["retry"]);
+  });
+
+  it("a run started outside this window is never claimed by a dead confirmation", () => {
+    const result = reconcileStartedRuns({ pending: [PENDING], bindings: {} }, [planRun("old"), planRun("external")], evidence({}));
+    assert.deepEqual(result.state, { pending: [], bindings: {} });
+  });
+
+  it("an unresolved submission keeps waiting until the engine records its run", () => {
+    const result = reconcileStartedRuns({ pending: [PENDING], bindings: {} }, [planRun("old")], evidence({ p: "submitted" }));
+    assert.deepEqual(result.state.pending, [PENDING]);
+  });
+
+  it("two live confirmations claiming one run bind neither", () => {
+    const a: PendingStartedRun = { ...PENDING, provisionalRunId: "a" };
+    const b: PendingStartedRun = { ...PENDING, provisionalRunId: "b" };
+    const result = reconcileStartedRuns({ pending: [a, b], bindings: {} }, [planRun("old"), planRun("new")], evidence({ a: "running", b: "running" }));
+    assert.deepEqual(result.state, { pending: [], bindings: {} });
+  });
+
+  it("a run already bound is never taken by another confirmation", () => {
+    const late: PendingStartedRun = { ...PENDING, provisionalRunId: "late" };
+    const result = reconcileStartedRuns({ pending: [late], bindings: { new: "first" } }, [planRun("old"), planRun("new")], evidence({ late: "running" }));
+    assert.deepEqual(result.state.bindings, { new: "first" });
+    assert.deepEqual(result.state.pending, [late]);
+  });
+
+  it("an ended confirmation with no recorded run stops waiting", () => {
+    const result = reconcileStartedRuns({ pending: [PENDING], bindings: {} }, [planRun("old")], evidence({ p: "ended" }));
+    assert.deepEqual(result.state.pending, []);
   });
 });
