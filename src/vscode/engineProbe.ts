@@ -17,6 +17,7 @@
 
 import { execFile } from "node:child_process";
 import { planExecutable } from "../core/cli";
+import { parseStartPlanStatus, startPlanSupportFrom, type StartPlanStatus, type StartPlanSupport } from "../core/startPlan";
 import { hostEnv } from "./shellIntegration";
 
 export type EngineSupport = "supported" | "missing-manifest" | "unknown";
@@ -69,5 +70,58 @@ function probe(file: string, cwd: string): Promise<EngineSupport> {
 
 /** Testing seam: forget what was probed. */
 export function resetManifestSupportCache(): void {
+  startPlanCache.clear();
   cache.clear();
+}
+
+const startPlanCache = new Map<string, StartPlanSupport>();
+
+/**
+ * Whether the installed engine has `sparring start-plan`. Cached per
+ * resolved executable like {@link manifestSupport}; "unknown" is not cached.
+ * Run Plan uses start-plan only on "supported" and otherwise keeps the
+ * extension-built manifest path for engines that predate it.
+ */
+export async function startPlanSupport(configured: string | undefined, cwd: string): Promise<StartPlanSupport> {
+  const planned = await planExecutable(configured, hostEnv(cwd), false);
+  if (!planned.ok || planned.plan.kind === "shell") {
+    return "unknown";
+  }
+  const file = planned.plan.path;
+  const known = startPlanCache.get(file);
+  if (known !== undefined) {
+    return known;
+  }
+  const answer = await new Promise<StartPlanSupport>((resolve) => {
+    execFile(file, ["start-plan", "--help"], { cwd, timeout: 10_000, maxBuffer: 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
+      resolve(startPlanSupportFrom(`${stdout ?? ""}${stderr ?? ""}`, Boolean(error)));
+    });
+  });
+  if (answer !== "unknown") {
+    startPlanCache.set(file, answer);
+  }
+  return answer;
+}
+
+/** How long one `start-plan --json` may take: a preparation is one provider turn. */
+const START_PLAN_TIMEOUT_MS = 30 * 60_000;
+
+/**
+ * Run `sparring start-plan … --json` and read its status. Exit status 0, 1
+ * and 2 all print a status; anything that is not one is returned verbatim
+ * as `output`, never read as a state.
+ */
+export async function evaluateStartPlan(configured: string | undefined, args: string[], cwd: string): Promise<{ status?: StartPlanStatus; output: string }> {
+  const planned = await planExecutable(configured, hostEnv(cwd), false);
+  if (!planned.ok || planned.plan.kind === "shell") {
+    return { output: "The sparring CLI could not be resolved from this window. Set agentSparring.executable to its full path." };
+  }
+  const file = planned.plan.path;
+  return new Promise((resolve) => {
+    execFile(file, args, { cwd, timeout: START_PLAN_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
+      const status = parseStartPlanStatus(stdout ?? "");
+      const output = `${stderr ?? ""}${stdout ?? ""}`.trim() || (error ? error.message : "");
+      resolve(status ? { status, output } : { output: output || "start-plan printed nothing." });
+    });
+  });
 }

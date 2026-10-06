@@ -41,6 +41,7 @@ import { freshSessionOffers, generationLabel, providerPauseCard, type FreshSessi
 import { hasSessions, planAction, stageActions, type PlanAction, type StageRunAction } from "./runner";
 import { branchNotice, branchStateLabel, reportFor, type BranchNotice, type SliceBranchReport } from "./sliceBranch";
 import { QUIET_AFTER_MS, formatAge } from "./status";
+import type { StartPlanStatus } from "./startPlan";
 
 export type TimelineState = "accepted" | "finalizing" | "active" | "paused" | "working" | "future";
 
@@ -60,6 +61,8 @@ export interface ManifestStageView {
   /** `Stage 3D` exactly as the manifest labels it; display only, the array order is the execution order. */
   label: string;
   title: string;
+  /** The human plan's stage label this node was compiled from, when intake recorded it; see {@link TimelineItem.group}. */
+  planStageLabel?: string;
   /** `state.json` status; undefined for a stage the engine has not created yet. */
   status?: StageStatus;
 }
@@ -89,6 +92,12 @@ export interface TimelineItem {
   current: boolean;
   /** The plan's own label for the stage (`3D`), when the run knows one; the number is then only its position. */
   label?: string;
+  /**
+   * The human plan's stage label this node was compiled from (`3`), when the
+   * engine recorded one. Consecutive nodes of one plan stage are drawn as a
+   * group; display only.
+   */
+  group?: string;
 }
 
 export type ActorActivity = "Working" | "Sparring" | "Waiting" | "Idle";
@@ -1010,9 +1019,11 @@ export interface OverviewModel {
   setup?: SetupNotice;
   /** The slice on screen needs a feature branch; see {@link BranchNotice}. */
   branch?: BranchNotice;
-  kind: "empty" | "ambiguous" | "run" | "intake";
+  kind: "empty" | "ambiguous" | "run" | "intake" | "startPlan";
   /** Set when `kind` is `intake`. */
   intake?: IntakeView;
+  /** Set when `kind` is `startPlan`: a Run Plan in progress through `sparring start-plan`. */
+  startPlan?: StartPlanView;
   /** The plan the stage belongs to (managed run or associated file), for the header. */
   planName?: string;
   /** The checked-out branch is not this stage's; nothing that runs the engine is offered while it is set. */
@@ -3024,6 +3035,7 @@ function timeline(run: PlanRunSnapshot, manifest: ManifestView | undefined): Pic
         title: stage.title,
         current: index === manifest.at,
         state: timelineStateOf(stage.status, index, manifest.at, run.state.status),
+        ...(stage.planStageLabel ? { group: stage.planStageLabel } : {}),
       })),
     };
   }
@@ -3479,4 +3491,180 @@ function siblingFacts(recorded: StateRepository[], declared: DeclaredRepository[
     const note = pinned ? (sha ? "pinned by the engine" : "recorded for this stage") : "declared in VS Code";
     return { label: "Also reviews", value: `${name}${branch ? ` on ${branch}` : ""}${sha ? ` @ ${sha}` : ""} (${note})` };
   });
+}
+
+/** Consecutive timeline nodes of one human-plan stage; a node with no recorded plan stage is its own group. */
+export interface TimelineGroup {
+  /** The human plan's stage label, when the nodes have one. */
+  label?: string;
+  items: TimelineItem[];
+}
+
+export function timelineGroups(items: readonly TimelineItem[]): TimelineGroup[] {
+  const groups: TimelineGroup[] = [];
+  for (const item of items) {
+    const last = groups[groups.length - 1];
+    if (item.group !== undefined && last?.label === item.group) {
+      last.items.push(item);
+    } else {
+      groups.push({ ...(item.group !== undefined ? { label: item.group } : {}), items: [item] });
+    }
+  }
+  return groups;
+}
+
+// ---------------------------------------------------------------- Run Plan through start-plan
+
+/**
+ * One Run Plan in progress through `sparring start-plan`, as this window
+ * holds it: what was asked of the engine and what it answered. In memory
+ * only; the engine's intake on disk is the durable record.
+ */
+export interface StartPlanSession {
+  planName: string;
+  planLabel: string;
+  planPath: string;
+  expectedBranch: string;
+  /** `preparing`: start-plan --json is running (it may spend a provider turn). `started`: confirmed and handed to the engine. */
+  phase: "preparing" | "shown" | "started";
+  /** The answers the running or last evaluation carried. */
+  answers: Record<string, string>;
+  /** The engine's last status, verbatim. */
+  status?: StartPlanStatus;
+  /** start-plan printed no status this version reads: its own output, verbatim. */
+  failure?: string;
+  /** The roles as the engine's `show-config` reports them, for the summary. */
+  models?: { role: string; text: string }[];
+  /** The exact command the next evaluation or confirmation runs, for the details layer. */
+  command?: string;
+}
+
+export interface StartPlanView {
+  planName: string;
+  planLabel: string;
+  stateLabel: string;
+  preparing: boolean;
+  /** Shown whenever a preparation may run: a dry run or an answer rerun can spend a read-only provider turn. */
+  providerTurnNotice: string;
+  route?: "direct" | "intake";
+  intake?: { id: string; reused: boolean; report: string; line: string };
+  decisions: {
+    id: string;
+    question: string;
+    why: string;
+    stages: string[];
+    options: { id: string; label: string; consequence: string }[];
+    /** The option the engine recorded for this decision earlier, if any. */
+    recorded?: string;
+  }[];
+  findings: { severity: string; code: string; message: string; stages: string[]; disposition: string }[];
+  /** What will run, only when the engine reported `ready`. */
+  summary?: {
+    lines: string[];
+    stages: { label: string; title: string; mode?: string; group?: string; gatesBefore: string[] }[];
+    completionGates: string[];
+    laterSlices: string[];
+  };
+  /** The engine's refusal, verbatim. */
+  refusal?: string;
+  /** start-plan printed something that is not a status, verbatim. */
+  failure?: string;
+  /** The one Start, carrying the exact token the engine printed. */
+  start?: { token: string; label: string; detail: string };
+  /** Answers can be submitted: the engine asked decisions and nothing is running. */
+  canAnswer: boolean;
+  command?: string;
+}
+
+export const START_PLAN_PROVIDER_TURN_NOTICE =
+  "Preparing a plan that is not a plain '## Stage <n>' plan, or rerunning it with answers, may spend one read-only provider turn. Nothing is approved or run until you press Start run.";
+
+const STATE_LABEL: Record<StartPlanStatus["status"], string> = {
+  refused: "Refused by the engine",
+  needs_decision: "Needs your decisions",
+  ready: "Ready to start",
+};
+
+function gateLine(gate: { id: string; title: string; kind: string; reason: string }): string {
+  return `${gate.kind} gate ${gate.id}: ${gate.title}${gate.reason ? ` — ${gate.reason}` : ""}`;
+}
+
+/** The Run Plan screen, from the session and nothing else: every word about the plan is the engine's. */
+export function startPlanView(session: StartPlanSession): StartPlanView {
+  const status = session.status;
+  const preparing = session.phase === "preparing";
+  const view: StartPlanView = {
+    planName: session.planName,
+    planLabel: session.planLabel,
+    stateLabel: preparing ? "Preparing…" : session.phase === "started" ? "Started" : status ? STATE_LABEL[status.status] : session.failure ? "No answer from the engine" : "Not prepared",
+    preparing,
+    providerTurnNotice: START_PLAN_PROVIDER_TURN_NOTICE,
+    decisions: [],
+    findings: [],
+    canAnswer: false,
+    ...(session.command ? { command: session.command } : {}),
+  };
+  if (session.failure) {
+    view.failure = session.failure;
+  }
+  if (!status) {
+    return view;
+  }
+  if (status.route) {
+    view.route = status.route;
+  }
+  if (status.intake) {
+    view.intake = {
+      id: status.intake.id,
+      reused: status.intake.reused,
+      report: status.intake.report,
+      line: `${status.intake.reused ? "Reused" : "Prepared"} intake ${status.intake.id}${status.intake.mode ? ` (${status.intake.mode})` : ""}.`,
+    };
+  }
+  view.findings = status.findings.map((finding) => ({ severity: finding.severity, code: finding.code, message: finding.message, stages: finding.stages, disposition: finding.disposition }));
+  if (status.status === "refused") {
+    view.refusal = status.error ?? "The engine refused without saying why.";
+    return view;
+  }
+  if (status.status === "needs_decision") {
+    view.decisions = status.decisions.map((decision) => ({
+      id: decision.id,
+      question: decision.question,
+      why: decision.why,
+      stages: decision.stages,
+      options: decision.options,
+      ...(status.intake?.answers[decision.id] ? { recorded: status.intake.answers[decision.id] } : {}),
+    }));
+    view.canAnswer = !preparing && session.phase !== "started" && view.decisions.length > 0;
+    return view;
+  }
+  const execution = status.execution ?? {};
+  const lines = [
+    `Route: ${status.route ?? "unknown"} · branch ${status.expectedBranch}`,
+    ...(session.models ?? []).map((model) => `${model.role}: ${model.text}`),
+    `Permission mode: ${String(execution["permission_mode"] ?? "not reported")}`,
+    `Executables: claude ${String(execution["claude_executable"] ?? "not reported")}, codex ${String(execution["codex_executable"] ?? "not reported")}`,
+    `Max send-back cycles: ${String(execution["max_send_back_cycles"] ?? "not reported")}`,
+    `Sparring directory: ${String(execution["sparring_dir"] ?? "not reported")}`,
+    "Push: not authorized for this run; the engine stops to ask before pushing.",
+  ];
+  if (status.slice?.runId) {
+    lines.push(`Run slice ${status.slice.runId}${status.slice.runKey ? ` (run key ${status.slice.runKey})` : ""}`);
+  }
+  view.summary = {
+    lines,
+    stages: (status.slice?.stages ?? []).map((stage) => ({
+      label: stage.label,
+      title: stage.title,
+      ...(stage.mode !== "implementation" ? { mode: stage.mode } : {}),
+      ...(stage.planStageLabel ? { group: stage.planStageLabel } : {}),
+      gatesBefore: stage.gatesBefore.map(gateLine),
+    })),
+    completionGates: (status.slice?.completionGates ?? []).map(gateLine),
+    laterSlices: status.laterSlices.map((later) => `Later slice ${later.runId} (${later.primaryRepository}): ${later.stages.join(", ")} — start it from that repository.`),
+  };
+  if (status.confirmToken && session.phase === "shown") {
+    view.start = { token: status.confirmToken, label: "Start run", detail: "Reruns the same start-plan command with --confirm and this token. The engine recomputes it and refuses any difference." };
+  }
+  return view;
 }

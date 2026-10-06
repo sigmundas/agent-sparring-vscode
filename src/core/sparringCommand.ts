@@ -19,7 +19,7 @@ import * as crypto from "node:crypto";
 import { runIdFor, type RunSnapshot, type SparringLocation } from "./discovery";
 import { planKey } from "./engineFormats";
 
-export type SparringSubcommand = "run-loop" | "run-sparring" | "run-plan" | "resume-plan";
+export type SparringSubcommand = "run-loop" | "run-sparring" | "run-plan" | "resume-plan" | "start-plan";
 
 export interface ParsedSparringCommand {
   subcommand: SparringSubcommand;
@@ -42,7 +42,7 @@ export interface ParsedSparringCommand {
   expectedBranch?: string;
 }
 
-const SUBCOMMANDS: ReadonlySet<string> = new Set<SparringSubcommand>(["run-loop", "run-sparring", "run-plan", "resume-plan"]);
+const SUBCOMMANDS: ReadonlySet<string> = new Set<SparringSubcommand>(["run-loop", "run-sparring", "run-plan", "resume-plan", "start-plan"]);
 /** Executable names that stand for the engine CLI, with any directory and Windows extension stripped. */
 const EXECUTABLE_NAMES: ReadonlySet<string> = new Set(["sparring"]);
 

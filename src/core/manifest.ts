@@ -418,6 +418,20 @@ export interface ManifestStageIdentity {
   /** `Stage 3D`: what a person calls this stage. */
   label: string;
   title: string;
+  /**
+   * The human plan's stage label this node maps to (`3`, `3A`), when an
+   * intake recorded one. Display only: it groups nodes on the Overview and
+   * is never part of what runs.
+   */
+  planStageLabel?: string;
+}
+
+/** A plan-declared gate of a version 2 manifest (`plan_model.ManifestGate`). */
+export interface ManifestGate {
+  id: string;
+  title: string;
+  kind: string;
+  reason: string;
 }
 
 /** A manifest read back from disk, with the fields that say *whose* it is. */
@@ -427,6 +441,12 @@ export interface ManifestIdentity {
   /** `source_digest`: provenance of the plan text it was built from. */
   sourceDigest: string;
   stages: ManifestStageIdentity[];
+  /** `1`, or `2` for a manifest with plan-declared gates. */
+  version?: number;
+  /** v2: gates owed before each stage, by stage id (only stages that have any). */
+  gatesBefore?: Record<string, ManifestGate[]>;
+  /** v2: gates owed after the last stage is accepted. */
+  completionGates?: ManifestGate[];
 }
 
 /**
@@ -452,7 +472,14 @@ export interface ParsedManifest {
 // ---------------------------------------------------------------------------
 
 const TOP_LEVEL_KEYS: ReadonlySet<string> = new Set(["version", "plan_label", "source_digest", "stages"]);
+const TOP_LEVEL_KEYS_V2: ReadonlySet<string> = new Set([...TOP_LEVEL_KEYS, "completion_gates"]);
 const STAGE_KEYS: ReadonlySet<string> = new Set(["stage_id", "label", "title", "brief", "mode", "repositories"]);
+const STAGE_KEYS_V2: ReadonlySet<string> = new Set([...STAGE_KEYS, "gates_before"]);
+const GATE_KEYS: ReadonlySet<string> = new Set(["id", "title", "kind", "reason"]);
+/** manifest.py `_MAX_GATE_ID_LENGTH`, in code points as Python's `len` counts them. */
+const MAX_GATE_ID_LENGTH = 128;
+/** manifest.py `MANIFEST_VERSION_GATES`: v1 plus `gates_before` and `completion_gates`. */
+export const MANIFEST_VERSION_GATES = 2;
 const REPOSITORY_KEYS: ReadonlySet<string> = new Set(["name", "path", "branch", "candidate_sha"]);
 const STAGE_MODES: ReadonlySet<string> = new Set(["implementation", "independent_review"]);
 
@@ -516,22 +543,19 @@ export function pythonStrip(value: string): string {
 }
 
 /**
- * Whether the engine's `version` check would pass: `payload.get("version") !=
- * 1` in Python.
+ * The version the engine's check accepts, or undefined: `isinstance(version,
+ * bool) or version not in (1, 2)` in Python.
  *
- * Python compares *values*, and `True == 1`, so the engine accepts
- * `"version": true` — as it accepts `1.0`, and refuses `false`, `0` and
- * `"1"`. This extension used `!== 1`, which refused `true`, so a manifest the
- * engine runs happily had no digest here and its run lost its stage list.
+ * Python compares *values*, so `1.0` and `2.0` pass (and JSON gives this side
+ * the same numbers). Booleans are refused explicitly — the engine used to
+ * accept `true` because `True == 1`, and tightened that when it added v2.
  *
  * Parity is the rule and not a preference: the digest computed here is
  * compared against a `plan_digest` the engine wrote, so a file this side
- * refuses is a run this side cannot describe. `true` is a wart in the engine's
- * contract rather than a feature, and tightening it is a change to the engine
- * that has to happen there, in a change that moves both sides at once.
+ * refuses is a run this side cannot describe.
  */
-function acceptedVersion(value: unknown): boolean {
-  return value === MANIFEST_VERSION || value === true;
+function acceptedVersion(value: unknown): number | undefined {
+  return value === MANIFEST_VERSION || value === MANIFEST_VERSION_GATES ? value : undefined;
 }
 
 /**
@@ -578,12 +602,17 @@ interface ExecutableStage {
   /** Only the non-default mode contributes, exactly as in `manifest_digest`. */
   mode?: "independent_review";
   repositories: { name: string; path: string; branch: string; candidateSha: string | null }[];
+  /** v2 only; always empty in a v1 manifest. */
+  gatesBefore: ManifestGate[];
 }
 
 interface ExecutableManifest {
+  version: number;
   planLabel: string;
   sourceDigest: string;
   stages: ExecutableStage[];
+  /** v2 only; always empty in a v1 manifest. */
+  completionGates: ManifestGate[];
 }
 
 /**
@@ -630,11 +659,14 @@ export function parseExecutionManifest(text: string | undefined): ParsedManifest
   if (digest === undefined) {
     return undefined;
   }
+  const gated = executable.version === MANIFEST_VERSION_GATES;
+  const gatesBefore = Object.fromEntries(executable.stages.filter((stage) => stage.gatesBefore.length > 0).map((stage) => [stage.stageId, stage.gatesBefore]));
   return {
     identity: {
       planLabel: executable.planLabel,
       sourceDigest: executable.sourceDigest,
       stages: executable.stages.map((stage) => ({ stageId: stage.stageId, label: stage.label, title: stage.title })),
+      ...(gated ? { version: executable.version, gatesBefore, completionGates: executable.completionGates } : {}),
     },
     digest,
   };
@@ -647,7 +679,8 @@ export function manifestDigest(manifest: ExecutionManifest): string | undefined 
 
 /** The engine's `manifest_digest`, or `undefined` when Python's own encode step would raise. */
 function digestOf(manifest: ExecutableManifest): string | undefined {
-  const parts: string[] = [String(MANIFEST_VERSION), manifest.planLabel, manifest.sourceDigest];
+  const gated = manifest.version === MANIFEST_VERSION_GATES;
+  const parts: string[] = [String(manifest.version), manifest.planLabel, manifest.sourceDigest];
   for (const stage of manifest.stages) {
     parts.push(stage.stageId, stage.label, stage.title, stage.brief);
     if (stage.mode) {
@@ -656,6 +689,12 @@ function digestOf(manifest: ExecutableManifest): string | undefined {
     for (const repository of stage.repositories) {
       parts.push(repository.name, repository.path, repository.branch, repository.candidateSha ?? "");
     }
+    if (gated) {
+      parts.push(...gateParts(stage.gatesBefore, "gates_before"));
+    }
+  }
+  if (gated) {
+    parts.push(...gateParts(manifest.completionGates, "completion_gates"));
   }
   const digest = crypto.createHash("sha256");
   for (const part of parts) {
@@ -671,9 +710,19 @@ function digestOf(manifest: ExecutableManifest): string | undefined {
 
 const NUL = Buffer.from([0]);
 
+/** manifest.py `_gate_parts`: marked and counted, so a gate cannot move without changing the digest. */
+function gateParts(gates: readonly ManifestGate[], marker: string): string[] {
+  return [marker, String(gates.length), ...gates.flatMap((gate) => [gate.id, gate.title, gate.kind, gate.reason])];
+}
+
 function readExecutableManifest(text: string | undefined): ExecutableManifest | undefined {
   const payload = asObject(text);
-  if (!payload || unknownKeys(payload, TOP_LEVEL_KEYS) || !acceptedVersion(payload["version"])) {
+  const version = payload ? acceptedVersion(payload["version"]) : undefined;
+  if (!payload || version === undefined) {
+    return undefined;
+  }
+  const gated = version === MANIFEST_VERSION_GATES;
+  if (unknownKeys(payload, gated ? TOP_LEVEL_KEYS_V2 : TOP_LEVEL_KEYS)) {
     return undefined;
   }
   const planLabel = requiredText(payload["plan_label"]);
@@ -684,7 +733,7 @@ function readExecutableManifest(text: string | undefined): ExecutableManifest | 
   }
   const stages: ExecutableStage[] = [];
   for (const entry of raw) {
-    const stage = readExecutableStage(entry);
+    const stage = readExecutableStage(entry, gated);
     if (!stage) {
       return undefined;
     }
@@ -693,15 +742,26 @@ function readExecutableManifest(text: string | undefined): ExecutableManifest | 
   if (!unique(stages.map((stage) => stage.stageId))) {
     return undefined;
   }
-  return { planLabel, sourceDigest, stages };
+  const completionGates = gated ? readGates(payload["completion_gates"]) : [];
+  if (!completionGates) {
+    return undefined;
+  }
+  if (gated) {
+    // A v2 manifest must declare a gate, and gate ids are unique across it.
+    const gateIds = [...stages.flatMap((stage) => stage.gatesBefore), ...completionGates].map((gate) => gate.id);
+    if (gateIds.length === 0 || !unique(gateIds)) {
+      return undefined;
+    }
+  }
+  return { version, planLabel, sourceDigest, stages, completionGates };
 }
 
-function readExecutableStage(entry: unknown): ExecutableStage | undefined {
+function readExecutableStage(entry: unknown, gated: boolean): ExecutableStage | undefined {
   if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
     return undefined;
   }
   const payload = entry as Record<string, unknown>;
-  if (unknownKeys(payload, STAGE_KEYS)) {
+  if (unknownKeys(payload, gated ? STAGE_KEYS_V2 : STAGE_KEYS)) {
     return undefined;
   }
   const stageId = requiredText(payload["stage_id"]);
@@ -728,7 +788,37 @@ function readExecutableStage(entry: unknown): ExecutableStage | undefined {
   if (!repositories) {
     return undefined;
   }
-  return { stageId, label, title, brief, ...(mode ? { mode } : {}), repositories };
+  const gatesBefore = gated ? readGates(payload["gates_before"]) : [];
+  if (!gatesBefore) {
+    return undefined;
+  }
+  return { stageId, label, title, brief, ...(mode ? { mode } : {}), repositories, gatesBefore };
+}
+
+/** manifest.py `_gates`: null or absent is none; every field a non-empty string, stripped; no unknown key. */
+function readGates(raw: unknown): ManifestGate[] | undefined {
+  if (raw === undefined || raw === null) {
+    return [];
+  }
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const out: ManifestGate[] = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      return undefined;
+    }
+    const payload = entry as Record<string, unknown>;
+    if (unknownKeys(payload, GATE_KEYS)) {
+      return undefined;
+    }
+    const [id, title, kind, reason] = [requiredText(payload["id"]), requiredText(payload["title"]), requiredText(payload["kind"]), requiredText(payload["reason"])];
+    if (id === undefined || title === undefined || kind === undefined || reason === undefined || [...id].length > MAX_GATE_ID_LENGTH) {
+      return undefined;
+    }
+    out.push({ id, title, kind, reason });
+  }
+  return out;
 }
 
 /** `undefined` for the default implementation mode, the mode itself for the other, `false` for one the engine refuses. */

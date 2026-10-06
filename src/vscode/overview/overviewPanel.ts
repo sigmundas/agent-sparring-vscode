@@ -20,6 +20,7 @@ import { planRunDisplayName } from "../../core/planMembership";
 import {
   isActionMessage,
   isIntakeActionMessage,
+  isStartPlanMessage,
   isAutoPushMessage,
   isCopyMessage,
   isCopyPromptMessage,
@@ -36,12 +37,13 @@ import {
   type HumanCheckMessage,
   type HumanFeedbackMessage,
   type IntakeActionMessage,
+  type StartPlanMessage,
   type OpenPromptSourceMessage,
   type OverviewAction,
   type StopMessage,
 } from "../../core/overviewHtml";
 import { PROMPTS_DIRNAME, PROMPT_INDEX_FILENAME, latestCapture, parseCaptureIndex } from "../../core/promptInspector";
-import { buildOverviewModel, type AgentConfigOutcome, type CapturedPrompt, type ManagedPlanRun, type IntakeRecovery, type ManifestStageView, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
+import { buildOverviewModel, startPlanView, type StartPlanSession, type AgentConfigOutcome, type CapturedPrompt, type ManagedPlanRun, type IntakeRecovery, type ManifestStageView, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
 import { outstanding as operationOutstanding } from "../operationRegistry";
 import { checkCopyText, reviewCopyText, type ReviewCopySource } from "../../core/reviewCopy";
 import { locateStage, parsePlanHeadings, type HeadingRef } from "../../core/planAssociation";
@@ -70,6 +72,7 @@ export class OverviewPanelManager implements vscode.Disposable {
     private readonly controller: SparringController,
     private readonly onAction: (action: OverviewAction) => Promise<void>,
     private readonly onIntakeAction: (message: IntakeActionMessage) => Promise<void> = async () => undefined,
+    private readonly onStartPlan: (message: StartPlanMessage) => Promise<void> = async () => undefined,
   ) {
     this.subscriptions.push(controller.onDidChange(() => this.scheduleUpdate()));
   }
@@ -100,6 +103,8 @@ export class OverviewPanelManager implements vscode.Disposable {
         void this.onAction(message.action);
       } else if (isIntakeActionMessage(message)) {
         void this.onIntakeAction(message);
+      } else if (isStartPlanMessage(message)) {
+        void this.onStartPlan(message);
       } else if (isHumanCheckMessage(message)) {
         void this.recordHumanCheck(message);
       } else if (isHumanFeedbackMessage(message)) {
@@ -368,6 +373,22 @@ export class OverviewPanelManager implements vscode.Disposable {
   }
 
   /**
+   * The Run Plan in progress through `sparring start-plan`, if any. While it
+   * is set the Overview shows it in place of the selection: it is what the
+   * person just asked for, and nothing on it is acted on except by them.
+   */
+  private startPlan: StartPlanSession | undefined;
+
+  get startPlanSession(): StartPlanSession | undefined {
+    return this.startPlan;
+  }
+
+  setStartPlanSession(session: StartPlanSession | undefined): void {
+    this.startPlan = session;
+    this.scheduleUpdate();
+  }
+
+  /**
    * The model, and the recorded prose it was built from.
    *
    * The Overview itself only ever shows derived facts, so the model is enough
@@ -377,6 +398,10 @@ export class OverviewPanelManager implements vscode.Disposable {
    */
   private async gather(): Promise<{ model: OverviewModel; source: ReviewCopySource }> {
     const selection = this.controller.currentSelection;
+    if (this.startPlan) {
+      const model: OverviewModel = { kind: "startPlan", title: this.startPlan.planName, startPlan: startPlanView(this.startPlan) }
+      return { model, source: { model, artifacts: { handoff: false, sparring: false, brief: false, plan: false } } };
+    }
     // Asked of the engine for whichever repository the cockpit is in, run or
     // no run, so the configuration on screen is the configuration of the
     // project the rest of the screen describes.
@@ -474,7 +499,7 @@ export class OverviewPanelManager implements vscode.Disposable {
     const scope: OperationScope = {
       repoRoot: selection.selected?.location.repoRoot ?? selection.intake?.location.repoRoot ?? selection.scope?.repoRoot,
       intakeDir: selection.selected ? undefined : selection.intake?.dir,
-      runId: selection.selected?.id,
+      runId: selection.selected ? this.controller.trackedId(selection.selected.id) : undefined,
     };
     const active = activeOperationView(this.controller.activeOperations().filter((record) => relevantTo(record, scope, samePath)));
     if (active) {
