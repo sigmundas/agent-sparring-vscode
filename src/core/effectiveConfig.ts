@@ -456,6 +456,19 @@ export function sameModelName(a: string, b: string): boolean {
 }
 
 /**
+ * A model suggestion's dropdown label: the provider's name for it alone when
+ * that name is only another spelling of the id (`Claude Opus 5.5` for
+ * `claude-opus-5-5`), both when they say different things. The exact id is
+ * always the option's value and its tooltip.
+ */
+export function modelOptionLabel(id: string, displayName: string | undefined): string {
+  if (!displayName || displayName === id) {
+    return id;
+  }
+  return sameModelName(id, displayName) ? displayName : `${id} \u00b7 ${displayName}`;
+}
+
+/**
  * Whether a provider-reported runtime model only repeats the model the
  * controls already show as selected (by value or by its option label).
  */
@@ -567,7 +580,7 @@ function modelControl(role: EngineRoleConfig, provider: string, entry: EngineMod
   for (const choice of suggestions) {
     const name = choice.model.trim();
     const display = choice.display_name?.trim();
-    options.push({ value: name, label: display && display !== name ? `${name} \u00b7 ${display}` : name });
+    options.push({ value: name, label: modelOptionLabel(name, display) });
   }
   options.push({ value: CUSTOM_MODEL_VALUE, label: CUSTOM_MODEL_LABEL, custom: true });
   return {

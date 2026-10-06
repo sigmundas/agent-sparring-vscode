@@ -29,6 +29,7 @@ import {
   type EngineModelChoices,
   runtimeRepeatsSelection,
   sameModelName,
+  modelOptionLabel,
 } from "../core/effectiveConfig";
 import { discoverRuns, selectRun, type RunSelection } from "../core/discovery";
 import { MODEL_MAX_LENGTH, isActionMessage, isAgentConfigMessage, renderOverviewHtml } from "../core/overviewHtml";
@@ -693,7 +694,7 @@ describe("choosing the model from the engine's suggestions", () => {
     const stage = controls(withChoices(), "stage")!;
     assert.equal(stage.model.value, "claude-opus-5-5");
     assert.deepEqual(stage.model.options?.map((option) => option.value), [PROVIDER_DEFAULT_VALUE, "claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5", CUSTOM_MODEL_VALUE], "the configured model is listed once");
-    assert.equal(stage.model.options?.[1]?.label, "claude-opus-5-5 · Claude Opus 5.5", "the exact id first, then the provider's name for it");
+    assert.equal(stage.model.options?.[1]?.label, "Claude Opus 5.5", "a display name that only respells the id is shown alone");
     assert.equal(stage.model.options?.at(-1)?.label, CUSTOM_MODEL_LABEL);
     assert.equal(stage.model.options?.at(-1)?.custom, true);
     assert.match(stage.model.detail, /Suggestions from the models Agent Sparring knows; not a complete list\. Any exact model id can be entered\./, "an incomplete list is marked as such and is not validation");
@@ -717,7 +718,15 @@ describe("choosing the model from the engine's suggestions", () => {
 
   it("renders the model as a dropdown that posts the same agentConfig message as effort", () => {
     const html = renderOverviewHtml(buildOverviewModel({ ambiguous: [] }, undefined, { handoff: false, sparring: false, brief: false, plan: false, agentConfig: withChoices() } as OverviewArtifacts, NOW), "n", "c");
-    assert.match(html, /<select [^>]*data-field="model"[^>]*>[\s\S]*?<option value="claude-fable-5-1">claude-fable-5-1 · Claude Fable 5\.1<\/option>/);
+    assert.match(html, /<select [^>]*data-field="model"[^>]*>[\s\S]*?<option value="claude-fable-5-1" title="claude-fable-5-1">Claude Fable 5\.1<\/option>/, "the exact id stays on the option's tooltip");
+  });
+
+  it("labels a model once unless its display name says something the id does not", () => {
+    assert.equal(modelOptionLabel("gpt-6.1-sol", "GPT-6.1 Sol"), "GPT-6.1 Sol");
+    assert.equal(modelOptionLabel("claude-opus-5-5", "Claude Opus 5.5"), "Claude Opus 5.5");
+    assert.equal(modelOptionLabel("claude-opus-5-5", undefined), "claude-opus-5-5");
+    assert.equal(modelOptionLabel("claude-opus-5-5", "claude-opus-5-5"), "claude-opus-5-5");
+    assert.equal(modelOptionLabel("eu-prod-deploy-3", "GPT-6.1 Sol"), "eu-prod-deploy-3 · GPT-6.1 Sol", "a deployment name and a model name are different information");
   });
 
   it("the write is set-config for the provider on screen, with no per-worktree flag", async () => {

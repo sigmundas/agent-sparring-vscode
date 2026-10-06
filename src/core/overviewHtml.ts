@@ -2108,7 +2108,7 @@ function options(items: readonly { value: string; label: string; custom?: boolea
       item.custom
         ? // Never selected: it asks for a value, it is not one.
           `<option value="${escapeHtml(CUSTOM_MODEL_VALUE)}" data-custom="1">${escapeHtml(item.label)}</option>`
-        : `<option value="${escapeHtml(item.value)}"${item.value === selected ? " selected" : ""}>${escapeHtml(item.label)}</option>`,
+        : `<option value="${escapeHtml(item.value)}"${item.value !== "" && item.label !== item.value ? ` title="${escapeHtml(item.value)}"` : ""}${item.value === selected ? " selected" : ""}>${escapeHtml(item.label)}</option>`,
     )
     .join("");
 }
