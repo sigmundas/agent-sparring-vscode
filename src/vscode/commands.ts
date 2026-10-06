@@ -57,6 +57,7 @@ import { checkedOutBranch, checkRepositoryMapping } from "../core/repositoryMapp
 import { stageScopeOf } from "../core/stageScope";
 import { CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
+import { applyFeatureBranch, inspectFeatureBranch } from "../core/featureBranch";
 import { GETTING_STARTED, NOT_A_PLAN_TITLE, notAPlanDetail } from "../core/gettingStarted";
 import { DEFERRED_VERIFICATION_REQUIRED, parseHandoffBranch, parsePlanStages, type PlanRunSource } from "../core/engineFormats";
 import { appendHumanEvidence, OUTCOME_WORDS, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
@@ -2424,13 +2425,54 @@ async function resolveExpectedBranch(location: SparringLocation, recorded?: stri
 
 async function askBranch(suggestion?: string): Promise<string | undefined> {
   const value = await vscode.window.showInputBox({
-    title: "Agent Sparring: expected branch",
-    prompt: "The feature branch every stage of this plan must modify (passed as --expected-branch).",
+    title: "Agent Sparring: feature branch",
+    prompt: "Feature branch for this plan. If it does not exist, Agent Sparring will create it from the current commit.",
     value: suggestion ?? "",
     ignoreFocusOut: true,
     validateInput: (text) => (text.trim() ? undefined : "A branch name is required."),
   });
   return value?.trim() || undefined;
+}
+
+/**
+ * Before a new plan run: make the feature branch the person named exist and
+ * be checked out, since the engine requires that and never creates one.
+ * A missing branch is created at the current commit, a remote-only one as a
+ * local branch tracking it — both after a confirmation. An existing local
+ * branch is left exactly as it is and passed on; the engine's own
+ * expected-branch check still decides. Returns false when the run must not
+ * start (cancelled, or refused with the reason already shown).
+ */
+async function ensureFeatureBranch(controller: SparringController, location: SparringLocation, branch: string): Promise<boolean> {
+  const repoRoot = location.repoRoot;
+  const plan = await inspectFeatureBranch(repoRoot, branch);
+  if (plan.kind === "checked-out" || plan.kind === "existing") {
+    return true;
+  }
+  if (plan.kind === "refuse") {
+    controller.log(`Run plan: feature branch ${plan.branch} not prepared — ${plan.reason}`);
+    void vscode.window.showErrorMessage(`Agent Sparring: cannot prepare the feature branch ${plan.branch}: ${plan.reason}`);
+    return false;
+  }
+  const from = `${plan.from.branch ?? "detached HEAD"} at ${plan.from.commit.slice(0, 7)}`;
+  const question =
+    plan.kind === "create" ? `Create ${plan.branch} from ${from}?` : `Create ${plan.branch} tracking ${plan.remoteRef} at ${plan.commit.slice(0, 7)}?`;
+  const detail =
+    plan.kind === "create"
+      ? `${plan.branch} does not exist in ${location.folderName}. It will be created at the current commit and checked out; your files are not changed.`
+      : `${plan.branch} exists only on the remote. A local branch tracking ${plan.remoteRef} will be created and checked out, replacing ${from} in the worktree. Nothing is fetched.`;
+  const choice = await vscode.window.showInformationMessage(question, { modal: true, detail }, "Create branch");
+  if (choice !== "Create branch") {
+    return false;
+  }
+  const outcome = await applyFeatureBranch(repoRoot, plan);
+  if (!outcome.ok) {
+    controller.log(`Run plan: feature branch ${plan.branch} not created — ${outcome.reason}`);
+    void vscode.window.showErrorMessage(`Agent Sparring: could not create ${plan.branch}: ${outcome.reason}`);
+    return false;
+  }
+  controller.log(plan.kind === "create" ? `Run plan: created ${plan.branch} from ${from} and checked it out.` : `Run plan: created ${plan.branch} tracking ${plan.remoteRef} and checked it out.`);
+  return true;
 }
 
 // ---------------------------------------------------------------- executable configuration
@@ -2659,8 +2701,10 @@ async function runPlanCommand(controller: SparringController, overview: Overview
     }
     return;
   }
+  // The feature branch is created here when it does not exist yet; the
+  // engine still receives it, unchanged, as --expected-branch.
   const expectedBranch = await resolveExpectedBranch(location);
-  if (!expectedBranch) {
+  if (!expectedBranch || !(await ensureFeatureBranch(controller, location, expectedBranch))) {
     return;
   }
   // The engine's own one-command start, when it has one: it interprets the

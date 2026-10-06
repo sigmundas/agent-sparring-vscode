@@ -59,7 +59,7 @@ describe("overview view model", () => {
     assert.deepEqual(model.facts?.slice(0, 3), [
       { label: "Repository", value: "repo" },
       { label: "Plan", value: "running" },
-      { label: "Expected branch", value: "feature/x" },
+      { label: "Feature branch", value: "feature/x" },
     ]);
   });
 

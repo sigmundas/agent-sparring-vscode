@@ -3458,7 +3458,7 @@ function facts(
   const out: { label: string; value: string }[] = [{ label: "Repository", value: run.location.folderName }];
   if (run.kind === "plan") {
     out.push({ label: "Plan", value: run.state.status });
-    out.push({ label: "Expected branch", value: run.state.expectedBranch });
+    out.push({ label: "Feature branch", value: run.state.expectedBranch });
     out.push({ label: "Run key", value: run.runKey });
   } else if (associated) {
     out.push({ label: "Plan", value: `${basename(associated.path)} (associated in VS Code)` });
