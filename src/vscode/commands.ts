@@ -58,7 +58,7 @@ import { stageScopeOf } from "../core/stageScope";
 import { CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
 import { applyFeatureBranch, inspectFeatureBranch } from "../core/featureBranch";
-import { GETTING_STARTED, NOT_A_PLAN_TITLE, notAPlanDetail } from "../core/gettingStarted";
+import { GETTING_STARTED, MAKE_PLAN_FROM_THIS, NOT_A_PLAN_TITLE, notAPlanDetail } from "../core/gettingStarted";
 import { DEFERRED_VERIFICATION_REQUIRED, parseHandoffBranch, parsePlanStages, type PlanRunSource } from "../core/engineFormats";
 import { appendHumanEvidence, OUTCOME_WORDS, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
 import { blocksLaunch } from "../core/liveness";
@@ -86,6 +86,7 @@ import { currentBranch, knownRepositories, pendingChanges } from "./git";
 import { evaluateStartPlan, manifestSupport, resetManifestSupportCache, startPlanSupport } from "./engineProbe";
 import { openCandidateDiff } from "./overview/gitDiff";
 import { configuredExecutable } from "./engineExecutable";
+import { disposeMakePlanWatchers, makePlanCommand, type MakePlanDeps } from "./makePlan";
 import { settingsTarget } from "../core/settingsTarget";
 import { fixSetup, readEffectiveConfig, readModelChoices, readOverriddenConfig, resetModelChoicesCache } from "./configProbe";
 import { askFreshSession, describeAgent, freshRefusedByPause, otherAgentLabel, roleNoun, type FreshSessionUi } from "../core/freshSession";
@@ -126,6 +127,8 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.diagnoseDiscovery", () => controller.diagnoseDiscovery()),
     vscode.commands.registerCommand("agentSparring.openOverview", () => openOverviewCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.runPlan", () => runPlanCommand(controller, overview)),
+    vscode.commands.registerCommand("agentSparring.makePlan", () => makePlanCommand(makePlanDeps(controller, overview))),
+    new vscode.Disposable(disposeMakePlanWatchers),
     vscode.commands.registerCommand("agentSparring.resumePlan", () => resumePlanCommand(controller)),
     vscode.commands.registerCommand("agentSparring.runStage", () => runStageCommand(controller)),
     vscode.commands.registerCommand("agentSparring.acceptStage", () => acceptStageCommand(controller, overview)),
@@ -1119,6 +1122,15 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       return;
     case "runPlan":
       return runPlanCommand(controller, overview);
+    case "makePlan":
+      return makePlanCommand(makePlanDeps(controller, overview));
+    case "makePlanFromThis": {
+      // The document on screen, and only while the screen still shows the
+      // engine refusing it as planning input; otherwise Make Plan asks.
+      const shown = overview.startPlanSession;
+      const fromThis = shown?.planningInput && shown.status?.status === "refused" && startPlanContext?.planPath === shown.planPath ? startPlanContext : undefined;
+      return makePlanCommand(makePlanDeps(controller, overview), fromThis ? { location: fromThis.location, source: fromThis.planPath } : undefined);
+    }
     case "resumePlan":
       await resumePlanCommand(controller, run?.kind === "plan" ? run : undefined);
       await overview.update();
@@ -2660,12 +2672,21 @@ async function launch(controller: SparringController, location: SparringLocation
  * from another kind of input, rightly). In **manual** mode the plan's own
  * path is handed to `run-plan`, which is what that mode is for.
  */
-async function runPlanCommand(controller: SparringController, overview: OverviewPanelManager): Promise<void> {
-  const location = await pickLocation(controller);
+/** Make Plan…'s ways back into the extension: the same repository picker, and Run Plan for the plan it wrote. */
+function makePlanDeps(controller: SparringController, overview: OverviewPanelManager): MakePlanDeps {
+  return {
+    pickLocation: () => pickLocation(controller),
+    runPlan: (location, planPath) => runPlanCommand(controller, overview, { location, planPath }),
+    log: (line) => controller.log(line),
+  };
+}
+
+async function runPlanCommand(controller: SparringController, overview: OverviewPanelManager, preset?: { location: SparringLocation; planPath: string }): Promise<void> {
+  const location = preset?.location ?? (await pickLocation(controller));
   if (!location) {
     return;
   }
-  const planPath = await pickPlanDocument(location);
+  const planPath = preset?.planPath ?? (await pickPlanDocument(location));
   if (!planPath) {
     return;
   }
@@ -2723,8 +2744,10 @@ async function runPlanCommand(controller: SparringController, overview: Overview
   // (start-plan routes such a document through the engine's intake instead.)
   if (!(await looksLikePlan(planPath))) {
     controller.log(`Run plan: refused — ${path.basename(planPath)} has no '## Stage <n> — <title>' sections.`);
-    const choice = await vscode.window.showWarningMessage(NOT_A_PLAN_TITLE, { modal: true, detail: notAPlanDetail(path.basename(planPath)) }, "Open file");
-    if (choice === "Open file") {
+    const choice = await vscode.window.showWarningMessage(NOT_A_PLAN_TITLE, { modal: true, detail: notAPlanDetail(path.basename(planPath)) }, MAKE_PLAN_FROM_THIS, "Open file");
+    if (choice === MAKE_PLAN_FROM_THIS) {
+      await makePlanCommand(makePlanDeps(controller, overview), { location, source: planPath });
+    } else if (choice === "Open file") {
       await openDocument(planPath, `${path.basename(planPath)} is missing.`, overview.documentColumn);
     }
     return;
@@ -2811,6 +2834,7 @@ async function beginStartPlan(controller: SparringController, overview: Overview
       phase: "preparing",
       answers,
       command: `sparring ${args.join(" ")}`,
+      ...((await looksLikePlan(planPath)) ? {} : { planningInput: true }),
     };
     startPlanContext = context;
     overview.setStartPlanSession(preparing);

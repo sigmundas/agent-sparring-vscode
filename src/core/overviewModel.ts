@@ -3558,6 +3558,8 @@ export interface StartPlanSession {
   models?: { role: string; text: string }[];
   /** The exact command the next evaluation or confirmation runs, for the details layer. */
   command?: string;
+  /** The document has no '## Stage <n>' sections: planning input, should the engine refuse it. */
+  planningInput?: boolean;
 }
 
 export interface StartPlanView {
@@ -3588,6 +3590,8 @@ export interface StartPlanView {
   };
   /** The engine's refusal, verbatim. */
   refusal?: string;
+  /** Refused, and the document is planning input: the page offers Make Plan… first. */
+  planningInput?: boolean;
   /** start-plan printed something that is not a status, verbatim. */
   failure?: string;
   /** The one Start, carrying the exact token the engine printed. */
@@ -3645,6 +3649,9 @@ export function startPlanView(session: StartPlanSession): StartPlanView {
   view.findings = status.findings.map((finding) => ({ severity: finding.severity, code: finding.code, message: finding.message, stages: finding.stages, disposition: finding.disposition }));
   if (status.status === "refused") {
     view.refusal = status.error ?? "The engine refused without saying why.";
+    if (session.planningInput) {
+      view.planningInput = true;
+    }
     return view;
   }
   if (status.status === "needs_decision") {

@@ -215,6 +215,11 @@ describe("overview view model", () => {
     const ws = await planWorkspace("complete", 2, { stageState: { base_sha: "b".repeat(40), candidate_sha: "c".repeat(40) } });
     const model = buildOverviewModel(await selection(ws), undefined, ALL, NOW);
     assert.deepEqual(model.banner, { kind: "done", text: "Plan complete — 3 stages accepted" });
+    const html = renderOverviewHtml(model, "n", "c");
+    const header = html.slice(html.indexOf('<header class="top">'), html.indexOf("</header>"));
+    assert.ok(model.status, "the model still knows the status");
+    assert.doesNotMatch(header, /class="hpill/, "the banner states the state; the header does not repeat it");
+    assert.match(html, /<div class="banner done">Plan complete — 3 stages accepted<\/div>/);
     assert.deepEqual(
       model.timeline?.map((item) => item.state),
       ["accepted", "accepted", "accepted"],

@@ -11,9 +11,13 @@ navigates.
    describes: `sparring` on your shell's `PATH`, with the `claude` and `codex`
    CLIs signed in.
 2. Install this extension (see [Install locally](#install-locally)).
-3. Get a staged plan. Audit the repository first, then use Claude or Codex
-   with the Agent Sparring planning skill (`/agent-sparring:sparring-plan`
-   in Claude Code) to turn it into a staged plan. Review the generated plan.
+3. Get a staged plan. Run **Agent Sparring: Make Plan…**, choose the idea,
+   INBOX or notes file and Claude or Codex. It opens that agent in a
+   terminal with the Agent Sparring planning skill
+   (`/agent-sparring:sparring-plan`), which audits the repository and writes
+   a staged plan under `docs/plans/` without implementing or running
+   anything. Codex is pointed at the same skill file, so the agent-sparring
+   Claude Code plugin must be installed. Review the generated plan.
    **Run Plan only executes an existing plan.** It does not write one.
 4. Open the repository and run **Agent Sparring: Run Plan**. A repository
    without any `.sparring` state yet is fine. Running any Agent Sparring

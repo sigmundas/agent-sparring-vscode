@@ -15,7 +15,8 @@
  * details, collapsed).
  */
 
-import { workingFor } from "./activeOperation";
+import { formatElapsed } from "./activeOperation";
+import { MAKE_PLAN_FROM_THIS, MAKE_PLAN_TITLE, NOT_A_PLAN_TITLE, PLANNING_INPUT_ADVICE } from "./gettingStarted";
 import { ACTIVE_CONTEXT_HEADLINE, CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, SELECT_RUN_LABEL } from "./activeRepository";
 import {
   CONFIG_FIELDS,
@@ -55,6 +56,8 @@ export type OverviewAction =
   | "sliceBranch"
   | "followActiveEditor"
   | "runPlan"
+  | "makePlan"
+  | "makePlanFromThis"
   | "resumePlan"
   | "freshSparrer"
   | "freshStageAgent"
@@ -405,6 +408,8 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "sliceBranch",
   "followActiveEditor",
   "runPlan",
+  "makePlan",
+  "makePlanFromThis",
   "resumePlan",
   "freshSparrer",
   "freshStageAgent",
@@ -561,7 +566,7 @@ function renderBody(model: OverviewModel): string {
 <header class="top"><div><h1>Agent Sparring</h1><div class="run muted">${escapeHtml(model.title)}</div></div></header>
 ${(model.emptyLines ?? []).map((line) => `<p class="muted">${escapeHtml(line)}</p>`).join("\n")}
 ${renderActors(model, discloseScope(model))}
-<div class="actions">${button("runPlan", "Run plan…")}${button("showLog", "Show log")}</div>`;
+<div class="actions">${button("makePlan", "Make Plan…", true, MAKE_PLAN_TITLE)}${button("runPlan", "Run plan…")}${button("showLog", "Show log")}</div>`;
   }
   if (model.kind === "intake" && model.intake) {
     const intake = model.intake;
@@ -619,7 +624,10 @@ ${intake.command ? `<details class="intake-command"><summary>Engine command</sum
   const parts: string[] = [];
   parts.push(renderRepositoryContext(model));
   parts.push(renderOperation(model));
-  parts.push(renderHeader(model));
+  // The banner below states the run's state in full ("Plan complete — 2
+  // stages accepted"); when it is shown, the header does not say it again.
+  const bannerShown = !model.pushAuthorization && !model.actionRequired && model.banner !== undefined;
+  parts.push(renderHeader(model, bannerShown));
   if (model.branchGuard) {
     parts.push(renderBranchGuard(model.branchGuard));
   }
@@ -755,6 +763,7 @@ function renderRepositoryLine(model: OverviewModel): string {
   }
   const controls = [
     button("runPlan", "Run Plan", true, "Choose a repository and a plan document, and start a new run of it"),
+    button("makePlan", "Make Plan…", true, MAKE_PLAN_TITLE, "quiet"),
     button("selectRun", SELECT_RUN_LABEL, true, "Pin a recorded run — including a finished one — to inspect it", "quiet"),
     releasable ? button("followActiveRepository", FOLLOW_ACTIVE_LABEL, true, context.explanation) : "",
     context.chosen ? button("followActiveEditor", FOLLOW_EDITOR_LABEL, true, "Follow the repository of the active editor or Source Control focus again", "quiet") : "",
@@ -773,7 +782,7 @@ function contextLine(headline: string, repository: string | undefined, pinned: b
   return `<div class="line"><span class="headline">${pinned ? icon("pin", "pin") : ""}${escapeHtml(headline)}:</span>${shown}</div>`;
 }
 
-function renderHeader(model: OverviewModel): string {
+function renderHeader(model: OverviewModel, bannerShown = false): string {
   // Passive facts, styled as text rather than as controls. The breadcrumb
   // already names the plan and the stage, so neither is repeated here; a plan
   // run is the ordinary case and needs no label, while a historical or
@@ -786,7 +795,7 @@ function renderHeader(model: OverviewModel): string {
       : "A stage that was run on its own; no managed plan run claims it.";
     pills.push(`<span class="hpill${historical ? " history" : ""}" title="${escapeHtml(explain)}">${escapeHtml(model.runKind)}</span>`);
   }
-  if (model.status) {
+  if (model.status && !bannerShown) {
     pills.push(`<span class="hpill ${model.status.tone}">${icon("dot", "dot")}${escapeHtml(model.status.label)}</span>`);
   }
   if (model.branchGuard) {
@@ -2108,7 +2117,7 @@ function options(items: readonly { value: string; label: string; custom?: boolea
       item.custom
         ? // Never selected: it asks for a value, it is not one.
           `<option value="${escapeHtml(CUSTOM_MODEL_VALUE)}" data-custom="1">${escapeHtml(item.label)}</option>`
-        : `<option value="${escapeHtml(item.value)}"${item.value === selected ? " selected" : ""}>${escapeHtml(item.label)}</option>`,
+        : `<option value="${escapeHtml(item.value)}"${item.value !== "" && item.label !== item.value ? ` title="${escapeHtml(item.value)}"` : ""}${item.value === selected ? " selected" : ""}>${escapeHtml(item.label)}</option>`,
     )
     .join("");
 }
@@ -2128,21 +2137,38 @@ function renderOperation(model: OverviewModel): string {
     const line = `<p class="muted small last-operation">${icon(last.liveness === "failed" ? "warn" : "check", last.liveness === "failed" ? "escalate" : "")}Last operation: ${escapeHtml(last.text)}</p>`;
     return last.technical && last.technical.length > 0 ? `${line}\n${operationTechnical(model, "last-operation", last.technical)}` : line;
   }
-  const elapsed = workingFor(active, Date.now());
-  const meta = [...active.meta.map(escapeHtml), ...(elapsed ? [`<span data-started-ms="${active.startedAtMs}">${escapeHtml(elapsed)}</span>`] : [])];
+  // One line: the cockpit below already shows the stage, the actor and the
+  // latest activity. How the launch went — recorded, handed to a shell,
+  // process found — is diagnosis, so it sits under Technical details.
+  const elapsed = active.startedAtMs !== undefined ? `<span data-started-ms="${active.startedAtMs}">${escapeHtml(formatElapsed(Date.now() - active.startedAtMs))}</span>` : undefined;
+  const meta = [...active.meta.map(escapeHtml), ...(elapsed ? [elapsed] : [])];
+  const unknown = active.liveness === "liveness_unknown";
+  const technical = [active.command.join(" "), ...(active.activity.length > 0 ? ["", ...active.activity] : [])];
   return `<section class="active-operation" data-liveness="${active.liveness}">
-<div class="op-title">${icon(active.liveness === "liveness_unknown" ? "warn" : "pulse", active.liveness === "liveness_unknown" ? "escalate" : "")}<strong>${escapeHtml(active.title)}</strong></div>
-${meta.length > 0 ? `<div class="muted small">${meta.join(" · ")}</div>` : ""}
+<div class="op-strip">${icon(unknown ? "warn" : "pulse", unknown ? "escalate" : "")}<strong>${escapeHtml(active.title)}</strong>${meta.length > 0 ? `<span class="muted"> · ${meta.join(" · ")}</span>` : ""}<span class="op-actions">${button("showLog", "Activity", true, "Show activity")}${active.terminalName ? button("showTerminal", "Terminal", true, "Show terminal") : ""}</span></div>
 ${active.note ? `<div class="muted small">${escapeHtml(active.note)}</div>` : ""}
-${active.activity.length > 0 ? `<div class="small">Activity:<ul class="op-activity">${active.activity.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul></div>` : ""}
-<div class="actions">${button("showLog", "Show activity")}${active.terminalName ? button("showTerminal", "Show terminal") : ""}</div>
-${operationTechnical(model, "active-operation", [active.command.join(" ")])}
+${operationTechnical(model, "active-operation", technical)}
 </section>`;
 }
 
 /** The engine's command line for an operation, folded away under Technical details. */
 function operationTechnical(model: OverviewModel, which: string, lines: readonly string[]): string {
   return `<details class="tech"${disclose(discloseScope(model), which, "technical")}><summary>Technical details</summary><pre class="command">${lines.map(escapeHtml).join("\n")}</pre></details>`;
+}
+
+/**
+ * A refused document with no stage sections is planning input: say what to
+ * do with it, with the way to do it, and keep the engine's refusal one click
+ * away. The engine's validation decided; this only explains it.
+ */
+function renderPlanningInput(refusal: string): string {
+  return `<section class="card planning-input">
+<h2>${escapeHtml(NOT_A_PLAN_TITLE)}</h2>
+<p>${escapeHtml(PLANNING_INPUT_ADVICE)} Nothing was approved or run.</p>
+<p class="muted small">The engine said: ${escapeHtml(refusal.split("\n")[0])}</p>
+<div class="actions">${button("makePlanFromThis", MAKE_PLAN_FROM_THIS, true, MAKE_PLAN_TITLE)}</div>
+<details class="tech"><summary>Technical details</summary><p class="muted small">Refused by the engine:</p><pre class="engineerror">${escapeHtml(refusal)}</pre></details>
+</section>`;
 }
 
 /**
@@ -2190,7 +2216,7 @@ ${view.summary.laterSlices.map((line) => `<p class="muted">${escapeHtml(line)}</
 <p class="muted start-notice">${escapeHtml(view.providerTurnNotice)}</p>
 ${view.preparing ? `<p class="start-preparing">${icon("sync")}The engine is preparing the plan…</p>` : ""}
 ${view.intake ? `<p>${escapeHtml(view.intake.line)}</p>` : view.route === "direct" ? "<p>Direct route: the plan's own stages run as written.</p>" : ""}
-${view.refusal ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}Refused by the engine. Nothing was approved or run.</p><pre class="engineerror">${escapeHtml(view.refusal)}</pre></div>` : ""}
+${view.refusal && view.planningInput ? renderPlanningInput(view.refusal) : view.refusal ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}Refused by the engine. Nothing was approved or run.</p><pre class="engineerror">${escapeHtml(view.refusal)}</pre></div>` : ""}
 ${view.failure ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}start-plan did not report a status.</p><pre class="engineerror">${escapeHtml(view.failure)}</pre></div>` : ""}
 ${decisions}
 ${findings}
@@ -2360,11 +2386,11 @@ textarea.note:focus { outline: 1px solid var(--vscode-focusBorder); }
 
 /* A submission in flight, and one that failed with everything preserved. */
 .submitting { display: flex; align-items: center; margin: 8px 0 0; font-weight: 600; color: var(--info); }
-.active-operation { margin: 8px 0 12px; padding: 8px 10px; border-left: 3px solid var(--vscode-focusBorder); background: var(--vscode-textBlockQuote-background); }
-.active-operation[data-liveness="liveness_unknown"] { border-left-color: var(--bad); }
-.active-operation .op-title { display: flex; align-items: center; gap: 6px; }
-.active-operation .op-activity { margin: 2px 0 0; padding-left: 18px; }
-.active-operation .actions { margin-top: 6px; }
+.active-operation { margin: 6px 0 10px; padding: 3px 8px; border-left: 3px solid var(--vscode-focusBorder); }
+.active-operation[data-liveness="liveness_unknown"] { border-left-color: var(--vscode-editorWarning-foreground, var(--bad)); }
+.active-operation .op-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 0 6px; }
+.active-operation .op-actions { margin-left: auto; display: inline-flex; gap: 4px; }
+.active-operation details.tech { margin-top: 2px; }
 .last-operation { display: flex; align-items: center; gap: 4px; }
 .subfail { margin: 10px 0 0; padding: 8px 10px; border-left: 3px solid var(--bad); background: var(--vscode-textBlockQuote-background); }
 .subfail .preserved { display: flex; align-items: flex-start; margin: 0; font-weight: 600; }
@@ -2889,7 +2915,7 @@ const ELAPSED_TICKER = `
     for (var i = 0; i < nodes.length; i++) {
       var s = Math.max(0, Math.floor((Date.now() - Number(nodes[i].getAttribute('data-started-ms'))) / 1000));
       var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
-      nodes[i].textContent = 'working for ' + (h > 0 ? h + 'h ' + (m < 10 ? '0' : '') + m + 'm' : m > 0 ? m + 'm ' + r + 's' : r + 's');
+      nodes[i].textContent = (h > 0 ? h + 'h ' + (m < 10 ? '0' : '') + m + 'm' : m > 0 ? m + 'm ' + r + 's' : r + 's');
     }
   }
   setInterval(tick, 1000);
