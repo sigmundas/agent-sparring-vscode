@@ -72,7 +72,11 @@ export class RunsViewProvider implements vscode.TreeDataProvider<Node>, vscode.D
       Math.floor(Date.now() / 60_000),
       selection.selected?.id ?? "",
       selection.scope?.repoRoot ?? "",
-      ...discovery.runs.map((run) => `${run.id}@${run.stateMtimeMs}@${run.kind === "plan" ? `${run.currentStage.state?.nextTurn}@${run.currentOutcome?.action}` : `${run.stage.state?.nextTurn}@${run.outcome?.action}`}`),
+      ...discovery.runs.map((run) => {
+        const outcome = run.kind === "plan" ? run.currentOutcome : run.outcome;
+        const stage = run.kind === "plan" ? run.currentStage : run.stage;
+        return [run.id, run.stateMtimeMs, run.location.external ? "external" : "", stage.state?.nextTurn, outcome?.action, outcome?.summary, outcome?.humanGate?.title].join("@");
+      }),
     ].join("\n");
     if (next === this.signature || this.timer) {
       return;
@@ -107,6 +111,7 @@ export class RunsViewProvider implements vscode.TreeDataProvider<Node>, vscode.D
       familyOf: (root) => this.controller.familyOf(root),
       memberships,
       showOlder: this.showOlder,
+      keepIds: this.controller.currentSelection.selected ? [this.controller.currentSelection.selected.id] : [],
     });
   }
 

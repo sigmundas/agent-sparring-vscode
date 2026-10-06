@@ -16,6 +16,7 @@ import { discoverRuns, locateExternalWorktree, type RunSnapshot } from "../core/
 import { DEFERRED_VERIFICATION_REQUIRED } from "../core/engineFormats";
 import type { PlanMembership } from "../core/planMembership";
 import { buildRunIndex } from "../core/runIndex";
+import { initialRunFocus } from "../core/runPick";
 import { formatWhen, runFacts, runRowDescription, summarizeRun } from "../core/runSummary";
 import { externalWorktrees, familyResolver, parseWorktreeList } from "../core/worktrees";
 import { Workspace, sparringMarkdown } from "./fixtures";
@@ -208,6 +209,30 @@ describe("run index", () => {
     const all = buildRunIndex(runs, { followedRoot: ws.root, recentLimit: 2, showOlder: true });
     assert.equal(all.recent.length, 5);
     assert.equal(all.hidden, 0);
+  });
+
+  it("the pinned or shown run is listed even beyond the bounds", async () => {
+    const ws = await Workspace.create();
+    for (let i = 0; i < 4; i++) {
+      await planRun(ws, `done-${i}`, "complete");
+      await setMtime(ws, `done-${i}`, Date.now() - i * 60_000);
+    }
+    const runs = (await discoverRuns([ws.location])).runs;
+    const oldest = runs.find((run) => run.kind === "plan" && run.runKey === "done-3")!;
+    const index = buildRunIndex(runs, { followedRoot: ws.root, recentLimit: 1, keepIds: [oldest.id] });
+    assert.deepEqual(keys(index.recent), ["done-0", "done-3"]);
+    assert.equal(index.hidden, 2);
+  });
+
+  it("the picker highlights a running run in a sibling worktree of the followed repository", async () => {
+    const main = await Workspace.create({ name: "app" });
+    const agentWorktree = await Workspace.create({ name: "app-agent-run" });
+    await planRun(agentWorktree, "agent", "running");
+    // A sibling worktree that is open in the workspace too: only its family says it is the same repository.
+    const runs = (await discoverRuns([main.location, agentWorktree.location])).runs;
+    assert.equal(initialRunFocus(runs, undefined, main.root), undefined, "without families, a sibling worktree is another repository");
+    const familyOf = (root: string) => (root === agentWorktree.root ? main.root : root);
+    assert.equal(initialRunFocus(runs, undefined, main.root, undefined, familyOf)?.id, runs[0].id);
   });
 
   it("a run in a sibling worktree of the followed repository is this repository's, not another's", async () => {

@@ -453,6 +453,7 @@ async function selectRunCommand(controller: SparringController, showOlder = fals
     familyOf: (root) => controller.familyOf(root),
     memberships: await controller.planMemberships(),
     showOlder,
+    keepIds: [pinnedId, selection.selected?.id].filter((id): id is string => id !== undefined),
   });
   const items: RunItem[] = [];
   for (const section of buildRunQuickPickSections(index, { pinnedId, nowMs: Date.now() })) {
@@ -462,7 +463,7 @@ async function selectRunCommand(controller: SparringController, showOlder = fals
     }
   }
   const sortedIntakes = intakes.slice().sort((a, b) => (b.record.createdAtMs ?? 0) - (a.record.createdAtMs ?? 0));
-  const shownIntakes = showOlder ? sortedIntakes : sortedIntakes.slice(0, RECENT_INTAKES);
+  const shownIntakes = showOlder ? sortedIntakes : sortedIntakes.filter((intake, i) => i < RECENT_INTAKES || selection.intake?.dir === intake.dir);
   if (shownIntakes.length > 0) {
     // Plan intakes, newest first, whatever their state: an intake can be
     // pinned and kept on screen like any run.
@@ -496,7 +497,7 @@ async function selectRunCommand(controller: SparringController, showOlder = fals
   // createQuickPick rather than showQuickPick, because only it can set the
   // initial highlight: without one, focus lands on the first row, which may
   // be a run this window is not following.
-  const focusRun = initialRunFocus(runs, pinnedId, selection.scope?.repoRoot, selection.selected?.id);
+  const focusRun = initialRunFocus(runs, pinnedId, selection.scope?.repoRoot, selection.selected?.id, (root) => controller.familyOf(root));
   const picker = vscode.window.createQuickPick<RunItem>();
   picker.items = items;
   picker.placeholder = `Pin a run, or follow the active repository. ${context.text}`;

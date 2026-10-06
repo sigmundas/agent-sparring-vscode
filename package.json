@@ -65,7 +65,8 @@
       {
         "command": "agentSparring.selectRun",
         "title": "Select Repository / Run",
-        "category": "Agent Sparring"
+        "category": "Agent Sparring",
+        "icon": "$(list-selection)"
       },
       {
         "command": "agentSparring.followActiveRepository",

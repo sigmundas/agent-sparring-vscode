@@ -188,7 +188,14 @@ export function buildRunQuickPickSections(index: RunIndex, options: RunQuickPick
  * A run from another repository is never highlighted while a different one
  * is followed — Enter would silently move the cockpit there.
  */
-export function initialRunFocus(runs: readonly RunSnapshot[], pinnedId: string | undefined, followedRoot: string | undefined, shownId?: string): RunSnapshot | undefined {
+export function initialRunFocus(
+  runs: readonly RunSnapshot[],
+  pinnedId: string | undefined,
+  followedRoot: string | undefined,
+  shownId?: string,
+  /** The repository family of a root (core/worktrees.ts), so a sibling worktree's run counts as the followed repository's. */
+  familyOf: (root: string) => string = (root) => root,
+): RunSnapshot | undefined {
   const pinned = pinnedId ? runs.find((run) => run.id === pinnedId) : undefined;
   if (pinned) {
     return pinned;
@@ -196,11 +203,13 @@ export function initialRunFocus(runs: readonly RunSnapshot[], pinnedId: string |
   if (!followedRoot) {
     return undefined;
   }
-  const shown = shownId ? runs.find((run) => run.id === shownId && samePath(run.location.repoRoot, followedRoot)) : undefined;
+  const followed = familyOf(followedRoot);
+  const inFollowed = (run: RunSnapshot): boolean => samePath(familyOf(run.location.external?.siblingOf ?? run.location.repoRoot), followed);
+  const shown = shownId ? runs.find((run) => run.id === shownId && inFollowed(run)) : undefined;
   if (shown) {
     return shown;
   }
-  const running = runs.filter((run) => run.kind === "plan" && run.state.status === "running" && samePath(run.location.repoRoot, followedRoot));
+  const running = runs.filter((run) => run.kind === "plan" && run.state.status === "running" && inFollowed(run));
   return running.length === 1 ? running[0] : undefined;
 }
 

@@ -490,6 +490,6 @@ describe("the intake screen and status bar", () => {
     for (const glob of ["**/.sparring/intake/*/intake.json", "**/.sparring/intake/*/runs/*/approval.json", "**/.sparring/intake/registry/*.json"]) {
       assert.ok(source.includes(`"${glob}"`), glob);
     }
-    assert.ok(source.includes("this.allLocations(), this.discovery.intakes);"), "and hands the intakes to selection");
+    assert.ok(source.includes("this.allLocations(), selectableIntakes);"), "and hands the intakes to selection");
   });
 });

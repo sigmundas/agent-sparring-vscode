@@ -67,6 +67,12 @@ export interface RunIndexOptions {
   showOlder?: boolean;
   recentLimit?: number;
   otherRecentLimit?: number;
+  /**
+   * Runs listed whatever the bounds: the pinned run and the run on screen,
+   * so the picker can mark and highlight them and the Runs view never hides
+   * what the cockpit shows.
+   */
+  keepIds?: readonly string[];
 }
 
 const PHASE_ORDER: Record<RunPhase, number> = { running: 0, "needs-you": 1, paused: 2, open: 3, complete: 4 };
@@ -81,10 +87,13 @@ export function buildRunIndex(runs: readonly RunSnapshot[], options: RunIndexOpt
   const otherLimit = options.showOlder ? Infinity : (options.otherRecentLimit ?? OTHER_RECENT_LIMIT);
   const followed = options.followedRoot ? familyOf(options.followedRoot) : undefined;
   let hidden = 0;
+  const keep = new Set(options.keepIds ?? []);
+  // The first `limit` entries plus every kept one beyond them, in order.
+  const bounded = (entries: RunIndexEntry[], limit: number): RunIndexEntry[] => entries.filter((entry, i) => i < limit || keep.has(entry.run.id));
 
   const listed: RunIndexEntry[] = [];
   for (const run of runs) {
-    if (run.kind === "stage" && options.memberships?.has(run.id) && !options.showOlder) {
+    if (run.kind === "stage" && options.memberships?.has(run.id) && !options.showOlder && !keep.has(run.id)) {
       hidden += 1;
       continue;
     }
@@ -97,7 +106,7 @@ export function buildRunIndex(runs: readonly RunSnapshot[], options: RunIndexOpt
 
   const open = here.filter((entry) => entry.summary.open).sort(byPhaseThenNewest);
   const done = here.filter((entry) => !entry.summary.open).sort(byPhaseThenNewest);
-  const recent = done.slice(0, recentLimit);
+  const recent = bounded(done, recentLimit);
   hidden += done.length - recent.length;
 
   const families = new Map<string, RunIndexEntry[]>();
@@ -110,7 +119,7 @@ export function buildRunIndex(runs: readonly RunSnapshot[], options: RunIndexOpt
     const sorted = entries.slice().sort(byPhaseThenNewest);
     const openHere = sorted.filter((entry) => entry.summary.open);
     const doneHere = sorted.filter((entry) => !entry.summary.open);
-    const shown = [...openHere, ...doneHere.slice(0, otherLimit)];
+    const shown = [...openHere, ...bounded(doneHere, otherLimit)];
     hidden += sorted.length - shown.length;
     const display = options.familyOf ? options.familyOf(entries[0].run.location.external?.siblingOf ?? entries[0].run.location.repoRoot) : entries[0].run.location.repoRoot;
     other.push({ name: path.basename(display), key, entries: shown });

@@ -509,7 +509,13 @@ export class SparringController implements vscode.Disposable {
         this.externalWatcherDisposables.push(watcher);
       }
       const activity = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(base, "stages/*/activity.jsonl"));
-      const onActivity = (uri: vscode.Uri) => this.onActivityFile(uri);
+      // Only the run being tailed: an external run is never selected
+      // automatically, so its telemetry is no reason to rediscover.
+      const onActivity = (uri: vscode.Uri) => {
+        if (this.tailer && path.resolve(uri.fsPath) === path.resolve(this.tailer.path)) {
+          this.schedulePoll();
+        }
+      };
       activity.onDidCreate(onActivity);
       activity.onDidChange(onActivity);
       activity.onDidDelete(onActivity);
@@ -552,7 +558,8 @@ export class SparringController implements vscode.Disposable {
     // chose it; automatic selection keeps to the projects this window opened.
     const preference = this.preference();
     const selectable = this.discovery.runs.filter((run) => !run.location.external || run.id === preference?.id);
-    this.selection = selectRun(selectable, preference, sticky, await this.repositoryScope(), ownership, this.allLocations(), this.discovery.intakes);
+    const selectableIntakes = this.discovery.intakes?.filter((intake) => !intake.location.external || intakeIdFor(intake.location, intake.record.intakeId) === preference?.id);
+    this.selection = selectRun(selectable, preference, sticky, await this.repositoryScope(), ownership, this.allLocations(), selectableIntakes);
     if (this.selection.released) {
       await this.retireReleasedPin(this.selection.released);
     }
