@@ -102,7 +102,9 @@ describe("the active operation on the Overview", () => {
     const bannerTechnical = banner.indexOf("<summary>Technical details</summary>");
     assert.ok(bannerTechnical > 0, "the banner has a Technical details fold");
     assert.doesNotMatch(visibleText(banner.slice(0, bannerTechnical)), /prepare-plan|docs\/plan\.md/, "no subcommand or target outside Technical details");
-    assert.match(banner.slice(bannerTechnical), /<pre class="command">prepare-plan docs\/plan\.md<\/pre>/);
+    assert.match(banner.slice(bannerTechnical), /<pre class="command">prepare-plan docs\/plan\.md\n/);
+    assert.match(banner.slice(bannerTechnical), /Command recorded/, "how the launch went is diagnosis, under Technical details");
+    assert.doesNotMatch(visibleText(banner.slice(0, bannerTechnical)), /Command recorded|Handed to the shell|Engine process/, "not in the one-line strip");
     const technical = html.slice(html.indexOf('<details class="intake-technical">'));
     assert.match(technical, /not what is running now/);
     assert.ok(technical.includes("approve-plan"), "only under Technical details");

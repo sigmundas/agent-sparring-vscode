@@ -15,7 +15,7 @@
  * details, collapsed).
  */
 
-import { workingFor } from "./activeOperation";
+import { formatElapsed } from "./activeOperation";
 import { ACTIVE_CONTEXT_HEADLINE, CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, SELECT_RUN_LABEL } from "./activeRepository";
 import {
   CONFIG_FIELDS,
@@ -2128,15 +2128,17 @@ function renderOperation(model: OverviewModel): string {
     const line = `<p class="muted small last-operation">${icon(last.liveness === "failed" ? "warn" : "check", last.liveness === "failed" ? "escalate" : "")}Last operation: ${escapeHtml(last.text)}</p>`;
     return last.technical && last.technical.length > 0 ? `${line}\n${operationTechnical(model, "last-operation", last.technical)}` : line;
   }
-  const elapsed = workingFor(active, Date.now());
-  const meta = [...active.meta.map(escapeHtml), ...(elapsed ? [`<span data-started-ms="${active.startedAtMs}">${escapeHtml(elapsed)}</span>`] : [])];
+  // One line: the cockpit below already shows the stage, the actor and the
+  // latest activity. How the launch went — recorded, handed to a shell,
+  // process found — is diagnosis, so it sits under Technical details.
+  const elapsed = active.startedAtMs !== undefined ? `<span data-started-ms="${active.startedAtMs}">${escapeHtml(formatElapsed(Date.now() - active.startedAtMs))}</span>` : undefined;
+  const meta = [...active.meta.map(escapeHtml), ...(elapsed ? [elapsed] : [])];
+  const unknown = active.liveness === "liveness_unknown";
+  const technical = [active.command.join(" "), ...(active.activity.length > 0 ? ["", ...active.activity] : [])];
   return `<section class="active-operation" data-liveness="${active.liveness}">
-<div class="op-title">${icon(active.liveness === "liveness_unknown" ? "warn" : "pulse", active.liveness === "liveness_unknown" ? "escalate" : "")}<strong>${escapeHtml(active.title)}</strong></div>
-${meta.length > 0 ? `<div class="muted small">${meta.join(" · ")}</div>` : ""}
+<div class="op-strip">${icon(unknown ? "warn" : "pulse", unknown ? "escalate" : "")}<strong>${escapeHtml(active.title)}</strong>${meta.length > 0 ? `<span class="muted"> · ${meta.join(" · ")}</span>` : ""}<span class="op-actions">${button("showLog", "Activity", true, "Show activity")}${active.terminalName ? button("showTerminal", "Terminal", true, "Show terminal") : ""}</span></div>
 ${active.note ? `<div class="muted small">${escapeHtml(active.note)}</div>` : ""}
-${active.activity.length > 0 ? `<div class="small">Activity:<ul class="op-activity">${active.activity.map((line) => `<li>${escapeHtml(line)}</li>`).join("")}</ul></div>` : ""}
-<div class="actions">${button("showLog", "Show activity")}${active.terminalName ? button("showTerminal", "Show terminal") : ""}</div>
-${operationTechnical(model, "active-operation", [active.command.join(" ")])}
+${operationTechnical(model, "active-operation", technical)}
 </section>`;
 }
 
@@ -2360,11 +2362,11 @@ textarea.note:focus { outline: 1px solid var(--vscode-focusBorder); }
 
 /* A submission in flight, and one that failed with everything preserved. */
 .submitting { display: flex; align-items: center; margin: 8px 0 0; font-weight: 600; color: var(--info); }
-.active-operation { margin: 8px 0 12px; padding: 8px 10px; border-left: 3px solid var(--vscode-focusBorder); background: var(--vscode-textBlockQuote-background); }
-.active-operation[data-liveness="liveness_unknown"] { border-left-color: var(--bad); }
-.active-operation .op-title { display: flex; align-items: center; gap: 6px; }
-.active-operation .op-activity { margin: 2px 0 0; padding-left: 18px; }
-.active-operation .actions { margin-top: 6px; }
+.active-operation { margin: 6px 0 10px; padding: 3px 8px; border-left: 3px solid var(--vscode-focusBorder); }
+.active-operation[data-liveness="liveness_unknown"] { border-left-color: var(--vscode-editorWarning-foreground, var(--bad)); }
+.active-operation .op-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 0 6px; }
+.active-operation .op-actions { margin-left: auto; display: inline-flex; gap: 4px; }
+.active-operation details.tech { margin-top: 2px; }
 .last-operation { display: flex; align-items: center; gap: 4px; }
 .subfail { margin: 10px 0 0; padding: 8px 10px; border-left: 3px solid var(--bad); background: var(--vscode-textBlockQuote-background); }
 .subfail .preserved { display: flex; align-items: flex-start; margin: 0; font-weight: 600; }
@@ -2889,7 +2891,7 @@ const ELAPSED_TICKER = `
     for (var i = 0; i < nodes.length; i++) {
       var s = Math.max(0, Math.floor((Date.now() - Number(nodes[i].getAttribute('data-started-ms'))) / 1000));
       var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
-      nodes[i].textContent = 'working for ' + (h > 0 ? h + 'h ' + (m < 10 ? '0' : '') + m + 'm' : m > 0 ? m + 'm ' + r + 's' : r + 's');
+      nodes[i].textContent = (h > 0 ? h + 'h ' + (m < 10 ? '0' : '') + m + 'm' : m > 0 ? m + 'm ' + r + 's' : r + 's');
     }
   }
   setInterval(tick, 1000);
