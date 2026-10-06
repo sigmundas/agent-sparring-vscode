@@ -139,6 +139,10 @@ async function planningSkillFile(): Promise<string | undefined> {
  * Markdown file under docs/plans/. Only an offer; nothing is opened or run.
  */
 function watchForPlan(deps: MakePlanDeps, location: SparringLocation, terminal: vscode.Terminal): void {
+  // One watcher per repository: a second planning session there replaces
+  // the first's, so a plan is never offered twice.
+  const key = path.resolve(location.repoRoot);
+  watchers.get(key)?.dispose();
   const watcher = vscode.workspace.createFileSystemWatcher(new vscode.RelativePattern(location.repoRoot, "docs/plans/*.md"), false, true, true);
   const offered = new Set<string>();
   const created = watcher.onDidCreate(async (uri) => {
@@ -156,9 +160,25 @@ function watchForPlan(deps: MakePlanDeps, location: SparringLocation, terminal: 
   });
   const closed = vscode.window.onDidCloseTerminal((gone) => {
     if (gone === terminal) {
-      created.dispose();
-      watcher.dispose();
-      closed.dispose();
+      stop.dispose();
     }
   });
+  const stop = new vscode.Disposable(() => {
+    created.dispose();
+    watcher.dispose();
+    closed.dispose();
+    if (watchers.get(key) === stop) {
+      watchers.delete(key);
+    }
+  });
+  watchers.set(key, stop);
+}
+
+const watchers = new Map<string, vscode.Disposable>();
+
+/** Stop every plan watcher; for extension deactivation. */
+export function disposeMakePlanWatchers(): void {
+  for (const stop of [...watchers.values()]) {
+    stop.dispose();
+  }
 }

@@ -262,7 +262,8 @@ describe("Run Plan screen (start-plan → view model)", () => {
     assert.match(card, /This looks like planning input rather than a staged plan\./);
     assert.match(card, /data-action="makePlanFromThis"[^>]*>Make Plan from this…<\/button>/);
     const technical = card.indexOf("<summary>Technical details</summary>");
-    assert.ok(technical > 0 && card.indexOf("--answer: this plan runs directly") > technical, "the engine's refusal is kept, verbatim, one click away");
+    assert.ok(technical > 0 && card.lastIndexOf("--answer: this plan runs directly") > technical, "the engine's refusal is kept, verbatim, under Technical details");
+    assert.match(card.slice(0, technical), /The engine said: --answer: this plan runs directly/, "its first line stays in view, in case the refusal is about something else");
     // Only on a refusal: planning input the engine accepts is the engine's to route.
     assert.equal(startPlanView(session(INTAKE_READY, { planningInput: true })).planningInput, undefined);
   });

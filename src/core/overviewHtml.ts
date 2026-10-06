@@ -2165,6 +2165,7 @@ function renderPlanningInput(refusal: string): string {
   return `<section class="card planning-input">
 <h2>${escapeHtml(NOT_A_PLAN_TITLE)}</h2>
 <p>${escapeHtml(PLANNING_INPUT_ADVICE)} Nothing was approved or run.</p>
+<p class="muted small">The engine said: ${escapeHtml(refusal.split("\n")[0])}</p>
 <div class="actions">${button("makePlanFromThis", MAKE_PLAN_FROM_THIS, true, MAKE_PLAN_TITLE)}</div>
 <details class="tech"><summary>Technical details</summary><p class="muted small">Refused by the engine:</p><pre class="engineerror">${escapeHtml(refusal)}</pre></details>
 </section>`;
