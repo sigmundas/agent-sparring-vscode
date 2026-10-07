@@ -317,7 +317,7 @@ describe("the Goal never complains about Markdown", () => {
     const brief = ["# Stage brief: stage-3d-snapshot-v2-and-attachment-export-import-transport", "", "Stage 3D from plan `reported-statistics.md`. Implement only this section; the other stages are separate.", "", "## Stage 3D — Snapshot v2 and attachment/export/import transport", "", "Owns the frozen-evidence representation of enhanced content and the gates that protect old readers.", "", "- A bullet is not a description.", ""].join("\n");
     const { model, html } = await managedStage3d({ brief });
     assert.equal(model.goal, "Owns the frozen-evidence representation of enhanced content and the gates that protect old readers.", "the embedded plan section, not the provenance line");
-    assert.match(html, /<summary>About this stage<\/summary><div class="reportbody"><p>Owns the frozen-evidence/, "section text is a description to open, not the Goal");
+    assert.match(html, /<h3>About this stage<\/h3><div class="reportbody"><p>Owns the frozen-evidence/, "section text is a description to open, not the Goal");
     assert.ok(!html.includes("## Goal"));
   });
 

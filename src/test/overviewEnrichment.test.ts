@@ -60,7 +60,7 @@ describe("goal extraction from brief.md", () => {
     assert.equal(withGoal.goalSource, "brief");
     assert.equal(opening.goalSource, "brief-opening");
     // A description that is not an explicit goal is offered, not labelled Goal.
-    assert.match(renderOverviewHtml(opening, "n", "c"), /<details class="block stagedesc"[^>]*><summary>About this stage<\/summary><div class="reportbody"><p>Stop the crash on open.<\/p>/);
+    assert.match(renderOverviewHtml(opening, "n", "c"), /<div class="block stagedesc"><h3>About this stage<\/h3><div class="reportbody"><p>Stop the crash on open.<\/p>/);
     assert.ok(!/Goal<\/h3>/.test(renderOverviewHtml(opening, "n", "c")));
     assert.ok(!/Goal<\/h3>/.test(renderOverviewHtml(nothing, "n", "c")), "nothing to say about the goal: no section, and no complaint");
     assert.ok(!/has no ## Goal/.test(renderOverviewHtml(nothing, "n", "c")));
@@ -289,7 +289,7 @@ describe("active duration", () => {
     // true, in the card's corner.
     assert.match(html, /<span class="statepill sparring"><svg[^>]*>.*?<\/svg><span>Sparring for 12s<\/span><\/span>/);
     assert.match(html, /<span class="avatar codex"><svg class="glyph"[^>]*>.*?<\/svg><\/span>/);
-    assert.match(html, /<span class="hpill good"><svg[^>]*>.*?<\/svg>Working<\/span>/, "standalone working stage status pill");
+    assert.ok(!/<span class="hpill good">/.test(html), "a working stage's good status is not repeated in the header");
   });
 
   it("a shell command in flight counts as current activity and is never presented as 'no meaningful activity'", async () => {

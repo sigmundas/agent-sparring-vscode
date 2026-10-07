@@ -795,7 +795,9 @@ function renderHeader(model: OverviewModel, bannerShown = false): string {
       : "A stage that was run on its own; no managed plan run claims it.";
     pills.push(`<span class="hpill${historical ? " history" : ""}" title="${escapeHtml(explain)}">${escapeHtml(model.runKind)}</span>`);
   }
-  if (model.status && !bannerShown) {
+  // Running and Working are already said by the operation strip and the
+  // stage card, so the header does not repeat them.
+  if (model.status && !model.status.inProgress && !bannerShown) {
     pills.push(`<span class="hpill ${model.status.tone}">${icon("dot", "dot")}${escapeHtml(model.status.label)}</span>`);
   }
   if (model.branchGuard) {
@@ -1524,8 +1526,8 @@ ${right}
  * What the stage is for. An explicit goal (intake's `## Goal`) is the Goal:
  * its first sentence in view, the rest one click away. Anything else is the
  * stage's own section text — usually the implementer's contract, file names
- * and test lists — so it is offered as a description to open, under the
- * stage title the card already shows, never labelled as the Goal. Nothing is
+ * and test lists — so it is shown as a description in a box that scrolls
+ * when it overfills, under the stage title the card already shows, never labelled as the Goal. Nothing is
  * reworded: what is shown is the source's text.
  */
 function renderGoal(model: OverviewModel): string {
@@ -1533,7 +1535,7 @@ function renderGoal(model: OverviewModel): string {
     return "";
   }
   if (model.goalSource !== "brief") {
-    return `<details class="block stagedesc"${disclose(discloseScope(model), "stage-description")}><summary>About this stage</summary><div class="reportbody">${renderReportMarkdown(model.goal)}</div></details>`;
+    return `<div class="block stagedesc"><h3>About this stage</h3><div class="reportbody">${renderReportMarkdown(model.goal)}</div></div>`;
   }
   const { lead, rest } = splitLead(model.goal);
   const more = rest ? `<details class="goalmore"><summary>More</summary><p class="goal">${escapeHtml(rest)}</p></details>` : "";
@@ -2145,7 +2147,7 @@ function renderOperation(model: OverviewModel): string {
   const unknown = active.liveness === "liveness_unknown";
   const technical = [active.command.join(" "), ...(active.activity.length > 0 ? ["", ...active.activity] : [])];
   return `<section class="active-operation" data-liveness="${active.liveness}">
-<div class="op-strip">${icon(unknown ? "warn" : "pulse", unknown ? "escalate" : "")}<strong>${escapeHtml(active.title)}</strong>${meta.length > 0 ? `<span class="muted"> · ${meta.join(" · ")}</span>` : ""}<span class="op-actions">${button("showLog", "Activity", true, "Show activity")}${active.terminalName ? button("showTerminal", "Terminal", true, "Show terminal") : ""}</span></div>
+<div class="op-strip">${icon(unknown ? "warn" : "pulse", unknown ? "escalate" : "")}<strong>${escapeHtml(active.title)}</strong>${meta.length > 0 ? `<span class="muted"> · ${meta.join(" · ")}</span>` : ""}</div>
 ${active.note ? `<div class="muted small">${escapeHtml(active.note)}</div>` : ""}
 ${operationTechnical(model, "active-operation", technical)}
 </section>`;
@@ -2389,7 +2391,6 @@ textarea.note:focus { outline: 1px solid var(--vscode-focusBorder); }
 .active-operation { margin: 6px 0 10px; padding: 3px 8px; border-left: 3px solid var(--vscode-focusBorder); }
 .active-operation[data-liveness="liveness_unknown"] { border-left-color: var(--vscode-editorWarning-foreground, var(--bad)); }
 .active-operation .op-strip { display: flex; flex-wrap: wrap; align-items: center; gap: 0 6px; }
-.active-operation .op-actions { margin-left: auto; display: inline-flex; gap: 4px; }
 .active-operation details.tech { margin-top: 2px; }
 .last-operation { display: flex; align-items: center; gap: 4px; }
 .subfail { margin: 10px 0 0; padding: 8px 10px; border-left: 3px solid var(--bad); background: var(--vscode-textBlockQuote-background); }
@@ -2585,8 +2586,8 @@ h3 { display: flex; align-items: center; font-size: 0.95em; font-weight: 600; ma
 h3 .icon { width: 15px; height: 15px; }
 p { margin: 0 0 4px; line-height: 1.45; }
 .goal { color: var(--vscode-foreground); }
-details.goalmore > summary, details.stagedesc > summary { cursor: pointer; color: var(--vscode-descriptionForeground); width: fit-content; }
-details.goalmore > summary:hover, details.stagedesc > summary:hover { color: var(--vscode-foreground); }
+details.goalmore > summary { cursor: pointer; color: var(--vscode-descriptionForeground); width: fit-content; }
+details.goalmore > summary:hover { color: var(--vscode-foreground); }
 .verdict { font-weight: 700; letter-spacing: 0.02em; color: var(--info); }
 .verdict.ready { color: var(--good); }
 .verdict.send_back, .verdict.needs_you { color: var(--warn); }

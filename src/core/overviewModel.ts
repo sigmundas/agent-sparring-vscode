@@ -462,6 +462,8 @@ export interface OverviewActions {
 export interface RunStatus {
   label: string;
   tone: "good" | "info" | "warn" | "muted";
+  /** Running or Working: already said by the operation strip and the stage card. */
+  inProgress?: true;
 }
 
 /**
@@ -2722,7 +2724,7 @@ function runStatus(run: RunSnapshot, presentation: StagePresentation, liveness: 
   if (run.kind === "plan") {
     switch (run.state.status) {
       case "running":
-        return liveness.interrupted ? { label: "Stopped", tone: "warn" } : { label: "Running", tone: "good" };
+        return liveness.interrupted ? { label: "Stopped", tone: "warn" } : { label: "Running", tone: "good", inProgress: true };
       case "paused": {
         const action = run.currentOutcome?.action;
         return { label: action === "NEEDS_YOU" || action === "ESCALATE" ? actionWord(action) : "Paused", tone: "warn" };
@@ -2746,7 +2748,7 @@ function runStatus(run: RunSnapshot, presentation: StagePresentation, liveness: 
     case "send_back":
       return { label: presentation.label, tone: "warn" };
     default:
-      return { label: "Working", tone: "good" };
+      return { label: "Working", tone: "good", inProgress: true };
   }
 }
 
