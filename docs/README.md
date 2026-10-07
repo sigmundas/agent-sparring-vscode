@@ -14,8 +14,14 @@ These pages cover setup, detailed behavior and the extension's technical contrac
 | [Terminals and runners](runners.md) | Command submission, process liveness, reload recovery and manual verification |
 | [Development](development.md) | Build and test commands, manifest parity, integration harness limits and known follow-ups |
 
-Files under `docs/plans/` record historical or proposed work. Use the reference
-pages above for current behavior.
+Two plans are retained in the repository:
+
+- [Colleague sharing](https://github.com/sigmundas/agent-sparring-vscode/blob/main/docs/plans/colleague-sharing.md)
+  is a completed example of a staged implementation plan.
+- [Windows extension](https://github.com/sigmundas/agent-sparring-vscode/blob/main/docs/plans/windows-extension.md)
+  describes proposed Windows support.
+
+Use the reference pages above for current behavior.
 
 The [engine documentation](https://github.com/sigmundas/agent-sparring/blob/main/docs/README.md)
 covers engine installation, plan formats and CLI behavior.
