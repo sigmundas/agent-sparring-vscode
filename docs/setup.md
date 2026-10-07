@@ -19,10 +19,6 @@
 | Per-project settings (`project.toml`) | Required, once per repository | Created by the engine's `init-config` (**Open Project Settings** → **Create project settings**). Test commands and project conventions belong there and in the project's own context, not in the extension. |
 | agent-sparring Claude Code plugin | Optional | Needed only for **Make Plan…** (both with Claude and with Codex). You can write a plan by hand instead. |
 
-The engine repository is currently private. You need access to it to follow
-the installation and Quickstart links or install its planning plugin. Readers
-without access will see a GitHub 404.
-
 Nothing database-specific is needed for ordinary runs; the engine's optional
 Supabase migration parser only matters to projects that use it.
 

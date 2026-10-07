@@ -22,8 +22,7 @@ verification and acceptance; the extension presents its state and invokes its co
 
 You need **VS Code 1.93+**, the separately installed **agent-sparring engine**
 (Python 3.11+), signed-in **Claude and Codex CLIs** for the default setup, and a
-Git repository with a writable remote. The engine repository is currently private;
-you need access to install it and read its Quickstart.
+Git repository with a writable remote.
 
 **macOS and Linux are supported.** Native Windows is not supported in this release;
 WSL has not been verified.
