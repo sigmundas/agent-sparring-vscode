@@ -12,9 +12,9 @@ the extension observes, presents and invokes it. Keep that boundary intact.
 - Search symbols with scoped `rg -n`, then read bounded definitions/callers.
   Narrow truncated output. Do not read the entire README, `controller.ts`,
   `commands.ts`, overview renderer, logs or generated bundles for orientation.
-- Use README headings as an index to the behavior under investigation. Read
-  `Source-of-truth rule` when changing what a displayed state means, and the
-  relevant runner section for process/lifecycle changes.
+- Use `docs/README.md` as the reference index. Read `Source-of-truth rule`
+  in `docs/state.md` when changing what a displayed state means, and the
+  relevant section in `docs/runners.md` for process/lifecycle changes.
 - Cross into the engine only for a concrete protocol/ownership question, after
   reading its `AGENTS.md`. Do not search the parent workspace or other worktrees.
 - Reuse findings within the session. Keep delegated questions narrow and
@@ -43,7 +43,7 @@ Start with the relevant row and matching tests in `src/test/`, not every file.
 - Keep repository, worktree, plan, stage and process identity scoped correctly
   across refresh/reload. UI liveness is not acceptance authority.
 - Preserve the distinction between captured provider prompts and review context.
-  Read the relevant README contract before changing either export.
+  Read the relevant contract in `docs/state.md` before changing either export.
 - Do not launch providers, resume live user plans, kill user processes, install
   the extension, push or publish as incidental validation. Use fake engine
   fixtures unless the task authorizes a live operation.
@@ -58,12 +58,13 @@ Run from this repository root:
 - Shared command, lifecycle or format changes: broaden to `npm test` and
   `npm run lint` as relevant. The Sporely app's npm-test restriction does not
   apply to this separate repository.
-- Manifest/protocol changes: read README's `Keeping the manifest contract in
-  step with the engine` section and run the applicable parity checks. Do not
-  regenerate pins just to silence a mismatch.
+- Manifest/protocol changes: read `Keeping the manifest contract in
+  step with the engine` in `docs/development.md` and run the applicable parity
+  checks. Do not regenerate pins just to silence a mismatch.
 - Use `npm run test:integration` when an extension-host change needs that
-  coverage; it may download VS Code and launch a test host. Check the README's
-  harness limitations before claiming real interactive behavior is verified.
+  coverage; it may download VS Code and launch a test host. Check
+  `docs/development.md` for harness limitations before claiming real
+  interactive behavior is verified.
 - Bundle/package only when needed for the requested result. Documentation-only
   edits need diff inspection and `git diff --check`, not a build/test run.
 
