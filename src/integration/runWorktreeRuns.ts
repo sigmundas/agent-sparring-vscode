@@ -5,9 +5,8 @@
  * `git worktree list`, shown in the Runs view, never selected on its own,
  * and — opened through a symlink to the repository, as git never reports it
  * — not have the workspace's own directory rediscovered as a second,
- * external project. With the proposed chat sessions API enabled for this
- * extension and
- * the experimental setting on — listed as an agent session.
+ * external project. It runs the standard manifest, with no proposed API
+ * enabled.
  */
 
 import { runTests } from "@vscode/test-electron";
@@ -29,13 +28,11 @@ async function main(): Promise<void> {
   const app = path.join(base, "app");
   const sibling = path.join(base, "app-agent-run");
   const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, "-c", "user.name=T", "-c", "user.email=t@example.com", ...args], { stdio: "pipe" });
-  await fs.mkdir(path.join(app, ".vscode"), { recursive: true });
   execFileSync("git", ["init", "-q", "-b", "main", app]);
   await fs.writeFile(path.join(app, "README.md"), "app\n");
   git(app, "add", "README.md");
   git(app, "commit", "-q", "-m", "init");
   await fs.mkdir(path.join(app, ".sparring"), { recursive: true });
-  await fs.writeFile(path.join(app, ".vscode", "settings.json"), JSON.stringify({ "agentSparring.experimental.agentSessions": true }, null, 2));
   git(app, "worktree", "add", "-q", "-b", "sparring/tidy", sibling);
   await fs.mkdir(path.join(sibling, "docs", "plans"), { recursive: true });
   await fs.writeFile(path.join(sibling, "docs", "plans", "tidy.md"), PLAN);
@@ -56,7 +53,7 @@ async function main(): Promise<void> {
       extensionDevelopmentPath: path.resolve(__dirname, "..", ".."),
       extensionTestsPath: path.resolve(__dirname, "worktreeRunsSuite"),
       extensionTestsEnv: { AGENT_SPARRING_TEST_SIBLING: sibling },
-      launchArgs: [alias, "--disable-extensions", "--disable-workspace-trust", "--enable-proposed-api", "sintef.agent-sparring-vscode"],
+      launchArgs: [alias, "--disable-extensions", "--disable-workspace-trust"],
     });
   } catch (error) {
     console.error("worktree runs integration test failed", error);

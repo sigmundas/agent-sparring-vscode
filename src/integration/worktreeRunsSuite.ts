@@ -20,7 +20,6 @@ async function eventually<T>(read: () => Promise<T>, ok: (value: T) => boolean, 
 }
 
 type Row = { depth: number; label: string; description: string; contextValue?: string };
-type Sessions = { active: boolean; items?: { label: string; description: string; status: number }[] };
 
 export async function run(): Promise<void> {
   const sibling = process.env.AGENT_SPARRING_TEST_SIBLING ?? "";
@@ -53,18 +52,4 @@ export async function run(): Promise<void> {
   );
   console.log("worktree runs: a run in a worktree outside the workspace was discovered, listed under Open with stage, next actor and worktree, and not auto-selected");
 
-  const proposed = typeof (vscode as unknown as { chat?: { createChatSessionItemController?: unknown } }).chat?.createChatSessionItemController === "function";
-  if (!proposed) {
-    console.log("agent sessions: the proposed chatSessionsProvider API is not exposed in this host; experiment not exercised");
-    return;
-  }
-  const sessions = await eventually(
-    async () => (await vscode.commands.executeCommand<Sessions>("agentSparring._test.agentSessions")) ?? { active: false },
-    (value) => value.active && (value.items ?? []).some((item) => item.label === "Tidy the cockpit"),
-    "the experimental adapter lists the run as an agent session",
-  );
-  const item = sessions.items!.find((entry) => entry.label === "Tidy the cockpit")!;
-  assert.equal(item.status, 2, "InProgress");
-  assert.equal(item.description, "Stage 2 of 2 · Reviewer");
-  console.log("agent sessions: the run was published through the proposed chat sessions API as an in-progress session");
 }

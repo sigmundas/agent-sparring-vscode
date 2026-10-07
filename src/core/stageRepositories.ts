@@ -34,7 +34,7 @@ import type { ManifestRepository } from "./manifest";
 
 /** One sibling repository, as the user declared it. */
 export interface DeclaredRepository {
-  /** Display name and the key the engine records the pin under (`sporely-web`). */
+  /** Display name and the key the engine records the pin under (`my-web`). */
   name: string;
   /** Absolute path of the sibling's repository root, as picked in this window. */
   path: string;
@@ -54,7 +54,7 @@ export interface DeclaredRepository {
  * And keyed by **worktree** as well, through the shared identity in
  * declarationScope.ts. A plan key is a hash of the plan's repo-relative path,
  * so every checkout of the same plan shares one; keyed by plan alone,
- * declaring `sporely-web` as Stage 3D's sibling in one worktree changed what
+ * declaring `my-web` as Stage 3D's sibling in one worktree changed what
  * every other worktree of that repository executes. Like a stage's mode, this
  * is not a display setting: it goes into the execution manifest, the engine
  * folds each declared repository's name, path, branch and candidate SHA into
@@ -206,7 +206,7 @@ export function manifestRepositories(byLabel: Record<string, DeclaredRepository[
   return out;
 }
 
-/** `../sporely-web-reported-statistics` for a sibling checkout next door; the absolute path when no relative one exists. */
+/** `../my-web-reports` for a sibling checkout next door; the absolute path when no relative one exists. */
 export function relativeRepositoryPath(repoRoot: string, repositoryPath: string): string {
   if (!path.isAbsolute(repositoryPath)) {
     return repositoryPath;
