@@ -1226,7 +1226,7 @@ export class OperationRegistry implements vscode.Disposable {
     return { overridden: true, view: resolved };
   }
 
-  /** One concise, durable host event: `prepare-plan sporely-py: starting`. */
+  /** One concise, durable host event: `prepare-plan my-app: starting`. */
   private brief(operation: Operation, text: string): void {
     this.log(`${operation.subcommand} ${path.basename(operation.cwd)}: ${text}`);
   }
