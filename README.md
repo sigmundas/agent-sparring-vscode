@@ -1,8 +1,10 @@
 # Agent Sparring for VS Code
 
-A thin desktop cockpit for the `agent-sparring` engine (the sibling Python project).
+A VS Code interface for the [agent-sparring engine](https://github.com/sigmundas/agent-sparring).
 The engine stays the authority; this extension only observes, launches and
 navigates.
+
+![Agent Sparring Overview showing a completed three-stage plan, stage agent and reviewer cards, and recent events](docs/Screenshot%202026-10-07%20at%2013.09.32.png)
 
 ## First run
 
@@ -17,6 +19,10 @@ navigates.
 | A Git repository with a writable intended remote | Required | See "Git and pushing" below. |
 | Per-project settings (`project.toml`) | Required, once per repository | Created by the engine's `init-config` (**Open Project Settings** → **Create project settings**). Test commands and project conventions belong there and in the project's own context, not in the extension. |
 | agent-sparring Claude Code plugin | Optional | Needed only for **Make Plan…** (both with Claude and with Codex). You can write a plan by hand instead. |
+
+The engine repository is currently private. You need access to it to follow
+the installation and Quickstart links or install its planning plugin. Readers
+without access will see a GitHub 404.
 
 Nothing database-specific is needed for ordinary runs; the engine's optional
 Supabase migration parser only matters to projects that use it.
@@ -54,7 +60,9 @@ runs `git push`.
    (`/agent-sparring:sparring-plan`), which audits the repository and writes
    a staged plan under `docs/plans/` without implementing or running
    anything. Review the generated plan.
-   **Run Plan only executes an existing plan.** It does not write one.
+   **Run Plan starts from an existing document.** With a compatible engine,
+   it can prepare an execution plan and ask you to resolve decisions before
+   starting. Use **Make Plan…** to turn an idea into a reviewed staged plan.
 
    Make Plan setup:
    - Install the planning skill: in Claude Code run
@@ -67,22 +75,28 @@ runs `git push`.
      (VS Code) was started with, not your integrated shell's `PATH`. If it
      reports the CLI was not found, start VS Code from a shell where the CLI
      is on `PATH` (for instance `code .`), or write the plan by hand.
-4. Open the repository and run **Agent Sparring: Run Plan**. A repository
-   without any `.sparring` state yet is fine. Running any Agent Sparring
-   command activates the extension, and **Open Project Settings** →
-   **Create project settings** runs the engine's `init-config`.
-5. In the Overview's **Agents** section, pick your model and effort. They
-   are your own preferences, shared by every repository that uses the same
-   provider for that role, and they are never written to the repository.
-   Leave them at **Provider default** to let each provider choose.
-6. After that, the **Overview** is where you continue a paused run, answer
+4. Open the repository and run **Agent Sparring: Open Project Settings**.
+   A repository without any `.sparring` state yet is fine. Running any Agent
+   Sparring command activates the extension; **Create project settings**
+   runs the engine's `init-config` if settings do not exist yet.
+5. Run **Agent Sparring: Open Overview**. On its **Stage agent** and
+   **Sparrer** cards, pick your model and effort. These are your own preferences, shared by every
+   repository that uses the same provider for that role, and are never
+   written to the repository. Leave them at **Provider default** to let each
+   provider choose.
+6. Run **Agent Sparring: Run Plan**, select the document and confirm the
+   branch. Review the Run Plan screen, answer any decisions the engine asks,
+   and press **Start** when it is ready. Preparation may use a read-only provider
+   turn before this confirmation. Older engines use the fallback described
+   in [Two ways to progress a plan](#two-ways-to-progress-a-plan).
+7. After that, the **Overview** is where you continue a paused run, answer
    checks, accept stages and apply setup fixes. Every one of those is an
    engine command.
 
 If the integrated terminal can't find `sparring`, run **Agent Sparring:
 Choose sparring Executable…** (see "Executable resolution").
 
-## What it does (V1 shell)
+## What it does
 
 - Detects every `.sparring/` directory in the workspace: directly under each
   workspace folder and in projects nested below one (a git worktree or a
@@ -98,19 +112,20 @@ Choose sparring Executable…** (see "Executable resolution").
   engine never writes them and the extension never invents them).
 - Attaches automatically to runs started from any terminal, and rediscovers
   everything from disk after a reload.
-- Launches `sparring run-plan` / `sparring resume-plan` / `sparring run-loop`
-  in an integrated terminal through the shell-integration API (executable +
+- Launches `sparring start-plan` / `sparring run-plan` / `sparring resume-plan` /
+  `sparring run-loop` in an integrated terminal through the shell-integration API (executable +
   argument array) and observes when the process ends; see "Runner lifecycle".
-- **Continues a whole plan automatically**: interprets the plan document once
-  into an execution manifest and hands it to the engine's managed run, which
-  then goes from stage to stage on its own and stops when it needs you. One
-  confirmation, at the start. See "Two ways to progress a plan".
+- **Continues a whole plan automatically**: the engine prepares and runs the
+  plan, moving from stage to stage and stopping when it needs you. The
+  extension presents its decisions, findings and confirmation. Older engines
+  use an extension-built manifest. See "Two ways to progress a plan".
 
 ## Commands
 
 | Command | Effect |
 | --- | --- |
-| `Agent Sparring: Run Plan` | Pick a plan Markdown file (`## Stage <n> — <title>` headings), confirm the branch, and start it the way `agentSparring.planContinuation` says a plan is run: in automatic mode the same managed, manifest-driven run **Continue automatically** starts; in manual mode `run-plan <plan>`. The branch is asked for here because nothing has been decided yet — this is the run that records it. If a run already exists for that plan it is continued, on its own recorded input kind, rather than started again. |
+| `Agent Sparring: Run Plan` | Pick a plan document and confirm the branch. When the engine supports `start-plan`, the Overview shows its preparation, decisions and execution summary; press **Start** to confirm. Otherwise, use the configured automatic/manual fallback. Starts a new run; an open run of the same plan offers continuation, while a completed run does not prevent a fresh start. |
+| `Agent Sparring: Make Plan…` | Choose an idea, INBOX or notes file and launch Claude or Codex with the installed planning skill to write a staged plan. See the setup in **First run**. |
 | `Agent Sparring: Resume Plan` | Pick a paused/running plan run, optionally record human evidence, launch `resume-plan`. The branch is *not* asked for: the run recorded `expected_branch` when it started and the engine refuses any other, so the checked-out branch is used when it matches and the mismatch is explained when it does not. |
 | `Agent Sparring: Run / Resume Stage` | For the selected standalone stage (or after picking one), launch `sparring run-loop <stage> --repo-root <project> --expected-branch <current branch>` in a terminal. The branch comes from the Git repository owning the project (built-in Git API, then `.git/HEAD`); a detached HEAD is refused, never guessed. Also offered as **Run stage** / **Resume stage** in the Overview. |
 | `Agent Sparring: Accept Stage` | For a stage whose independent review passed (**Review complete**): one action that runs the engine's `freeze-candidate` and, only if that succeeds, `accept-candidate` for the selected stage, project and current branch. Refusals are translated (uncommitted changes, not pushed, wrong branch, code changed after the review); the engine's own output goes to the Output Channel. Also offered as **Accept stage** in the Overview. |
@@ -125,10 +140,15 @@ Choose sparring Executable…** (see "Executable resolution").
 | `Agent Sparring: Copy Review Context for Chat` | For a stage the reviewer handed back to you: put the whole review on the clipboard as plain Markdown — the stage and its goal, the routing state, the reviewer's summary and note, every human-gate check with its instruction and pass criteria verbatim, the concrete names the review refers to, the latest handoff claims, the reviewer's findings and the stage's plan section — so it can be pasted into ChatGPT/Claude, an issue or a message and asked about. No provider prompts, model reasoning, command output or activity log. Also **Copy context for chat** in the Overview, beside **Open detailed review**, with **Copy this check** under each outstanding check. |
 | `Agent Sparring: Open Project Settings` | Open the active repository's `.sparring/project.toml` — where the provider for the stage agent and the sparrer is set. If the file does not exist yet, offers **Create project settings**, which runs the engine's own `sparring init-config` and opens what it wrote. Model and effort are your own preferences, outside every repository, and are changed on the Overview's actor cards through the engine's `sparring set-config`; nothing in the extension writes TOML. |
 | `Agent Sparring: Choose sparring Executable…` | Pick the `sparring` CLI with a file dialog and store it as `agentSparring.executable`. |
-| `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / finalizing / future stages), the current stage as primary content (the stage as the plan names it — `Stage 3D — title`, with `6 of 8` as secondary metadata — a human state word with one explaining sentence, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), latest sparring result, small Stage Agent / Sparrer cards, Brief / Handoff / Sparring report / Diff / Plan document / Log buttons, and quiet metadata (where the engine's own words live). Never auto-opens; updates in place. |
+| `Agent Sparring: Open Overview` | One editor-area Run Overview panel: compact plan journey (accepted / current / paused / finalizing / future stages), the current stage as primary content (the stage as the plan names it — `Stage 3D — title`, with `6 of 8` as secondary metadata — a human state word with one explaining sentence, loop cycle, the Goal paragraph from `brief.md`, `Working for Xm Ys` or the last visible event), latest sparring result, small Stage Agent / Sparrer cards, Brief / Handoff / Sparring report / Diff / Plan document / Log buttons, and quiet metadata (where the engine's own words live). Updates in place; Run Plan opens it to show preparation and confirmation. |
 | `Agent Sparring: Show Log` | Focus the Output Channel. |
 | `Agent Sparring: Follow Active Repository` | Release the pin and go back to automatic selection in whichever repository this window is in. Also the last group of Select Repository / Run, and a **Follow active repository** control at the top of the Overview whenever a pin is in force. |
-| `Agent Sparring: Select Run` | Choose explicitly when several runs look active; the choice *pins* that run, so it is kept even when the window moves to another repository, and the Overview says so. The choice is remembered per workspace. The list is grouped — *Plan runs* first, then *Standalone / historical stages* — and each row is labelled by what a person calls it (the plan document's title, the plan's own `Stage 3D — …` name for a stage), with the repository and the raw stage id in the detail line. |
+| `Agent Sparring: Select Repository / Run` | Choose explicitly when several runs look active; the choice *pins* that run, so it is kept even when the window moves to another repository, and the Overview says so. The choice is remembered per workspace. The list is grouped — *Plan runs* first, then *Standalone / historical stages* — and each row is labelled by what a person calls it (the plan document's title, the plan's own `Stage 3D — …` name for a stage), with the repository and the raw stage id in the detail line. |
+| `Agent Sparring: Choose Repository to Follow` | Choose a repository whose current work the Overview should follow regardless of the active editor. Releases any run pin. |
+| `Agent Sparring: Follow Active Editor` | Clear the chosen repository and run pin, then follow the active editor or Source Control focus again. |
+| `Agent Sparring: Clean Up Terminals` | Close idle Agent Sparring terminals, keep active or current terminals, and ask before closing old terminals whose activity cannot be established. |
+| `Agent Sparring: Confirm Previous Runner Is No Longer Active` | When runner status is unknown, record your confirmation that the previous command has ended and cannot start later. Releases that run's actions; does not change engine state or claim an operation succeeded. |
+| `Agent Sparring: Refresh Runs` | Refresh the Runs sidebar. Its item actions let you show a run in the Overview, open an external worktree in a new window, or copy the run key; its history controls show older runs or recent runs only. |
 | `Agent Sparring: Rediscover State` | Re-scan `.sparring` from disk. |
 | `Agent Sparring: Diagnose Discovery` | Trace discovery for every workspace folder into the Output Channel: scheme, path, the `.sparring` probed, nested projects, stage/plan files and whether they parsed (lifecycle status only), runs produced, whether the built-in Git extension's API is attached, the active repository and the roots runs were attributed against, the runs in other repositories — and the runs no known root owns — that automatic selection therefore did not consider, what Select Repository / Run would list (group, label, description and the raw stage id), and why nothing is selected. Never logs file contents. |
 
@@ -257,12 +277,14 @@ provider is set.
 ## Settings
 
 - `agentSparring.executable` — full path to `sparring`. Empty (the default)
-  hands the bare word `sparring` to your integrated shell, which resolves it
-  with its own `PATH` exactly as when you type it; the extension host's
-  `PATH` is never consulted for that, so "works in the terminal" means
-  "works from the button". See "Executable resolution" below.
-- `agentSparring.planContinuation` — `automatic` (default) or `manual`. See
-  "Two ways to progress a plan".
+  lets terminal launches use your integrated shell's `PATH` when shell
+  integration is available. Preparation, capability probes and direct
+  processes use the extension host's `PATH`; set the full path if those
+  cannot find your engine. See "Executable resolution" below.
+- `agentSparring.planContinuation` — `automatic` (default) or `manual` for
+  the legacy Run Plan fallback and per-stage continuation controls. When
+  `start-plan` is supported, the engine prepares Run Plan regardless of this
+  setting. See "Two ways to progress a plan".
 - **Make Plan…** does not use `agentSparring.executable`: it looks up `claude`
   or `codex` on the extension host's `PATH` (see "First run").
 - `agentSparring.pollIntervalMs` — fallback poll interval for the activity log.
@@ -279,6 +301,12 @@ provider is set.
 | `agentSparring.executable` set | Exactly that path (relative paths resolve against the project). It is validated before anything is launched. | `agentSparring.executable points at …, which does not exist or is not executable.` |
 | Nothing configured, no shell integration within 5 s | A best-effort `PATH` search in the extension host, then a dedicated terminal whose process is `sparring`. | `Agent Sparring could not resolve the CLI from this VS Code environment. Set agentSparring.executable to the full path.` (never a suggestion to reinstall the engine). |
 | Nothing configured, submitting free text (`--evidence`, `--deferred-result`) | The same host `PATH` search, because no shell is involved to do the resolving (see "Free-text arguments never go through a shell"). | Same message. If your shell finds `sparring` but VS Code's environment does not — a venv activated only by your shell profile, for instance — set `agentSparring.executable` to the full path and every route works. |
+
+Run Plan capability detection and preparation (`start-plan --help` and
+`start-plan --json`) use a direct process and the extension host's `PATH`.
+If the probe cannot resolve the engine or confirm support, Run Plan uses the
+legacy fallback. Set `agentSparring.executable` to the full path to make the
+engine available to preparation as well as terminal launches.
 
 Short commands (Accept stage) use the same rule: your shell through shell
 integration when available (the output is read back for translation and
@@ -340,8 +368,29 @@ words stay in tooltips, the metadata footer and the Output Channel.
 
 ## Two ways to progress a plan
 
-`agentSparring.planContinuation` picks one; both only ever run engine
-operations, and the extension never sequences stages itself.
+### Run Plan with a current engine
+
+When capability detection confirms `sparring start-plan` support, **Run Plan**
+asks the engine to prepare the selected document with `start-plan --json`.
+The Overview shows preparation progress, findings, any decisions you must
+answer, and the proposed stages, gates and execution settings. Preparation
+may use a read-only provider turn and write an intake before you press Start.
+The extension does not choose decision answers.
+
+When the engine reports **Ready to start**, **Start** submits the same inputs
+with its confirmation token. The engine checks that confirmation against the
+current files and owns execution, verification and acceptance. A refusal is
+shown with the engine's explanation. Resume continues the recorded run using
+its original Markdown or manifest input.
+
+### Legacy engines and stage-by-stage continuation
+
+If `start-plan` support cannot be confirmed, Run Plan uses the fallback below.
+`agentSparring.planContinuation` selects its automatic or manual mode and also
+controls per-stage continuation actions. The extension never sequences stages
+itself. The extension-built manifests and workspace declarations described
+below apply to this fallback and **Continue Plan Automatically**; they are
+not passed to the engine's `start-plan` preparation.
 
 **Continue automatically** (the default) treats the plan as the unit of work.
 The extension interprets the document once — which headings are canonical
@@ -529,13 +578,10 @@ the command builder refuses to assemble a mismatch at all. Historical
 Markdown runs therefore stay resumable exactly as they are; nothing migrates
 or rewrites a run's input kind.
 
-For the same reason, **Run plan…** starts a new plan the way the configured
-mode says a plan is run: in automatic mode it is the same managed,
-manifest-driven run that **Continue automatically** starts — same manifest,
-same preflight, same confirmation — and in manual mode it hands the plan's own
-path to `run-plan`. There is no second button that quietly starts the same
-plan on the other terms. If a run already exists for that plan, Run plan…
-continues it instead of starting a second one.
+In the legacy fallback, **Run Plan** starts a fresh manifest-driven run in
+automatic mode and hands the plan's own path to `run-plan` in manual mode.
+An open run of the same plan offers **Continue that run**; a completed run
+does not block a new one. Current engines use the `start-plan` flow above.
 
 **Pause after each stage** (`manual`) keeps the per-stage checkpoints below
 unchanged, for when you want to look before every provider turn. In automatic
@@ -733,6 +779,7 @@ run them.
 
 | Displayed fact | Source |
 | --- | --- |
+| Run Plan preparation, decisions, readiness and confirmation | `sparring start-plan --json`. The extension presents the engine's status, findings, stages and gates, forwards only the person's chosen answers, and submits the current engine-issued token when **Start** is pressed. Readiness is not acceptance; the engine rechecks the inputs when confirming and owns the resulting run. |
 | running / paused / complete, current stage index and id | `.sparring/plans/<key>.json` |
 | working / frozen / accepted per stage | `.sparring/stages/<id>/state.json` |
 | stage count and titles | the plan Markdown named in the run state — except for a run recorded with `source: "intake-manifest"` |
@@ -763,7 +810,6 @@ run them.
 | "Claude working", "Codex sparring", active-turn duration, loop cycle, last visible event, changed files, verdict chronology | `activity.jsonl` (observational only; the Overview and the Output Channel share one filter for what counts as visible activity) |
 | Goal paragraph in the Overview | `## Goal` in the current stage's `brief.md`, else the brief's own opening description (the plan section a generated brief embeds), else the plan section's opening paragraph. When there is none the section is omitted: a brief without a `## Goal` heading is a fact for `Agent Sparring: Diagnose`, not a Markdown complaint on the stage screen (display only) |
 | **Also reviews** — a stage's sibling repositories | *pinned by the engine* and *recorded for this stage* come from `repositories` in that stage's `state.json` (with the commit only when the freeze has pinned one); *declared in VS Code* is a declaration in workspace state that the engine has not written yet. Nothing here claims a sibling was reviewed or is current |
-
 | **Continue plan automatically** on a standalone stage | the associated plan plus the stage directories on disk. It creates a managed run (`run-plan --manifest … --adopt`); it never edits a stage. A stage already stopped at NEEDS_YOU or ESCALATE keeps that pause — the engine reads the recorded verdict and stops there, running neither agent |
 | A rebuilt manifest's `source_digest`, and why editing the plan's prose no longer ends a run | the manifest is regenerated on every invocation, and the engine folds `source_digest` — a hash of the whole plan document — into the digest that identifies a recorded run, refusing to continue when it changes. Recording a `## Stage 3D handoff — 2026-09-14 (…)` section in the plan, which the manifest builder deliberately excludes from execution and which the engine's own `plan_digest` says does not count, therefore used to end the run: a real managed run answered *the executable content of … has changed since this run started* with all eight executable stages byte-identical. So provenance is **carried forward**: when the manifest that would be written executes exactly what the manifest on disk executes — same version, plan label and stages, with the same ids, labels, titles, briefs and sibling repositories — it keeps that file's `source_digest`. Any difference in what would execute takes the new hash and the engine refuses exactly as before |
 | The journey of a manifest run, and the stage's own name | the execution manifest the run was handed (read back from the extension's global storage), plus each stage's own `state.json` for its status. So a manifest run's stage is called `Stage 3D — …` as the plan calls it, its position (`6 of 8`) is secondary metadata, and the journey shows every stage of the manifest. Shown only when the run's recorded current stage is one of the manifest's — a file describing a different sequence is ignored, and then only the recorded stage is shown |
@@ -955,9 +1001,11 @@ A selection stored before this distinction existed is kept as a pin.
 ### Every Run Plan is a new run
 
 A plan document is an *input* to a run, not the run's identity. Each run has a
-**run key** of its own (`<plan key>-<8 hex>`), and Run Plan mints one, names
-the run's stage ids with it (`<run key>-stage-1-foundation`) and passes it to
-the engine as `--run-key`.
+**run key** of its own. On the `start-plan` route, the engine supplies the
+identity: an intake slice reports its key before launch, while a direct run
+is discovered after the engine records it. In the legacy fallback, the
+extension mints a key (`<plan key>-<8 hex>`), names the stage ids with it
+(`<run key>-stage-1-foundation`) and passes it as `--run-key`.
 
 So Run Plan starts new work even when the repository, the branch and the plan
 file are the ones a previous run already finished, and even when the plan's
@@ -1195,10 +1243,11 @@ without `--enable-proposed-api`. Set `AGENT_SPARRING_VSCODE_VERSION` to an
 exact release or `stable` to run `out/integration/runFreshWorkspace.js` on
 another build.
 
-**Activation.** `activationEvents` lists only `workspaceContains:` patterns,
-so a window that already has Agent Sparring state activates the extension on
-open. A brand-new repository has none, and relies on VS Code (1.74 and later;
-`engines.vscode` requires 1.93) activating an extension when one of its
+**Activation.** `activationEvents` lists `workspaceContains:` patterns and
+`onView:agentSparring.runs`, so existing Agent Sparring state or opening the
+Runs view activates the extension. Commands also activate it in a brand-new
+repository: VS Code (1.74 and later; `engines.vscode` requires 1.93) activates
+an extension when one of its
 `contributes.commands` is invoked. `src/integration/freshWorkspaceSuite.ts`
 checks exactly that, so no redundant `onCommand:` events are declared.
 
@@ -1224,7 +1273,7 @@ npm test                                  # the TypeScript side against the pins
 
 # and the pins themselves against a live engine:
 AGENT_SPARRING_SRC=../agent-sparring/src PYTHON=/path/to/venv/bin/python3 \
-  npm run compile-tests && node --test out/test/manifestParity.test.js
+  npm run test:parity
 ```
 
 When the engine's manifest contract changes on purpose, regenerate the pins and
@@ -1292,6 +1341,7 @@ From a clone of this repository:
 ```sh
 npm install
 npm run package:vsix                     # writes agent-sparring-vscode-<version>.vsix here
+npm run check:vsix -- agent-sparring-vscode-0.1.0.vsix  # verify the packaged files
 code --install-extension agent-sparring-vscode-0.1.0.vsix   # use the filename it printed
 ```
 

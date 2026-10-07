@@ -13,6 +13,7 @@ const EXPECTED = [
   'LICENSE',
   'README.md',
   'dist/extension.js',
+  'docs/Screenshot 2026-10-07 at 13.09.32.png',
   'icons/icon.png',
   'package.json',
 ].sort();
