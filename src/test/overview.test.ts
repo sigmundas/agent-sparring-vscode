@@ -180,6 +180,8 @@ describe("overview view model", () => {
     assert.ok(!stageCard.includes("Latest sparring result") && !stageCard.includes("sparverdict"), "the stage card no longer carries the result");
     const sparrerCard = /<div class="card actor [^"]*" data-role="sparrer">[\s\S]*?<div class="cardfoot">[\s\S]*?<\/div><\/div>/.exec(html)?.[0] ?? "";
     assert.match(sparrerCard, /<div class="sparresult"><p class="sparverdict"><span class="verdict send_back"[^>]*>Changes requested<\/span>/);
+    // The verdict sits under the settings, so the two cards' controls line up.
+    assert.ok(sparrerCard.includes("agentconfig-block") && sparrerCard.indexOf("agentconfig-block") < sparrerCard.indexOf("sparresult"), "the verdict follows the model and effort controls");
     // Read feedback is a tab on the Sparrer card's footer line; the report opens below both cards.
     assert.match(sparrerCard, /<button type="button" class="showinstr" data-instr="feedback" aria-controls="feedback-sparrer" aria-expanded="false" data-show="Read feedback" data-hide="Hide feedback">Read feedback<\/button>/);
     assert.match(html, /<div class="instrpanel [^"]*" id="feedback-sparrer" data-instrpanel="feedback"[^>]* hidden>[\s\S]*?<div class="reportbody"><p>Long findings that must never reach the status bar\.<\/p><\/div>/);

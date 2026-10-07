@@ -1854,7 +1854,9 @@ function renderActor(
   ].join("");
   const technical = roleControls?.technical ?? "";
   const foot = tabs || technical ? `<div class="cardfoot">${tabs}${technical}</div>` : "";
-  return `<div class="card actor ${who}" data-role="${role}">${identity}${verdict}${settings}${foot}</div>`;
+  // The verdict sits under the settings, so both cards' model and effort
+  // controls start at the same height.
+  return `<div class="card actor ${who}" data-role="${role}">${identity}${settings}${verdict}${foot}</div>`;
 }
 
 /**
