@@ -18,6 +18,15 @@ verification and acceptance; the extension presents its state and invokes its co
 - **Navigate your work:** follow the active repository, inspect earlier runs,
   and open briefs, handoffs, diffs and captured agent instructions.
 
+Review at each stage aims to catch mistakes before later work builds on them.
+Corrections normally reuse each agent's separate conversation, and human checks
+that block the stage return to its reviewer. The Overview makes those checkpoints
+visible while the work is in progress.
+
+Context reuse may reduce repeated setup and explanation, but token usage, cost
+and completion time have not been benchmarked against other workflows. See the
+engine's [context reuse and its limits](https://github.com/sigmundas/agent-sparring/blob/main/docs/stages.md#feedback-and-context-continuity).
+
 ## Get started
 
 You need **VS Code 1.93+**, the separately installed **agent-sparring engine**
