@@ -22,6 +22,12 @@
     "workspace"
   ],
   "main": "./dist/extension.js",
+  "files": [
+    "dist/extension.js",
+    "icons/icon.png",
+    "README.md",
+    "LICENSE"
+  ],
   "activationEvents": [
     "workspaceContains:.sparring",
     "workspaceContains:.sparring/project.toml",
@@ -323,7 +329,8 @@
     "test:smoke": "npm run bundle && npm run compile-integration && AGENT_SPARRING_VSCODE_VERSION=1.93.1 node out/integration/runFreshWorkspace.js && AGENT_SPARRING_VSCODE_VERSION=stable node out/integration/runFreshWorkspace.js",
     "lint": "eslint src",
     "vscode:prepublish": "npm run build",
-    "package:vsix": "vsce package --no-dependencies"
+    "package:vsix": "vsce package --no-dependencies",
+    "check:vsix": "node scripts/check-vsix.js"
   },
   "devDependencies": {
     "@eslint/js": "^9.9.0",
