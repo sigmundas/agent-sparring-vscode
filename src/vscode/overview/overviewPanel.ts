@@ -96,7 +96,10 @@ export class OverviewPanelManager implements vscode.Disposable {
       localResourceRoots: [],
       retainContextWhenHidden: false,
     });
-    this.panel.iconPath = new vscode.ThemeIcon("debug-alt");
+    if (hostAcceptsThemeIconForPanels()) {
+      // Typed against the declared minimum (1.93), where only Uri icons exist.
+      (this.panel as { iconPath?: unknown }).iconPath = new vscode.ThemeIcon("debug-alt");
+    }
     this.panel.onDidDispose(() => {
       this.panel = undefined;
       this.lastHtmlKey = undefined;
@@ -910,4 +913,10 @@ export function overviewRenderKey(model: OverviewModel): string {
       submittable: panel.submittable.map(item => ({ ...item, record: { outcome: item.record.outcome } })),
     },
   });
+}
+
+/** Webview panels accept a ThemeIcon from VS Code 1.108; older hosts keep the default tab icon. */
+function hostAcceptsThemeIconForPanels(): boolean {
+  const [major, minor] = vscode.version.split(".").map((part) => Number.parseInt(part, 10));
+  return major > 1 || (major === 1 && minor >= 108);
 }

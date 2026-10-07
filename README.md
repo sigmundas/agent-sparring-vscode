@@ -1131,12 +1131,24 @@ npm run build      # typecheck + esbuild bundle to dist/
 npm test           # node:test unit tests against fake .sparring fixtures
 npm run lint
 npm run test:integration   # downloads VS Code once, opens a generated multi-root workspace, asserts discovery, runner lifecycle, bare-`sparring` resolution by the shell, command-not-found, Accept stage and plan association with a fake `sparring`; then opens an empty repository and asserts that invoking a command activates the extension
+npm run test:smoke         # the empty-repository activation check alone, at the declared minimum (VS Code 1.93.1) and at the current stable release
 ```
+
+**Supported VS Code.** `engines.vscode` is `^1.93.0`: the terminal shell
+execution events used during activation do not exist before 1.93. The
+`@types/vscode` devDependency is pinned to the same minor (`~1.93.0`) so the
+typechecker rejects any stable API newer than the declared minimum; a newer
+API may only be used behind a runtime version check (the Overview tab's theme
+icon is one). The manifest declares no proposed API, so the standard VSIX
+is eligible for the Marketplace and every integration runner launches it
+without `--enable-proposed-api`. Set `AGENT_SPARRING_VSCODE_VERSION` to an
+exact release or `stable` to run `out/integration/runFreshWorkspace.js` on
+another build.
 
 **Activation.** `activationEvents` lists only `workspaceContains:` patterns,
 so a window that already has Agent Sparring state activates the extension on
 open. A brand-new repository has none, and relies on VS Code (1.74 and later;
-`engines.vscode` requires 1.90) activating an extension when one of its
+`engines.vscode` requires 1.93) activating an extension when one of its
 `contributes.commands` is invoked. `src/integration/freshWorkspaceSuite.ts`
 checks exactly that, so no redundant `onCommand:` events are declared.
 

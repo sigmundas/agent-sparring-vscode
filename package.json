@@ -12,7 +12,7 @@
     "url": "https://github.com/sigmundas/agent-sparring-vscode.git"
   },
   "engines": {
-    "vscode": "^1.90.0",
+    "vscode": "^1.93.0",
     "node": ">=20"
   },
   "categories": [
@@ -230,11 +230,6 @@
           "minimum": 0,
           "maximum": 4,
           "markdownDescription": "How many directory levels below each workspace folder are searched for nested projects with their own `.sparring` (for example a git worktree or a monorepo package checked out under a parent folder). `0` probes only the workspace folders themselves. Hidden and dependency/build directories are never entered."
-        },
-        "agentSparring.experimental.agentSessions": {
-          "type": "boolean",
-          "default": false,
-          "markdownDescription": "**Experimental.** Also list Agent Sparring runs as agent sessions through VS Code's proposed chat sessions API (read-only). Takes effect only when VS Code exposes that proposed API to this extension (`--enable-proposed-api` or `enable-proposed-api` in `~/.vscode/argv.json`); in VS Code 1.140 such sessions appear in the Chat sessions list, not in the Agents window. The Runs view is unaffected."
         }
       }
     },
@@ -313,16 +308,7 @@
           "when": "false"
         }
       ]
-    },
-    "chatSessions": [
-      {
-        "type": "agent-sparring",
-        "name": "agentSparring",
-        "displayName": "Agent Sparring",
-        "description": "Agent Sparring plan runs (experimental, read-only).",
-        "when": "config.agentSparring.experimental.agentSessions"
-      }
-    ]
+    }
   },
   "scripts": {
     "build": "npm run typecheck && npm run bundle",
@@ -334,6 +320,7 @@
     "test:parity": "npm run compile-tests && node --test out/test/manifestParity.test.js",
     "compile-integration": "tsc -p tsconfig.integration.json",
     "test:integration": "npm run bundle && npm run compile-integration && node out/integration/runTests.js && node out/integration/runFreshWorkspace.js && node out/integration/runWorktreeRuns.js",
+    "test:smoke": "npm run bundle && npm run compile-integration && AGENT_SPARRING_VSCODE_VERSION=1.93.1 node out/integration/runFreshWorkspace.js && AGENT_SPARRING_VSCODE_VERSION=stable node out/integration/runFreshWorkspace.js",
     "lint": "eslint src",
     "vscode:prepublish": "npm run build",
     "package:vsix": "vsce package --no-dependencies"
@@ -341,7 +328,7 @@
   "devDependencies": {
     "@eslint/js": "^9.9.0",
     "@types/node": "^20.14.0",
-    "@types/vscode": "^1.90.0",
+    "@types/vscode": "~1.93.0",
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.23.0",
@@ -354,8 +341,5 @@
     "claude",
     "codex",
     "orchestration"
-  ],
-  "enabledApiProposals": [
-    "chatSessionsProvider"
   ]
 }

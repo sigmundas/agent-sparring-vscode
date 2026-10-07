@@ -23,8 +23,8 @@ export async function run(): Promise<void> {
   assert.equal(extension.isActive, true, "invoking a contributed command activates the extension");
 
   const commands = await vscode.commands.getCommands(true);
-  for (const id of ["agentSparring.runPlan", "agentSparring.openSettings"]) {
+  for (const id of ["agentSparring.runPlan", "agentSparring.openSettings", "agentSparring.openOverview", "agentSparring.runs.focus"]) {
     assert.ok(commands.includes(id), `${id} is registered once the extension is active`);
   }
-  console.log("fresh workspace: command activation ok");
+  console.log(`fresh workspace: command activation, Runs view and Overview registration ok on VS Code ${vscode.version}`);
 }
