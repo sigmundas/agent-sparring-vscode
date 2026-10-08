@@ -122,12 +122,21 @@ describe("Run Plan classifies the document before asking anything", () => {
     assert.ok(isStartPlanMessage({ type: "startPlan", action: "prepareIntake" }));
   });
 
-  it("an invalid staged plan shows the engine's refusal, not the planning-input advice", () => {
-    const view = startPlanView(classifiedSession("invalid", "Stage 2 appears twice"));
-    assert.equal(view.planningInput, undefined);
+  it("a staged-looking document check-plan cannot run directly (e.g. '## Stage S1') still offers the engine's intake, with check-plan's reason in view", () => {
+    // start-plan routes any document that is not a direct plan to its intake,
+    // so a check-plan refusal is not a dead end (sporely-py's 2026-10-07 plan).
+    const reason = "line 143 looks like a stage heading but does not follow the convention '## Stage <n> — <title>': '## Stage S1 — Orchestration completion design'";
+    const view = startPlanView(classifiedSession("invalid", reason));
+    assert.deepEqual(view.planningInput, { reason, staged: true });
+    assert.equal(view.refusal, undefined, "not shown as a refusal");
+    assert.equal(view.stateLabel, "Not a direct staged plan");
     const html = renderOverviewHtml({ kind: "startPlan", title: view.planName, startPlan: view }, "n", "vscode-resource:");
-    assert.ok(html.includes("Stage 2 appears twice"));
-    assert.ok(!html.includes(PLANNING_INPUT_TITLE));
+    assert.ok(html.includes(PLANNING_INPUT_TITLE));
+    assert.ok(html.includes(`data-startplan="prepareIntake"`), "Prepare intake is offered");
+    assert.ok(html.includes(`data-action="makePlanFromThis"`), "Make Plan… stays optional");
+    const technical = html.indexOf("<summary>Technical details</summary>");
+    assert.ok(html.indexOf("Stage S1 — Orchestration completion design") < technical, "the reason is in view, not only under Technical details");
+    assert.ok(!html.includes("Refused by the engine"));
   });
 });
 

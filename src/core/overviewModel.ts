@@ -3671,7 +3671,13 @@ export interface StartPlanView {
   /** The engine's refusal, verbatim. */
   refusal?: string;
   /** check-plan classified the document as planning input: Prepare intake or Make Plan…, with check-plan's reason. */
-  planningInput?: { reason: string };
+  /**
+   * Not a direct plan by check-plan: Prepare intake or Make Plan…, with
+   * check-plan's reason. `staged`: the document has stage-like sections the
+   * engine cannot run directly (e.g. `## Stage S1`); start-plan routes such
+   * a document to its intake, so intake is offered for it too.
+   */
+  planningInput?: { reason: string; staged?: boolean };
   /** start-plan printed something that is not a status, verbatim. */
   failure?: string;
   /** The one Start, carrying the exact token the engine printed. */
@@ -3715,12 +3721,14 @@ export function startPlanView(session: StartPlanSession): StartPlanView {
   if (session.classification) {
     // Nothing was prepared, so no provider turn could have been spent.
     view.providerTurnNotice = "";
+    // Either way the engine's start-plan would route this document to its
+    // intake rather than run it directly, so intake is offered for both.
     if (session.classification.kind === "planning-input") {
       view.stateLabel = "Planning input";
       view.planningInput = { reason: session.classification.reason };
     } else {
-      view.stateLabel = "Not a runnable plan";
-      view.refusal = session.classification.reason;
+      view.stateLabel = "Not a direct staged plan";
+      view.planningInput = { reason: session.classification.reason, staged: true };
     }
     return view;
   }

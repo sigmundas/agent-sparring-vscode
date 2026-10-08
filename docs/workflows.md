@@ -57,7 +57,10 @@ branch is changed or `start-plan` runs. Stage headings inside fenced examples do
 not count as stage sections. In automatic mode a staged plan runs as the
 execution manifest the extension builds, so a Markdown refusal is checked again
 with `check-plan --manifest --json` against that manifest before the plan is
-refused; a plan refused both ways shows the engine's reason. When the engine
+refused. A plan refused both ways, for example one with `## Stage S1 — …`
+sections, is not one `start-plan` runs directly, but its intake route can still
+analyze it. So the same screen offers **Prepare intake** and **Make Plan…**,
+with the reason from `check-plan` in view. When the engine
 cannot classify the document at all (not reachable, no `check-plan`, or an
 answer it cannot read), Run Plan stops with that reason and asks nothing else.
 **Close** returns to

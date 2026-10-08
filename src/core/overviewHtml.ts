@@ -2182,14 +2182,20 @@ function operationTechnical(model: OverviewModel, which: string, lines: readonly
  * choices — the engine's intake, or another planning pass — and the one
  * limitation of the intake route, stated rather than hidden.
  */
-function renderPlanningInput(reason: string): string {
+function renderPlanningInput(input: { reason: string; staged?: boolean }): string {
+  // A staged-looking document check-plan cannot run directly: its reason is
+  // the point, so it stays in view rather than under Technical details.
+  const notDirect = input.staged
+    ? `<p class="muted">${icon("warn", "escalate")}check-plan cannot run it directly as a '## Stage &lt;n&gt; — &lt;title&gt;' plan: <code>${escapeHtml(input.reason)}</code></p>`
+    : "";
   return `<section class="card planning-input">
 <h2>${escapeHtml(PLANNING_INPUT_TITLE)}</h2>
 <p>${escapeHtml(PLANNING_INPUT_LEAD)}</p>
+${notDirect}
 <div class="actions"><button type="button" class="primary" data-startplan="prepareIntake" title="${escapeHtml(PREPARE_INTAKE_TITLE)}">${escapeHtml(PREPARE_INTAKE)}</button>${button("makePlanFromThis", MAKE_PLAN_AGAIN, true, MAKE_PLAN_AGAIN_NOTE)}</div>
 <p class="muted small">${escapeHtml(MAKE_PLAN_AGAIN)} — ${escapeHtml(MAKE_PLAN_AGAIN_NOTE)}</p>
 <p class="muted small planning-input-limitation">${icon("warn", "escalate")}${escapeHtml(MANAGED_INTAKE_LIMITATION)}</p>
-<details class="tech"><summary>Technical details</summary><p class="muted small">check-plan said:</p><pre class="engineerror">${escapeHtml(reason)}</pre></details>
+<details class="tech"><summary>Technical details</summary><p class="muted small">check-plan said:</p><pre class="engineerror">${escapeHtml(input.reason)}</pre></details>
 </section>`;
 }
 
@@ -2238,7 +2244,7 @@ ${view.summary.laterSlices.map((line) => `<p class="muted">${escapeHtml(line)}</
 ${view.providerTurnNotice ? `<p class="muted start-notice">${escapeHtml(view.providerTurnNotice)}</p>` : ""}
 ${view.preparing ? `<p class="start-preparing">${icon("sync")}The engine is preparing the plan…</p>` : ""}
 ${view.intake ? `<p>${escapeHtml(view.intake.line)}</p>` : view.route === "direct" ? "<p>Direct route: the plan's own stages run as written.</p>" : ""}
-${view.planningInput ? renderPlanningInput(view.planningInput.reason) : view.refusal ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}Refused by the engine. Nothing was approved or run.</p><pre class="engineerror">${escapeHtml(view.refusal)}</pre></div>` : ""}
+${view.planningInput ? renderPlanningInput(view.planningInput) : view.refusal ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}Refused by the engine. Nothing was approved or run.</p><pre class="engineerror">${escapeHtml(view.refusal)}</pre></div>` : ""}
 ${view.failure ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}start-plan did not report a status.</p><pre class="engineerror">${escapeHtml(view.failure)}</pre></div>` : ""}
 ${decisions}
 ${findings}

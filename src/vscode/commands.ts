@@ -1147,7 +1147,7 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       // The document on screen, and only while the screen still shows the
       // engine's check-plan classifying it as planning input; otherwise Make Plan asks.
       const shown = overview.startPlanSession;
-      const fromThis = shown?.classification?.kind === "planning-input" && startPlanContext?.planPath === shown.planPath ? startPlanContext : undefined;
+      const fromThis = shown?.classification !== undefined && startPlanContext?.planPath === shown.planPath ? startPlanContext : undefined;
       return makePlanCommand(makePlanDeps(controller, overview), fromThis ? { location: fromThis.location, source: fromThis.planPath } : undefined);
     }
     case "resumePlan":
@@ -3167,7 +3167,9 @@ async function handleStartPlanMessage(controller: SparringController, overview: 
       return;
     }
     case "prepareIntake":
-      if (session.classification?.kind === "planning-input") {
+      // Planning input, or a staged-looking document check-plan cannot run
+      // directly: either way start-plan's intake route is the engine's to try.
+      if (session.classification) {
         await prepareIntakeInCheckout(controller, overview, context);
       }
       return;
