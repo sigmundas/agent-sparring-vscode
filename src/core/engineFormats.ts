@@ -1182,6 +1182,10 @@ export interface IsolatedRun {
    * gave one this version reads. The only source of "Ready to merge".
    */
   finish?: FinishCheck;
+  /** Why an embedded finish object was not read (schema mismatch, another run's, malformed); reported, never guessed at. */
+  finishProblem?: string;
+  /** When the extension received {@link finish} from the engine; stamped by the reader, not the engine. */
+  finishCheckedAtMs?: number;
 }
 
 export type IsolatedRunsReport = { kind: "runs"; runs: IsolatedRun[] } | { kind: "version-mismatch"; version: unknown };
@@ -1229,7 +1233,7 @@ export function parseIsolatedRuns(text: string): IsolatedRunsReport {
         targetBranch: requireString(raw, "target_branch"),
         lifecycle: lifecycle as IsolatedRunLifecycle,
         runStatus: requireString(raw, "run_status"),
-        ...listedFinish(raw["finish"]),
+        ...listedFinish(raw["finish"], requireString(raw, "run_key")),
       };
     }),
   };
@@ -1240,15 +1244,24 @@ export function parseIsolatedRuns(text: string): IsolatedRunsReport {
  * output — but a missing, unknown-version or malformed one only withholds
  * "Ready to merge"; it never hides the run.
  */
-function listedFinish(raw: unknown): { finish?: FinishCheck } {
-  if (!isRecord(raw)) {
+function listedFinish(raw: unknown, runKey: string): { finish?: FinishCheck; finishProblem?: string } {
+  if (raw === undefined || raw === null) {
     return {};
+  }
+  if (!isRecord(raw)) {
+    return { finishProblem: 'field "finish" must be a JSON object' };
   }
   try {
     const report = finishCheckFrom(raw);
-    return report.kind === "finish" ? { finish: report.finish } : {};
-  } catch {
-    return {};
+    if (report.kind === "version-mismatch") {
+      return { finishProblem: `engine/extension mismatch: the finish check reported schema_version ${JSON.stringify(report.version)}, and this extension reads only ${FINISH_RUN_SCHEMA_VERSION}` };
+    }
+    if (report.finish.runKey !== runKey) {
+      return { finishProblem: `the finish check is for run ${report.finish.runKey}, not ${runKey}` };
+    }
+    return { finish: report.finish };
+  } catch (error) {
+    return { finishProblem: `the finish check could not be read: ${(error as Error).message}` };
   }
 }
 

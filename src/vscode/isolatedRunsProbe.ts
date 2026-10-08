@@ -71,7 +71,14 @@ export class IsolatedRunsProbe {
         );
         return { ok: false, runs: [] };
       }
-      return { ok: true, runs: report.runs };
+      // Stamped on receipt: "Ready to merge" is shown only while this answer is fresh.
+      const atMs = Date.now();
+      for (const run of report.runs) {
+        if (run.finishProblem) {
+          this.once(`${root}: ${run.runKey}: ${run.finishProblem}`, `sparring runs --json for ${root}, run ${run.runKey}: ${run.finishProblem}. Ready to merge is not shown for it.`);
+        }
+      }
+      return { ok: true, runs: report.runs.map((run) => (run.finish ? { ...run, finishCheckedAtMs: atMs } : run)) };
     } catch (error) {
       const reason = error instanceof EngineFormatError ? error.message : String(error);
       this.once(`${root}: ${reason}`, `sparring runs --json for ${root} could not be read: ${reason}`);

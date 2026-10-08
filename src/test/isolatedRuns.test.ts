@@ -51,7 +51,19 @@ function engineRun(overrides: Record<string, unknown> = {}): Record<string, unkn
     lifecycle: "created",
     run_status: "running",
     git: {},
-    finish: {},
+    // The engine's own finish check for this run, as `runs --json` embeds it.
+    finish: {
+      schema_version: 1,
+      run_key: overrides["run_key"] ?? KEY,
+      managed: true,
+      eligible: { merge: false, cleanup: false },
+      merge_mode: null,
+      actions: [],
+      checks: [{ code: "run_not_complete", ok: false, detail: "the run is running, not complete" }],
+      deleted_ignored_paths: [],
+      kept: [],
+      summary: "cannot be finished: run_not_complete",
+    },
     ...overrides,
   };
 }
@@ -100,6 +112,16 @@ describe("sparring runs --json", () => {
         targetBranch: "main",
         lifecycle: "created",
         runStatus: "running",
+        finish: {
+          runKey: KEY,
+          eligible: { merge: false, cleanup: false },
+          mergeMode: null,
+          actions: [],
+          checks: [{ code: "run_not_complete", ok: false, detail: "the run is running, not complete" }],
+          deletedIgnoredPaths: [],
+          kept: [],
+          summary: "cannot be finished: run_not_complete",
+        },
       },
     ]);
   });

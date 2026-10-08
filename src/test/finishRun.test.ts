@@ -14,7 +14,7 @@ import { discoverRuns, selectRun } from "../core/discovery";
 import { parseFinishCheck, parseFinishResult, parseIsolatedRuns, type IsolatedRun } from "../core/engineFormats";
 import { checkSentence, mergeAndCleanUp, readyToMerge, type FinishChoice, type FinishNotice, type FinishPrompt, type FinishRunEffects, type FinishTarget } from "../core/finishRun";
 import { renderOverviewHtml } from "../core/overviewHtml";
-import { buildOverviewModel } from "../core/overviewModel";
+import { READY_FRESH_MS, buildOverviewModel } from "../core/overviewModel";
 import { FOO_PLAN_KEY, FOO_PLAN_LABEL, FOO_STAGE_IDS, Workspace, sparringMarkdown } from "./fixtures";
 
 const KEY = "isolated-demo-0badf00d";
@@ -118,9 +118,15 @@ describe("finish-run JSON", () => {
     };
     assert.equal(readyToMerge(read(dry()).finish), true);
     assert.equal(readyToMerge(read(dry({ eligible: { merge: true, cleanup: false } })).finish), false);
-    assert.equal(read({ schema_version: 9 }).finish, undefined);
-    assert.equal(read({ schema_version: 1, eligible: "yes" }).finish, undefined);
+    const mismatch = read({ schema_version: 9 });
+    assert.equal(mismatch.finish, undefined);
+    assert.match(mismatch.finishProblem ?? "", /engine\/extension mismatch.*schema_version 9/);
+    assert.ok(read({ schema_version: 1, eligible: "yes" }).finishProblem);
+    const other = read(dry({ run_key: "someone-else" }));
+    assert.equal(other.finish, undefined, "another run's finish check is never this run's");
+    assert.match(other.finishProblem ?? "", /someone-else/);
     assert.equal(read(undefined).finish, undefined);
+    assert.equal(read(undefined).finishProblem, undefined);
   });
 });
 
@@ -139,12 +145,18 @@ describe("Merge & clean up", () => {
     assert.deepEqual(h.runs, [["finish-run", "--repo-root", ROOT, "--run-key", KEY, "--json"]]);
     assert.equal(outcome.kind, "finished");
     assert.equal(h.notices.at(-1)?.kind, "finished");
+    // Technical facts go to diagnostics, never the dialog.
+    for (const text of [prompt.message, prompt.detail]) {
+      assert.doesNotMatch(text, /sparring\/demo-0badf00d|abc|would:|unmanaged|run_not_complete|isolated-demo/);
+    }
+    assert.ok(prompt.technical.some((line) => line.includes("sparring/demo-0badf00d")));
   });
 
   it("with a remote: says the remote branch is kept and offers a separate push choice", async () => {
     const plain = harness({ answers: [dry({ kept: REMOTE_KEPT })] });
     await mergeAndCleanUp(TARGET, plain.effects);
     assert.match(plain.prompts[0].detail, /remote is kept/);
+    assert.doesNotMatch(plain.prompts[0].detail, /remote_delete_unavailable|origin\//);
     assert.deepEqual(plain.prompts[0].choices.map((choice) => choice.label), ["Merge & clean up", "Merge, push main & clean up"]);
     assert.ok(!plain.runs[0].includes("--push-target"), "push only when chosen");
 
@@ -228,18 +240,20 @@ describe("Merge & clean up", () => {
 });
 
 describe("Ready to merge on the cockpit", () => {
-  async function completeRun(isolatedRun: IsolatedRun | undefined) {
+  async function completeRun(isolatedRun: IsolatedRun | undefined, nowMs = Date.now()) {
     const ws = await Workspace.create();
     await ws.writePlan();
     await ws.writePlanRun(FOO_PLAN_KEY, { plan: FOO_PLAN_LABEL, status: "complete", current_stage_index: 2, current_stage: FOO_STAGE_IDS[2], expected_branch: "main" });
     await ws.writeStage(FOO_STAGE_IDS[2], { status: "accepted" }, { "sparring.md": sparringMarkdown("READY", "Done.") });
-    const model = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, { handoff: false, sparring: true, brief: false, plan: true, planText: "# Foo plan\n", git: { branch: "main" }, isolatedRun }, Date.now());
+    const model = buildOverviewModel(selectRun((await discoverRuns([ws.location])).runs), undefined, { handoff: false, sparring: true, brief: false, plan: true, planText: "# Foo plan\n", git: { branch: "main" }, isolatedRun }, nowMs);
     return { model, html: renderOverviewHtml(model, "n", "c") };
   }
-  const listed = (finish?: Record<string, unknown>): IsolatedRun => {
+  const listed = (finish?: Record<string, unknown>, checkedAtMs: number = Date.now()): IsolatedRun => {
     const report = parseIsolatedRuns(JSON.stringify({ schema_version: 1, runs: [{ run_key: FOO_PLAN_KEY, plan_label: FOO_PLAN_LABEL, managed: true, worktree_path: "/w", worktree_exists: true, branch: "b", target_branch: "main", lifecycle: "created", run_status: "complete", ...(finish ? { finish } : {}) }] }));
-    return report.kind === "runs" ? report.runs[0] : (undefined as never);
+    const run = report.kind === "runs" ? report.runs[0] : (undefined as never);
+    return run.finish ? { ...run, finishCheckedAtMs: checkedAtMs } : run;
   };
+  const own = (overrides: Record<string, unknown> = {}) => dry({ run_key: FOO_PLAN_KEY, ...overrides });
 
   it("offers Merge & clean up for a complete isolated run, and says Ready to merge only from the engine's dry run", async () => {
     const unchecked = await completeRun(listed());
@@ -247,11 +261,26 @@ describe("Ready to merge on the cockpit", () => {
     assert.match(unchecked.html, /data-action="mergeCleanUp"/);
     assert.doesNotMatch(unchecked.html, /Ready to merge/, "complete alone is not ready to merge");
 
-    const refused = await completeRun(listed(dry({ eligible: { merge: false, cleanup: false } })));
+    const refused = await completeRun(listed(own({ eligible: { merge: false, cleanup: false } })));
     assert.doesNotMatch(refused.html, /Ready to merge/);
 
-    const ready = await completeRun(listed(dry()));
+    const ready = await completeRun(listed(own()));
     assert.match(ready.html, /Ready to merge/);
+  });
+
+  it("withholds Ready to merge once the engine's answer is no longer fresh", async () => {
+    const now = Date.now();
+    const stale = await completeRun(listed(own(), now - READY_FRESH_MS - 1), now);
+    assert.doesNotMatch(stale.html, /Ready to merge/);
+    assert.match(stale.html, /data-action="mergeCleanUp"/, "still offered; the click re-checks");
+    const fresh = await completeRun(listed(own(), now - 1_000), now);
+    assert.match(fresh.html, /Ready to merge/);
+  });
+
+  it("never shows another run's eligibility as this run's", async () => {
+    const { html, model } = await completeRun(listed(dry({ run_key: "isolated-other-00000000" })));
+    assert.ok(model.finishRun);
+    assert.doesNotMatch(html, /Ready to merge/);
   });
 
   it("is not offered for a run in this checkout", async () => {

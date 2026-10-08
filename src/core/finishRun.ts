@@ -39,6 +39,8 @@ export interface FinishPrompt {
   kind: "confirm" | "merge-commit";
   message: string;
   detail: string;
+  /** Branch, actions with SHAs and paths, check codes: for diagnostics (the log), never the dialog. */
+  technical: string[];
   choices: FinishChoice[];
 }
 
@@ -146,10 +148,8 @@ function mergeCommitPrompt(target: FinishTarget, finish: FinishCheck): FinishPro
   return {
     kind: "merge-commit",
     message: `${target.targetBranch} has moved on since this run started, so it can only be merged with a merge commit.`,
-    detail: [
-      `This run's work cannot simply be added on top of ${target.targetBranch}. A merge commit joins the two histories instead. Nothing is merged yet: Agent Sparring checks again with a merge commit allowed, then asks you to confirm.`,
-      technical(target, finish),
-    ].join("\n\n"),
+    detail: `This run's work cannot simply be added on top of ${target.targetBranch}. A merge commit joins the two histories instead. Nothing is merged yet: Agent Sparring checks again with a merge commit allowed, then asks you to confirm.`,
+    technical: technical(target, finish),
     choices: [{ label: "Check with a merge commit", pushTarget: false, allowMergeCommit: true }],
   };
 }
@@ -174,19 +174,17 @@ function confirmPrompt(target: FinishTarget, finish: FinishCheck, allowMergeComm
   if (remote) {
     lines.push(`The run's branch on the remote is kept; Agent Sparring never deletes it. ${into} is pushed only if you choose "Merge, push ${into} & clean up".`);
   }
-  lines.push(technical(target, finish));
   const mergeCommit = allowMergeCommit && finish.mergeMode === "merge_commit";
   const verb = mergeCommit ? "Merge with a merge commit" : "Merge";
   const choices: FinishChoice[] = [{ label: `${verb} & clean up`, pushTarget: false, allowMergeCommit: mergeCommit }];
   if (remote) {
     choices.push({ label: `${verb}, push ${into} & clean up`, pushTarget: true, allowMergeCommit: mergeCommit });
   }
-  return { kind: "confirm", message: `Merge "${target.planLabel}" into ${into} and clean up its workspace?`, detail: lines.join("\n\n"), choices };
+  return { kind: "confirm", message: `Merge "${target.planLabel}" into ${into} and clean up its workspace?`, detail: lines.join("\n\n"), technical: technical(target, finish), choices };
 }
 
-function technical(target: FinishTarget, finish: FinishCheck): string {
-  const rows = [`Technical details: run ${target.runKey}, branch ${target.branch} → ${target.targetBranch}`, ...finish.actions.map((action) => `would: ${action}`), ...finish.kept.map((kept) => `kept (${kept.code}): ${kept.detail}`)];
-  return rows.join("\n");
+function technical(target: FinishTarget, finish: FinishCheck): string[] {
+  return [`run ${target.runKey}, branch ${target.branch} → ${target.targetBranch}`, ...finish.actions.map((action) => `would: ${action}`), ...finish.kept.map((kept) => `kept (${kept.code}): ${kept.detail}`), ...finish.checks.map((item) => `[${item.ok ? "ok" : "NO"}] ${item.code}: ${item.detail}`)];
 }
 
 function ineligibleNotice(target: FinishTarget, finish: FinishCheck): FinishNotice {

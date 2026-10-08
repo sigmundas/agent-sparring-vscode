@@ -1826,7 +1826,7 @@ function buildScreen(
   // whatever else it happens to be stopped on, and a note that disappears
   // when another panel opens is a note that cannot be relied on.
   model.deferredNote = deferredNote(run, outcome);
-  model.finishRun = finishRunOffer(run, artifacts);
+  model.finishRun = finishRunOffer(run, artifacts, nowMs);
   model.pushAuthorization = pushAuthorization(run, artifacts, model, branchGuard, liveness);
   if (model.pushAuthorization) {
     // The run is stopped on a permission, not on a review. Nothing that would
@@ -1927,6 +1927,9 @@ export function branchMismatch(run: RunSnapshot, artifacts: OverviewArtifacts): 
  * while the branch is wrong (the engine refuses the resume outright), and
  * while a stage-accept operation of this window is in flight.
  */
+/** How long the engine's finish check backs "Ready to merge"; the controller re-asks more often than this while it is offered. */
+export const READY_FRESH_MS = 10_000;
+
 export interface FinishRunOffer {
   ready: boolean;
   text: string;
@@ -1938,7 +1941,7 @@ export interface FinishRunOffer {
  * created and has not finished with. Whether it can actually go ahead is
  * the engine's dry run's to say, when the button is pressed.
  */
-function finishRunOffer(run: RunSnapshot, artifacts: OverviewArtifacts): FinishRunOffer | undefined {
+function finishRunOffer(run: RunSnapshot, artifacts: OverviewArtifacts, nowMs: number): FinishRunOffer | undefined {
   const isolated = artifacts.isolatedRun;
   if (run.kind !== "plan" || run.state.status !== "complete" || !isolated) {
     return undefined;
@@ -1946,7 +1949,10 @@ function finishRunOffer(run: RunSnapshot, artifacts: OverviewArtifacts): FinishR
   if (isolated.lifecycle === "creating" || isolated.lifecycle === "creation_failed" || isolated.lifecycle === "finished") {
     return undefined;
   }
-  const ready = readyToMerge(isolated.finish);
+  // Only an answer the engine gave moments ago, for this run: the target
+  // checkout can change without any event this window sees.
+  const fresh = isolated.finishCheckedAtMs !== undefined && nowMs - isolated.finishCheckedAtMs <= READY_FRESH_MS && isolated.finish?.runKey === isolated.runKey;
+  const ready = fresh && readyToMerge(isolated.finish);
   return {
     ready,
     text: ready

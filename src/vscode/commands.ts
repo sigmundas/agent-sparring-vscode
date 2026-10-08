@@ -3125,6 +3125,11 @@ async function mergeCleanUpCommand(controller: SparringController, run: PlanRunS
   const outcome = await mergeAndCleanUp(target, {
     dryRun: (args) => engineReadOnlyQuery(configuredExecutable(), args, repoRoot),
     choose: async (prompt) => {
+      // The engine's technical facts go to the Output Channel (Show Log), not the dialog.
+      controller.log(`Merge & clean up: ${prompt.message}`);
+      for (const line of prompt.technical) {
+        controller.log(`  ${line}`);
+      }
       const picked = await vscode.window.showWarningMessage(prompt.message, { modal: true, detail: prompt.detail }, ...prompt.choices.map((choice) => choice.label));
       return prompt.choices.find((choice) => choice.label === picked);
     },

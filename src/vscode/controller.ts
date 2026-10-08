@@ -153,6 +153,8 @@ export type RunWorkspaceChoice = "isolated" | "checkout";
 const OUTPUT_CHANNEL_NAME = "Agent Sparring";
 /** How often a pending start in its own workspace asks the engine again. */
 const ISOLATED_START_POLL_MS = 3_000;
+/** Below READY_FRESH_MS, so a fresh answer replaces the last before it lapses. */
+const FINISH_READINESS_POLL_MS = 4_000;
 /** How often the process table may be read for one run whose liveness nothing in this window watched. */
 const PROBE_COOLDOWN_MS = 15_000;
 
@@ -593,6 +595,7 @@ export class SparringController implements vscode.Disposable {
     this.pollInterval = setInterval(() => {
       void this.pollActivity();
       this.pollPendingIsolatedStart();
+      this.pollFinishReadiness();
     }, interval);
   }
 
@@ -1939,6 +1942,28 @@ export class SparringController implements vscode.Disposable {
     }
     this.lastIsolatedPollMs = Date.now();
     this.worktreeProbe.invalidate();
+    this.isolatedRunsProbe.invalidate();
+    this.scheduleRefresh();
+  }
+
+  private lastReadinessPollMs = 0;
+
+  /**
+   * While a complete run in its own workspace is on screen, ask the engine
+   * for its finish check again every few seconds, so "Ready to merge" stays
+   * the engine's answer for the current state (READY_FRESH_MS withholds it
+   * otherwise). Read-only.
+   */
+  private pollFinishReadiness(): void {
+    if (Date.now() - this.lastReadinessPollMs < FINISH_READINESS_POLL_MS) {
+      return;
+    }
+    const selected = this.currentSelection.selected;
+    const isolated = selected && selected.kind === "plan" && selected.state.status === "complete" ? this.isolatedRunFor(selected) : undefined;
+    if (!isolated || isolated.run.lifecycle === "finished") {
+      return;
+    }
+    this.lastReadinessPollMs = Date.now();
     this.isolatedRunsProbe.invalidate();
     this.scheduleRefresh();
   }
