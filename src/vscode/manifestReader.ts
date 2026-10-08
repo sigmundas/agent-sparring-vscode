@@ -134,6 +134,30 @@ export class ManifestReader {
     }
     return best ?? { binding: bindParsedManifest(parsed, binding, expect), file: manifestFileName(run.runKey, run.location.projectDir), derived: false };
   }
+
+  /**
+   * {@link readBound}, then — only when that refuses — the same strict read
+   * as if `run` were in each of `otherOwners`: the checkouts a run in its own
+   * workspace may have been started from, whose manifest was written before
+   * its worktree existed. Every check still applies (sidecar, digest, plan
+   * label, current stage); a legacy derived proof is not accepted there.
+   */
+  async readBoundAmong(directory: string, run: ManifestRun, peers: readonly ManifestRun[], otherOwners: readonly string[]): Promise<BoundManifest> {
+    const bound = await this.readBound(directory, run, peers);
+    if (bound.binding.ok) {
+      return bound;
+    }
+    for (const projectDir of otherOwners) {
+      if (path.resolve(projectDir) === path.resolve(run.location.projectDir)) {
+        continue;
+      }
+      const other = await this.readBound(directory, { ...run, location: { ...run.location, projectDir } }, peers);
+      if (other.binding.ok && !other.derived) {
+        return other;
+      }
+    }
+    return bound;
+  }
 }
 
 function sameOwner(a: ManifestRun, b: ManifestRun): boolean {

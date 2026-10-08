@@ -13,7 +13,11 @@ import { describe, it } from "node:test";
 import { install } from "./vscodeStub";
 install();
 import { buildResumePlanArgs, buildRunPlanArgs, buildRunsArgs } from "../core/cli";
-import { discoverRuns, locateExternalWorktree, type RunSnapshot } from "../core/discovery";
+import { discoverRuns, locateExternalWorktree, locateRecordedWorktree, type PlanRunSnapshot, type RunSnapshot } from "../core/discovery";
+import { manifestDigest, manifestPathFor, renderBindingRecord, renderManifest, bindingPathFor, sourceDigest, BINDING_VERSION, type ExecutionManifest } from "../core/manifest";
+import { autoPushScope } from "../core/presentation";
+import { ManifestReader } from "../vscode/manifestReader";
+import { ManifestStore, Workspace, recordPlanDigest } from "./fixtures";
 import { parseIsolatedRuns, EngineFormatError, type IsolatedRun } from "../core/engineFormats";
 import { readStartPlanRuns, reconcileStartedRuns, type PendingStartedRun } from "../core/startPlanBinding";
 import { externalWorktrees, isolatedRunAt, isolatedWorktreeLists, parseWorktreeList, type IsolatedRunsOfRepository } from "../core/worktrees";
@@ -221,5 +225,68 @@ describe("following a run in its own workspace by its key", () => {
     const result = reconcileStartedRuns({ pending: [pending], bindings: {} }, [run("/hand-made"), run("/elsewhere/wt", "other-key")], () => "running", owns);
     assert.deepEqual(result.bound, []);
     assert.equal(result.state.pending.length, 1);
+  });
+});
+
+describe("review fixes", () => {
+  it("finds a nested project inside a recorded worktree, owned by the record", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "isolated-nested-"));
+    try {
+      const tree = path.join(tmp, `repo-sparring-${KEY}`);
+      const nested = path.join(tree, "subproject");
+      await fs.mkdir(path.join(nested, ".sparring", "plans"), { recursive: true });
+      assert.equal(await locateExternalWorktree({ path: tree, siblingOf: "/repo" }), undefined, "the root-only probe misses it");
+      const found = await locateRecordedWorktree({ path: tree, siblingOf: "/repo" });
+      assert.deepEqual(found.map((location) => location.projectDir), [nested]);
+      assert.equal(found[0].external?.siblingOf, "/repo");
+      const reports: IsolatedRunsOfRepository[] = [{ repoRoot: "/repo", runs: runsOf(runsJson([engineRun({ worktree_path: tree })])) }];
+      assert.ok(isolatedRunAt(reports, KEY, nested), "the record's worktree contains the nested project");
+    } finally {
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("an isolated start that ended waits for a record read after the end, and is retired only on one", () => {
+    const pending: PendingStartedRun = { provisionalRunId: "/repo|plan:" + KEY, sparringDir: "/repo/.sparring", planLabel: "docs/plans/demo.md", before: [], launchedAtMs: 0, show: true, runKey: KEY };
+    const recorded = { kind: "plan", id: `/wt|plan:${KEY}`, runKey: KEY, location: { projectDir: "/wt", sparringDir: "/wt/.sparring" }, state: { plan: "docs/plans/demo.md", source: "markdown", status: "paused" } } as unknown as RunSnapshot;
+    // The cached (stale, empty) report: not retired.
+    const stale = reconcileStartedRuns({ pending: [pending], bindings: {} }, [], () => "ended", () => true, false);
+    assert.equal(stale.state.pending.length, 1);
+    // Reload, then a fresh read that lists the run: bound, though it already paused.
+    const fresh = reconcileStartedRuns(readStartPlanRuns(JSON.parse(JSON.stringify(stale.state))), [recorded], () => "ended", () => true, true);
+    assert.deepEqual(fresh.bound.map((entry) => entry.runId), [`/wt|plan:${KEY}`]);
+    // A fresh read that still lists nothing: the engine refused it.
+    assert.equal(reconcileStartedRuns({ pending: [pending], bindings: {} }, [], () => "ended", () => true, true).state.pending.length, 0);
+  });
+
+  it("presentation and resume read the manifest written for the checkout the run was started from", async () => {
+    const ws = await Workspace.create();
+    const runKey = "demo-0badf00d";
+    const stage = `${runKey}-stage-1`;
+    await ws.writeStage(stage, { status: "working" });
+    await ws.writePlanRun(runKey, { plan: "docs/plans/demo.md", status: "running", current_stage_index: 0, current_stage: stage, source: "manifest" });
+    const manifest: ExecutionManifest = { version: 1, plan_label: "docs/plans/demo.md", source_digest: sourceDigest("# Demo\n"), stages: [{ stage_id: stage, label: "Stage 1", title: "Only", brief: "# Only\n" }] };
+    const store = await ManifestStore.create();
+    const picked = "/picked/checkout";
+    const owner = { runKey, planKey: runKey, location: { projectDir: picked } };
+    await fs.writeFile(manifestPathFor(store.dir, owner), renderManifest(manifest));
+    await fs.writeFile(
+      bindingPathFor(store.dir, owner),
+      renderBindingRecord({ version: BINDING_VERSION, manifestFile: path.basename(manifestPathFor(store.dir, owner)), manifestDigest: manifestDigest(manifest)!, planKey: runKey, planLabel: "docs/plans/demo.md", projectDir: picked }),
+    );
+    const first = (await discoverRuns([ws.location])).runs.find((c): c is PlanRunSnapshot => c.kind === "plan")!;
+    await recordPlanDigest(first, manifestDigest(manifest)!);
+    const run = (await discoverRuns([ws.location])).runs.find((c): c is PlanRunSnapshot => c.kind === "plan")!;
+    const reader = new ManifestReader();
+    assert.equal((await reader.readBound(store.dir, run)).binding.ok, false, "not under the worktree's own name");
+    assert.equal((await reader.readBoundAmong(store.dir, run, [], [])).binding.ok, false, "a run that is not isolated gets no other owners");
+    const bound = await reader.readBoundAmong(store.dir, run, [], [picked]);
+    assert.equal(bound.binding.ok, true);
+    assert.equal(bound.binding.ok && bound.binding.identity.stages[0].stageId, stage);
+  });
+
+  it("the push permission for a run in its own workspace does not name the branch it started from", () => {
+    assert.doesNotMatch(autoPushScope({ isolated: true, expectedBranch: "main" }), /main/);
+    assert.match(autoPushScope({ expectedBranch: "feature/x" }), /feature\/x/);
   });
 });

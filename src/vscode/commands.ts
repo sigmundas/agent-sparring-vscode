@@ -70,7 +70,7 @@ import { stageBelongsToPlan, type PlanScope, type StageOrigin } from "../core/pl
 import { stageMatchRows, type StageMatchRow, type StageToMatch } from "../core/stageMatches";
 import { buildRunQuickPickSections, describeRun, initialRunFocus, resolveAmbiguousChoice } from "../core/runPick";
 import { buildRunIndex } from "../core/runIndex";
-import { dialogQuote, humanizeStageId, stageDisplayName } from "../core/presentation";
+import { autoPushScope, dialogQuote, humanizeStageId, stageDisplayName } from "../core/presentation";
 import { stageActions, stageRunAction } from "../core/runner";
 import { newRunKey, planKey, planLabel, planRunId, type SparringSubcommand } from "../core/sparringCommand";
 import { chooseLaunchRepository, launchTargets } from "../core/launchRepositories";
@@ -4413,7 +4413,7 @@ function describePlan(
   // second button rather than a tick-box — the default is still no.)
   parts.push(
     "",
-    `"${AUTO_PUSH_START_LABEL}" additionally lets this run push the candidates it verifies to their remote branch, so it does not stop to ask for each one. It applies to this run only, and to nothing but an ordinary push of ${context.expectedBranch}.`,
+    `"${AUTO_PUSH_START_LABEL}" additionally lets this run push the candidates it verifies to their remote branch, so it does not stop to ask for each one. It applies to this run only, and to nothing but ${autoPushScope(context)}.`,
   );
   return parts.join("\n");
 }

@@ -173,3 +173,15 @@ export function presentRunStage(run: RunSnapshot, live?: LiveState): StagePresen
   }
   return presentStage(run.stage.state?.status, run.outcome, live);
 }
+
+/**
+ * What the run-wide push permission offered at a plan's start covers. A run
+ * in its own workspace pushes only its own branch there, never the branch
+ * it was started from, and that branch is not named outside Technical
+ * details.
+ */
+export function autoPushScope(context: { isolated?: boolean; expectedBranch: string }): string {
+  return context.isolated
+    ? "an ordinary push of the run's own branch in its workspace. Nothing is pushed to the branch it was started from"
+    : `an ordinary push of ${context.expectedBranch}`;
+}

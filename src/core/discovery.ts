@@ -350,6 +350,18 @@ export async function locateExternalWorktree(worktree: { path: string; siblingOf
   return location ? { ...location, external: { siblingOf: worktree.siblingOf, ...(worktree.branch ? { branch: worktree.branch } : {}) } } : undefined;
 }
 
+/**
+ * Probe a worktree the engine's own record names as a run's (`sparring runs
+ * --json`) for every project in it, nested ones included: the engine runs a
+ * plan picked in a nested project in the same project directory inside the
+ * worktree it creates. Which run owns the worktree is still the record's to
+ * say; this only finds where its state is.
+ */
+export async function locateRecordedWorktree(worktree: { path: string; siblingOf: string; branch?: string }, options: LocateOptions = {}): Promise<SparringLocation[]> {
+  const found = await locateSparringDirs(worktree.path, path.basename(worktree.path), options);
+  return found.map((location) => ({ ...location, external: { siblingOf: worktree.siblingOf, ...(worktree.branch ? { branch: worktree.branch } : {}) } }));
+}
+
 /** Resolve a recorded plan label (plan.py: plan_label) back to an absolute path. */
 export function resolvePlanPath(label: string, repoRoot: string): string {
   if (path.isAbsolute(label) || /^[A-Za-z]:[\\/]/.test(label)) {

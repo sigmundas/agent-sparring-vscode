@@ -5,7 +5,7 @@
  */
 
 
-import { START_PLAN_RUNS_KEY, readStartPlanRuns, reconcileStartedRuns, type PendingStartedRun, type StartPlanRuns } from "../core/startPlanBinding";
+import { START_PLAN_RUNS_KEY, readStartPlanRuns, reconcileStartedRuns, type LaunchEvidence, type PendingStartedRun, type StartPlanRuns } from "../core/startPlanBinding";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { ActivityTailer } from "../core/activityTailer";
@@ -21,6 +21,7 @@ import {
   isNestedLocation,
   locateAll,
   locateExternalWorktree,
+  locateRecordedWorktree,
   runLabel,
   samePath,
   selectRun,
@@ -375,7 +376,16 @@ export class SparringController implements vscode.Disposable {
       await withRealPaths(this.fileFolders().map((folder) => folder.uri.fsPath)),
       await withRealPaths(this.locations.map((location) => location.projectDir)),
     );
-    const found = (await Promise.all(candidates.map((candidate) => locateExternalWorktree(candidate)))).filter((location): location is SparringLocation => location !== undefined);
+    const recorded = isolated.flatMap((report) => report.runs.map((run) => run.worktreePath));
+    const found = (
+      await Promise.all(
+        candidates.map(async (candidate) =>
+          recorded.some((worktree) => samePath(worktree, candidate.path)) ? locateRecordedWorktree(candidate, this.locateOptions()) : [await locateExternalWorktree(candidate)],
+        ),
+      )
+    )
+      .flat()
+      .filter((location): location is SparringLocation => location !== undefined);
     const before = this.externalLocations.map((location) => location.sparringDir).join("\0");
     this.externalLocations = found;
     const changed = found.map((location) => location.sparringDir).join("\0") !== before;
@@ -900,11 +910,7 @@ export class SparringController implements vscode.Disposable {
     if (run.state.source !== "manifest") {
       return undefined;
     }
-    // The other discovered plan runs, so a manifest written before sidecars
-    // existed can be refused when more than one of them could claim it.
-    const peers = this.discovery.runs.filter((candidate): candidate is PlanRunSnapshot => candidate.kind === "plan" && candidate.state.source === "manifest");
-    const bound = await this.manifests.readBound(this.manifestDirectoryPath, run, peers);
-    this.reportManifestBinding(run, bound);
+    const bound = await this.readRunManifest(run);
     return bound.binding.ok ? bound.binding.identity.stages : undefined;
   }
 
@@ -915,42 +921,36 @@ export class SparringController implements vscode.Disposable {
    * Otherwise why not, for the person.
    */
   async boundManifestFile(run: PlanRunSnapshot): Promise<{ file: string } | { refusal: string }> {
-    const peers = this.discovery.runs.filter((candidate): candidate is PlanRunSnapshot => candidate.kind === "plan" && candidate.state.source === "manifest");
-    const bound = await this.manifests.readBound(this.manifestDirectoryPath, run, peers);
-    if (!bound.binding.ok) {
-      const written = await this.isolatedManifestFile(run, peers);
-      if (written) {
-        return written;
-      }
-    }
-    this.reportManifestBinding(run, bound);
+    const bound = await this.readRunManifest(run);
     return bound.binding.ok ? { file: path.join(this.manifestDirectoryPath, bound.file) } : { refusal: bound.binding.detail };
   }
 
   /**
-   * A run in its own workspace was started from a manifest written for the
-   * checkout it was started from, before its worktree existed. That manifest
-   * is still the run's: it is looked up under the same run key for each
-   * checkout of the same repository, and bound with every check the strict
-   * path makes (sidecar, digest, plan label, current stage) — only the
-   * worktree it was written from differs, and the engine's record is what
-   * says this run belongs to this repository at all.
+   * The manifest bound to `run`, for presentation and resume alike. A run in
+   * its own workspace was started from a manifest written for the checkout
+   * it was started from, before its worktree existed; that checkout's
+   * manifest under the same run key is tried too, strictly
+   * (`ManifestReader.readBoundAmong`). The engine's record is what says the
+   * run belongs to this repository at all.
    */
-  private async isolatedManifestFile(run: PlanRunSnapshot, peers: readonly PlanRunSnapshot[]): Promise<{ file: string } | undefined> {
+  private async readRunManifest(run: PlanRunSnapshot): Promise<BoundManifest> {
+    // The other discovered plan runs, so a manifest written before sidecars
+    // existed can be refused when more than one of them could claim it.
+    const peers = this.discovery.runs.filter((candidate): candidate is PlanRunSnapshot => candidate.kind === "plan" && candidate.state.source === "manifest");
+    const bound = await this.manifests.readBoundAmong(this.manifestDirectoryPath, run, peers, this.isolatedManifestOwners(run));
+    this.reportManifestBinding(run, bound);
+    return bound;
+  }
+
+  /** The checkouts of an isolated run's repository its manifest may have been written for; none for any other run. */
+  private isolatedManifestOwners(run: PlanRunSnapshot): string[] {
     const isolated = this.isolatedRunFor(run);
     if (!isolated) {
-      return undefined;
+      return [];
     }
     const family = this.repositoryFamily(isolated.repoRoot);
     const owners = [isolated.primaryCheckout, ...this.allLocations().filter((location) => samePath(this.repositoryFamily(location.repoRoot), family)).map((location) => location.projectDir)];
-    for (const projectDir of owners.filter((dir, index) => !samePath(dir, run.location.projectDir) && owners.findIndex((other) => samePath(other, dir)) === index)) {
-      const bound = await this.manifests.readBound(this.manifestDirectoryPath, { ...run, location: { ...run.location, projectDir } }, peers);
-      if (bound.binding.ok && !bound.derived) {
-        this.reportManifestBinding(run, bound);
-        return { file: path.join(this.manifestDirectoryPath, bound.file) };
-      }
-    }
-    return undefined;
+    return owners.filter((dir, index) => owners.findIndex((other) => samePath(other, dir)) === index);
   }
 
   /** Say what was decided the first time, and again whenever it changes; never once per render. */
@@ -1401,13 +1401,24 @@ export class SparringController implements vscode.Disposable {
     if (state.pending.length === 0) {
       return;
     }
-    const result = reconcileStartedRuns(state, this.discovery.runs, (provisional) => {
+    const evidence = (provisional: string): LaunchEvidence => {
       const execution = this.tracker.executionFor(provisional);
       if (execution) {
         return execution.state === "ended" ? "ended" : "running";
       }
       return this.submissions.inFlightFor(runnerKey(provisional)) ? "submitted" : "none";
-    }, (run) => this.isolatedRunFor(run) !== undefined);
+    };
+    // An isolated start whose execution ended is decided only on a record
+    // read after the end: the engine may have recorded the run and stopped
+    // within one cached answer, and a stale empty report must not retire it.
+    const ended = state.pending.some((entry) => entry.runKey !== undefined && evidence(entry.provisionalRunId) === "ended");
+    if (ended) {
+      this.worktreeProbe.invalidate();
+      this.isolatedRunsProbe.invalidate();
+      await this.relocate();
+      this.discovery = await discoverRuns(this.allLocations());
+    }
+    const result = reconcileStartedRuns(state, this.discovery.runs, evidence, (run) => this.isolatedRunFor(run) !== undefined, ended);
     for (const note of result.notes) {
       this.log(`start-plan: ${note}`);
     }

@@ -292,7 +292,9 @@ describe("a stage is called what the plan calls it", () => {
     const reader = /async manifestStagesFor[\s\S]*?\n {2}}\n/.exec(controller)?.[0] ?? "";
     assert.ok(reader, "manifestStagesFor exists");
     assert.match(reader, /run\.state\.source !== "manifest"/, "only a manifest run has one");
-    assert.match(reader, /this\.manifests\.readBound\(this\.manifestDirectoryPath, run, peers\)/, "through the one reader that binds a manifest to the run asking for it");
+    assert.match(reader, /this\.readRunManifest\(run\)/, "through the controller's one manifest read, shared with resume");
+    const shared = /private async readRunManifest[\s\S]*?\n {2}}\n/.exec(controller)?.[0] ?? "";
+    assert.match(shared, /this\.manifests\.readBoundAmong\(this\.manifestDirectoryPath, run, peers, /, "through the one reader that binds a manifest to the run asking for it");
 
     // The reader caches the bytes and re-derives the binding every call, so a
     // cache can never become an authority of its own.
