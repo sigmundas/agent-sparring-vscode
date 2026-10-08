@@ -1418,7 +1418,17 @@ export class SparringController implements vscode.Disposable {
       await this.relocate();
       this.discovery = await discoverRuns(this.allLocations());
     }
-    const result = reconcileStartedRuns(state, this.discovery.runs, evidence, (run) => this.isolatedRunFor(run) !== undefined, ended);
+    // Retired only on a successful post-exit report for the start's own
+    // repository; a failed read keeps it waiting for the next attempt.
+    const freshFor = (pending: PendingStartedRun): boolean => {
+      const picked = this.allLocations().find((location) => samePath(location.sparringDir, pending.sparringDir));
+      if (!ended || !picked) {
+        return false;
+      }
+      const family = this.repositoryFamily(picked.repoRoot);
+      return this.isolatedReports.some((report) => report.ok && samePath(this.repositoryFamily(report.repoRoot), family));
+    };
+    const result = reconcileStartedRuns(state, this.discovery.runs, evidence, (run) => this.isolatedRunFor(run) !== undefined, freshFor);
     for (const note of result.notes) {
       this.log(`start-plan: ${note}`);
     }

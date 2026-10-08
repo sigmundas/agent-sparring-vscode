@@ -24,7 +24,7 @@ import { WORKTREE_CACHE_MS } from "./worktreeProbe";
 export type RunsReader = (repoRoot: string) => Promise<{ ok: true; stdout: string } | { ok: false; reason: string }>;
 
 export class IsolatedRunsProbe {
-  private readonly cache = new Map<string, { atMs: number; runs: IsolatedRun[] }>();
+  private readonly cache = new Map<string, { atMs: number; ok: boolean; runs: IsolatedRun[] }>();
   private readonly reported = new Set<string>();
 
   constructor(
@@ -42,24 +42,25 @@ export class IsolatedRunsProbe {
     for (const root of repoRoots) {
       unique.set(canonicalPath(root), root);
     }
-    return Promise.all([...unique.entries()].map(async ([key, root]) => ({ repoRoot: root, runs: await this.listOne(key, root) })));
+    return Promise.all([...unique.entries()].map(async ([key, root]) => ({ repoRoot: root, ...(await this.listOne(key, root)) })));
   }
 
-  private async listOne(key: string, root: string): Promise<IsolatedRun[]> {
+  private async listOne(key: string, root: string): Promise<{ ok: boolean; runs: IsolatedRun[] }> {
     const cached = this.cache.get(key);
     if (cached && Date.now() - cached.atMs < WORKTREE_CACHE_MS) {
-      return cached.runs;
+      return { ok: cached.ok, runs: cached.runs };
     }
-    const runs = await this.ask(root);
-    this.cache.set(key, { atMs: Date.now(), runs });
-    return runs;
+    const answer = await this.ask(root);
+    this.cache.set(key, { atMs: Date.now(), ...answer });
+    return answer;
   }
 
-  private async ask(root: string): Promise<IsolatedRun[]> {
+  /** The engine's report; `ok: false` when it gave none this version reads (never "no runs"). */
+  private async ask(root: string): Promise<{ ok: boolean; runs: IsolatedRun[] }> {
     const answer = await this.read(root);
     if (!answer.ok) {
       this.once(`${path.basename(root)}: ${answer.reason}`, `could not list the runs in their own workspaces of ${root}; those runs are found only if their worktree is (${answer.reason})`);
-      return [];
+      return { ok: false, runs: [] };
     }
     try {
       const report = parseIsolatedRuns(answer.stdout);
@@ -68,13 +69,13 @@ export class IsolatedRunsProbe {
           `${root}: schema ${String(report.version)}`,
           `engine/extension mismatch: sparring runs --json for ${root} reported schema_version ${JSON.stringify(report.version)}, and this extension reads only ${ISOLATED_RUNS_SCHEMA_VERSION}. Runs in their own workspaces are not associated with their worktrees until the two agree.`,
         );
-        return [];
+        return { ok: false, runs: [] };
       }
-      return report.runs;
+      return { ok: true, runs: report.runs };
     } catch (error) {
       const reason = error instanceof EngineFormatError ? error.message : String(error);
       this.once(`${root}: ${reason}`, `sparring runs --json for ${root} could not be read: ${reason}`);
-      return [];
+      return { ok: false, runs: [] };
     }
   }
 

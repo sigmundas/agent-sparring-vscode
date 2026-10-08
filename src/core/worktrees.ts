@@ -146,6 +146,12 @@ export function familyResolver(lists: readonly { repoRoot: string; worktrees: re
 export interface IsolatedRunsOfRepository {
   /** The root the engine was asked about. */
   repoRoot: string;
+  /**
+   * False when the engine gave no supported answer (it could not be run,
+   * failed, printed something unreadable or an unknown schema): `runs` is
+   * then empty, and that says nothing about which runs exist.
+   */
+  ok: boolean;
   runs: readonly IsolatedRun[];
 }
 

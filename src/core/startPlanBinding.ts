@@ -126,12 +126,13 @@ export function reconcileStartedRuns(
   evidence: (provisionalRunId: string) => LaunchEvidence,
   recordOwns: IsolatedOwnership = () => false,
   /**
-   * Whether the engine's run records were read after every isolated start's
-   * execution ended. An isolated start that ended may have recorded its run
-   * just before exiting; a record read earlier cannot show it, so without a
-   * fresh read such a start keeps waiting instead of retiring.
+   * Whether the engine's run records for this start's repository were read
+   * *successfully* (a supported-schema report) after its execution ended. An
+   * isolated start that ended may have recorded its run just before exiting;
+   * a record read earlier, or a read that failed, cannot show it, so without
+   * such a read the start keeps waiting instead of retiring.
    */
-  isolatedRecordFresh = false,
+  isolatedRecordFresh: (pending: PendingStartedRun) => boolean = () => false,
 ): Reconciled {
   const alreadyBound = new Set(Object.keys(state.bindings));
   const notes: string[] = [];
@@ -150,7 +151,7 @@ export function reconcileStartedRuns(
     } else if (outcome.kind === "ambiguous") {
       retired.add(pending);
       notes.push(`more than one new run of ${pending.planLabel} was recorded (${outcome.runIds.join(", ")}); none is attributed to the confirmation ${pending.provisionalRunId}.`);
-    } else if (launch === "ended" && (pending.runKey === undefined || isolatedRecordFresh)) {
+    } else if (launch === "ended" && (pending.runKey === undefined || isolatedRecordFresh(pending))) {
       retired.add(pending);
       notes.push(`the confirmation ${pending.provisionalRunId} ended and the engine recorded no new run of ${pending.planLabel}.`);
     }

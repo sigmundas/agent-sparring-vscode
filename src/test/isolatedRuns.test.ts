@@ -150,7 +150,7 @@ describe("discovery of runs in their own workspace", () => {
       // A hand-made worktree carrying a run state under the very same key.
       await fs.writeFile(path.join(unmanaged, ".sparring", "plans", `${KEY}.json`), state(KEY));
 
-      const reports: IsolatedRunsOfRepository[] = [{ repoRoot: primary, runs: runsOf(runsJson([engineRun({ worktree_path: isolatedTree })])) }];
+      const reports: IsolatedRunsOfRepository[] = [{ repoRoot: primary, ok: true, runs: runsOf(runsJson([engineRun({ worktree_path: isolatedTree })])) }];
       // git knows only the primary and the hand-made worktree here (its
       // answer is cached, say); the engine's record still names the run's.
       const git = [{ repoRoot: primary, worktrees: parseWorktreeList(`worktree ${primary}\nHEAD ${"1".repeat(40)}\nbranch refs/heads/main\n\nworktree ${unmanaged}\nHEAD ${"2".repeat(40)}\nbranch refs/heads/hand\n`) }];
@@ -171,7 +171,7 @@ describe("discovery of runs in their own workspace", () => {
   });
 
   it("a removed worktree is nothing to probe", () => {
-    const reports: IsolatedRunsOfRepository[] = [{ repoRoot: "/repo", runs: runsOf(runsJson([engineRun({ worktree_exists: false })])) }];
+    const reports: IsolatedRunsOfRepository[] = [{ repoRoot: "/repo", ok: true, runs: runsOf(runsJson([engineRun({ worktree_exists: false })])) }];
     assert.deepEqual(isolatedWorktreeLists(reports), [{ repoRoot: "/repo", worktrees: [] }]);
   });
 });
@@ -207,7 +207,7 @@ describe("following a run in its own workspace by its key", () => {
   const pending: PendingStartedRun = { provisionalRunId: provisional, sparringDir: "/repo/.sparring", planLabel: "docs/plans/demo.md", before: [], launchedAtMs: 0, show: true, runKey: KEY };
   const run = (projectDir: string, runKey = KEY): RunSnapshot =>
     ({ kind: "plan", id: `${projectDir}|plan:${runKey}`, runKey, location: { projectDir, sparringDir: `${projectDir}/.sparring` }, state: { plan: "docs/plans/demo.md", source: "manifest", status: "running" } }) as unknown as RunSnapshot;
-  const reports: IsolatedRunsOfRepository[] = [{ repoRoot: "/repo", runs: runsOf(runsJson([engineRun({ worktree_path: "/elsewhere/wt" })])) }];
+  const reports: IsolatedRunsOfRepository[] = [{ repoRoot: "/repo", ok: true, runs: runsOf(runsJson([engineRun({ worktree_path: "/elsewhere/wt" })])) }];
   const owns = (candidate: RunSnapshot) => candidate.kind === "plan" && isolatedRunAt(reports, candidate.runKey, candidate.location.projectDir) !== undefined;
 
   it("waits until the record lists it, then binds to the run in the recorded worktree, surviving a reload", () => {
@@ -239,7 +239,7 @@ describe("review fixes", () => {
       const found = await locateRecordedWorktree({ path: tree, siblingOf: "/repo" });
       assert.deepEqual(found.map((location) => location.projectDir), [nested]);
       assert.equal(found[0].external?.siblingOf, "/repo");
-      const reports: IsolatedRunsOfRepository[] = [{ repoRoot: "/repo", runs: runsOf(runsJson([engineRun({ worktree_path: tree })])) }];
+      const reports: IsolatedRunsOfRepository[] = [{ repoRoot: "/repo", ok: true, runs: runsOf(runsJson([engineRun({ worktree_path: tree })])) }];
       assert.ok(isolatedRunAt(reports, KEY, nested), "the record's worktree contains the nested project");
     } finally {
       await fs.rm(tmp, { recursive: true, force: true });
@@ -250,13 +250,13 @@ describe("review fixes", () => {
     const pending: PendingStartedRun = { provisionalRunId: "/repo|plan:" + KEY, sparringDir: "/repo/.sparring", planLabel: "docs/plans/demo.md", before: [], launchedAtMs: 0, show: true, runKey: KEY };
     const recorded = { kind: "plan", id: `/wt|plan:${KEY}`, runKey: KEY, location: { projectDir: "/wt", sparringDir: "/wt/.sparring" }, state: { plan: "docs/plans/demo.md", source: "markdown", status: "paused" } } as unknown as RunSnapshot;
     // The cached (stale, empty) report: not retired.
-    const stale = reconcileStartedRuns({ pending: [pending], bindings: {} }, [], () => "ended", () => true, false);
+    const stale = reconcileStartedRuns({ pending: [pending], bindings: {} }, [], () => "ended", () => true, () => false);
     assert.equal(stale.state.pending.length, 1);
     // Reload, then a fresh read that lists the run: bound, though it already paused.
-    const fresh = reconcileStartedRuns(readStartPlanRuns(JSON.parse(JSON.stringify(stale.state))), [recorded], () => "ended", () => true, true);
+    const fresh = reconcileStartedRuns(readStartPlanRuns(JSON.parse(JSON.stringify(stale.state))), [recorded], () => "ended", () => true, () => true);
     assert.deepEqual(fresh.bound.map((entry) => entry.runId), [`/wt|plan:${KEY}`]);
     // A fresh read that still lists nothing: the engine refused it.
-    assert.equal(reconcileStartedRuns({ pending: [pending], bindings: {} }, [], () => "ended", () => true, true).state.pending.length, 0);
+    assert.equal(reconcileStartedRuns({ pending: [pending], bindings: {} }, [], () => "ended", () => true, () => true).state.pending.length, 0);
   });
 
   it("presentation and resume read the manifest written for the checkout the run was started from", async () => {
@@ -288,5 +288,36 @@ describe("review fixes", () => {
   it("the push permission for a run in its own workspace does not name the branch it started from", () => {
     assert.doesNotMatch(autoPushScope({ isolated: true, expectedBranch: "main" }), /main/);
     assert.match(autoPushScope({ expectedBranch: "feature/x" }), /feature\/x/);
+  });
+});
+
+describe("a failed post-exit engine read keeps the follow request", () => {
+  it("the probe reports a failed or unsupported answer as not ok, never as no runs", async () => {
+    const answers = [
+      { ok: false as const, reason: "timed out" },
+      { ok: true as const, stdout: "not json" },
+      { ok: true as const, stdout: runsJson([], 7) },
+      { ok: true as const, stdout: runsJson([]) },
+    ];
+    const probe = new IsolatedRunsProbe(() => undefined, async () => answers.shift()!);
+    const seen: boolean[] = [];
+    for (let i = 0; i < 4; i++) {
+      probe.invalidate();
+      seen.push((await probe.list(["/repo"]))[0].ok);
+    }
+    assert.deepEqual(seen, [false, false, false, true]);
+  });
+
+  it("failed reads retain the start; a later successful report binds it, and a successful empty one retires it", () => {
+    const pending: PendingStartedRun = { provisionalRunId: "/repo|plan:" + KEY, sparringDir: "/repo/.sparring", planLabel: "docs/plans/demo.md", before: [], launchedAtMs: 0, show: true, runKey: KEY };
+    const recorded = { kind: "plan", id: `/wt|plan:${KEY}`, runKey: KEY, location: { projectDir: "/wt", sparringDir: "/wt/.sparring" }, state: { plan: "docs/plans/demo.md", source: "markdown", status: "complete" } } as unknown as RunSnapshot;
+    let state = { pending: [pending], bindings: {} };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      state = reconcileStartedRuns(readStartPlanRuns(JSON.parse(JSON.stringify(state))), [], () => "ended", () => true, () => false).state;
+      assert.equal(state.pending.length, 1, "a failed read never retires it");
+    }
+    const bound = reconcileStartedRuns(state, [recorded], () => "ended", () => true, () => true);
+    assert.deepEqual(bound.bound.map((entry) => entry.runId), [`/wt|plan:${KEY}`]);
+    assert.equal(reconcileStartedRuns(state, [], () => "ended", () => true, () => true).state.pending.length, 0);
   });
 });
