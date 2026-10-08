@@ -146,7 +146,8 @@ export async function inspectFeatureBranch(repoRoot: string, requested: string, 
   return { kind: "create", branch, from: origin };
 }
 
-export type FeatureBranchOutcome = { ok: true } | { ok: false; reason: string };
+/** `superseded`: the flow that asked for the branch ended before the write; nothing was changed. */
+export type FeatureBranchOutcome = { ok: true } | { ok: false; reason: string; superseded?: true };
 
 /**
  * Carry out a `create` or `track` plan. Re-checks that HEAD has not moved
@@ -154,11 +155,15 @@ export type FeatureBranchOutcome = { ok: true } | { ok: false; reason: string };
  * — that the worktree is clean, so nothing local is carried onto another
  * commit. Both writes use `switch -c` without force: git refuses if the
  * branch exists by now, and nothing existing is ever moved.
+ *
+ * `stillCurrent` is asked once more right before `git switch`, after every
+ * read: a flow closed or replaced meanwhile changes nothing.
  */
 export async function applyFeatureBranch(
   repoRoot: string,
   plan: Extract<FeatureBranchPlan, { kind: "create" | "track" }>,
   git: GitRunner = runGit,
+  stillCurrent: () => boolean = () => true,
 ): Promise<FeatureBranchOutcome> {
   const now = await currentOrigin(git, repoRoot);
   if (!isOrigin(now) || now.commit !== plan.from.commit || now.branch !== plan.from.branch) {
@@ -172,6 +177,9 @@ export async function applyFeatureBranch(
     if (status.stdout.trim()) {
       return { ok: false, reason: `checking out ${plan.remoteRef} would carry uncommitted changes onto another commit. Commit or stash them first.` };
     }
+  }
+  if (!stillCurrent()) {
+    return { ok: false, reason: "the flow that asked for this branch was closed or replaced; nothing was created.", superseded: true };
   }
   const args = plan.kind === "create" ? ["switch", "-c", plan.branch] : ["switch", "-c", plan.branch, "--track", plan.remoteRef];
   const result = await git(repoRoot, args);

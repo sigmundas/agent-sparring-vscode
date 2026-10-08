@@ -61,6 +61,15 @@ describe("Run Plan classifies the document before asking anything", () => {
     unclassified(2, { ok: false, reason: "the sparring executable is resolved only by the shell" }, /could not be run: the sparring executable is resolved only by the shell/);
     unclassified(2, { ok: true, exitCode: 2, stdout: "usage: sparring {run-plan,…}" }, /does not accept check-plan.*usage: sparring/);
     unclassified(0, { ok: true, exitCode: 2, stdout: "usage: sparring …" }, /usage error/);
+    // A JSON refusal outside the 0/1 contract is not a refusal: Prepare intake must not follow.
+    const refusal = JSON.stringify({ valid: false, error: "usage: sparring check-plan …" });
+    unclassified(0, { ok: true, exitCode: 2, stdout: refusal }, /usage error, exit 2.*usage: sparring check-plan/);
+    unclassified(2, { ok: true, exitCode: 3, stdout: refusal }, /exited 3, which is neither/);
+    const markdownRefused = { ok: true as const, exitCode: 1, stdout: JSON.stringify({ valid: false, error: "Stage 1A" }) };
+    for (const exitCode of [2, 3, 127]) {
+      const result = classifyPlanDocument(2, markdownRefused, { ok: true, exitCode, stdout: refusal });
+      assert.equal(result.kind, "unclassified", `manifest check exit ${exitCode}`);
+    }
     unclassified(2, { ok: true, exitCode: 0, stdout: "not json" }, /exited 0 without a JSON answer: not json/);
     unclassified(2, { ok: true, exitCode: 0, stdout: JSON.stringify({ stages: [] }) }, /without a JSON answer/);
     unclassified(2, { ok: true, exitCode: 1, stdout: VALID.stdout }, /contradict/);

@@ -298,6 +298,45 @@ async function prepareIntakeAssertions(): Promise<void> {
     const replaced = await vscode.commands.executeCommand<StartPlanModel>("agentSparring._test.overviewModel");
     assert.equal(replaced.startPlan?.planName, "more-ideas.md", "the newer document stays on screen");
 
+    // Closed while the branch is being prepared: after the person confirmed
+    // Create branch, while the pre-write reads run, the screen goes away.
+    await show(ideas);
+    dialogs = stubDialogs(undefined, "Create branch", "feature/intake");
+    const confirm = window["showInformationMessage"] as (message: string, ...rest: unknown[]) => Promise<unknown>;
+    window["showInformationMessage"] = async (message: string, ...rest: unknown[]) => {
+      const choice = await confirm(message, ...rest);
+      if (choice === "Create branch") {
+        await vscode.commands.executeCommand("agentSparring._test.startPlanMessage", { type: "startPlan", action: "dismiss" });
+      }
+      return choice;
+    };
+    try {
+      await prepare();
+    } finally {
+      dialogs.restore();
+    }
+    assert.ok(dialogs.asked.some((line) => /^Create feature\/intake/.test(line)), `the branch was confirmed: ${JSON.stringify(dialogs.asked)}`);
+    assert.equal(branch(), "main", "but closed before the write, so it was not created");
+    assert.ok(!execFileSync("git", ["-C", app, "branch", "--list", "feature/intake"], { encoding: "utf8" }).trim(), "no branch exists");
+    assert.deepEqual(await prepared(), []);
+
+    // Replaced by a runnable document whose workspace question is then dismissed.
+    await show(ideas);
+    dialogs = stubDialogs(undefined, "Create branch", "feature/intake");
+    const typed = window["showInputBox"] as (options?: vscode.InputBoxOptions) => Promise<string | undefined>;
+    window["showInputBox"] = async (options?: vscode.InputBoxOptions) => {
+      await vscode.commands.executeCommand("agentSparring._test.runPlan", app, path.join(app, "docs-plan.md"));
+      return typed(options);
+    };
+    try {
+      await prepare();
+    } finally {
+      dialogs.restore();
+    }
+    assert.ok(dialogs.picks.length > 0, "the runnable document reached its workspace question");
+    assert.equal(branch(), "main", "the replaced intake did not change the branch");
+    assert.deepEqual(await prepared(), [], "nor prepare");
+
     // Undisturbed, clicked twice: one branch question, one start-plan.
     await show(ideas);
     dialogs = stubDialogs(undefined, "Create branch", "feature/intake");

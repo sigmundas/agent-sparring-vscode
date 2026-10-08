@@ -42,10 +42,16 @@ export function readCheckPlan(query: CheckPlanQuery): CheckPlanReading {
   if (!query.ok) {
     return { failed: `check-plan could not be run: ${query.reason}` };
   }
+  if (query.exitCode !== 0 && query.exitCode !== 1) {
+    // Outside the contract (a usage error, a crash), whatever it printed.
+    const said = query.stdout.trim().split("\n")[0]?.slice(0, 300) ?? "";
+    const what = query.exitCode === 2 ? "the installed engine does not accept check-plan --json (usage error, exit 2)" : `check-plan exited ${query.exitCode}, which is neither a plan (0) nor a refusal (1)`;
+    return { failed: said ? `${what}: ${said}` : `${what}.` };
+  }
   const parsed = parseCheckPlan(query.stdout);
   if (!parsed) {
     const said = query.stdout.trim().split("\n")[0]?.slice(0, 300) ?? "";
-    const what = query.exitCode === 2 ? "the installed engine does not accept check-plan --json (usage error)" : `check-plan exited ${query.exitCode} without a JSON answer`;
+    const what = `check-plan exited ${query.exitCode} without a JSON answer`;
     return { failed: said ? `${what}: ${said}` : `${what}.` };
   }
   if (parsed.valid !== (query.exitCode === 0)) {

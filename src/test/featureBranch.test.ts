@@ -87,6 +87,29 @@ describe("feature branch before a new plan run", () => {
     assert.equal(fs.readFileSync(path.join(repo, "a.txt"), "utf8"), "edited");
   });
 
+  it("a flow closed or replaced during the pre-write reads switches nothing", async () => {
+    for (const make of [() => ({ repo: repository(), branch: "feature/closed" }), () => ({ repo: cloneWithRemoteBranch().repo, branch: "feature/remote" })]) {
+      const { repo, branch } = make();
+      const plan = await inspectFeatureBranch(repo, branch);
+      assert.ok(plan.kind === "create" || plan.kind === "track");
+      if (plan.kind !== "create" && plan.kind !== "track") return;
+      let current = true;
+      const issued: string[][] = [];
+      // Every read resolves after the flow was superseded, as a Close would.
+      const deferred: GitRunner = async (root, args) => {
+        issued.push(args);
+        const result = await runGit(root, args);
+        current = false;
+        return result;
+      };
+      const outcome = await applyFeatureBranch(repo, plan, deferred, () => current);
+      assert.equal(outcome.ok, false);
+      assert.equal((outcome as { superseded?: true }).superseded, true);
+      assert.ok(!issued.some((args) => args[0] === "switch"), `no switch was issued: ${JSON.stringify(issued)}`);
+      assert.equal(git(repo, "branch", "--show-current"), "main");
+    }
+  });
+
   it("creates a local branch tracking the remote when only the remote has it", async () => {
     const { repo, remoteCommit } = cloneWithRemoteBranch();
     const plan = await inspectFeatureBranch(repo, "feature/remote");

@@ -2501,7 +2501,11 @@ async function ensureFeatureBranch(controller: SparringController, location: Spa
   if (choice !== "Create branch" || !stillCurrent()) {
     return false;
   }
-  const outcome = await applyFeatureBranch(repoRoot, plan);
+  const outcome = await applyFeatureBranch(repoRoot, plan, undefined, stillCurrent);
+  if (!outcome.ok && outcome.superseded) {
+    controller.log(`Run plan: feature branch ${plan.branch} not created — ${outcome.reason}`);
+    return false;
+  }
   if (!outcome.ok) {
     controller.log(`Run plan: feature branch ${plan.branch} not created — ${outcome.reason}`);
     void vscode.window.showErrorMessage(`Agent Sparring: could not create ${plan.branch}: ${outcome.reason}`);
@@ -2715,6 +2719,13 @@ async function runPlanCommand(controller: SparringController, overview: Overview
     return;
   }
   const label = planLabel(planPath, location.repoRoot);
+  // A new document replaces whatever Run Plan screen was pending: a Prepare
+  // intake still awaiting for it sees its screen gone and stops.
+  // Only a classification screen; a start-plan preparation has its own claim.
+  if (overview.startPlanSession?.classification) {
+    startPlanContext = undefined;
+    overview.closeRunPlan(location.repoRoot);
+  }
   // Classified first, by the engine: a branch or a workspace is only a
   // question for a plan it would run. Planning input goes to its own screen
   // — Make Plan… — with nothing asked and nothing launched.
