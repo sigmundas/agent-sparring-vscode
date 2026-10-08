@@ -78,15 +78,19 @@ offers **Merge & clean up** (also the command
 **Ready to merge** is shown only when the engine's own finish check, for the
 run's current listed state and seconds old, says it can be merged and cleaned
 up — never because the run is complete. The extension never creates, merges
-or removes a worktree or branch itself. Branch names, worktree paths, SHAs and
-check codes go to the Output Channel (**Show Log**), not the dialogs.
+or removes a worktree or branch itself. The dialogs name the branch the run
+merges into and the ignored paths that would be deleted, because that is what
+you are confirming; the run's own branch, the workspace's location, SHAs,
+the engine's planned actions and check codes go to the Output Channel
+(**Show Log**), not the dialogs.
 
 ## Two ways to progress a plan
 
 ### Run Plan with a current engine
 
-When capability detection confirms `sparring start-plan` support, **Run Plan**
-asks the engine to prepare the selected document with `start-plan --json`.
+This applies to **Run in this checkout**; a run in its own workspace skips
+this preparation and goes straight to `run-plan`. When capability detection
+confirms `sparring start-plan` support, **Run Plan** asks the engine to prepare the selected document with `start-plan --json`.
 The Overview shows preparation progress, findings, any decisions you must
 answer, and the proposed stages, gates and execution settings. Preparation
 may use a read-only provider turn and write an intake before you press Start.
