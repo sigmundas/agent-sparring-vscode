@@ -157,7 +157,8 @@ async function runPlanChoiceAssertions(): Promise<void> {
  */
 async function planningInputAssertions(app: string): Promise<void> {
   const ideas = path.join(app, "ideas.md");
-  const launches = async () => [...(await callsOf("run-plan")), ...(await callsOf("start-plan"))].length;
+  // `--help` is the capability probe, not a launch.
+  const launches = async () => [...(await callsOf("run-plan")), ...(await callsOf("start-plan"))].filter((line) => !/ --help$/.test(line)).length;
   const before = await launches();
   const dialogs = stubDialogs("Run in this checkout", undefined, "main");
   try {
@@ -170,18 +171,31 @@ async function planningInputAssertions(app: string): Promise<void> {
   assert.equal(await launches(), before, "nothing is launched against main");
   const real = await fs.realpath(ideas);
   assert.ok((await callsOf("check-plan")).some((line) => line.startsWith(`check-plan ${real} `) || line.startsWith(`check-plan ${ideas} `)), "the engine classified it");
-  type Model = { kind: string; startPlan?: { stateLabel: string; planningInput?: boolean; planName: string }; emptyLines?: string[] };
+  type Model = { kind: string; startPlan?: { stateLabel: string; planningInput?: { reason: string }; refusal?: string; planName: string }; emptyLines?: string[] };
   const shown = await vscode.commands.executeCommand<Model>("agentSparring._test.overviewModel");
   assert.equal(shown.kind, "startPlan", "the chosen document is what the Overview shows");
   assert.equal(shown.startPlan?.planName, "ideas.md");
-  assert.equal(shown.startPlan?.planningInput, true, "as planning input, with Make Plan…");
+  assert.ok(shown.startPlan?.planningInput, "as planning input: Prepare intake or Make Plan…");
+  assert.equal(shown.startPlan?.refusal, undefined, "not as a refusal");
   assert.equal(shown.startPlan?.stateLabel, "Planning input");
+
+  // Prepare intake is the engine's start-plan; this fake engine has none, so
+  // it says so — before asking any branch — and launches nothing.
+  const prepare = stubDialogs(undefined, undefined, "feature/intake");
+  try {
+    await vscode.commands.executeCommand("agentSparring._test.startPlanMessage", { type: "startPlan", action: "prepareIntake" });
+  } finally {
+    prepare.restore();
+  }
+  assert.deepEqual(prepare.inputs, [], "no branch is asked when the engine cannot prepare an intake");
+  assert.ok(prepare.asked.some((line) => /has no start-plan/.test(line)), `the reason is said: ${JSON.stringify(prepare.asked)}`);
+  assert.equal(await launches(), before, "and nothing is launched");
 
   await vscode.commands.executeCommand("agentSparring._test.startPlanMessage", { type: "startPlan", action: "dismiss" });
   const closed = await vscode.commands.executeCommand<Model>("agentSparring._test.overviewModel");
   assert.equal(closed.kind, "empty", `Close returns to a neutral view of the repository: ${JSON.stringify(closed)}`);
   assert.match(closed.emptyLines?.join(" ") ?? "", /Run Plan was closed; nothing was started/);
-  console.log("worktree runs: planning input was classified by check-plan before any branch or workspace question, shown with Make Plan…, launched nothing, and Close left a neutral view");
+  console.log("worktree runs: planning input was classified by check-plan before any branch or workspace question, offered Prepare intake and Make Plan…, launched nothing, and Close left a neutral view");
 }
 
 /**

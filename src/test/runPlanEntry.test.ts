@@ -17,7 +17,8 @@ import { describe, it } from "node:test";
 import { buildCheckPlanArgs } from "../core/cli";
 import { discoverRuns, type SparringLocation } from "../core/discovery";
 import { decideExpectedBranch } from "../core/expectedBranch";
-import { NOT_A_PLAN_TITLE, MAKE_PLAN_FROM_THIS } from "../core/gettingStarted";
+import { MANAGED_INTAKE_LIMITATION, PLANNING_INPUT_TITLE, PREPARE_INTAKE } from "../core/gettingStarted";
+import { isStartPlanMessage } from "../core/overviewHtml";
 import { renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel, runPlanClosedModel, startPlanView, type StartPlanSession } from "../core/overviewModel";
 import { classifyPlanDocument, featureBranchPrompt } from "../core/runPlanEntry";
@@ -61,17 +62,27 @@ describe("Run Plan classifies the document before asking anything", () => {
     assert.deepEqual(buildCheckPlanArgs({ planPath: "/repo/ideas.md", repoRoot: "/repo", sparringDir: "/elsewhere/.sparring" }).slice(0, 3), ["--sparring-dir", "/elsewhere/.sparring", "check-plan"]);
   });
 
-  it("the planning-input screen offers Make Plan…, spends no provider turn and offers no Start", () => {
+  it("the planning-input screen offers the engine's intake first and Make Plan… as an option, and states the managed limitation", () => {
     const view = startPlanView(classifiedSession("planning-input", "no '## Stage <n> — <title>' sections"));
     assert.equal(view.stateLabel, "Planning input");
-    assert.equal(view.planningInput, true);
+    assert.deepEqual(view.planningInput, { reason: "no '## Stage <n> — <title>' sections" });
+    assert.equal(view.refusal, undefined, "planning input is not a refusal");
     assert.equal(view.providerTurnNotice, "", "nothing was prepared");
     assert.equal(view.start, undefined);
     const html = renderOverviewHtml({ kind: "startPlan", title: view.planName, startPlan: view }, "n", "vscode-resource:");
-    assert.ok(html.includes(NOT_A_PLAN_TITLE));
-    assert.ok(html.includes(MAKE_PLAN_FROM_THIS));
+    assert.ok(html.includes(PLANNING_INPUT_TITLE));
+    assert.ok(html.includes("It will be analyzed into runnable stages before anything executes."));
+    const prepare = html.indexOf(`data-startplan="prepareIntake"`);
+    const makePlan = html.indexOf(`data-action="makePlanFromThis"`);
+    assert.ok(prepare > 0 && makePlan > prepare, "Prepare intake first, then Make Plan…");
+    assert.ok(html.includes(PREPARE_INTAKE));
+    assert.match(html, /another planning\/audit pass/, "Make Plan… is described as optional");
+    assert.ok(!/Use Make Plan|rather than a staged plan|Refused by the engine/.test(html), "Make Plan… is not presented as required");
+    assert.ok(html.includes(MANAGED_INTAKE_LIMITATION.replace(/'/g, "&#39;")) || html.includes(MANAGED_INTAKE_LIMITATION), "the limitation is stated");
+    assert.ok(!html.includes(`data-startplan="retry"`));
+    assert.ok(html.includes(`data-startplan="dismiss"`), "Close");
     assert.ok(html.includes("2026-10-07-cloud-sync-extraction-and-orchestration.md"), "the chosen document is named");
-    assert.ok(!html.includes("provider turn"), "no provider-turn notice");
+    assert.ok(isStartPlanMessage({ type: "startPlan", action: "prepareIntake" }));
   });
 
   it("an invalid staged plan shows the engine's refusal, not the planning-input advice", () => {
@@ -79,7 +90,7 @@ describe("Run Plan classifies the document before asking anything", () => {
     assert.equal(view.planningInput, undefined);
     const html = renderOverviewHtml({ kind: "startPlan", title: view.planName, startPlan: view }, "n", "vscode-resource:");
     assert.ok(html.includes("Stage 2 appears twice"));
-    assert.ok(!html.includes(NOT_A_PLAN_TITLE));
+    assert.ok(!html.includes(PLANNING_INPUT_TITLE));
   });
 });
 

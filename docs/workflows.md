@@ -44,9 +44,15 @@ asks where the run goes:
 
 Before either choice, the engine classifies the document with
 `sparring check-plan --json`, which records nothing. A document with no
-`## Stage <n> — <title>` sections is planning input. The Overview shows it with
-**Make Plan from this…**, and nothing about a workspace or branch is asked. A
-staged plan the engine refuses shows the engine's reason. **Close** returns to
+`## Stage <n> — <title>` sections is planning input, and that is not a dead end.
+The Overview offers **Prepare intake (recommended)**, which is the engine's
+`start-plan` intake route: it analyzes the document into runnable stages and
+asks its decisions before anything runs. It also offers **Make Plan…** as an
+optional further planning or audit pass. Nothing about a workspace or branch is
+asked on that screen. The engine's `start-plan --managed` does not yet accept
+intake-based plans, and the screen says so. Prepare intake therefore runs in
+this checkout and asks for the feature branch only once you choose it. A staged
+plan the engine refuses shows the engine's reason. **Close** returns to
 a neutral view of the repository, not to whatever intake automatic selection
 would pick; older intakes stay under **History / Runs…**, and their screen
 names the source plan file.

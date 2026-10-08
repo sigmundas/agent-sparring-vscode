@@ -16,7 +16,7 @@
  */
 
 import { formatElapsed } from "./activeOperation";
-import { MAKE_PLAN_FROM_THIS, MAKE_PLAN_TITLE, NOT_A_PLAN_TITLE, PLANNING_INPUT_ADVICE } from "./gettingStarted";
+import { MAKE_PLAN_AGAIN, MAKE_PLAN_AGAIN_NOTE, MAKE_PLAN_TITLE, MANAGED_INTAKE_LIMITATION, PLANNING_INPUT_LEAD, PLANNING_INPUT_TITLE, PREPARE_INTAKE, PREPARE_INTAKE_TITLE } from "./gettingStarted";
 import { ACTIVE_CONTEXT_HEADLINE, CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, SELECT_RUN_LABEL } from "./activeRepository";
 import {
   CONFIG_FIELDS,
@@ -245,7 +245,7 @@ export interface IntakeActionMessage {
 export type StartPlanMessage =
   | { type: "startPlan"; action: "answer"; answers: Record<string, string> }
   | { type: "startPlan"; action: "start"; token: string }
-  | { type: "startPlan"; action: "openReport" | "retry" | "dismiss" };
+  | { type: "startPlan"; action: "openReport" | "retry" | "dismiss" | "prepareIntake" };
 
 export function isStartPlanMessage(message: unknown): message is StartPlanMessage {
   const record = asRecord(message);
@@ -260,7 +260,7 @@ export function isStartPlanMessage(message: unknown): message is StartPlanMessag
   if (action === "start") {
     return typeof record["token"] === "string" && record["token"] !== "";
   }
-  return action === "openReport" || action === "retry" || action === "dismiss";
+  return action === "openReport" || action === "retry" || action === "dismiss" || action === "prepareIntake";
 }
 
 /** A row on the ambiguity screen was chosen: pin this run, if it is still one of those offered. */
@@ -2178,17 +2178,18 @@ function operationTechnical(model: OverviewModel, which: string, lines: readonly
 }
 
 /**
- * A refused document with no stage sections is planning input: say what to
- * do with it, with the way to do it, and keep the engine's refusal one click
- * away. The engine's validation decided; this only explains it.
+ * Planning input, as the engine's check-plan classified it: two real
+ * choices — the engine's intake, or another planning pass — and the one
+ * limitation of the intake route, stated rather than hidden.
  */
-function renderPlanningInput(refusal: string): string {
+function renderPlanningInput(reason: string): string {
   return `<section class="card planning-input">
-<h2>${escapeHtml(NOT_A_PLAN_TITLE)}</h2>
-<p>${escapeHtml(PLANNING_INPUT_ADVICE)} Nothing was approved or run.</p>
-<p class="muted small">The engine said: ${escapeHtml(refusal.split("\n")[0])}</p>
-<div class="actions">${button("makePlanFromThis", MAKE_PLAN_FROM_THIS, true, MAKE_PLAN_TITLE)}</div>
-<details class="tech"><summary>Technical details</summary><p class="muted small">Refused by the engine:</p><pre class="engineerror">${escapeHtml(refusal)}</pre></details>
+<h2>${escapeHtml(PLANNING_INPUT_TITLE)}</h2>
+<p>${escapeHtml(PLANNING_INPUT_LEAD)}</p>
+<div class="actions"><button type="button" class="primary" data-startplan="prepareIntake" title="${escapeHtml(PREPARE_INTAKE_TITLE)}">${escapeHtml(PREPARE_INTAKE)}</button>${button("makePlanFromThis", MAKE_PLAN_AGAIN, true, MAKE_PLAN_AGAIN_NOTE)}</div>
+<p class="muted small">${escapeHtml(MAKE_PLAN_AGAIN)} — ${escapeHtml(MAKE_PLAN_AGAIN_NOTE)}</p>
+<p class="muted small planning-input-limitation">${icon("warn", "escalate")}${escapeHtml(MANAGED_INTAKE_LIMITATION)}</p>
+<details class="tech"><summary>Technical details</summary><p class="muted small">check-plan said:</p><pre class="engineerror">${escapeHtml(reason)}</pre></details>
 </section>`;
 }
 
@@ -2230,14 +2231,14 @@ ${view.summary.laterSlices.map((line) => `<p class="muted">${escapeHtml(line)}</
     view.start ? `<button type="button" class="primary" data-startplan="start" data-token="${escapeHtml(view.start.token)}" title="${escapeHtml(view.start.detail)}">${escapeHtml(view.start.label)}</button>` : "",
     view.decisions.length > 0 ? `<button type="button" class="primary" data-startplan="answer"${view.canAnswer ? "" : " disabled"} title="Reruns start-plan with your answers as --answer. Nothing is approved or run.">Answer and prepare again</button>` : "",
     view.intake ? `<button type="button" data-startplan="openReport">Open intake report</button>` : "",
-    !view.preparing && !view.start && view.decisions.length === 0 ? `<button type="button" data-startplan="retry">Check again</button>` : "",
+    !view.preparing && !view.start && view.decisions.length === 0 && !view.planningInput ? `<button type="button" data-startplan="retry">Check again</button>` : "",
     `<button type="button" data-startplan="dismiss"${view.preparing ? " disabled" : ""}>Close</button>`,
   ].join("");
   return `<header class="top"><div><h1>${escapeHtml(view.planName)}</h1><div class="run muted">Run plan · ${escapeHtml(view.stateLabel)}</div></div></header>
 ${view.providerTurnNotice ? `<p class="muted start-notice">${escapeHtml(view.providerTurnNotice)}</p>` : ""}
 ${view.preparing ? `<p class="start-preparing">${icon("sync")}The engine is preparing the plan…</p>` : ""}
 ${view.intake ? `<p>${escapeHtml(view.intake.line)}</p>` : view.route === "direct" ? "<p>Direct route: the plan's own stages run as written.</p>" : ""}
-${view.refusal && view.planningInput ? renderPlanningInput(view.refusal) : view.refusal ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}Refused by the engine. Nothing was approved or run.</p><pre class="engineerror">${escapeHtml(view.refusal)}</pre></div>` : ""}
+${view.planningInput ? renderPlanningInput(view.planningInput.reason) : view.refusal ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}Refused by the engine. Nothing was approved or run.</p><pre class="engineerror">${escapeHtml(view.refusal)}</pre></div>` : ""}
 ${view.failure ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}start-plan did not report a status.</p><pre class="engineerror">${escapeHtml(view.failure)}</pre></div>` : ""}
 ${decisions}
 ${findings}

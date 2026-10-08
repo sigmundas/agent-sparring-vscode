@@ -12,18 +12,27 @@ export const PLANNING_SKILL = "/agent-sparring:sparring-plan";
 export const GETTING_STARTED =
   `To get started with Agent Sparring: use Make Plan… to audit the repository and turn an idea or INBOX into a staged plan with Claude or Codex and the Agent Sparring planning skill (${PLANNING_SKILL}). Run Plan only executes an existing plan.`;
 
-export const NOT_A_PLAN_TITLE = "This looks like planning input rather than a staged plan.";
-
 /** Make Plan…'s tooltip: what it does and what it does not. */
 export const MAKE_PLAN_TITLE = "Turn an idea, INBOX or notes into a staged plan with Claude or Codex. Planning only: nothing is implemented or run.";
 
-/** The button that turns the refused file into a plan. */
-export const MAKE_PLAN_FROM_THIS = "Make Plan from this…";
+/**
+ * Planning input on Run Plan: a document with no `## Stage` sections is not
+ * a dead end. The engine's start-plan intake analyzes it into runnable
+ * stages; Make Plan… is an optional further planning pass, never a
+ * requirement that follows from the missing headings.
+ */
+export const PLANNING_INPUT_TITLE = "This is planning input, ready for Agent Sparring intake.";
+export const PLANNING_INPUT_LEAD = "It will be analyzed into runnable stages before anything executes. Nothing has been prepared, approved or run yet.";
+export const PREPARE_INTAKE = "Prepare intake (recommended)";
+export const PREPARE_INTAKE_TITLE = "Prepare an intake with the engine's start-plan: it analyzes this document into runnable stages and asks its decisions. Nothing runs until you press Start.";
+export const MAKE_PLAN_AGAIN = "Make Plan…";
+export const MAKE_PLAN_AGAIN_NOTE = "Run another planning/audit pass on this document first. Optional.";
 
-/** What to do with planning input: one wording for the modal and the Overview. */
-export const PLANNING_INPUT_ADVICE = "Use Make Plan… to audit the idea and create a runnable plan with Claude or Codex, review it, then return to Run Plan.";
-
-/** The modal detail under {@link NOT_A_PLAN_TITLE}. */
-export function notAPlanDetail(fileName: string): string {
-  return [`${fileName} has no '## Stage <n> — <title>' sections.`, "", PLANNING_INPUT_ADVICE].join("\n");
-}
+/**
+ * Said, not hidden: the engine's `start-plan --managed` runs only `## Stage`
+ * plans today, so an intake runs in this checkout and needs a feature
+ * branch there. When the engine gains managed intake runs, preparing one
+ * becomes the default here and this goes away.
+ */
+export const MANAGED_INTAKE_LIMITATION =
+  "An intake-based plan cannot yet run in its own workspace: the engine's start-plan --managed accepts only '## Stage' plans. Prepare intake therefore runs in this checkout and asks for a feature branch when you choose it.";

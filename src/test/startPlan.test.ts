@@ -254,17 +254,16 @@ describe("Run Plan screen (start-plan → view model)", () => {
     assert.match(html, /--answer: this plan runs directly, and asks no decisions/);
   });
 
-  it("a refused document with no stages is planning input: Make Plan from this… first, the refusal under Technical details", () => {
+  it("an engine refusal of an intake preparation is shown as the engine's refusal, never as Make Plan advice", () => {
+    // Planning input is classified before start-plan (runPlanEntry.test.ts);
+    // once its intake is being prepared, a refusal (e.g. a protected branch)
+    // is the engine's answer about that preparation, not about the document.
     const view = startPlanView(session(REFUSED, { planningInput: true }));
-    assert.equal(view.planningInput, true);
+    assert.equal(view.planningInput, undefined);
+    assert.ok(view.refusal);
     const html = renderOverviewHtml({ kind: "startPlan", title: "INBOX.md", startPlan: view }, "n", "vscode-resource:");
-    const card = html.slice(html.indexOf('<section class="card planning-input">'));
-    assert.match(card, /This looks like planning input rather than a staged plan\./);
-    assert.match(card, /data-action="makePlanFromThis"[^>]*>Make Plan from this…<\/button>/);
-    const technical = card.indexOf("<summary>Technical details</summary>");
-    assert.ok(technical > 0 && card.lastIndexOf("--answer: this plan runs directly") > technical, "the engine's refusal is kept, verbatim, under Technical details");
-    assert.match(card.slice(0, technical), /The engine said: --answer: this plan runs directly/, "its first line stays in view, in case the refusal is about something else");
-    // Only on a refusal: planning input the engine accepts is the engine's to route.
+    assert.ok(!html.includes('class="card planning-input"'));
+    assert.match(html, /Refused by the engine\. Nothing was approved or run\./);
     assert.equal(startPlanView(session(INTAKE_READY, { planningInput: true })).planningInput, undefined);
   });
 

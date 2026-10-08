@@ -1145,9 +1145,9 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       return makePlanCommand(makePlanDeps(controller, overview));
     case "makePlanFromThis": {
       // The document on screen, and only while the screen still shows the
-      // engine refusing it as planning input; otherwise Make Plan asks.
+      // engine's check-plan classifying it as planning input; otherwise Make Plan asks.
       const shown = overview.startPlanSession;
-      const fromThis = shown?.planningInput && (shown.status?.status === "refused" || shown.classification?.kind === "planning-input") && startPlanContext?.planPath === shown.planPath ? startPlanContext : undefined;
+      const fromThis = shown?.classification?.kind === "planning-input" && startPlanContext?.planPath === shown.planPath ? startPlanContext : undefined;
       return makePlanCommand(makePlanDeps(controller, overview), fromThis ? { location: fromThis.location, source: fromThis.planPath } : undefined);
     }
     case "resumePlan":
@@ -3027,7 +3027,6 @@ async function beginStartPlan(controller: SparringController, overview: Overview
       phase: "preparing",
       answers,
       command: `sparring ${args.join(" ")}`,
-      ...((await looksLikePlan(planPath)) ? {} : { planningInput: true }),
     };
     startPlanContext = context;
     overview.setStartPlanSession(preparing);
@@ -3054,6 +3053,29 @@ async function beginStartPlan(controller: SparringController, overview: Overview
   }
 }
 
+/**
+ * Prepare intake, chosen on the planning-input screen: the engine's own
+ * start-plan intake route. It cannot run in its own workspace yet (engine
+ * start-plan --managed takes only '## Stage' plans — the screen says so), so
+ * this is the one point at which a feature branch in this checkout is asked.
+ */
+async function prepareIntakeInCheckout(controller: SparringController, overview: OverviewPanelManager, context: StartPlanContext): Promise<void> {
+  const { location } = context;
+  if ((await startPlanSupport(configuredExecutable(), location.repoRoot)) !== "supported") {
+    controller.log("Run plan: Prepare intake not available — the installed engine has no start-plan.");
+    void vscode.window.showWarningMessage("Agent Sparring: the installed engine has no start-plan, so it cannot prepare an intake from this document. Update the engine, or use Make Plan….");
+    return;
+  }
+  const expectedBranch = await resolveExpectedBranch(location);
+  if (!expectedBranch || !(await ensureFeatureBranch(controller, location, expectedBranch))) {
+    return;
+  }
+  if (await blockedByObsoleteSettings(controller, location)) {
+    return;
+  }
+  await beginStartPlan(controller, overview, { ...context, expectedBranch }, {});
+}
+
 /** Worktrees with a start-plan preparation running in this window. */
 const preparingWorktrees = new Set<string>();
 
@@ -3078,6 +3100,11 @@ async function handleStartPlanMessage(controller: SparringController, overview: 
       }
       return;
     }
+    case "prepareIntake":
+      if (session.classification?.kind === "planning-input") {
+        await prepareIntakeInCheckout(controller, overview, context);
+      }
+      return;
     case "retry":
       if (session.classification) {
         // Classified, never prepared: check the document again from the start.

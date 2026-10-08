@@ -105,6 +105,15 @@ A real reload remains a manual check; see [Manual verification](runners.md#manua
 Recorded rather than fixed, so they are visible without being smuggled into an
 unrelated change:
 
+- **Engine: `start-plan --managed` for intake-based planning input.** Today
+  `--managed` accepts only `## Stage` plans (engine `plan_start.evaluate`), so
+  Run Plan's planning-input screen prepares an intake in this checkout. It asks
+  for a feature branch and states the limitation (`MANAGED_INTAKE_LIMITATION`).
+  Once the engine supports it, **Prepare intake** should become the managed
+  default. After its decisions, **Start managed run** should let the engine
+  create the run's branch and worktree itself, with no branch asked. The
+  limitation text and `prepareIntakeInCheckout` then go away.
+
 - **A file cache keyed on size and mtime can serve a stale parse** if a file's
   contents are replaced while both are preserved (`src/vscode/fileHead.ts`).
 - **Symlink aliases** are resolved for repository roots (`RealPaths`) but not
