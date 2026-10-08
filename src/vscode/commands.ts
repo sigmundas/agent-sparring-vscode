@@ -59,7 +59,7 @@ import { stageScopeOf } from "../core/stageScope";
 import { CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
 import { applyFeatureBranch, inspectFeatureBranch } from "../core/featureBranch";
-import { classifyPlanDocument, featureBranchPrompt, type PlanClassification } from "../core/runPlanEntry";
+import { classifyPlanDocument, countStageHeadings, featureBranchPrompt, type CheckPlanQuery, type PlanClassification } from "../core/runPlanEntry";
 import { GETTING_STARTED } from "../core/gettingStarted";
 import { DEFERRED_VERIFICATION_REQUIRED, parseHandoffBranch, parsePlanStages, type PlanRunSource } from "../core/engineFormats";
 import { appendHumanEvidence, OUTCOME_WORDS, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
@@ -2479,7 +2479,7 @@ async function askBranch(current?: string): Promise<string | undefined> {
  * expected-branch check still decides. Returns false when the run must not
  * start (cancelled, or refused with the reason already shown).
  */
-async function ensureFeatureBranch(controller: SparringController, location: SparringLocation, branch: string): Promise<boolean> {
+async function ensureFeatureBranch(controller: SparringController, location: SparringLocation, branch: string, stillCurrent: () => boolean = () => true): Promise<boolean> {
   const repoRoot = location.repoRoot;
   const plan = await inspectFeatureBranch(repoRoot, branch);
   if (plan.kind === "checked-out" || plan.kind === "existing") {
@@ -2498,7 +2498,7 @@ async function ensureFeatureBranch(controller: SparringController, location: Spa
       ? `${plan.branch} does not exist in ${location.folderName}. It will be created at the current commit and checked out; your files are not changed.`
       : `${plan.branch} exists only on the remote. A local branch tracking ${plan.remoteRef} will be created and checked out, replacing ${from} in the worktree. Nothing is fetched.`;
   const choice = await vscode.window.showInformationMessage(question, { modal: true, detail }, "Create branch");
-  if (choice !== "Create branch") {
+  if (choice !== "Create branch" || !stillCurrent()) {
     return false;
   }
   const outcome = await applyFeatureBranch(repoRoot, plan);
@@ -2718,7 +2718,7 @@ async function runPlanCommand(controller: SparringController, overview: Overview
   // Classified first, by the engine: a branch or a workspace is only a
   // question for a plan it would run. Planning input goes to its own screen
   // — Make Plan… — with nothing asked and nothing launched.
-  const classification = await classifyPlan(location, planPath);
+  const classification = await classifyPlan(controller, location, planPath);
   if (classification.kind !== "runnable") {
     await showPlanClassification(controller, overview, { location, planPath, label }, classification);
     return;
@@ -2808,17 +2808,36 @@ async function runPlanCommand(controller: SparringController, overview: Overview
 
 /**
  * The engine's reading of the chosen document (`check-plan --json`, which
- * records nothing), with the file's own `## Stage` headings only to tell
- * planning input from a staged plan the engine refused.
+ * records nothing), with the file's own `## Stage` headings (outside fenced
+ * blocks) only to tell planning input from a staged plan the engine refused.
+ *
+ * In automatic mode a staged plan is executed as the manifest the extension
+ * builds from it, not as raw Markdown, so a Markdown refusal is checked again
+ * against that manifest (`check-plan --manifest --json`) before the plan is
+ * called unrunnable.
  */
-async function classifyPlan(location: SparringLocation, planPath: string): Promise<PlanClassification> {
+async function classifyPlan(controller: SparringController, location: SparringLocation, planPath: string): Promise<PlanClassification> {
   const text = await readOptional(planPath);
   if (text === undefined) {
     return classifyPlanDocument(undefined, undefined);
   }
-  const headings = (text.match(/^##\s+stage\b/gim) ?? []).length;
-  const query = await engineReadOnlyQuery(configuredExecutable(), buildCheckPlanArgs({ planPath, repoRoot: location.repoRoot, sparringDir: location.sparringDir }), location.repoRoot);
-  return classifyPlanDocument(headings, query.ok ? { exitCode: query.exitCode, stdout: query.stdout } : undefined);
+  const headings = countStageHeadings(text);
+  const ask = (args: string[]): Promise<CheckPlanQuery> => engineReadOnlyQuery(configuredExecutable(), args, location.repoRoot);
+  const markdown = await ask(buildCheckPlanArgs({ planPath, repoRoot: location.repoRoot, sparringDir: location.sparringDir }));
+  const first = classifyPlanDocument(headings, markdown);
+  if (first.kind !== "invalid" || planContinuationMode() !== "automatic") {
+    return first;
+  }
+  const label = planLabel(planPath, location.repoRoot);
+  const built = buildManifest({ markdown: text, planLabel: label, planName: path.basename(planPath), runKey: planKey(label), ...declarationsFor(controller, planKey(label), location) });
+  if (!built.ok) {
+    return first;
+  }
+  // A throwaway copy for the engine to read; the run writes its own later.
+  const manifest = await withTemporaryFile(renderManifest(built.manifest), "manifest.json", (file) =>
+    ask(buildCheckPlanArgs({ planPath: file, repoRoot: location.repoRoot, sparringDir: location.sparringDir, manifest: true })),
+  );
+  return classifyPlanDocument(headings, markdown, manifest);
 }
 
 /**
@@ -2837,6 +2856,12 @@ async function showPlanClassification(
   controller.log(`Run plan: ${name} not started — ${classification.kind}: ${classification.reason}`);
   if (classification.kind === "unreadable") {
     void vscode.window.showWarningMessage(`Agent Sparring: the plan document ${name} could not be read.`);
+    return;
+  }
+  if (classification.kind === "unclassified") {
+    // Not the engine's verdict on the plan: it could not give one. Nothing
+    // else is asked, so nothing runs on an unverified reading.
+    void vscode.window.showWarningMessage(`Agent Sparring: ${name} was not started — the engine could not classify it. ${classification.reason}`);
     return;
   }
   startPlanContext = { ...context, expectedBranch: "" };
@@ -3061,20 +3086,50 @@ async function beginStartPlan(controller: SparringController, overview: Overview
  */
 async function prepareIntakeInCheckout(controller: SparringController, overview: OverviewPanelManager, context: StartPlanContext): Promise<void> {
   const { location } = context;
-  if ((await startPlanSupport(configuredExecutable(), location.repoRoot)) !== "supported") {
-    controller.log("Run plan: Prepare intake not available — the installed engine has no start-plan.");
-    void vscode.window.showWarningMessage("Agent Sparring: the installed engine has no start-plan, so it cannot prepare an intake from this document. Update the engine, or use Make Plan….");
+  // The planning-input screen this was chosen on, claimed before the first
+  // await: a second click finds the claim, and Close or another document
+  // replaces the screen, which every later step checks before going on.
+  const shown = overview.startPlanSession;
+  if (!shown || preparingIntakeFrom.has(shown)) {
     return;
   }
-  const expectedBranch = await resolveExpectedBranch(location);
-  if (!expectedBranch || !(await ensureFeatureBranch(controller, location, expectedBranch))) {
-    return;
+  preparingIntakeFrom.add(shown);
+  const current = (): boolean => overview.startPlanSession === shown && startPlanContext === context;
+  const superseded = (): boolean => {
+    if (current()) {
+      return false;
+    }
+    controller.log(`Run plan: Prepare intake for ${path.basename(context.planPath)} abandoned — the screen was closed or replaced.`);
+    return true;
+  };
+  try {
+    const support = await startPlanSupport(configuredExecutable(), location.repoRoot);
+    if (superseded()) {
+      return;
+    }
+    if (support !== "supported") {
+      controller.log("Run plan: Prepare intake not available — the installed engine has no start-plan.");
+      void vscode.window.showWarningMessage("Agent Sparring: the installed engine has no start-plan, so it cannot prepare an intake from this document. Update the engine, or use Make Plan….");
+      return;
+    }
+    const expectedBranch = await resolveExpectedBranch(location);
+    if (!expectedBranch || superseded()) {
+      return;
+    }
+    if (!(await ensureFeatureBranch(controller, location, expectedBranch, current)) || superseded()) {
+      return;
+    }
+    if ((await blockedByObsoleteSettings(controller, location)) || superseded()) {
+      return;
+    }
+    await beginStartPlan(controller, overview, { ...context, expectedBranch }, {});
+  } finally {
+    preparingIntakeFrom.delete(shown);
   }
-  if (await blockedByObsoleteSettings(controller, location)) {
-    return;
-  }
-  await beginStartPlan(controller, overview, { ...context, expectedBranch }, {});
 }
+
+/** Planning-input screens whose Prepare intake is under way (before start-plan claims the worktree). */
+const preparingIntakeFrom = new WeakSet<StartPlanSession>();
 
 /** Worktrees with a start-plan preparation running in this window. */
 const preparingWorktrees = new Set<string>();

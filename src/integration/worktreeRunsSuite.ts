@@ -4,6 +4,7 @@
  */
 
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
@@ -55,7 +56,10 @@ export async function run(): Promise<void> {
   console.log("worktree runs: a run in a worktree outside the workspace was discovered, listed under Open with stage, next actor and worktree, and not auto-selected");
 
   await runPlanChoiceAssertions();
+  await letteredManifestPlanAssertions();
   await mergeCleanUpAssertions(sibling);
+  // Last: a successful Prepare intake creates and checks out a feature branch.
+  await prepareIntakeAssertions();
 }
 
 const calls = process.env.AGENT_SPARRING_TEST_CALLS ?? "";
@@ -196,6 +200,124 @@ async function planningInputAssertions(app: string): Promise<void> {
   assert.equal(closed.kind, "empty", `Close returns to a neutral view of the repository: ${JSON.stringify(closed)}`);
   assert.match(closed.emptyLines?.join(" ") ?? "", /Run Plan was closed; nothing was started/);
   console.log("worktree runs: planning input was classified by check-plan before any branch or workspace question, offered Prepare intake and Make Plan…, launched nothing, and Close left a neutral view");
+}
+
+type StartPlanModel = { kind: string; startPlan?: { planName: string; planningInput?: { reason: string }; stateLabel: string }; emptyLines?: string[] };
+
+/**
+ * Automatic continuation runs a staged plan as the manifest the extension
+ * builds. A plan whose raw Markdown the engine refuses (lettered stages) but
+ * whose manifest it accepts is still offered the managed run, not stopped
+ * at classification. (The fake engine's preflight inputs or the declined
+ * confirmation then stop it; nothing runs.)
+ */
+async function letteredManifestPlanAssertions(): Promise<void> {
+  const app = vscode.workspace.workspaceFolders![0].uri.fsPath;
+  const settings = vscode.workspace.getConfiguration("agentSparring");
+  await settings.update("planContinuation", "automatic", vscode.ConfigurationTarget.Workspace);
+  const before = (await callsOf("run-plan")).length;
+  const dialogs = stubDialogs("Run in its own workspace (recommended)", undefined);
+  try {
+    assert.ok(await vscode.commands.executeCommand<boolean>("agentSparring._test.runPlan", app, path.join(app, "lettered.md")));
+  } finally {
+    dialogs.restore();
+    await settings.update("planContinuation", "manual", vscode.ConfigurationTarget.Workspace);
+  }
+  assert.ok((await callsOf("check-plan")).some((line) => / --manifest --repo-root /.test(line)), "the manifest that would run was checked by the engine");
+  assert.deepEqual(dialogs.picks[0], ["Run in its own workspace (recommended)", "Run in this checkout"], `the managed run is offered: ${JSON.stringify(dialogs.asked)}`);
+  assert.ok(!dialogs.asked.some((line) => /could not classify|lettered stage numbers/.test(line)), `not refused at classification: ${JSON.stringify(dialogs.asked)}`);
+  // `--help` is a capability probe; the managed path's own preflight or confirmation stops it here.
+  assert.deepEqual((await callsOf("run-plan")).slice(before).filter((line) => !/ --help$/.test(line)), [], `nothing ran: ${JSON.stringify(dialogs.asked)}`);
+  console.log("worktree runs: a lettered plan refused as Markdown but accepted as its manifest was offered the managed run");
+}
+
+/**
+ * Prepare intake through its real helper, against an engine with start-plan:
+ * Close during a cold capability probe and replacement during the branch
+ * question both stop it before any branch is changed or start-plan runs; a
+ * double click prepares once; and an undisturbed one asks the branch, creates
+ * it and hands the document to the engine's start-plan.
+ */
+async function prepareIntakeAssertions(): Promise<void> {
+  const app = vscode.workspace.workspaceFolders![0].uri.fsPath;
+  const ideas = path.join(app, "ideas.md");
+  const settings = vscode.workspace.getConfiguration("agentSparring");
+  const original = settings.get<string>("executable");
+  await settings.update("executable", process.env.AGENT_SPARRING_TEST_START_PLAN, vscode.ConfigurationTarget.Workspace);
+  const slow = process.env.AGENT_SPARRING_TEST_SLOW_HELP ?? "";
+  const prepared = async () => (await callsOf("start-plan")).filter((line) => !/ --help$/.test(line));
+  const branch = () => execFileSync("git", ["-C", app, "rev-parse", "--abbrev-ref", "HEAD"], { encoding: "utf8" }).trim();
+  const show = async (file: string) => {
+    const quiet = stubDialogs(undefined, undefined);
+    try {
+      await vscode.commands.executeCommand("agentSparring._test.runPlan", app, file);
+    } finally {
+      quiet.restore();
+    }
+    const model = await vscode.commands.executeCommand<StartPlanModel>("agentSparring._test.overviewModel");
+    assert.equal(model.startPlan?.planName, path.basename(file));
+    assert.ok(model.startPlan?.planningInput);
+  };
+  const prepare = () => vscode.commands.executeCommand("agentSparring._test.startPlanMessage", { type: "startPlan", action: "prepareIntake" });
+  try {
+    // Closed while the cold `start-plan --help` probe is still running.
+    await show(ideas);
+    await fs.writeFile(slow, "");
+    let dialogs = stubDialogs(undefined, "Create branch", "feature/intake");
+    try {
+      const pending = prepare();
+      await eventually(() => callsOf("start-plan"), (lines) => lines.some((line) => / --help$/.test(line)), "the capability probe started");
+      await vscode.commands.executeCommand("agentSparring._test.startPlanMessage", { type: "startPlan", action: "dismiss" });
+      await pending;
+    } finally {
+      dialogs.restore();
+      await fs.rm(slow, { force: true });
+    }
+    assert.deepEqual(dialogs.inputs, [], "no branch is asked after Close");
+    assert.deepEqual(await prepared(), [], "and start-plan never runs");
+    assert.equal(branch(), "main", "nothing was checked out");
+    assert.equal((await vscode.commands.executeCommand<StartPlanModel>("agentSparring._test.overviewModel")).kind, "empty", "Close stays closed");
+
+    // Replaced by another document while the branch is being asked.
+    await show(ideas);
+    dialogs = stubDialogs(undefined, "Create branch", "feature/intake");
+    const window = vscode.window as unknown as Record<string, unknown>;
+    const answer = window["showInputBox"] as (options?: vscode.InputBoxOptions) => Promise<string | undefined>;
+    window["showInputBox"] = async (options?: vscode.InputBoxOptions) => {
+      await vscode.commands.executeCommand("agentSparring._test.runPlan", app, path.join(app, "more-ideas.md"));
+      return answer(options);
+    };
+    try {
+      await prepare();
+    } finally {
+      dialogs.restore();
+    }
+    assert.equal(dialogs.inputs.length, 1, "the branch was asked once");
+    assert.deepEqual(await prepared(), [], "the replaced document is not prepared");
+    assert.equal(branch(), "main", "and no branch was created for it");
+    const replaced = await vscode.commands.executeCommand<StartPlanModel>("agentSparring._test.overviewModel");
+    assert.equal(replaced.startPlan?.planName, "more-ideas.md", "the newer document stays on screen");
+
+    // Undisturbed, clicked twice: one branch question, one start-plan.
+    await show(ideas);
+    dialogs = stubDialogs(undefined, "Create branch", "feature/intake");
+    try {
+      await Promise.all([prepare(), prepare()]);
+      await eventually(prepared, (lines) => lines.length > 0, "start-plan was invoked");
+    } finally {
+      dialogs.restore();
+    }
+    assert.equal(dialogs.inputs.length, 1, `the branch is asked once: ${JSON.stringify(dialogs.asked)}`);
+    assert.equal(dialogs.inputs[0].value, "", "main is not proposed");
+    assert.equal(branch(), "feature/intake", "the feature branch was created and checked out");
+    const runs = await prepared();
+    assert.equal(runs.length, 1, `prepared once: ${JSON.stringify(runs)}`);
+    assert.match(runs[0], /ideas\.md .*--expected-branch feature\/intake/, runs[0]);
+    console.log("worktree runs: Prepare intake stopped when closed during the cold probe or replaced during the branch question, prepared once on a double click, and otherwise created the branch and ran start-plan");
+  } finally {
+    await settings.update("executable", original, vscode.ConfigurationTarget.Workspace);
+    execFileSync("git", ["-C", app, "checkout", "-q", "main"]);
+  }
 }
 
 /**

@@ -22,7 +22,7 @@ import type { ActiveOperationView, SettledOperationLine } from "./activeOperatio
 import { describeRepositoryContext, emptyStateLines, emptyStateTitle, SELECT_RUN_LABEL, type RepositoryContextView } from "./activeRepository";
 import { SETUP_NOT_IGNORED, SETUP_OBSOLETE_AGENT_SETTING, agentConfigView, providerLabel, withStagePin, type AgentConfigView, type ConfigRole, type EffectiveConfig } from "./effectiveConfig";
 import { parseBriefGoal, parseBriefOpening } from "./brief";
-import { currentStageOf, owningRoot, repositoryDisplayName, runLabel, samePath, type DiscoveredIntake, type PlanRunSnapshot, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
+import { currentStageOf, owningRoot, repositoryDisplayName, runLabel, samePath, type DiscoveredIntake, type PlanRunSnapshot, type RepositoryScopeView, type RunSelection, type RunSnapshot, type StageSnapshot } from "./discovery";
 import { intakeContinuation, intakeNextAction, intakeStateLabel, isExecutionGroup, sliceHeading, sliceRoot, sliceStageName, type IntakeContinuation, type IntakeNextAction, type IntakeSliceSnapshot } from "./intake";
 import { activeDurationMs, commandInFlight as anyCommandInFlight, formatDuration, providerDisplayName, quietSince, type ActorBudget, type ActorLive, type LiveState, type MeaningfulEvent } from "./liveState";
 import { DEFERRED_VERIFICATION_REQUIRED, PUSH_AUTHORIZATION_REQUIRED, obligationFailed, obligationResolved, parseHandoffBranch, type DeferredObligation, type PlanRunState, type RoutingAction, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
@@ -1572,8 +1572,11 @@ const NO_ARTIFACTS: OverviewArtifacts = { handoff: false, sparring: false, brief
  * older plan's intake, which is not the plan the person just chose; it is
  * still in History, and choosing anything there ends this view.
  */
-export function runPlanClosedModel(selection: RunSelection, artifacts: OverviewArtifacts = NO_ARTIFACTS): OverviewModel {
-  const neutral: RunSelection = { ...selection, selected: undefined, intake: undefined, ambiguous: [], pinned: false };
+export function runPlanClosedModel(selection: RunSelection, artifacts: OverviewArtifacts = NO_ARTIFACTS, repository?: RepositoryScopeView): OverviewModel {
+  // The repository of the document that was closed, named explicitly: it
+  // may not be the one the window follows (Run Plan's picker can choose another).
+  const scope = repository ? { ...repository, chosen: true } : selection.scope;
+  const neutral: RunSelection = { ...selection, selected: undefined, intake: undefined, ambiguous: [], pinned: false, ...(scope ? { scope } : {}) };
   const model = buildOverviewModel(neutral, undefined, artifacts);
   return { ...model, emptyLines: [`Run Plan was closed; nothing was started. Earlier runs and plan intakes are under ${SELECT_RUN_LABEL}`] };
 }

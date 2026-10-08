@@ -53,12 +53,19 @@ async function main(): Promise<void> {
   const fake = path.join(base, "bin", "sparring");
   await fs.mkdir(path.dirname(fake), { recursive: true });
   await fs.writeFile(fake, fakeEngine(base, sibling), { mode: 0o755 });
+  // The same engine with start-plan, under its own path so its capability
+  // probe starts cold: Prepare intake runs against this one.
+  const withStartPlan = path.join(base, "bin", "sparring-start-plan");
+  await fs.writeFile(withStartPlan, `#!/bin/sh\nSTART_PLAN=1 exec '${fake}' "$@"\n`, { mode: 0o755 });
   await fs.mkdir(path.join(app, ".vscode"), { recursive: true });
   // manual: Run Plan launches run-plan itself instead of building a manifest first.
   await fs.writeFile(path.join(app, ".vscode", "settings.json"), JSON.stringify({ "agentSparring.executable": fake, "agentSparring.planContinuation": "manual" }, null, 2));
   await fs.writeFile(path.join(app, "docs-plan.md"), PLAN);
   // Planning input: prose with no stage sections, for Make Plan….
   await fs.writeFile(path.join(app, "ideas.md"), "# Cloud sync extraction and orchestration\n\nSome thoughts, no stages yet.\n");
+  await fs.writeFile(path.join(app, "more-ideas.md"), "# More ideas\n\nStill no stages.\n");
+  // Lettered stages: the engine reads them only through the extension's manifest.
+  await fs.writeFile(path.join(app, "lettered.md"), "# Lettered\n\n## Stage 1A — Foundation\nbody\n\n## Stage 1B — Polish\nbody\n");
   // The window opens the repository through this alias; git lists it by its real path.
   const alias = path.join(base, "app-alias");
   await fs.symlink(app, alias, "dir");
@@ -68,7 +75,7 @@ async function main(): Promise<void> {
     await runTests({
       extensionDevelopmentPath: path.resolve(__dirname, "..", ".."),
       extensionTestsPath: path.resolve(__dirname, "worktreeRunsSuite"),
-      extensionTestsEnv: { AGENT_SPARRING_TEST_SIBLING: sibling, AGENT_SPARRING_TEST_CALLS: path.join(base, "fake-calls.log") },
+      extensionTestsEnv: { AGENT_SPARRING_TEST_SIBLING: sibling, AGENT_SPARRING_TEST_CALLS: path.join(base, "fake-calls.log"), AGENT_SPARRING_TEST_START_PLAN: withStartPlan, AGENT_SPARRING_TEST_SLOW_HELP: path.join(base, "slow-help") },
       // A user-data directory of its own, short enough for VS Code's IPC socket
       // path (macOS caps it at 103 characters) wherever this repository is.
       launchArgs: [alias, "--disable-extensions", "--disable-workspace-trust", `--user-data-dir=${userData}`],
@@ -101,6 +108,7 @@ function fakeEngine(base: string, sibling: string): string {
     summary: "eligible",
   };
   const result = { schema_version: 1, run_key: "tidy-1", completed_steps: ["checks", "merge", "archive_state", "remove_worktree", "delete_branch"], stopped_at: null, reason: null, remaining: [], deleted_ignored_paths: ["node_modules/"], kept: [] };
+  const startPlanStatus = { schema_version: 1, status: "needs_decision", route: "intake", plan: { path: "ideas.md", label: "ideas.md" }, expected_branch: "feature/intake", execution: {}, intake: null, slice: null, later_slices: [], decisions: [], findings: [], confirm_token: null, error: null };
   const q = (value: unknown) => `'${JSON.stringify(value)}'`;
   return [
     "#!/bin/sh",
@@ -114,12 +122,27 @@ function fakeEngine(base: string, sibling: string): string {
     "    esac",
     "    exit 0 ;;",
     "  run-plan) echo 'fake sparring: run-plan recorded'; exit 0 ;;",
-    // The engine's reading of a plan: runnable only with stage sections.
+    // The engine's reading of a plan: runnable only with stage sections; a
+    // lettered plan only as a manifest.
     '  check-plan)',
+    '    case " $* " in',
+    `      *" --manifest "*) printf '%s\\n' ${q({ valid: true, kind: "manifest", label: "plan", stages: [], error: null })}; exit 0 ;;`,
+    "    esac",
+    '    if grep -q "^## Stage 1A" "$2"; then',
+    `      printf '%s\\n' ${q({ valid: false, error: "Stage 1A: lettered stage numbers are not read from Markdown" })}; exit 1`,
+    "    fi",
     '    if grep -q "^## Stage" "$2"; then',
     `      printf '%s\\n' ${q({ valid: true, kind: "markdown", label: "plan", stages: [], error: null })}; exit 0`,
     "    fi",
-    `    printf '%s\\n' ${q({ valid: false, error: "no '## Stage <n> — <title>' sections" })}; exit 1 ;;`,
+    `    printf '%s\\n' ${q({ valid: false, error: "no ## Stage <n> — <title> sections" })}; exit 1 ;;`,
+    // start-plan exists only for the START_PLAN copy; its help can be slowed down.
+    '  start-plan)',
+    '    if [ -n "$START_PLAN" ]; then',
+    '      case " $* " in',
+    `        *" --help "*) if [ -f '${path.join(base, "slow-help")}' ]; then sleep 3; fi; echo 'usage: sparring start-plan PLAN --expected-branch BRANCH [--confirm TOKEN] [--json]'; exit 0 ;;`,
+    "      esac",
+    `      printf '%s\\n' ${q(startPlanStatus)}; exit 0`,
+    "    fi ;;",
     "esac",
     "exit 2",
     "",

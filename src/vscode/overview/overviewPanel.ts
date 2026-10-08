@@ -11,7 +11,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, intakeOfRun, samePath, type DiscoveredIntake, type PlanRunSnapshot, type RunSnapshot } from "../../core/discovery";
+import { BRIEF_FILENAME, HANDOFF_FILENAME, NOTES_FILENAME, SPARRING_FILENAME, STAGES_DIRNAME, STATE_FILENAME, currentStageOf, intakeOfRun, repositoryDisplayName, samePath, type DiscoveredIntake, type PlanRunSnapshot, type RunSnapshot } from "../../core/discovery";
 import { stageScopeOf } from "../../core/stageScope";
 import { intakeNextAction, sourcePlanDigest } from "../../core/intake";
 import { approveInvocation, preparedFromCurrentPlan, startInvocation } from "../../core/intakeActions";
@@ -44,6 +44,7 @@ import {
   type OverviewAction,
   type StopMessage,
 } from "../../core/overviewHtml";
+import { runPlanClosedHolds, type RunPlanClosed } from "../../core/runPlanEntry";
 import { PROMPTS_DIRNAME, PROMPT_INDEX_FILENAME, latestCapture, parseCaptureIndex } from "../../core/promptInspector";
 import { buildOverviewModel, runPlanClosedModel, startPlanView, type StartPlanSession, type AgentConfigOutcome, type CapturedPrompt, type ManagedPlanRun, type IntakeRecovery, type ManifestStageView, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
 import { outstanding as operationOutstanding } from "../operationRegistry";
@@ -404,25 +405,25 @@ export class OverviewPanelManager implements vscode.Disposable {
    * then shows {@link runPlanClosedModel} for that repository until the
    * selection is next chosen or the repository followed changes.
    */
-  private runPlanClosed: { repoRoot: string; selectionEpoch: string } | undefined;
+  private runPlanClosed: RunPlanClosed | undefined;
 
   closeRunPlan(repoRoot: string): void {
     this.startPlan = undefined;
-    this.runPlanClosed = { repoRoot, selectionEpoch: this.controller.selectionEpoch };
+    this.runPlanClosed = { repoRoot, followedAtClose: this.controller.currentSelection.scope?.repoRoot, selectionEpoch: this.controller.selectionEpoch };
     this.scheduleUpdate();
   }
 
-  private showsRunPlanClosed(): boolean {
+  /** The repository to show neutrally after Close, while navigation has not moved since. */
+  private runPlanClosedRepository(): string | undefined {
     const closed = this.runPlanClosed;
     if (!closed) {
-      return false;
+      return undefined;
     }
-    const scope = this.controller.currentSelection.scope?.repoRoot;
-    if (closed.selectionEpoch !== this.controller.selectionEpoch || (scope !== undefined && !samePath(scope, closed.repoRoot))) {
+    if (!runPlanClosedHolds(closed, { followed: this.controller.currentSelection.scope?.repoRoot, selectionEpoch: this.controller.selectionEpoch }, samePath)) {
       this.runPlanClosed = undefined;
-      return false;
+      return undefined;
     }
-    return true;
+    return closed.repoRoot;
   }
 
   /**
@@ -444,8 +445,9 @@ export class OverviewPanelManager implements vscode.Disposable {
     // project the rest of the screen describes.
     const agentConfig = await this.agentConfig();
     let artifacts: OverviewArtifacts = { handoff: false, sparring: false, brief: false, plan: false, agentConfig };
-    if (this.showsRunPlanClosed()) {
-      const model = runPlanClosedModel(selection, { ...artifacts, ...this.operationOnScreen() });
+    const closedRepository = this.runPlanClosedRepository();
+    if (closedRepository) {
+      const model = runPlanClosedModel(selection, { ...artifacts, ...this.operationOnScreen() }, { repoRoot: closedRepository, name: repositoryDisplayName(closedRepository) });
       return { model, source: { model, artifacts } };
     }
     let sparringText: string | undefined;

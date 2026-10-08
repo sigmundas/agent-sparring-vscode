@@ -21,11 +21,11 @@ import { MANAGED_INTAKE_LIMITATION, PLANNING_INPUT_TITLE, PREPARE_INTAKE } from 
 import { isStartPlanMessage } from "../core/overviewHtml";
 import { renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel, runPlanClosedModel, startPlanView, type StartPlanSession } from "../core/overviewModel";
-import { classifyPlanDocument, featureBranchPrompt } from "../core/runPlanEntry";
+import { classifyPlanDocument, countStageHeadings, featureBranchPrompt, runPlanClosedHolds, type CheckPlanQuery } from "../core/runPlanEntry";
 import { parseStartPlanStatus } from "../core/startPlan";
 
-const VALID = { exitCode: 0, stdout: JSON.stringify({ valid: true, kind: "markdown", label: "plan.md", stages: [], error: null }) };
-const NO_STAGES = { exitCode: 1, stdout: JSON.stringify({ valid: false, error: "no '## Stage <n> — <title>' sections" }) };
+const VALID = { ok: true as const, exitCode: 0, stdout: JSON.stringify({ valid: true, kind: "markdown", label: "plan.md", stages: [], error: null }) };
+const NO_STAGES = { ok: true as const, exitCode: 1, stdout: JSON.stringify({ valid: false, error: "no '## Stage <n> — <title>' sections" }) };
 
 function classifiedSession(kind: "planning-input" | "invalid", reason: string): StartPlanSession {
   return {
@@ -47,18 +47,46 @@ describe("Run Plan classifies the document before asking anything", () => {
 
   it("a plan the engine reads is runnable; a staged plan it refuses is invalid, with its reason", () => {
     assert.deepEqual(classifyPlanDocument(2, VALID), { kind: "runnable" });
-    assert.deepEqual(classifyPlanDocument(2, { exitCode: 1, stdout: JSON.stringify({ valid: false, error: "Stage 2 appears twice" }) }), { kind: "invalid", reason: "Stage 2 appears twice" });
+    assert.deepEqual(classifyPlanDocument(2, { ok: true, exitCode: 1, stdout: JSON.stringify({ valid: false, error: "Stage 2 appears twice" }) }), { kind: "invalid", reason: "Stage 2 appears twice" });
   });
 
-  it("an unreadable file is said so; an engine without check-plan falls back to the file's stage headings", () => {
+  it("an unreadable file is said so; an engine that cannot classify stops Run Plan, with its reason", () => {
     assert.equal(classifyPlanDocument(undefined, VALID).kind, "unreadable");
-    assert.deepEqual(classifyPlanDocument(2, undefined), { kind: "runnable" });
-    assert.deepEqual(classifyPlanDocument(2, { exitCode: 2, stdout: "usage: sparring …" }), { kind: "runnable" });
-    assert.equal(classifyPlanDocument(0, { exitCode: 2, stdout: "usage: sparring …" }).kind, "planning-input");
+    const unclassified = (headings: number, query: CheckPlanQuery | undefined, why: RegExp) => {
+      const result = classifyPlanDocument(headings, query);
+      assert.equal(result.kind, "unclassified", JSON.stringify(query));
+      assert.match((result as { reason: string }).reason, why);
+    };
+    unclassified(2, undefined, /not asked/);
+    unclassified(2, { ok: false, reason: "the sparring executable is resolved only by the shell" }, /could not be run: the sparring executable is resolved only by the shell/);
+    unclassified(2, { ok: true, exitCode: 2, stdout: "usage: sparring {run-plan,…}" }, /does not accept check-plan.*usage: sparring/);
+    unclassified(0, { ok: true, exitCode: 2, stdout: "usage: sparring …" }, /usage error/);
+    unclassified(2, { ok: true, exitCode: 0, stdout: "not json" }, /exited 0 without a JSON answer: not json/);
+    unclassified(2, { ok: true, exitCode: 0, stdout: JSON.stringify({ stages: [] }) }, /without a JSON answer/);
+    unclassified(2, { ok: true, exitCode: 1, stdout: VALID.stdout }, /contradict/);
+    unclassified(0, { ok: true, exitCode: 0, stdout: NO_STAGES.stdout }, /contradict/);
+  });
+
+  it("a staged plan whose Markdown the engine refuses still runs when the manifest built from it is accepted", () => {
+    const refused = { ok: true as const, exitCode: 1, stdout: JSON.stringify({ valid: false, error: "Stage 1A: lettered stages are not read as Markdown" }) };
+    const manifestValid = { ok: true as const, exitCode: 0, stdout: JSON.stringify({ valid: true, kind: "manifest", label: "plan.md", stages: [], error: null }) };
+    assert.deepEqual(classifyPlanDocument(2, refused, manifestValid), { kind: "runnable" });
+    assert.deepEqual(classifyPlanDocument(2, refused, { ok: true, exitCode: 1, stdout: JSON.stringify({ valid: false, error: "manifest says no" }) }), { kind: "invalid", reason: "Stage 1A: lettered stages are not read as Markdown" });
+    assert.equal(classifyPlanDocument(2, refused, { ok: false, reason: "spawn failed" }).kind, "unclassified", "a manifest check that could not run is not a verdict");
+    assert.equal(classifyPlanDocument(0, NO_STAGES, manifestValid).kind, "planning-input", "planning input is never rescued by a manifest");
+  });
+
+  it("the heading probe ignores stage headings inside fenced examples", () => {
+    const notes = "# Notes\n\nAn example plan:\n\n```markdown\n## Stage 1 — Example\nbody\n```\n\n~~~\n## Stage 2 — Also an example\n~~~\n";
+    assert.equal(countStageHeadings(notes), 0);
+    assert.deepEqual(classifyPlanDocument(countStageHeadings(notes), NO_STAGES), { kind: "planning-input", reason: "no '## Stage <n> — <title>' sections" });
+    assert.equal(countStageHeadings("## Stage 1 — Real\n````\n## Stage 9 — x\n```\nstill fenced\n````\n## Stage 2 — Real\n"), 2);
+    assert.equal(countStageHeadings("```\n## Stage 1 — never closed\n"), 0);
   });
 
   it("check-plan records nothing and needs no branch", () => {
     assert.deepEqual(buildCheckPlanArgs({ planPath: "/repo/ideas.md", repoRoot: "/repo" }), ["check-plan", "/repo/ideas.md", "--repo-root", "/repo", "--json"]);
+    assert.deepEqual(buildCheckPlanArgs({ planPath: "/tmp/m.json", repoRoot: "/repo", manifest: true }), ["check-plan", "/tmp/m.json", "--manifest", "--repo-root", "/repo", "--json"]);
     assert.deepEqual(buildCheckPlanArgs({ planPath: "/repo/ideas.md", repoRoot: "/repo", sparringDir: "/elsewhere/.sparring" }).slice(0, 3), ["--sparring-dir", "/elsewhere/.sparring", "check-plan"]);
   });
 
@@ -154,6 +182,23 @@ describe("an older plan's intake cannot stand in for the plan just chosen", () =
     assert.match(closed.emptyLines?.join(" ") ?? "", /nothing was started.*History \/ Runs…/);
     const html = renderOverviewHtml(closed, "n", "vscode-resource:");
     assert.ok(html.includes('data-action="runPlan"') || html.includes("Run plan…"), "Run plan… is offered again");
+  });
+
+  it("Close of a document from another repository names that repository and holds until navigation moves", async () => {
+    const followed = await intakeProject();
+    const intake = (await discoverRuns([followed])).intakes?.[0];
+    assert.ok(intake);
+    const selection = { ambiguous: [], intake, scope: { repoRoot: followed.repoRoot, name: "app" } };
+    // The document was in repository B; the window still follows A at Close.
+    const closed = { repoRoot: "/elsewhere/b", followedAtClose: followed.repoRoot, selectionEpoch: "e1" };
+    const same = (a: string, b: string) => path.resolve(a) === path.resolve(b);
+    assert.ok(runPlanClosedHolds(closed, { followed: followed.repoRoot, selectionEpoch: "e1" }, same), "it does not end the moment it starts");
+    const model = runPlanClosedModel(selection, undefined, { repoRoot: "/elsewhere/b", name: "b" });
+    assert.equal(model.kind, "empty");
+    assert.equal(model.intake, undefined, "A's old intake does not come back");
+    assert.ok(!runPlanClosedHolds(closed, { followed: "/other/c", selectionEpoch: "e1" }, same), "a change of followed repository ends it");
+    assert.ok(!runPlanClosedHolds(closed, { followed: followed.repoRoot, selectionEpoch: "e2" }, same), "so does a new selection");
+    assert.ok(runPlanClosedHolds({ ...closed, followedAtClose: undefined }, { followed: undefined, selectionEpoch: "e1" }, same));
   });
 
   it("the intake, when shown deliberately, names its source plan file prominently", async () => {
