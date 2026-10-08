@@ -770,6 +770,15 @@ export class SparringController implements vscode.Disposable {
     return this.selection;
   }
 
+  /**
+   * The stored selection and when it was made: changes whenever a run or
+   * intake is chosen, pinned or released. The Overview's neutral view after
+   * a closed Run Plan holds only until the selection is next chosen.
+   */
+  get selectionEpoch(): string {
+    return `${this.context.workspaceState.get<string>(SELECTED_RUN_KEY) ?? ""}|${this.context.workspaceState.get<number>(SELECTED_AT_KEY) ?? ""}`;
+  }
+
   /** The repository this window is in (integration tests and the diagnostic). */
   get activeRepositoryRoot(): string | undefined {
     return this.activeRepository.activeRepoRoot;

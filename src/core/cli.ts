@@ -441,6 +441,11 @@ export function buildFinishRunArgs(invocation: { repoRoot: string; runKey: strin
   return args;
 }
 
+/** `sparring check-plan PLAN --json`: reads the plan as run-plan would; records, approves and runs nothing. */
+export function buildCheckPlanArgs(invocation: { planPath: string; repoRoot: string; sparringDir?: string }): string[] {
+  return [...globalArgs(invocation), "check-plan", invocation.planPath, "--repo-root", invocation.repoRoot, "--json"];
+}
+
 function globalArgs(invocation: { repoRoot: string; sparringDir?: string }): string[] {
   if (!invocation.sparringDir) {
     return [];

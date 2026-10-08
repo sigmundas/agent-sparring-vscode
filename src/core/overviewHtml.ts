@@ -581,7 +581,7 @@ ${renderActors(model, discloseScope(model))}
       )
       .join("");
     return `${renderRepositoryContext(model)}${renderOperation(model)}
-<header class="top"><div><h1>${escapeHtml(intake.planName)}</h1><div class="run muted">Plan intake · ${escapeHtml(intake.stateLabel)}</div></div></header>
+<header class="top"><div><h1>${escapeHtml(intake.planName)}</h1><div class="run muted">Plan intake of <strong class="intake-source">${escapeHtml(intake.sourceFile)}</strong> · ${escapeHtml(intake.stateLabel)}</div></div></header>
 ${intake.blocked ? `<p class="intake-blocked"><strong>${escapeHtml(intake.blocked)}</strong></p>` : ""}
 ${intake.historical ? `<p class="preserved">${icon("warn", "escalate")}Historical intake · Source plan has newer intake <code>${escapeHtml(intake.historical.currentIntakeId)}</code></p>` : ""}
 ${intake.lines.map((line) => `<p>${escapeHtml(line)}</p>`).join("\n")}
@@ -2234,7 +2234,7 @@ ${view.summary.laterSlices.map((line) => `<p class="muted">${escapeHtml(line)}</
     `<button type="button" data-startplan="dismiss"${view.preparing ? " disabled" : ""}>Close</button>`,
   ].join("");
   return `<header class="top"><div><h1>${escapeHtml(view.planName)}</h1><div class="run muted">Run plan · ${escapeHtml(view.stateLabel)}</div></div></header>
-<p class="muted start-notice">${escapeHtml(view.providerTurnNotice)}</p>
+${view.providerTurnNotice ? `<p class="muted start-notice">${escapeHtml(view.providerTurnNotice)}</p>` : ""}
 ${view.preparing ? `<p class="start-preparing">${icon("sync")}The engine is preparing the plan…</p>` : ""}
 ${view.intake ? `<p>${escapeHtml(view.intake.line)}</p>` : view.route === "direct" ? "<p>Direct route: the plan's own stages run as written.</p>" : ""}
 ${view.refusal && view.planningInput ? renderPlanningInput(view.refusal) : view.refusal ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}Refused by the engine. Nothing was approved or run.</p><pre class="engineerror">${escapeHtml(view.refusal)}</pre></div>` : ""}

@@ -15,7 +15,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { acceptStage, type AcceptStageResult } from "../core/acceptance";
-import { buildReopenStageArgs, buildResumePlanArgs, roleOverrideArgs, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, readGitBranch, type DeferredResultAnswer } from "../core/cli";
+import { buildCheckPlanArgs, buildReopenStageArgs, buildResumePlanArgs, roleOverrideArgs, buildRunLoopArgs, buildRunPlanArgs, buildRunSparringArgs, commandNotFoundMessage, readGitBranch, type DeferredResultAnswer } from "../core/cli";
 import {
   BINDING_VERSION,
   adoptionGaps,
@@ -59,7 +59,8 @@ import { stageScopeOf } from "../core/stageScope";
 import { CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
 import { applyFeatureBranch, inspectFeatureBranch } from "../core/featureBranch";
-import { GETTING_STARTED, MAKE_PLAN_FROM_THIS, NOT_A_PLAN_TITLE, notAPlanDetail } from "../core/gettingStarted";
+import { classifyPlanDocument, featureBranchPrompt, type PlanClassification } from "../core/runPlanEntry";
+import { GETTING_STARTED } from "../core/gettingStarted";
 import { DEFERRED_VERIFICATION_REQUIRED, parseHandoffBranch, parsePlanStages, type PlanRunSource } from "../core/engineFormats";
 import { appendHumanEvidence, OUTCOME_WORDS, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
 import { blocksLaunch } from "../core/liveness";
@@ -1146,7 +1147,7 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
       // The document on screen, and only while the screen still shows the
       // engine refusing it as planning input; otherwise Make Plan asks.
       const shown = overview.startPlanSession;
-      const fromThis = shown?.planningInput && shown.status?.status === "refused" && startPlanContext?.planPath === shown.planPath ? startPlanContext : undefined;
+      const fromThis = shown?.planningInput && (shown.status?.status === "refused" || shown.classification?.kind === "planning-input") && startPlanContext?.planPath === shown.planPath ? startPlanContext : undefined;
       return makePlanCommand(makePlanDeps(controller, overview), fromThis ? { location: fromThis.location, source: fromThis.planPath } : undefined);
     }
     case "resumePlan":
@@ -2450,17 +2451,19 @@ async function resolveExpectedBranch(location: SparringLocation, recorded?: stri
     return decision.branch;
   }
   if (decision.kind === "ask") {
-    return askBranch(decision.suggestion);
+    return askBranch(decision.current);
   }
   await explainWrongBranch(decision, "this plan run was started for");
   return undefined;
 }
 
-async function askBranch(suggestion?: string): Promise<string | undefined> {
+async function askBranch(current?: string): Promise<string | undefined> {
+  const prompt = featureBranchPrompt(current);
   const value = await vscode.window.showInputBox({
     title: "Agent Sparring: feature branch",
-    prompt: "Feature branch for this plan. If it does not exist, Agent Sparring will create it from the current commit.",
-    value: suggestion ?? "",
+    prompt: prompt.prompt,
+    placeHolder: prompt.placeholder,
+    value: prompt.value,
     ignoreFocusOut: true,
     validateInput: (text) => (text.trim() ? undefined : "A branch name is required."),
   });
@@ -2712,6 +2715,14 @@ async function runPlanCommand(controller: SparringController, overview: Overview
     return;
   }
   const label = planLabel(planPath, location.repoRoot);
+  // Classified first, by the engine: a branch or a workspace is only a
+  // question for a plan it would run. Planning input goes to its own screen
+  // — Make Plan… — with nothing asked and nothing launched.
+  const classification = await classifyPlan(location, planPath);
+  if (classification.kind !== "runnable") {
+    await showPlanClassification(controller, overview, { location, planPath, label }, classification);
+    return;
+  }
   const where = await pickRunWorkspace(controller, location);
   if (!where) {
     return;
@@ -2768,19 +2779,6 @@ async function runPlanCommand(controller: SparringController, overview: Overview
     await beginStartPlan(controller, overview, { location, planPath, label, expectedBranch }, {});
     return;
   }
-  // Without start-plan nothing on this path can compile prose into stages,
-  // so a document with none is refused here, with where a plan comes from.
-  // (start-plan routes such a document through the engine's intake instead.)
-  if (!(await looksLikePlan(planPath))) {
-    controller.log(`Run plan: refused — ${path.basename(planPath)} has no '## Stage <n> — <title>' sections.`);
-    const choice = await vscode.window.showWarningMessage(NOT_A_PLAN_TITLE, { modal: true, detail: notAPlanDetail(path.basename(planPath)) }, MAKE_PLAN_FROM_THIS, "Open file");
-    if (choice === MAKE_PLAN_FROM_THIS) {
-      await makePlanCommand(makePlanDeps(controller, overview), { location, source: planPath });
-    } else if (choice === "Open file") {
-      await openDocument(planPath, `${path.basename(planPath)} is missing.`, overview.documentColumn);
-    }
-    return;
-  }
   // Minted here, before anything is written: this run's identity, which its
   // stage ids, its manifest file and the terminal tracking all derive from.
   const runKey = newRunKey(label);
@@ -2808,6 +2806,54 @@ async function runPlanCommand(controller: SparringController, overview: Overview
   }
 }
 
+/**
+ * The engine's reading of the chosen document (`check-plan --json`, which
+ * records nothing), with the file's own `## Stage` headings only to tell
+ * planning input from a staged plan the engine refused.
+ */
+async function classifyPlan(location: SparringLocation, planPath: string): Promise<PlanClassification> {
+  const text = await readOptional(planPath);
+  if (text === undefined) {
+    return classifyPlanDocument(undefined, undefined);
+  }
+  const headings = (text.match(/^##\s+stage\b/gim) ?? []).length;
+  const query = await engineReadOnlyQuery(configuredExecutable(), buildCheckPlanArgs({ planPath, repoRoot: location.repoRoot, sparringDir: location.sparringDir }), location.repoRoot);
+  return classifyPlanDocument(headings, query.ok ? { exitCode: query.exitCode, stdout: query.stdout } : undefined);
+}
+
+/**
+ * A document Run Plan will not run, on the Overview in place of whatever was
+ * there: the person just chose it, so an older intake or run must not stand
+ * in for it. Planning input offers Make Plan…; Close returns to a neutral
+ * view of the repository, never to an unrelated intake.
+ */
+async function showPlanClassification(
+  controller: SparringController,
+  overview: OverviewPanelManager,
+  context: { location: SparringLocation; planPath: string; label: string },
+  classification: Exclude<PlanClassification, { kind: "runnable" }>,
+): Promise<void> {
+  const name = path.basename(context.planPath);
+  controller.log(`Run plan: ${name} not started — ${classification.kind}: ${classification.reason}`);
+  if (classification.kind === "unreadable") {
+    void vscode.window.showWarningMessage(`Agent Sparring: the plan document ${name} could not be read.`);
+    return;
+  }
+  startPlanContext = { ...context, expectedBranch: "" };
+  overview.setStartPlanSession({
+    planName: name,
+    planLabel: context.label,
+    planPath: context.planPath,
+    expectedBranch: "",
+    phase: "shown",
+    answers: {},
+    classification: { kind: classification.kind, reason: classification.reason },
+    command: `sparring ${buildCheckPlanArgs({ planPath: context.planPath, repoRoot: context.location.repoRoot, sparringDir: context.location.sparringDir }).join(" ")}`,
+    ...(classification.kind === "planning-input" ? { planningInput: true } : {}),
+  });
+  await overview.show();
+}
+
 // ---------------------------------------------------------------- Run Plan in its own workspace
 
 const RUN_ISOLATED_LABEL = "Run in its own workspace (recommended)";
@@ -2816,7 +2862,7 @@ const RUN_IN_CHECKOUT_LABEL = "Run in this checkout";
 /**
  * Where a new run goes: a workspace of its own that the engine creates,
  * records, resumes and later merges (`run-plan --managed`), or this checkout
- * as before. The last answer for the repository is offered first; nothing
+ * as before. The managed run is always offered first; nothing
  * about a branch or a path is asked — the engine decides both.
  */
 async function pickRunWorkspace(controller: SparringController, location: SparringLocation): Promise<RunWorkspaceChoice | undefined> {
@@ -2824,9 +2870,13 @@ async function pickRunWorkspace(controller: SparringController, location: Sparri
     { choice: "isolated", label: RUN_ISOLATED_LABEL, detail: "Agent Sparring makes a separate workspace for this run. Your checkout is not switched or changed." },
     { choice: "checkout", label: RUN_IN_CHECKOUT_LABEL, detail: "The run works on the branch checked out here, as before." },
   ];
+  // The managed run stays first and is what Enter picks; running in this
+  // checkout is the deliberate, advanced choice even if it was used last.
   const last = controller.runWorkspaceChoice(location.repoRoot);
-  if (last === "checkout") {
-    items.reverse();
+  for (const item of items) {
+    if (item.choice === last) {
+      item.description = "last used here";
+    }
   }
   const picked = await vscode.window.showQuickPick(items, { title: "Agent Sparring: where should this plan run?", ignoreFocusOut: true });
   if (picked) {
@@ -2852,16 +2902,6 @@ async function runPlanIsolated(controller: SparringController, overview: Overvie
     void vscode.window.showErrorMessage(
       `Agent Sparring: no Git branch is checked out in ${location.folderName} (detached HEAD or not a repository). A run in its own workspace starts from the branch checked out here; check one out, then run again.`,
     );
-    return;
-  }
-  if (!(await looksLikePlan(planPath))) {
-    controller.log(`Run plan: refused — ${path.basename(planPath)} has no '## Stage <n> — <title>' sections.`);
-    const choice = await vscode.window.showWarningMessage(NOT_A_PLAN_TITLE, { modal: true, detail: notAPlanDetail(path.basename(planPath)) }, MAKE_PLAN_FROM_THIS, "Open file");
-    if (choice === MAKE_PLAN_FROM_THIS) {
-      await makePlanCommand(makePlanDeps(controller, overview), { location, source: planPath });
-    } else if (choice === "Open file") {
-      await openDocument(planPath, `${path.basename(planPath)} is missing.`, overview.documentColumn);
-    }
     return;
   }
   const runKey = newRunKey(label);
@@ -3025,8 +3065,11 @@ async function handleStartPlanMessage(controller: SparringController, overview: 
   }
   switch (message.action) {
     case "dismiss":
+      // Back to a neutral view of the repository, not to whatever automatic
+      // selection would show: that may be an older plan's intake, which is
+      // not the plan just chosen. History still reaches it deliberately.
       startPlanContext = undefined;
-      overview.setStartPlanSession(undefined);
+      overview.closeRunPlan(context.location.repoRoot);
       return;
     case "openReport": {
       const report = session.status?.intake?.report;
@@ -3036,6 +3079,11 @@ async function handleStartPlanMessage(controller: SparringController, overview: 
       return;
     }
     case "retry":
+      if (session.classification) {
+        // Classified, never prepared: check the document again from the start.
+        await runPlanCommand(controller, overview, { location: context.location, planPath: context.planPath });
+        return;
+      }
       await beginStartPlan(controller, overview, context, session.answers);
       return;
     case "answer": {

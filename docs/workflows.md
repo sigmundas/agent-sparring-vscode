@@ -42,8 +42,20 @@ asks where the run goes:
   the branch checked out here, as described under
   [Two ways to progress a plan](#two-ways-to-progress-a-plan).
 
-The last answer is offered first next time, per repository. No branch or path
-is asked for; the engine decides both.
+Before either choice, the engine classifies the document with
+`sparring check-plan --json`, which records nothing. A document with no
+`## Stage <n> — <title>` sections is planning input. The Overview shows it with
+**Make Plan from this…**, and nothing about a workspace or branch is asked. A
+staged plan the engine refuses shows the engine's reason. **Close** returns to
+a neutral view of the repository, not to whatever intake automatic selection
+would pick; older intakes stay under **History / Runs…**, and their screen
+names the source plan file.
+
+The managed run is always listed first and is what Enter picks; the last
+choice is marked "last used here". A managed run asks for no branch or path;
+the engine decides both. In this checkout, the feature-branch field starts
+empty and names the branch checked out only as context. A protected branch
+typed anyway is refused by the engine's branch guard.
 
 **Watch.** The extension reads `sparring runs --json` for each known
 repository on refresh. Each run listed there adds its worktree as a location

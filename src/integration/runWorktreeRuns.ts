@@ -57,6 +57,8 @@ async function main(): Promise<void> {
   // manual: Run Plan launches run-plan itself instead of building a manifest first.
   await fs.writeFile(path.join(app, ".vscode", "settings.json"), JSON.stringify({ "agentSparring.executable": fake, "agentSparring.planContinuation": "manual" }, null, 2));
   await fs.writeFile(path.join(app, "docs-plan.md"), PLAN);
+  // Planning input: prose with no stage sections, for Make Plan….
+  await fs.writeFile(path.join(app, "ideas.md"), "# Cloud sync extraction and orchestration\n\nSome thoughts, no stages yet.\n");
   // The window opens the repository through this alias; git lists it by its real path.
   const alias = path.join(base, "app-alias");
   await fs.symlink(app, alias, "dir");
@@ -112,6 +114,12 @@ function fakeEngine(base: string, sibling: string): string {
     "    esac",
     "    exit 0 ;;",
     "  run-plan) echo 'fake sparring: run-plan recorded'; exit 0 ;;",
+    // The engine's reading of a plan: runnable only with stage sections.
+    '  check-plan)',
+    '    if grep -q "^## Stage" "$2"; then',
+    `      printf '%s\\n' ${q({ valid: true, kind: "markdown", label: "plan", stages: [], error: null })}; exit 0`,
+    "    fi",
+    `    printf '%s\\n' ${q({ valid: false, error: "no '## Stage <n> — <title>' sections" })}; exit 1 ;;`,
     "esac",
     "exit 2",
     "",

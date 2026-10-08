@@ -44,12 +44,12 @@ describe("the expected branch of a managed run is resolved, not chosen", () => {
   });
 
   it("asks only when nothing has been recorded, suggesting the checked-out branch", () => {
-    assert.deepEqual(decideExpectedBranch(undefined, "feature/x"), { kind: "ask", suggestion: "feature/x" });
-    assert.deepEqual(decideExpectedBranch(undefined, undefined), { kind: "ask", suggestion: undefined });
+    assert.deepEqual(decideExpectedBranch(undefined, "feature/x"), { kind: "ask", current: "feature/x" });
+    assert.deepEqual(decideExpectedBranch(undefined, undefined), { kind: "ask", current: undefined });
   });
 
   it("treats a blank recorded branch as nothing recorded — it cannot be what the engine enforces", () => {
-    assert.deepEqual(decideExpectedBranch("   ", "feature/x"), { kind: "ask", suggestion: "feature/x" });
+    assert.deepEqual(decideExpectedBranch("   ", "feature/x"), { kind: "ask", current: "feature/x" });
   });
 
   it("ignores surrounding whitespace on both sides rather than calling it a mismatch", () => {

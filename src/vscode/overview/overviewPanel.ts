@@ -45,7 +45,7 @@ import {
   type StopMessage,
 } from "../../core/overviewHtml";
 import { PROMPTS_DIRNAME, PROMPT_INDEX_FILENAME, latestCapture, parseCaptureIndex } from "../../core/promptInspector";
-import { buildOverviewModel, startPlanView, type StartPlanSession, type AgentConfigOutcome, type CapturedPrompt, type ManagedPlanRun, type IntakeRecovery, type ManifestStageView, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
+import { buildOverviewModel, runPlanClosedModel, startPlanView, type StartPlanSession, type AgentConfigOutcome, type CapturedPrompt, type ManagedPlanRun, type IntakeRecovery, type ManifestStageView, type OverviewArtifacts, type OverviewModel, type PlanContinuation } from "../../core/overviewModel";
 import { outstanding as operationOutstanding } from "../operationRegistry";
 import { checkCopyText, reviewCopyText, type ReviewCopySource } from "../../core/reviewCopy";
 import { locateStage, parsePlanHeadings, type HeadingRef } from "../../core/planAssociation";
@@ -393,7 +393,36 @@ export class OverviewPanelManager implements vscode.Disposable {
 
   setStartPlanSession(session: StartPlanSession | undefined): void {
     this.startPlan = session;
+    if (session) {
+      this.runPlanClosed = undefined;
+    }
     this.scheduleUpdate();
+  }
+
+  /**
+   * Set when a Run Plan screen is closed with nothing started: the Overview
+   * then shows {@link runPlanClosedModel} for that repository until the
+   * selection is next chosen or the repository followed changes.
+   */
+  private runPlanClosed: { repoRoot: string; selectionEpoch: string } | undefined;
+
+  closeRunPlan(repoRoot: string): void {
+    this.startPlan = undefined;
+    this.runPlanClosed = { repoRoot, selectionEpoch: this.controller.selectionEpoch };
+    this.scheduleUpdate();
+  }
+
+  private showsRunPlanClosed(): boolean {
+    const closed = this.runPlanClosed;
+    if (!closed) {
+      return false;
+    }
+    const scope = this.controller.currentSelection.scope?.repoRoot;
+    if (closed.selectionEpoch !== this.controller.selectionEpoch || (scope !== undefined && !samePath(scope, closed.repoRoot))) {
+      this.runPlanClosed = undefined;
+      return false;
+    }
+    return true;
   }
 
   /**
@@ -415,6 +444,10 @@ export class OverviewPanelManager implements vscode.Disposable {
     // project the rest of the screen describes.
     const agentConfig = await this.agentConfig();
     let artifacts: OverviewArtifacts = { handoff: false, sparring: false, brief: false, plan: false, agentConfig };
+    if (this.showsRunPlanClosed()) {
+      const model = runPlanClosedModel(selection, { ...artifacts, ...this.operationOnScreen() });
+      return { model, source: { model, artifacts } };
+    }
     let sparringText: string | undefined;
     let repository: string | undefined;
     if (selection.selected) {

@@ -863,6 +863,12 @@ export interface IntakeView {
   /** The source plan's own `# ` title, else its label. */
   planName: string;
   planLabel: string;
+  /**
+   * The source plan's file name (`2026-08-23-cloud-sync-extraction.md`),
+   * shown beside the title: two plans can share a title, and an older
+   * plan's intake must not pass for the plan a person just chose.
+   */
+  sourceFile: string;
   /** `Prepared — 0 blocking findings, 6 recommendations`, `Approved — ready to start`, … */
   stateLabel: string;
   /** What is going on and what happens next, in the engine's terms. */
@@ -1521,6 +1527,7 @@ export function intakeView(
   return {
     planName: (sourceText ? planTitle(sourceText) : undefined) ?? intake.record.planLabel,
     planLabel: intake.record.planLabel,
+    sourceFile: (intake.record.sourcePath ?? intake.record.planLabel).split(/[\\/]/).pop() ?? intake.record.planLabel,
     stateLabel,
     lines,
     slices: intake.slices.map((entry) => ({
@@ -1557,6 +1564,19 @@ export function intakeView(
 }
 
 const NO_ARTIFACTS: OverviewArtifacts = { handoff: false, sparring: false, brief: false, plan: false };
+
+/**
+ * The Overview after a Run Plan screen was closed without starting anything:
+ * the repository, with Make Plan… and Run plan…, and nothing automatic
+ * selection would otherwise put there. Automatic selection may pick an
+ * older plan's intake, which is not the plan the person just chose; it is
+ * still in History, and choosing anything there ends this view.
+ */
+export function runPlanClosedModel(selection: RunSelection, artifacts: OverviewArtifacts = NO_ARTIFACTS): OverviewModel {
+  const neutral: RunSelection = { ...selection, selected: undefined, intake: undefined, ambiguous: [], pinned: false };
+  const model = buildOverviewModel(neutral, undefined, artifacts);
+  return { ...model, emptyLines: [`Run Plan was closed; nothing was started. Earlier runs and plan intakes are under ${SELECT_RUN_LABEL}`] };
+}
 
 export function buildOverviewModel(
   selection: RunSelection,
@@ -3612,6 +3632,11 @@ export interface StartPlanSession {
   command?: string;
   /** The document has no '## Stage <n>' sections: planning input, should the engine refuse it. */
   planningInput?: boolean;
+  /**
+   * Run Plan stopped at classification (`check-plan`), before any branch was
+   * asked or start-plan ran: the engine's reason, verbatim. No status then.
+   */
+  classification?: { kind: "planning-input" | "invalid"; reason: string };
 }
 
 export interface StartPlanView {
@@ -3683,6 +3708,16 @@ export function startPlanView(session: StartPlanSession): StartPlanView {
   };
   if (session.failure) {
     view.failure = session.failure;
+  }
+  if (session.classification) {
+    // Nothing was prepared, so no provider turn could have been spent.
+    view.stateLabel = session.classification.kind === "planning-input" ? "Planning input" : "Not a runnable plan";
+    view.providerTurnNotice = "";
+    view.refusal = session.classification.reason;
+    if (session.classification.kind === "planning-input") {
+      view.planningInput = true;
+    }
+    return view;
   }
   if (!status) {
     return view;

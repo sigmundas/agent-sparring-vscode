@@ -21,8 +21,8 @@
 export type ExpectedBranchDecision =
   /** One answer, no interaction: pass this branch. */
   | { kind: "use"; branch: string }
-  /** Nothing is recorded yet, so ask. `suggestion` is the checked-out branch, if any. */
-  | { kind: "ask"; suggestion?: string }
+  /** Nothing is recorded yet, so ask. `current` is the checked-out branch, if any: context for the question, never its default. */
+  | { kind: "ask"; current?: string }
   /**
    * A branch is recorded and the repository is somewhere else. Explain that
    * and launch nothing; `actual` is undefined on a detached HEAD or when the
@@ -45,7 +45,7 @@ export function decideExpectedBranch(
   const expected = recorded?.trim();
   const checkedOut = actual?.trim() || undefined;
   if (!expected) {
-    return { kind: "ask", suggestion: checkedOut };
+    return { kind: "ask", current: checkedOut };
   }
   if (checkedOut === expected) {
     return { kind: "use", branch: expected };

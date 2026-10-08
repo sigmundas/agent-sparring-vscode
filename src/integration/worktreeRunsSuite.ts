@@ -70,20 +70,22 @@ async function callsOf(subcommand: string): Promise<string[]> {
  * item whose label is `pick`, an input box with its proposed value, every warning/information dialog with
  * `confirm` when offered (and is recorded). Restored by the returned function.
  */
-function stubDialogs(pick: string | undefined, confirm: string | undefined): { asked: string[]; picks: string[][]; restore: () => void } {
+function stubDialogs(pick: string | undefined, confirm: string | undefined, typed?: string): { asked: string[]; inputs: vscode.InputBoxOptions[]; picks: string[][]; restore: () => void } {
   const window = vscode.window as unknown as Record<string, unknown>;
   const names = ["showQuickPick", "showInputBox", "showWarningMessage", "showInformationMessage", "showErrorMessage"];
   const originals = names.map((name) => [name, window[name]] as const);
   const asked: string[] = [];
+  const inputs: vscode.InputBoxOptions[] = [];
   const picks: string[][] = [];
   window["showQuickPick"] = async (items: readonly vscode.QuickPickItem[]) => {
     picks.push(items.map((item) => item.label));
     return items.find((item) => item.label === pick);
   };
-  // The branch question is answered with what it proposes: the branch checked out.
+  // An input box is answered with what the person types (`typed`), else with what it proposes.
   window["showInputBox"] = async (options?: vscode.InputBoxOptions) => {
     asked.push(options?.prompt ?? options?.title ?? "input");
-    return options?.value;
+    inputs.push(options ?? {});
+    return typed ?? options?.value;
   };
   for (const name of ["showWarningMessage", "showInformationMessage", "showErrorMessage"]) {
     window[name] = async (message: string, ...rest: unknown[]) => {
@@ -93,6 +95,7 @@ function stubDialogs(pick: string | undefined, confirm: string | undefined): { a
   }
   return {
     asked,
+    inputs,
     picks,
     restore: () => {
       for (const [name, original] of originals) {
@@ -102,23 +105,36 @@ function stubDialogs(pick: string | undefined, confirm: string | undefined): { a
   };
 }
 
-/** Run Plan asks where the run goes, and each answer builds its own invocation. */
+/**
+ * Run Plan classifies the chosen document with the engine first, then asks
+ * where the run goes, and each answer builds its own invocation.
+ */
 async function runPlanChoiceAssertions(): Promise<void> {
   const app = vscode.workspace.workspaceFolders![0].uri.fsPath;
+  await planningInputAssertions(app);
   const plan = path.join(app, "docs-plan.md");
   for (const [choice, managed] of [
     ["Run in its own workspace (recommended)", true],
     ["Run in this checkout", false],
+    // Asked again after this checkout was used: the managed run still comes first.
+    ["Run in its own workspace (recommended)", true],
   ] as const) {
     const before = (await callsOf("run-plan")).length;
-    const dialogs = stubDialogs(choice, undefined);
+    // In this checkout the person types the branch: nothing is proposed.
+    const dialogs = stubDialogs(choice, undefined, managed ? undefined : "main");
     try {
       assert.ok(await vscode.commands.executeCommand<boolean>("agentSparring._test.runPlan", app, plan), "the repository is a known location");
     } finally {
       dialogs.restore();
     }
-    // Both answers so far follow an own-workspace run (none, then this one), so it stays first.
-    assert.deepEqual(dialogs.picks[0], ["Run in its own workspace (recommended)", "Run in this checkout"], "both choices are offered, the recommended one first");
+    assert.deepEqual(dialogs.picks[0], ["Run in its own workspace (recommended)", "Run in this checkout"], "both choices are offered, the managed run first whatever was chosen last");
+    if (managed) {
+      assert.equal(dialogs.inputs.length, 0, `a managed run asks for no branch: ${JSON.stringify(dialogs.asked)}`);
+    } else {
+      assert.equal(dialogs.inputs.length, 1, "this checkout asks for the feature branch");
+      assert.equal(dialogs.inputs[0].value, "", "the checked-out branch (main) is never proposed as the feature branch");
+      assert.match(dialogs.inputs[0].prompt ?? "", /Checked out now: main\./, "it is named as context");
+    }
     const launched = await eventually(async () => (await callsOf("run-plan")).slice(before), (lines) => lines.length > 0, `${choice}: run-plan was invoked`);
     const line = launched[0];
     if (managed) {
@@ -130,7 +146,42 @@ async function runPlanChoiceAssertions(): Promise<void> {
     }
     assert.match(line, /--run-key docs-plan-/, `with a run key the extension minted: ${line}`);
   }
-  console.log("worktree runs: Run Plan offered its own workspace and this checkout, and launched run-plan with --managed --target-branch or --expected-branch accordingly");
+  console.log("worktree runs: Run Plan offered its own workspace first and this checkout, asked no branch for a managed run, proposed none in this checkout, and launched run-plan with --managed --target-branch or --expected-branch accordingly");
+}
+
+/**
+ * A document with no stage sections, chosen on main: the engine's check-plan
+ * classifies it first, and its screen — Make Plan… — is the first thing
+ * shown. No workspace or branch question, no start-plan or run-plan. Close
+ * leaves a neutral view of the repository, not some other plan.
+ */
+async function planningInputAssertions(app: string): Promise<void> {
+  const ideas = path.join(app, "ideas.md");
+  const launches = async () => [...(await callsOf("run-plan")), ...(await callsOf("start-plan"))].length;
+  const before = await launches();
+  const dialogs = stubDialogs("Run in this checkout", undefined, "main");
+  try {
+    assert.ok(await vscode.commands.executeCommand<boolean>("agentSparring._test.runPlan", app, ideas));
+  } finally {
+    dialogs.restore();
+  }
+  assert.deepEqual(dialogs.picks, [], "no workspace choice is asked for planning input");
+  assert.deepEqual(dialogs.inputs, [], "and no feature branch");
+  assert.equal(await launches(), before, "nothing is launched against main");
+  const real = await fs.realpath(ideas);
+  assert.ok((await callsOf("check-plan")).some((line) => line.startsWith(`check-plan ${real} `) || line.startsWith(`check-plan ${ideas} `)), "the engine classified it");
+  type Model = { kind: string; startPlan?: { stateLabel: string; planningInput?: boolean; planName: string }; emptyLines?: string[] };
+  const shown = await vscode.commands.executeCommand<Model>("agentSparring._test.overviewModel");
+  assert.equal(shown.kind, "startPlan", "the chosen document is what the Overview shows");
+  assert.equal(shown.startPlan?.planName, "ideas.md");
+  assert.equal(shown.startPlan?.planningInput, true, "as planning input, with Make Plan…");
+  assert.equal(shown.startPlan?.stateLabel, "Planning input");
+
+  await vscode.commands.executeCommand("agentSparring._test.startPlanMessage", { type: "startPlan", action: "dismiss" });
+  const closed = await vscode.commands.executeCommand<Model>("agentSparring._test.overviewModel");
+  assert.equal(closed.kind, "empty", `Close returns to a neutral view of the repository: ${JSON.stringify(closed)}`);
+  assert.match(closed.emptyLines?.join(" ") ?? "", /Run Plan was closed; nothing was started/);
+  console.log("worktree runs: planning input was classified by check-plan before any branch or workspace question, shown with Make Plan…, launched nothing, and Close left a neutral view");
 }
 
 /**
