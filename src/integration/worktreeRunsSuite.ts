@@ -298,27 +298,51 @@ async function prepareIntakeAssertions(): Promise<void> {
     const replaced = await vscode.commands.executeCommand<StartPlanModel>("agentSparring._test.overviewModel");
     assert.equal(replaced.startPlan?.planName, "more-ideas.md", "the newer document stays on screen");
 
-    // Closed while the branch is being prepared: after the person confirmed
-    // Create branch, while the pre-write reads run, the screen goes away.
-    await show(ideas);
-    dialogs = stubDialogs(undefined, "Create branch", "feature/intake");
-    const confirm = window["showInformationMessage"] as (message: string, ...rest: unknown[]) => Promise<unknown>;
-    window["showInformationMessage"] = async (message: string, ...rest: unknown[]) => {
-      const choice = await confirm(message, ...rest);
-      if (choice === "Create branch") {
-        await vscode.commands.executeCommand("agentSparring._test.startPlanMessage", { type: "startPlan", action: "dismiss" });
+    // Disturbed during applyFeatureBranch's pre-write reads: Create branch is
+    // confirmed and returns, the wrapped git then holds the HEAD read, the
+    // screen is closed (or replaced by a runnable document), and the read is
+    // released. The guard at the switch boundary must stop it.
+    const control = process.env.AGENT_SPARRING_TEST_GIT_CONTROL ?? "";
+    // The extension host's own PATH (VS Code resolves it from the login
+    // shell, so the runner cannot set it): the wrapped git comes first.
+    const realPath = process.env.PATH;
+    process.env.PATH = `${path.join(control, "gitbin")}${path.delimiter}${realPath ?? ""}`;
+    const exists = (name: string) => fs.access(path.join(control, name)).then(() => true, () => false);
+    const switches = async () => (await fs.readFile(path.join(control, "git-switch.log"), "utf8").catch(() => "")).split("\n").filter(Boolean);
+    for (const disturb of [
+      () => vscode.commands.executeCommand("agentSparring._test.startPlanMessage", { type: "startPlan", action: "dismiss" }),
+      () => vscode.commands.executeCommand("agentSparring._test.runPlan", app, path.join(app, "docs-plan.md")),
+    ]) {
+      await show(ideas);
+      dialogs = stubDialogs(undefined, "Create branch", "feature/intake");
+      const confirm = window["showInformationMessage"] as (message: string, ...rest: unknown[]) => Promise<unknown>;
+      window["showInformationMessage"] = async (message: string, ...rest: unknown[]) => {
+        const choice = await confirm(message, ...rest);
+        if (choice === "Create branch") {
+          await fs.writeFile(path.join(control, "git-pause"), "");
+        }
+        return choice;
+      };
+      const switchesBefore = (await switches()).length;
+      try {
+        const pending = prepare();
+        await eventually(() => exists("git-paused"), Boolean, "applyFeatureBranch's HEAD read is held");
+        await disturb();
+        await fs.writeFile(path.join(control, "git-release"), "");
+        await pending;
+      } finally {
+        dialogs.restore();
+        await fs.writeFile(path.join(control, "git-release"), "");
+        await fs.rm(path.join(control, "git-pause"), { force: true });
       }
-      return choice;
-    };
-    try {
-      await prepare();
-    } finally {
-      dialogs.restore();
+      assert.ok(dialogs.asked.some((line) => /^Create feature\/intake/.test(line)), `the branch was confirmed: ${JSON.stringify(dialogs.asked)}`);
+      assert.deepEqual((await switches()).slice(switchesBefore), [], "no git switch was issued");
+      assert.equal(branch(), "main", "nothing was checked out");
+      assert.ok(!execFileSync("git", ["-C", app, "branch", "--list", "feature/intake"], { encoding: "utf8" }).trim(), "no branch exists");
+      assert.deepEqual(await prepared(), [], "start-plan never ran");
+      await fs.rm(path.join(control, "git-release"), { force: true });
     }
-    assert.ok(dialogs.asked.some((line) => /^Create feature\/intake/.test(line)), `the branch was confirmed: ${JSON.stringify(dialogs.asked)}`);
-    assert.equal(branch(), "main", "but closed before the write, so it was not created");
-    assert.ok(!execFileSync("git", ["-C", app, "branch", "--list", "feature/intake"], { encoding: "utf8" }).trim(), "no branch exists");
-    assert.deepEqual(await prepared(), []);
+    process.env.PATH = realPath;
 
     // Replaced by a runnable document whose workspace question is then dismissed.
     await show(ideas);
@@ -352,7 +376,7 @@ async function prepareIntakeAssertions(): Promise<void> {
     const runs = await prepared();
     assert.equal(runs.length, 1, `prepared once: ${JSON.stringify(runs)}`);
     assert.match(runs[0], /ideas\.md .*--expected-branch feature\/intake/, runs[0]);
-    console.log("worktree runs: Prepare intake stopped when closed during the cold probe or replaced during the branch question, prepared once on a double click, and otherwise created the branch and ran start-plan");
+    console.log("worktree runs: Prepare intake stopped when closed during the cold probe, replaced during the branch question, or closed/replaced while a pre-write git read was held, prepared once on a double click, and otherwise created the branch and ran start-plan");
   } finally {
     await settings.update("executable", original, vscode.ConfigurationTarget.Workspace);
     execFileSync("git", ["-C", app, "checkout", "-q", "main"]);

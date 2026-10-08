@@ -56,6 +56,12 @@ async function main(): Promise<void> {
   // The same engine with start-plan, under its own path so its capability
   // probe starts cold: Prepare intake runs against this one.
   const withStartPlan = path.join(base, "bin", "sparring-start-plan");
+  // git for the extension host: records every `switch`, and can hold one
+  // HEAD read (applyFeatureBranch's first pre-write read) until released.
+  const realGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  const gitBin = path.join(base, "gitbin");
+  await fs.mkdir(gitBin, { recursive: true });
+  await fs.writeFile(path.join(gitBin, "git"), gitWrapper(base, realGit), { mode: 0o755 });
   await fs.writeFile(withStartPlan, `#!/bin/sh\nSTART_PLAN=1 exec '${fake}' "$@"\n`, { mode: 0o755 });
   await fs.mkdir(path.join(app, ".vscode"), { recursive: true });
   // manual: Run Plan launches run-plan itself instead of building a manifest first.
@@ -75,7 +81,7 @@ async function main(): Promise<void> {
     await runTests({
       extensionDevelopmentPath: path.resolve(__dirname, "..", ".."),
       extensionTestsPath: path.resolve(__dirname, "worktreeRunsSuite"),
-      extensionTestsEnv: { AGENT_SPARRING_TEST_SIBLING: sibling, AGENT_SPARRING_TEST_CALLS: path.join(base, "fake-calls.log"), AGENT_SPARRING_TEST_START_PLAN: withStartPlan, AGENT_SPARRING_TEST_SLOW_HELP: path.join(base, "slow-help") },
+      extensionTestsEnv: { AGENT_SPARRING_TEST_SIBLING: sibling, AGENT_SPARRING_TEST_CALLS: path.join(base, "fake-calls.log"), AGENT_SPARRING_TEST_START_PLAN: withStartPlan, AGENT_SPARRING_TEST_SLOW_HELP: path.join(base, "slow-help"), AGENT_SPARRING_TEST_GIT_CONTROL: base },
       // A user-data directory of its own, short enough for VS Code's IPC socket
       // path (macOS caps it at 103 characters) wherever this repository is.
       launchArgs: [alias, "--disable-extensions", "--disable-workspace-trust", `--user-data-dir=${userData}`],
@@ -87,6 +93,24 @@ async function main(): Promise<void> {
     await fs.rm(base, { recursive: true, force: true });
     await fs.rm(userData, { recursive: true, force: true });
   }
+}
+
+/**
+ * `git-pause` (one-shot) holds the next `HEAD^{commit}` read, announcing it
+ * with `git-paused`, until `git-release` appears. Every `switch` is logged to
+ * `git-switch.log` before it runs.
+ */
+function gitWrapper(base: string, realGit: string): string {
+  const at = (name: string) => `'${path.join(base, name)}'`;
+  return [
+    "#!/bin/sh",
+    `case " $* " in *" switch "*) echo "$*" >> ${at("git-switch.log")} ;; esac`,
+    'case " $* " in',
+    `  *" HEAD^{commit} "*) if [ -f ${at("git-pause")} ]; then rm -f ${at("git-pause")}; touch ${at("git-paused")}; while [ ! -f ${at("git-release")} ]; do sleep 0.1; done; rm -f ${at("git-release")} ${at("git-paused")}; fi ;;`,
+    "esac",
+    `exec '${realGit}' "$@"`,
+    "",
+  ].join("\n");
 }
 
 /**
