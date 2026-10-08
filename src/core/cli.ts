@@ -13,6 +13,9 @@
  *   sparring [--sparring-dir DIR] freeze-candidate STAGE --repo-root ROOT --expected-branch BRANCH
  *   sparring [--sparring-dir DIR] accept-candidate STAGE --repo-root ROOT --expected-branch BRANCH
  *   sparring [--sparring-dir DIR] new-stage   STAGE [--brief-file PATH]   (engine 7b6b2d8)
+ *   sparring run-plan    (PLAN | --manifest FILE) --repo-root ROOT --managed --target-branch BRANCH --run-key KEY   (engine 99e5e70)
+ *   sparring resume-plan (PLAN | --manifest FILE) --repo-root ROOT --run-key KEY   (a managed run; engine 99e5e70)
+ *   sparring runs --repo-root ROOT --json   (engine 99e5e70)
  *
  * No dependency on the vscode API.
  */
@@ -58,6 +61,17 @@ export interface PlanInvocation {
    * recorded before run instances existed.
    */
   runKey?: string;
+  /**
+   * A run in its own workspace: a worktree and branch the engine creates,
+   * records and resumes (the engine's `--managed`). No `--expected-branch`
+   * is ever sent for it — the engine chooses the branch, and on a resume
+   * reads it from its record — so `expectedBranch` is not used.
+   *
+   * On `run-plan`, `targetBranch` is the branch the run starts from and
+   * later merges into. On `resume-plan` the run key is required, because it
+   * is what the engine finds the record by.
+   */
+  isolated?: { targetBranch?: string };
 }
 
 /**
@@ -72,6 +86,12 @@ export interface PlanInvocation {
  */
 export function buildRunPlanArgs(invocation: PlanInvocation & { adopt?: boolean; allowPushForRun?: boolean }): string[] {
   const args = [...globalArgs(invocation), "run-plan", ...planInput(invocation), ...loopArgs(invocation)];
+  if (invocation.isolated) {
+    if (!invocation.isolated.targetBranch || !invocation.runKey) {
+      throw new Error("a run in its own workspace is started with a target branch and a run key");
+    }
+    args.push("--managed", "--target-branch", invocation.isolated.targetBranch);
+  }
   if (invocation.adopt) {
     args.push("--adopt");
   }
@@ -208,7 +228,13 @@ export interface DeferredResultAnswer {
 
 export function buildResumePlanArgs(invocation: ResumePlanInvocation): string[] {
   requireRecordedInputKind(invocation);
-  const args = [...globalArgs(invocation), "resume-plan", ...planInput(invocation), ...loopArgs(invocation)];
+  if (invocation.isolated && !invocation.runKey) {
+    throw new Error("a run in its own workspace is resumed by its run key");
+  }
+  // No `--sparring-dir` for a run in its own workspace: the engine takes the
+  // run's project directory from its record, and the worktree's would not be
+  // inside the `--repo-root` checkout this is resumed from.
+  const args = [...(invocation.isolated ? [] : globalArgs(invocation)), "resume-plan", ...planInput(invocation), ...loopArgs(invocation)];
   if (invocation.evidence && invocation.evidence.trim()) {
     args.push("--evidence", invocation.evidence.trim());
   }
@@ -387,6 +413,14 @@ export function buildNewStageArgs(invocation: NewStageInvocation): string[] {
   return args;
 }
 
+/**
+ * `sparring runs --repo-root ROOT --json`: the engine's read-only list of
+ * this repository's runs in their own workspaces (see `parseIsolatedRuns`).
+ */
+export function buildRunsArgs(repoRoot: string): string[] {
+  return ["runs", "--repo-root", repoRoot, "--json"];
+}
+
 function globalArgs(invocation: { repoRoot: string; sparringDir?: string }): string[] {
   if (!invocation.sparringDir) {
     return [];
@@ -398,8 +432,8 @@ function globalArgs(invocation: { repoRoot: string; sparringDir?: string }): str
   return ["--sparring-dir", invocation.sparringDir];
 }
 
-function loopArgs(invocation: { repoRoot: string; expectedBranch: string; runKey?: string }): string[] {
-  const args = ["--repo-root", invocation.repoRoot, "--expected-branch", invocation.expectedBranch];
+function loopArgs(invocation: { repoRoot: string; expectedBranch: string; runKey?: string; isolated?: object }): string[] {
+  const args = invocation.isolated ? ["--repo-root", invocation.repoRoot] : ["--repo-root", invocation.repoRoot, "--expected-branch", invocation.expectedBranch];
   if (invocation.runKey) {
     args.push("--run-key", invocation.runKey);
   }

@@ -1146,3 +1146,85 @@ function optionalString(payload: Record<string, unknown>, key: string): string |
   }
   return value;
 }
+
+// ---------------------------------------------------------------------------
+// `sparring runs --json`  (managed_finish.py: runs_report; reference.md
+// "Managed-run JSON"). The engine calls these *managed* runs; the extension
+// already says "managed run" for every engine-driven plan run, so here they
+// are *isolated* runs: a plan run in a worktree the engine created for it.
+// ---------------------------------------------------------------------------
+
+/** The only `runs --json` schema this extension reads. */
+export const ISOLATED_RUNS_SCHEMA_VERSION = 1;
+
+export type IsolatedRunLifecycle = "creating" | "creation_failed" | "created" | "merged" | "worktree_removed" | "finished";
+
+const ISOLATED_RUN_LIFECYCLES: ReadonlySet<string> = new Set<IsolatedRunLifecycle>(["creating", "creation_failed", "created", "merged", "worktree_removed", "finished"]);
+
+/**
+ * One engine-recorded run in its own worktree. The record is the only link
+ * between a run key and a worktree: nothing else (a folder name, a branch
+ * name, `git worktree list`) makes a worktree a run's.
+ */
+export interface IsolatedRun {
+  runKey: string;
+  planLabel: string;
+  /** Absolute, from the engine's record. */
+  worktreePath: string;
+  worktreeExists: boolean;
+  branch: string;
+  targetBranch: string;
+  lifecycle: IsolatedRunLifecycle;
+  /** The run state's status, or `missing` / `unreadable`; presentation reads the run state itself. */
+  runStatus: string;
+}
+
+export type IsolatedRunsReport = { kind: "runs"; runs: IsolatedRun[] } | { kind: "version-mismatch"; version: unknown };
+
+/**
+ * Parse `sparring runs --json`. An unknown `schema_version` is a mismatch
+ * between engine and extension, reported as such and never guessed at; a
+ * known version with a malformed body throws {@link EngineFormatError}.
+ */
+export function parseIsolatedRuns(text: string): IsolatedRunsReport {
+  const payload = parseJsonObject(text, "runs report");
+  if (payload["schema_version"] !== ISOLATED_RUNS_SCHEMA_VERSION) {
+    return { kind: "version-mismatch", version: payload["schema_version"] };
+  }
+  const runs = payload["runs"];
+  if (!Array.isArray(runs)) {
+    throw new EngineFormatError('field "runs" must be a list');
+  }
+  return {
+    kind: "runs",
+    runs: runs.map((raw): IsolatedRun => {
+      if (!isRecord(raw)) {
+        throw new EngineFormatError("each run must be a JSON object");
+      }
+      if (raw["managed"] !== true) {
+        throw new EngineFormatError('field "managed" must be true');
+      }
+      const lifecycle = requireString(raw, "lifecycle");
+      if (!ISOLATED_RUN_LIFECYCLES.has(lifecycle)) {
+        throw new EngineFormatError(`unknown managed-run lifecycle ${JSON.stringify(lifecycle)}`);
+      }
+      const worktreePath = requireString(raw, "worktree_path");
+      if (!path.isAbsolute(worktreePath)) {
+        throw new EngineFormatError('field "worktree_path" must be absolute');
+      }
+      if (typeof raw["worktree_exists"] !== "boolean") {
+        throw new EngineFormatError('field "worktree_exists" must be a boolean');
+      }
+      return {
+        runKey: requireString(raw, "run_key"),
+        planLabel: requireString(raw, "plan_label"),
+        worktreePath,
+        worktreeExists: raw["worktree_exists"],
+        branch: requireString(raw, "branch"),
+        targetBranch: requireString(raw, "target_branch"),
+        lifecycle: lifecycle as IsolatedRunLifecycle,
+        runStatus: requireString(raw, "run_status"),
+      };
+    }),
+  };
+}

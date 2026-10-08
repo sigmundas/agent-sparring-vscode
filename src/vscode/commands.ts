@@ -78,7 +78,7 @@ import { STAGE_REPOSITORIES_KEY, manifestRepositories, relativeRepositoryPath, r
 import type { ManifestRepository } from "../core/manifest";
 import { STAGE_MODES_KEY, STAGE_MODE_LABELS, STAGE_MODES, modesForPlan, type StageMode, type StageModes } from "../core/stageModes";
 import { withTemporaryFile } from "../core/tempFile";
-import type { SparringController } from "./controller";
+import type { RunWorkspaceChoice, SparringController } from "./controller";
 import type { EngineFailure, LaunchProblem, LaunchResult } from "./executionTracker";
 import type { OperationView } from "./operationRegistry";
 import { outputTail } from "./terminalOutput";
@@ -1640,7 +1640,7 @@ async function submitDeferredVerification(
   if (choice !== "Submit verification") {
     return;
   }
-  const expectedBranch = await resolveExpectedBranch(run.location, run.state.expectedBranch);
+  const expectedBranch = await resumeBranch(controller, run);
   if (!expectedBranch) {
     return;
   }
@@ -1648,7 +1648,7 @@ async function submitDeferredVerification(
   if (!input) {
     return;
   }
-  const args = buildResumePlanArgs({ ...input, repoRoot: run.location.repoRoot, expectedBranch, sparringDir: run.location.sparringDir, deferredResults: answers });
+  const args = buildResumePlanArgs({ ...input, expectedBranch, ...resumeTarget(controller, run), deferredResults: answers });
   controller.log(`Submit deferred verification: ${answers.length} result(s) passed to resume-plan --deferred-result`);
   if (await blockedByObsoleteSettings(controller, run.location)) {
     return;
@@ -1718,7 +1718,7 @@ async function reopenStageCommand(controller: SparringController, overview: Over
   if (choice !== "Reopen stage") {
     return;
   }
-  const expectedBranch = await resolveExpectedBranch(run.location, run.state.expectedBranch);
+  const expectedBranch = await resumeBranch(controller, run);
   if (!expectedBranch) {
     return;
   }
@@ -1855,7 +1855,7 @@ type Handover = { launched: false } | { launched: true; executionId: string };
 
 async function askReviewerAgain(controller: SparringController, run: RunSnapshot, entry: string, logPrefix: string): Promise<Handover> {
   if (run.kind === "plan") {
-    const expectedBranch = await resolveExpectedBranch(run.location, run.state.expectedBranch);
+    const expectedBranch = await resumeBranch(controller, run);
     if (!expectedBranch) {
       return { launched: false };
     }
@@ -1863,7 +1863,7 @@ async function askReviewerAgain(controller: SparringController, run: RunSnapshot
     if (!input) {
       return { launched: false };
     }
-    const args = buildResumePlanArgs({ ...input, repoRoot: run.location.repoRoot, expectedBranch, sparringDir: run.location.sparringDir, evidence: entry });
+    const args = buildResumePlanArgs({ ...input, expectedBranch, ...resumeTarget(controller, run), evidence: entry });
     controller.log(`${logPrefix} passed to resume-plan --evidence for ${run.currentStage.stageId}`);
     if (await blockedByObsoleteSettings(controller, run.location)) {
       return { launched: false };
@@ -1969,7 +1969,7 @@ async function allowPushCommand(controller: SparringController, overview: Overvi
     return { ok: false, reason: model.branchGuard ? "branch" : "cancelled" };
   }
   const forRun = panel.autoPush.checked;
-  const expectedBranch = await resolveExpectedBranch(run.location, run.state.expectedBranch);
+  const expectedBranch = await resumeBranch(controller, run);
   if (!expectedBranch) {
     return { ok: false, reason: "branch" };
   }
@@ -1979,9 +1979,8 @@ async function allowPushCommand(controller: SparringController, overview: Overvi
   }
   const args = buildResumePlanArgs({
     ...input,
-    repoRoot: run.location.repoRoot,
     expectedBranch,
-    sparringDir: run.location.sparringDir,
+    ...resumeTarget(controller, run),
     allowPush: { candidateSha: panel.candidateSha, forRun },
   });
   controller.log(
@@ -2689,6 +2688,14 @@ async function runPlanCommand(controller: SparringController, overview: Overview
     return;
   }
   const label = planLabel(planPath, location.repoRoot);
+  const where = await pickRunWorkspace(controller, location);
+  if (!where) {
+    return;
+  }
+  if (where === "isolated") {
+    await runPlanIsolated(controller, overview, { location, planPath, label });
+    return;
+  }
   // Run Plan starts a *new* run of the selected plan, always. It used to
   // redirect to Resume when a run of this document was already recorded,
   // which made "run this plan" mean "continue whatever ran it last" — and
@@ -2775,6 +2782,130 @@ async function runPlanCommand(controller: SparringController, overview: Overview
   if (result.ok) {
     await controller.showStartedRun(runId);
   }
+}
+
+// ---------------------------------------------------------------- Run Plan in its own workspace
+
+const RUN_ISOLATED_LABEL = "Run in its own workspace (recommended)";
+const RUN_IN_CHECKOUT_LABEL = "Run in this checkout";
+
+/**
+ * Where a new run goes: a workspace of its own that the engine creates,
+ * records, resumes and later merges (`run-plan --managed`), or this checkout
+ * as before. The last answer for the repository is offered first; nothing
+ * about a branch or a path is asked — the engine decides both.
+ */
+async function pickRunWorkspace(controller: SparringController, location: SparringLocation): Promise<RunWorkspaceChoice | undefined> {
+  const items: (vscode.QuickPickItem & { choice: RunWorkspaceChoice })[] = [
+    { choice: "isolated", label: RUN_ISOLATED_LABEL, detail: "Agent Sparring makes a separate workspace for this run. Your checkout is not switched or changed." },
+    { choice: "checkout", label: RUN_IN_CHECKOUT_LABEL, detail: "The run works on the branch checked out here, as before." },
+  ];
+  const last = controller.runWorkspaceChoice(location.repoRoot);
+  if (last === "checkout") {
+    items.reverse();
+  }
+  const picked = await vscode.window.showQuickPick(items, { title: "Agent Sparring: where should this plan run?", ignoreFocusOut: true });
+  if (picked) {
+    await controller.rememberRunWorkspaceChoice(location.repoRoot, picked.choice);
+  }
+  return picked?.choice;
+}
+
+/**
+ * Start a run in its own workspace. Same input, run key, push choice and
+ * provider settings as a run in this checkout; the engine makes the
+ * worktree and branch from the branch checked out here and is told no
+ * `--expected-branch`. The run is launched under the run id it would have
+ * here and bound — by its run key, once `sparring runs --json` names its
+ * worktree — to the run the engine records there, which the cockpit then
+ * follows. Engine `start-plan` is not used: it can route a plan through an
+ * intake, and an intake run cannot run in its own workspace.
+ */
+async function runPlanIsolated(controller: SparringController, overview: OverviewPanelManager, context: { location: SparringLocation; planPath: string; label: string }): Promise<void> {
+  const { location, planPath, label } = context;
+  const targetBranch = await currentBranch(location.repoRoot);
+  if (!targetBranch) {
+    void vscode.window.showErrorMessage(
+      `Agent Sparring: no Git branch is checked out in ${location.folderName} (detached HEAD or not a repository). A run in its own workspace starts from the branch checked out here; check one out, then run again.`,
+    );
+    return;
+  }
+  if (!(await looksLikePlan(planPath))) {
+    controller.log(`Run plan: refused — ${path.basename(planPath)} has no '## Stage <n> — <title>' sections.`);
+    const choice = await vscode.window.showWarningMessage(NOT_A_PLAN_TITLE, { modal: true, detail: notAPlanDetail(path.basename(planPath)) }, MAKE_PLAN_FROM_THIS, "Open file");
+    if (choice === MAKE_PLAN_FROM_THIS) {
+      await makePlanCommand(makePlanDeps(controller, overview), { location, source: planPath });
+    } else if (choice === "Open file") {
+      await openDocument(planPath, `${path.basename(planPath)} is missing.`, overview.documentColumn);
+    }
+    return;
+  }
+  const runKey = newRunKey(label);
+  const runId = planRunId(location, runKey);
+  const isolated = { targetBranch };
+  if (planContinuationMode() === "automatic") {
+    const markdown = await readOptional(planPath);
+    if (markdown === undefined) {
+      void vscode.window.showWarningMessage(`Agent Sparring: the plan document ${path.basename(planPath)} could not be read.`);
+      return;
+    }
+    await startManagedRun(controller, overview, { location, planPath, markdown, label, runKey, runId, expectedBranch: targetBranch, confirm: true, adopt: false, isolated });
+    return;
+  }
+  if (await blockedByObsoleteSettings(controller, location)) {
+    return;
+  }
+  const args = buildRunPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch: targetBranch, sparringDir: location.sparringDir, runKey, isolated });
+  const result = await controller.launch({ configured: configuredExecutable(), args, cwd: location.repoRoot, name: `run-plan: ${path.basename(planPath)}`, runId, kind: "run-plan", planPath, reveal: false });
+  await followIsolatedRun(controller, result, { location, label, runId, runKey });
+  await explainLaunch(controller, result);
+}
+
+/**
+ * Follow a run started in its own workspace once the engine records it.
+ * Expected only once the command was handed to a shell (or may have been):
+ * a launch refused before submission claims no run. The expectation is kept
+ * in workspace state, so a reload before the engine lists the run still
+ * follows it by its key.
+ */
+async function followIsolatedRun(controller: SparringController, result: LaunchResult, context: { location: SparringLocation; label: string; runId: string; runKey: string }): Promise<void> {
+  if (!result.ok && result.problem !== "unconfirmed") {
+    return;
+  }
+  await controller.expectStartedRun({
+    provisionalRunId: context.runId,
+    sparringDir: context.location.sparringDir,
+    planLabel: context.label,
+    before: [],
+    launchedAtMs: Date.now(),
+    show: true,
+    runKey: context.runKey,
+  });
+  await controller.rediscoverWorktrees();
+}
+
+/**
+ * Where a plan run is resumed from. A run in its own workspace — by the
+ * engine's record, nothing else — is resumed from the repository's primary
+ * checkout by its run key, with no `--expected-branch` and no
+ * `--sparring-dir`: the engine reads both from its record. Any other run is
+ * resumed where it is, as before.
+ */
+function resumeTarget(controller: SparringController, run: PlanRunSnapshot): { repoRoot: string; sparringDir?: string; isolated?: { targetBranch?: string } } {
+  const isolated = controller.isolatedRunFor(run);
+  return isolated ? { repoRoot: isolated.primaryCheckout, isolated: {} } : { repoRoot: run.location.repoRoot, sparringDir: run.location.sparringDir };
+}
+
+/**
+ * The branch a plan run is continued on. A run in its own workspace is on
+ * the branch the engine recorded for it and is never asked about or checked
+ * here; the engine verifies its own worktree.
+ */
+async function resumeBranch(controller: SparringController, run: PlanRunSnapshot): Promise<string | undefined> {
+  if (controller.isolatedRunFor(run)) {
+    return run.state.expectedBranch;
+  }
+  return resolveExpectedBranch(run.location, run.state.expectedBranch);
 }
 
 // ---------------------------------------------------------------- Run Plan through start-plan
@@ -3002,7 +3133,7 @@ async function resumePlanCommand(controller: SparringController, preselected?: P
       return;
     }
   }
-  const expectedBranch = await resolveExpectedBranch(run.location, run.state.expectedBranch);
+  const expectedBranch = await resumeBranch(controller, run);
   if (!expectedBranch) {
     return;
   }
@@ -3027,9 +3158,8 @@ async function resumePlanCommand(controller: SparringController, preselected?: P
   }
   const args = buildResumePlanArgs({
     ...input,
-    repoRoot: run.location.repoRoot,
     expectedBranch,
-    sparringDir: run.location.sparringDir,
+    ...resumeTarget(controller, run),
     evidence,
   });
   if (await blockedByObsoleteSettings(controller, run.location)) {
@@ -3063,7 +3193,7 @@ async function startFreshSessionCommand(controller: SparringController, run: Pla
   if (!choice) {
     return;
   }
-  const expectedBranch = await resolveExpectedBranch(run.location, run.state.expectedBranch);
+  const expectedBranch = await resumeBranch(controller, run);
   if (!expectedBranch) {
     return;
   }
@@ -3074,7 +3204,7 @@ async function startFreshSessionCommand(controller: SparringController, run: Pla
   if (await blockedByObsoleteSettings(controller, run.location)) {
     return;
   }
-  const args = buildResumePlanArgs({ ...input, repoRoot: run.location.repoRoot, expectedBranch, sparringDir: run.location.sparringDir, fresh: { role, ...choice } });
+  const args = buildResumePlanArgs({ ...input, expectedBranch, ...resumeTarget(controller, run), fresh: { role, ...choice } });
   controller.log(`Start fresh ${roleNoun(role)}: resume-plan ${role === "sparring" ? "--fresh-sparrer" : "--fresh-stage-agent"} for ${run.currentStage.stageId}`);
   await launch(controller, run.location, args, "resume-plan", run.planPath, run.id, manifestArgumentOf(input));
 }
@@ -3631,7 +3761,7 @@ async function performContinueAutomatically(controller: SparringController, over
   // engine, so it is resolved, not asked for; a fresh run takes the branch
   // the repository is actually on. Either way no picker appears.
   if (managed) {
-    const expectedBranch = await resolveExpectedBranch(location, managed.state.expectedBranch);
+    const expectedBranch = await resumeBranch(controller, managed);
     if (!expectedBranch) {
       return { ok: false, reason: "branch" }; // resolveExpectedBranch already named the mismatch
     }
@@ -3708,6 +3838,8 @@ interface ManagedStart {
    * evidence about the repository, never an instruction about intent.
    */
   adopt: boolean;
+  /** Run in its own workspace, created by the engine from this branch (see runPlanIsolated). */
+  isolated?: { targetBranch: string };
 }
 
 /**
@@ -3769,7 +3901,7 @@ async function startManagedRun(controller: SparringController, overview: Overvie
 
   let autoPush = false;
   if (start.confirm) {
-    const detail = describePlan(built.manifest, controller, location, { kind: "run-plan", adopt, expectedBranch, skipped: built.skipped.length });
+    const detail = describePlan(built.manifest, controller, location, { kind: "run-plan", adopt, expectedBranch, skipped: built.skipped.length, isolated: start.isolated !== undefined });
     const choice = await vscode.window.showInformationMessage(
       "Run this plan automatically until Agent Sparring needs you?",
       { modal: true, detail },
@@ -3798,7 +3930,7 @@ async function startManagedRun(controller: SparringController, overview: Overvie
     `Continue automatically: run-plan --run-key ${runKey}${adopt ? " --adopt" : ""}${autoPush ? " --allow-push-for-run" : ""} --manifest ${manifestPath} (${built.manifest.stages.length} stage(s): ${built.manifest.stages.map((stage) => stage.stage_id).join(", ")})`,
   );
 
-  const args = buildRunPlanArgs({ manifest: manifestPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir, runKey, adopt, allowPushForRun: autoPush });
+  const args = buildRunPlanArgs({ manifest: manifestPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir, runKey, adopt, allowPushForRun: autoPush, isolated: start.isolated });
   const result = await controller.launch({
     configured: configuredExecutable(),
     args,
@@ -3810,8 +3942,11 @@ async function startManagedRun(controller: SparringController, overview: Overvie
     manifest: manifestPath,
     reveal: false,
   });
+  if (start.isolated) {
+    await followIsolatedRun(controller, result, { location, label, runId, runKey });
+  }
   await explainLaunch(controller, result);
-  if (result.ok) {
+  if (result.ok && !start.isolated) {
     // The screen follows the work that was just started. Automatic selection
     // could not do this on its own: it is confined to the repository this
     // window is following, and a run is usually started in a different
@@ -3879,7 +4014,7 @@ async function continueManagedRun(
   }
 
   controller.log(`Continue automatically: resume-plan ${manifest ? `--manifest ${manifest}` : run.planPath} (the run is recorded as a ${input.source} plan input)`);
-  const args = buildResumePlanArgs({ ...input, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir });
+  const args = buildResumePlanArgs({ ...input, expectedBranch, ...resumeTarget(controller, run) });
   const result = await launch(controller, location, args, "resume-plan", run.planPath, run.id, manifest);
   await overview.update();
   if (!result.ok) {
@@ -4230,7 +4365,7 @@ function describePlan(
   manifest: ExecutionManifest,
   controller: SparringController,
   location: SparringLocation,
-  context: { kind: "run-plan" | "resume-plan"; adopt: boolean; expectedBranch: string; skipped: number },
+  context: { kind: "run-plan" | "resume-plan"; adopt: boolean; expectedBranch: string; skipped: number; isolated?: boolean },
 ): string {
   // Both shapes a stage can be discovered as: a standalone one, and one
   // already inside a managed plan run (this plan's, or an earlier one).
@@ -4256,7 +4391,7 @@ function describePlan(
       ? "Agent Sparring continues the engine's managed run of this plan."
       : "Agent Sparring hands the whole plan to the engine as one managed run.",
     "",
-    `Branch: ${context.expectedBranch}`,
+    context.isolated ? "Runs in its own workspace. Your checkout is not switched or changed." : `Branch: ${context.expectedBranch}`,
     `Stages (${manifest.stages.length}), in this order:`,
     ...lines,
   ];

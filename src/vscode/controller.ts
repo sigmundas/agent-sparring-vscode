@@ -41,8 +41,11 @@ import {
 } from "../core/discovery";
 import { type ManifestStageIdentity } from "../core/manifest";
 import { launchRepositories, type LaunchRepository } from "../core/launchRepositories";
-import { externalWorktrees, familyResolver } from "../core/worktrees";
+import { externalWorktrees, familyResolver, isolatedRunAt, isolatedWorktreeLists, type IsolatedRunsOfRepository } from "../core/worktrees";
+import type { IsolatedRun } from "../core/engineFormats";
 import { WorktreeProbe } from "./worktreeProbe";
+import { IsolatedRunsProbe, engineRunsReader } from "./isolatedRunsProbe";
+import { configuredExecutable } from "./engineExecutable";
 import { resolveMemberships, stageOwnership, type PlanMembership } from "../core/planMembership";
 import { deriveLiveness, type ExecutionRecord, type RunnerLiveness } from "../core/liveness";
 import { applyEvent, emptyLiveState, type LiveState } from "../core/liveState";
@@ -143,7 +146,12 @@ const PIN_ACTIVE_ROOT_KEY = "agentSparring.pinActiveRoot";
  * while following the active editor. Display/navigation state only.
  */
 const CHOSEN_REPOSITORY_KEY = "agentSparring.chosenRepositoryRoot";
+/** Run Plan's last answer to "where does this run", per repository family: `isolated` or `checkout`. */
+const RUN_WORKSPACE_CHOICE_KEY = "agentSparring.runWorkspaceChoice";
+export type RunWorkspaceChoice = "isolated" | "checkout";
 const OUTPUT_CHANNEL_NAME = "Agent Sparring";
+/** How often a pending start in its own workspace asks the engine again. */
+const ISOLATED_START_POLL_MS = 3_000;
 /** How often the process table may be read for one run whose liveness nothing in this window watched. */
 const PROBE_COOLDOWN_MS = 15_000;
 
@@ -161,6 +169,9 @@ export class SparringController implements vscode.Disposable {
    */
   private externalLocations: SparringLocation[] = [];
   private readonly worktreeProbe: WorktreeProbe;
+  /** `sparring runs --json` per known repository: which worktree is which run's. */
+  private readonly isolatedRunsProbe: IsolatedRunsProbe;
+  private isolatedReports: IsolatedRunsOfRepository[] = [];
   private repositoryFamily: (root: string) => string = (root) => root;
   private externalWatcherDisposables: vscode.Disposable[] = [];
   private discovery: Discovery = { locations: [], runs: [], problems: [] };
@@ -232,6 +243,7 @@ export class SparringController implements vscode.Disposable {
     // so it is a rediscovery like any other authoritative change.
     this.activeRepository = new ActiveRepositoryTracker((message) => this.log(message));
     this.worktreeProbe = new WorktreeProbe((message) => this.log(message));
+    this.isolatedRunsProbe = new IsolatedRunsProbe((message) => this.log(message), engineRunsReader(configuredExecutable));
     this.disposables.push(this.activeRepository, this.activeRepository.onDidChange(() => this.scheduleRefresh()));
     this.disposables.push(
       this.tracker,
@@ -347,15 +359,19 @@ export class SparringController implements vscode.Disposable {
    */
   private async relocateWorktrees(): Promise<void> {
     const roots = [...(this.activeRepository.knownRepoRoots ?? []), ...this.locations.map((location) => location.repoRoot)];
-    const lists = await this.worktreeProbe.list(roots);
+    const [lists, isolated] = await Promise.all([this.worktreeProbe.list(roots), this.isolatedRunsProbe.list(roots)]);
     this.repositoryFamily = familyResolver(lists);
+    this.isolatedReports = isolated;
     // Git lists worktrees by their real path, while a workspace opened
     // through a symlink keeps the alias. Both spellings, so the workspace's
     // own directory is not rediscovered as an external worktree and the same
     // run shown twice under two identities.
     const withRealPaths = async (paths: string[]): Promise<string[]> => [...paths, ...(await Promise.all(paths.map((target) => this.realPaths.of(target))))];
+    // The engine's records name the worktrees of runs in their own
+    // workspaces; they are looked in like any other worktree of the
+    // repository, wherever they are.
     const candidates = externalWorktrees(
-      lists,
+      [...lists, ...isolatedWorktreeLists(isolated)],
       await withRealPaths(this.fileFolders().map((folder) => folder.uri.fsPath)),
       await withRealPaths(this.locations.map((location) => location.projectDir)),
     );
@@ -384,6 +400,30 @@ export class SparringController implements vscode.Disposable {
     return [...this.locations, ...this.externalLocations];
   }
 
+  /**
+   * The engine's record of `run` when it is a run in its own workspace: the
+   * record names the worktree `run` was found in under `run`'s key. From
+   * `sparring runs --json` alone; undefined for every other run.
+   */
+  isolatedRunFor(run: RunSnapshot): { run: IsolatedRun; repoRoot: string; primaryCheckout: string } | undefined {
+    if (run.kind !== "plan") {
+      return undefined;
+    }
+    const found = isolatedRunAt(this.isolatedReports, run.runKey, run.location.projectDir);
+    return found ? { ...found, primaryCheckout: this.repositoryFamily(found.repoRoot) } : undefined;
+  }
+
+  /** Run Plan's last choice for this repository, if it made one. */
+  runWorkspaceChoice(repoRoot: string): RunWorkspaceChoice | undefined {
+    const stored = this.context.workspaceState.get<Record<string, unknown>>(RUN_WORKSPACE_CHOICE_KEY)?.[canonicalPath(this.repositoryFamily(repoRoot))];
+    return stored === "isolated" || stored === "checkout" ? stored : undefined;
+  }
+
+  async rememberRunWorkspaceChoice(repoRoot: string, choice: RunWorkspaceChoice): Promise<void> {
+    const stored = this.context.workspaceState.get<Record<string, unknown>>(RUN_WORKSPACE_CHOICE_KEY);
+    await this.context.workspaceState.update(RUN_WORKSPACE_CHOICE_KEY, { ...(stored && typeof stored === "object" ? stored : {}), [canonicalPath(this.repositoryFamily(repoRoot))]: choice });
+  }
+
   /** The repository family of a root: the same for every worktree of one repository (core/worktrees.ts). */
   familyOf(root: string): string {
     return this.repositoryFamily(root);
@@ -392,6 +432,7 @@ export class SparringController implements vscode.Disposable {
   /** Ask git for worktrees again on the next refresh instead of reusing its recent answer. */
   async rediscoverWorktrees(): Promise<void> {
     this.worktreeProbe.invalidate();
+    this.isolatedRunsProbe.invalidate();
     await this.refresh();
   }
 
@@ -539,7 +580,10 @@ export class SparringController implements vscode.Disposable {
     }
     const configured = vscode.workspace.getConfiguration("agentSparring").get<number>("pollIntervalMs", 1500);
     const interval = Math.max(250, configured);
-    this.pollInterval = setInterval(() => void this.pollActivity(), interval);
+    this.pollInterval = setInterval(() => {
+      void this.pollActivity();
+      this.pollPendingIsolatedStart();
+    }, interval);
   }
 
   // ---------------------------------------------------------------- discovery
@@ -873,8 +917,40 @@ export class SparringController implements vscode.Disposable {
   async boundManifestFile(run: PlanRunSnapshot): Promise<{ file: string } | { refusal: string }> {
     const peers = this.discovery.runs.filter((candidate): candidate is PlanRunSnapshot => candidate.kind === "plan" && candidate.state.source === "manifest");
     const bound = await this.manifests.readBound(this.manifestDirectoryPath, run, peers);
+    if (!bound.binding.ok) {
+      const written = await this.isolatedManifestFile(run, peers);
+      if (written) {
+        return written;
+      }
+    }
     this.reportManifestBinding(run, bound);
     return bound.binding.ok ? { file: path.join(this.manifestDirectoryPath, bound.file) } : { refusal: bound.binding.detail };
+  }
+
+  /**
+   * A run in its own workspace was started from a manifest written for the
+   * checkout it was started from, before its worktree existed. That manifest
+   * is still the run's: it is looked up under the same run key for each
+   * checkout of the same repository, and bound with every check the strict
+   * path makes (sidecar, digest, plan label, current stage) — only the
+   * worktree it was written from differs, and the engine's record is what
+   * says this run belongs to this repository at all.
+   */
+  private async isolatedManifestFile(run: PlanRunSnapshot, peers: readonly PlanRunSnapshot[]): Promise<{ file: string } | undefined> {
+    const isolated = this.isolatedRunFor(run);
+    if (!isolated) {
+      return undefined;
+    }
+    const family = this.repositoryFamily(isolated.repoRoot);
+    const owners = [isolated.primaryCheckout, ...this.allLocations().filter((location) => samePath(this.repositoryFamily(location.repoRoot), family)).map((location) => location.projectDir)];
+    for (const projectDir of owners.filter((dir, index) => !samePath(dir, run.location.projectDir) && owners.findIndex((other) => samePath(other, dir)) === index)) {
+      const bound = await this.manifests.readBound(this.manifestDirectoryPath, { ...run, location: { ...run.location, projectDir } }, peers);
+      if (bound.binding.ok && !bound.derived) {
+        this.reportManifestBinding(run, bound);
+        return { file: path.join(this.manifestDirectoryPath, bound.file) };
+      }
+    }
+    return undefined;
   }
 
   /** Say what was decided the first time, and again whenever it changes; never once per render. */
@@ -1331,7 +1407,7 @@ export class SparringController implements vscode.Disposable {
         return execution.state === "ended" ? "ended" : "running";
       }
       return this.submissions.inFlightFor(runnerKey(provisional)) ? "submitted" : "none";
-    });
+    }, (run) => this.isolatedRunFor(run) !== undefined);
     for (const note of result.notes) {
       this.log(`start-plan: ${note}`);
     }
@@ -1827,6 +1903,23 @@ export class SparringController implements vscode.Disposable {
       this.pollTimer = undefined;
       void this.pollActivity();
     }, 100);
+  }
+
+  private lastIsolatedPollMs = 0;
+
+  /**
+   * While a run started in its own workspace is waiting for the engine to
+   * record it, ask again every few seconds: its worktree is not watched until
+   * it has been found, so no file event would say it now exists.
+   */
+  private pollPendingIsolatedStart(): void {
+    if (Date.now() - this.lastIsolatedPollMs < ISOLATED_START_POLL_MS || !this.startPlanRuns().pending.some((entry) => entry.runKey !== undefined)) {
+      return;
+    }
+    this.lastIsolatedPollMs = Date.now();
+    this.worktreeProbe.invalidate();
+    this.isolatedRunsProbe.invalidate();
+    this.scheduleRefresh();
   }
 
   private async pollActivity(): Promise<void> {

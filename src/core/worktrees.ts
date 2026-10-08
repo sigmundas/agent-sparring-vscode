@@ -17,6 +17,7 @@
 
 import * as path from "node:path";
 import { canonicalPath, isInsidePath, samePath } from "./discovery";
+import type { IsolatedRun } from "./engineFormats";
 
 export interface GitWorktree {
   /** Absolute worktree path, as git printed it. */
@@ -139,4 +140,42 @@ export function familyResolver(lists: readonly { repoRoot: string; worktrees: re
     }
   }
   return (root: string) => families.get(canonicalPath(root)) ?? root;
+}
+
+/** What `sparring runs --json` reported for one known repository root. */
+export interface IsolatedRunsOfRepository {
+  /** The root the engine was asked about. */
+  repoRoot: string;
+  runs: readonly IsolatedRun[];
+}
+
+/**
+ * The worktrees the engine's records name, as worktree lists that
+ * {@link externalWorktrees} takes alongside git's: a run's worktree is a
+ * place to look even when git's answer is stale or was not asked. Only
+ * worktrees the record says exist; a removed one is nothing to probe.
+ */
+export function isolatedWorktreeLists(reports: readonly IsolatedRunsOfRepository[]): { repoRoot: string; worktrees: GitWorktree[] }[] {
+  return reports.map((report) => ({
+    repoRoot: report.repoRoot,
+    worktrees: report.runs
+      .filter((run) => run.worktreeExists)
+      .map((run) => ({ path: run.worktreePath, branch: run.branch, bare: false, detached: false })),
+  }));
+}
+
+/**
+ * The engine's record of the run `runKey` whose worktree holds `projectDir`,
+ * with the root it was reported for — or undefined. The association is the
+ * record's and nothing else's: a worktree that merely looks like a run's (its
+ * name, its branch, its being listed by git) is never one.
+ */
+export function isolatedRunAt(reports: readonly IsolatedRunsOfRepository[], runKey: string, projectDir: string): { run: IsolatedRun; repoRoot: string } | undefined {
+  for (const report of reports) {
+    const run = report.runs.find((candidate) => candidate.runKey === runKey && (samePath(candidate.worktreePath, projectDir) || isInsidePath(projectDir, candidate.worktreePath)));
+    if (run) {
+      return { run, repoRoot: report.repoRoot };
+    }
+  }
+  return undefined;
 }

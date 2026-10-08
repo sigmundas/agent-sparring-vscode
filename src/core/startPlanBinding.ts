@@ -28,6 +28,13 @@ export interface PendingStartedRun {
   launchedAtMs: number;
   /** Show the run once it is bound (the person just pressed Start). */
   show: boolean;
+  /**
+   * Set for a run started in its own workspace: the key the extension minted
+   * for it. Such a run is recorded in a worktree the engine creates, not in
+   * `sparringDir`, so it binds by this key to the run whose worktree the
+   * engine's own record names (`sparring runs --json`) — never by plan label.
+   */
+  runKey?: string;
 }
 
 export interface StartPlanRuns {
@@ -43,8 +50,13 @@ const BINDINGS_KEPT = 32;
 
 export type BindOutcome = { kind: "bound"; runId: string } | { kind: "waiting" } | { kind: "ambiguous"; runIds: string[] };
 
-export function bindStartedRun(pending: PendingStartedRun, runs: readonly RunSnapshot[]): BindOutcome {
-  const candidates = runs.filter(
+/** Whether the engine's record names the worktree `run` was found in as its run's (see worktrees.ts: isolatedRunAt). */
+export type IsolatedOwnership = (run: RunSnapshot) => boolean;
+
+export function bindStartedRun(pending: PendingStartedRun, runs: readonly RunSnapshot[], recordOwns: IsolatedOwnership = () => false): BindOutcome {
+  const candidates = pending.runKey !== undefined
+    ? runs.filter((run) => run.kind === "plan" && run.runKey === pending.runKey && run.id !== pending.provisionalRunId && recordOwns(run))
+    : runs.filter(
     (run) =>
       run.kind === "plan" &&
       samePath(run.location.sparringDir, pending.sparringDir) &&
@@ -70,7 +82,8 @@ export function readStartPlanRuns(value: unknown): StartPlanRuns {
           typeof entry.sparringDir === "string" &&
           typeof entry.planLabel === "string" &&
           Array.isArray(entry.before) &&
-          typeof entry.launchedAtMs === "number",
+          typeof entry.launchedAtMs === "number" &&
+          (entry.runKey === undefined || typeof entry.runKey === "string"),
       )
     : [];
   const bindings: Record<string, string> = {};
@@ -107,7 +120,12 @@ export interface Reconciled {
  * (`none`) was never handed to a shell, or its submission was resolved as
  * not started: it retires without binding anything.
  */
-export function reconcileStartedRuns(state: StartPlanRuns, runs: readonly RunSnapshot[], evidence: (provisionalRunId: string) => LaunchEvidence): Reconciled {
+export function reconcileStartedRuns(
+  state: StartPlanRuns,
+  runs: readonly RunSnapshot[],
+  evidence: (provisionalRunId: string) => LaunchEvidence,
+  recordOwns: IsolatedOwnership = () => false,
+): Reconciled {
   const alreadyBound = new Set(Object.keys(state.bindings));
   const notes: string[] = [];
   const retired = new Set<PendingStartedRun>();
@@ -119,7 +137,7 @@ export function reconcileStartedRuns(state: StartPlanRuns, runs: readonly RunSna
       notes.push(`the confirmation ${pending.provisionalRunId} was never started, so it claims no run of ${pending.planLabel}.`);
       continue;
     }
-    const outcome = bindStartedRun(pending, runs.filter((run) => !alreadyBound.has(run.id)));
+    const outcome = bindStartedRun(pending, runs.filter((run) => !alreadyBound.has(run.id)), recordOwns);
     if (outcome.kind === "bound") {
       claims.set(outcome.runId, [...(claims.get(outcome.runId) ?? []), pending]);
     } else if (outcome.kind === "ambiguous") {
