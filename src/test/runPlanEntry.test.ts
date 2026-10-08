@@ -280,8 +280,18 @@ describe("the Run Plan picker lists plan-like documents, newest first", () => {
     assert.equal(items.length, 51);
     assert.equal(items[49].description, "plans/p49.md");
     assert.equal(items[50].file, "");
-    const read = planCandidatesToRead([...many, doc("README.md", "", now), doc("docs/plans/active/old.md", "", 0)], 3);
-    assert.deepEqual(read.map((entry) => entry.relative), ["docs/plans/active/old.md", "plans/p0.md", "plans/p1.md"]);
+    const read = planCandidatesToRead([...many, doc("README.md", "", now - 30 * hour), doc("docs/plans/active/old.md", "", 0), doc("docs/plans/active/new.md", "", now - 3 * hour)], 3);
+    assert.deepEqual(read.map((entry) => entry.relative), ["docs/plans/active/new.md", "plans/p0.md", "plans/p1.md"], "same order as shown: location counts only within hours");
+  });
+
+  it("a recent staged document outside plans/ is read and shown ahead of 200 much older plans", async () => {
+    const { planPickerItems, planCandidatesToRead, PLAN_PICKER_LIMITS } = await import("../core/runPlanEntry");
+    const old = Array.from({ length: 200 }, (_, i) => doc(`docs/plans/active/p${i}.md`, "## Stage 1 — a\n", now - 100 * 24 * hour - i));
+    const current = doc("design/current.md", "## Stage S1 — Design\n", now);
+    const read = planCandidatesToRead([...old, current], PLAN_PICKER_LIMITS.read);
+    assert.equal(read.length, 200);
+    assert.equal(read[0].relative, "design/current.md");
+    assert.equal(planPickerItems(read, now)[0].description, "design/current.md");
   });
 
   it("says when a file was modified in human terms, against an injected clock", async () => {

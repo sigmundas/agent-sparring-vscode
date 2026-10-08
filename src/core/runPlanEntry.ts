@@ -200,13 +200,13 @@ export const PLAN_PICKER_LIMITS = {
 } as const;
 
 /**
- * Of the listed Markdown files, the ones worth reading: likely plan
- * locations first, then newest, capped at `limit`. Only paths and mtimes
- * are used, so nothing is read and nothing asks the engine.
+ * Of the listed Markdown files, the ones worth reading, in the same order
+ * the picker shows ({@link planRecency}), capped at `limit`. Only paths and
+ * mtimes are used, so nothing is read and nothing asks the engine.
  */
 export function planCandidatesToRead<T extends { relative: string; mtimeMs: number }>(files: readonly T[], limit: number = PLAN_PICKER_LIMITS.read): T[] {
   return [...files]
-    .sort((a, b) => planLocationRank(b.relative) - planLocationRank(a.relative) || b.mtimeMs - a.mtimeMs)
+    .sort((a, b) => planRecency(b) - planRecency(a) || a.relative.localeCompare(b.relative))
     .slice(0, limit);
 }
 
@@ -226,6 +226,11 @@ export function planLocationRank(relative: string): number {
 /** How much a likely plan location counts for, as if this much newer. */
 const LOCATION_BONUS_MS = 6 * 60 * 60 * 1000;
 
+/** Modification time, with a likely plan location counted a few hours newer. */
+function planRecency(file: { relative: string; mtimeMs: number }): number {
+  return file.mtimeMs + planLocationRank(file.relative) * LOCATION_BONUS_MS;
+}
+
 /**
  * What the Run Plan picker lists, newest first, then **Browse…** last.
  * Discovery only — a cheap local heuristic, never a runnability verdict: the
@@ -240,13 +245,9 @@ export function planPickerItems(
   limit: number = PLAN_PICKER_LIMITS.shown,
 ): { file: string; label: string; description: string; detail: string }[] {
   const plans = candidates
-    .map((candidate) => ({ candidate, stages: countStageHeadings(candidate.text), rank: planLocationRank(candidate.relative) }))
-    .filter(({ stages, rank }) => stages > 0 || rank > 0)
-    .sort(
-      (a, b) =>
-        b.candidate.mtimeMs + b.rank * LOCATION_BONUS_MS - (a.candidate.mtimeMs + a.rank * LOCATION_BONUS_MS) ||
-        a.candidate.relative.localeCompare(b.candidate.relative),
-    )
+    .map((candidate) => ({ candidate, stages: countStageHeadings(candidate.text) }))
+    .filter(({ candidate, stages }) => stages > 0 || planLocationRank(candidate.relative) > 0)
+    .sort((a, b) => planRecency(b.candidate) - planRecency(a.candidate) || a.candidate.relative.localeCompare(b.candidate.relative))
     .slice(0, limit)
     .map(({ candidate, stages }) => ({
       file: candidate.file,
