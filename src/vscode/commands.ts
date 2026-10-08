@@ -7,6 +7,7 @@
  */
 
 import * as crypto from "node:crypto";
+import { manifestRebuildRefusal } from "../core/worktrees";
 import { branchNotice, sliceBranchTargetOf } from "../core/sliceBranch";
 import { changeSliceBranch, readSliceBranch } from "./sliceBranchProbe";
 import { realpathSync } from "node:fs";
@@ -3708,12 +3709,11 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
   }
   // A run in its own workspace was recorded with the manifest at the path it
   // was started from; a rebuild lands at another path, which the engine
-  // refuses as an input mismatch. Refuse here instead, before any command.
-  if (controller.isolatedRunFor(run)) {
-    void vscode.window.showWarningMessage(
-      `Agent Sparring: this run in its own workspace was started from an execution manifest that is now missing (${held.refusal}). It can only be continued from that recorded manifest, so nothing was started.`,
-      { modal: true },
-    );
+  // refuses as an input mismatch. Rebuild only for a run established to be in
+  // this checkout; refuse here otherwise, before any command.
+  const notRebuilt = manifestRebuildRefusal(controller.runIsolation(run), held.refusal);
+  if (notRebuilt) {
+    void vscode.window.showWarningMessage(notRebuilt, { modal: true });
     return undefined;
   }
   const markdown = await readOptional(run.planPath);

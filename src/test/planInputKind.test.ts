@@ -172,16 +172,14 @@ describe("resuming a manifest run after a restart", () => {
     assert.match(body, /if \("file" in held\) \{\n\s*return \{ manifest: held\.file, source: "manifest", runKey: run\.runKey \};/);
   });
 
-  it("a run in its own workspace whose recorded manifest is missing is refused up front, never rebuilt at another path", async () => {
+  it("a manifest is rebuilt at a new path only for a run established to be in this checkout", async () => {
     const body = fn(await commandsSource(), "planInvocationFor");
-    const isolated = body.indexOf("if (controller.isolatedRunFor(run)) {");
-    assert.ok(isolated > body.indexOf('if ("file" in held)'), "after the recorded manifest is looked up");
-    assert.ok(isolated < body.indexOf("await readOptional(run.planPath)"), "before the plan is read");
-    assert.ok(isolated < body.indexOf("buildManifest("), "before any rebuild");
-    assert.ok(isolated < body.indexOf("writeManifestFile("), "and before any manifest is written");
-    const branch = body.slice(isolated, body.indexOf("const markdown", isolated));
-    assert.match(branch, /recorded manifest/);
-    assert.match(branch, /return undefined;/, "no command is issued");
+    const decided = body.indexOf("manifestRebuildRefusal(controller.runIsolation(run), held.refusal)");
+    assert.ok(decided > body.indexOf('if ("file" in held)'), "after the recorded manifest is looked up");
+    for (const later of ["await readOptional(run.planPath)", "buildManifest(", "writeManifestFile("]) {
+      assert.ok(decided < body.indexOf(later), `before ${later}`);
+    }
+    assert.match(body.slice(decided, body.indexOf("const markdown", decided)), /if \(notRebuilt\) \{\s*void vscode\.window\.showWarningMessage\(notRebuilt, \{ modal: true \}\);\s*return undefined;/, "a refusal issues no command");
   });
 
   it("every refusal to resume is a dialog that names why, and evidence is asked for only once the input is settled", async () => {

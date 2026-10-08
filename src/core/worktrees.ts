@@ -185,3 +185,44 @@ export function isolatedRunAt(reports: readonly IsolatedRunsOfRepository[], runK
   }
   return undefined;
 }
+
+/**
+ * What the engine's record establishes about whether `runKey` at
+ * `projectDir` is a run in its own workspace. `isolated`: the record names
+ * it. `checkout`: a supported report for its repository was read and does
+ * not. `unknown`: no supported report for its repository was read (the
+ * engine could not be asked, failed, or used a schema this version does not
+ * read), so nothing is established either way — never guessed from paths.
+ */
+export type RunIsolation = "isolated" | "checkout" | "unknown";
+
+export function runIsolation(
+  reports: readonly IsolatedRunsOfRepository[],
+  runKey: string,
+  projectDir: string,
+  repoRoot: string,
+  familyOf: (root: string) => string = (root) => root,
+): RunIsolation {
+  if (isolatedRunAt(reports, runKey, projectDir)) {
+    return "isolated";
+  }
+  const family = familyOf(repoRoot);
+  return reports.some((report) => report.ok && samePath(familyOf(report.repoRoot), family)) ? "checkout" : "unknown";
+}
+
+/**
+ * Whether a manifest run with no bound manifest may be resumed from a
+ * manifest rebuilt at a new path: only when it is established to be a run
+ * in this checkout. A run in its own workspace is recorded with the manifest
+ * it was started from, and the engine refuses any other path; when that is
+ * not established, a rebuild could only reach the same refusal later.
+ */
+export function manifestRebuildRefusal(isolation: RunIsolation, refusal: string): string | undefined {
+  if (isolation === "isolated") {
+    return `Agent Sparring: this run in its own workspace was started from an execution manifest that is now missing (${refusal}). It can only be continued from that recorded manifest, so nothing was started.`;
+  }
+  if (isolation === "unknown") {
+    return `Agent Sparring: the execution manifest this run was started from is missing (${refusal}), and the engine's list of runs could not be read to tell whether it runs in its own workspace, where only that recorded manifest is accepted. Nothing was started; try again once "History / Runs…" lists the run.`;
+  }
+  return undefined;
+}

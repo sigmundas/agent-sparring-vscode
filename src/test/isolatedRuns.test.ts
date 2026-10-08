@@ -20,8 +20,8 @@ import { ManifestReader } from "../vscode/manifestReader";
 import { ManifestStore, Workspace, recordPlanDigest } from "./fixtures";
 import { parseIsolatedRuns, EngineFormatError, type IsolatedRun } from "../core/engineFormats";
 import { UNFOLLOWED_AFTER_MS, UNFOLLOWED_AFTER_READS, readStartPlanRuns, reconcileStartedRuns, unfollowedStartMessage, type PendingStartedRun } from "../core/startPlanBinding";
-import { externalWorktrees, isolatedRunAt, isolatedWorktreeLists, parseWorktreeList, type IsolatedRunsOfRepository } from "../core/worktrees";
-import type { IsolatedRunsProbe as Probe } from "../vscode/isolatedRunsProbe";
+import { externalWorktrees, isolatedRunAt, isolatedWorktreeLists, manifestRebuildRefusal, parseWorktreeList, runIsolation, type IsolatedRunsOfRepository } from "../core/worktrees";
+import type { IsolatedRunsProbe as Probe, RunsReader } from "../vscode/isolatedRunsProbe";
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const { IsolatedRunsProbe } = require("../vscode/isolatedRunsProbe") as { IsolatedRunsProbe: typeof Probe };
 
@@ -322,6 +322,33 @@ describe("review fixes", () => {
     await probe.list(["/repo"]);
     assert.equal(shown.length, 1);
     assert.match(shown[0], /do not match.*schema_version 99/);
+  });
+
+  it("a run once listed as isolated is not rebuilt for when the run list later cannot be read", async () => {
+    const answers: Awaited<ReturnType<RunsReader>>[] = [
+      { ok: true, stdout: runsJson([engineRun({ worktree_path: "/elsewhere/wt" })]) },
+      { ok: false, reason: "sparring: command not found" },
+      { ok: true, stdout: JSON.stringify({ schema_version: 99, runs: [] }) },
+    ];
+    const probe = new IsolatedRunsProbe(() => undefined, async () => answers.shift()!);
+    const isolation = async () => {
+      probe.invalidate();
+      return runIsolation(await probe.list(["/repo"]), KEY, "/elsewhere/wt", "/elsewhere/wt", () => "/repo");
+    };
+    assert.equal(await isolation(), "isolated");
+    const afterFailure = await isolation();
+    assert.equal(afterFailure, "unknown", "a failed read establishes nothing, and paths are not read as ownership");
+    assert.match(manifestRebuildRefusal(afterFailure, "no binding")!, /Nothing was started/);
+    assert.equal(await isolation(), "unknown", "nor does an unsupported schema");
+    assert.match(manifestRebuildRefusal("isolated", "no binding")!, /missing.*nothing was started/is);
+  });
+
+  it("a manifest run is rebuilt only where a supported report establishes it is in this checkout", () => {
+    const ok: IsolatedRunsOfRepository[] = [{ repoRoot: "/repo", ok: true, runs: [] }];
+    assert.equal(runIsolation(ok, KEY, "/repo", "/repo"), "checkout");
+    assert.equal(manifestRebuildRefusal("checkout", "no binding"), undefined);
+    assert.equal(runIsolation([{ repoRoot: "/other", ok: true, runs: [] }], KEY, "/repo", "/repo"), "unknown", "another repository's report says nothing about this one");
+    assert.equal(runIsolation([], KEY, "/repo", "/repo"), "unknown");
   });
 
   it("presentation and resume read the manifest written for the checkout the run was started from", async () => {

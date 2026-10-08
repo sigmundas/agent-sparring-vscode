@@ -42,7 +42,7 @@ import {
 } from "../core/discovery";
 import { type ManifestStageIdentity } from "../core/manifest";
 import { launchRepositories, type LaunchRepository } from "../core/launchRepositories";
-import { externalWorktrees, familyResolver, isolatedRunAt, isolatedWorktreeLists, type IsolatedRunsOfRepository } from "../core/worktrees";
+import { externalWorktrees, familyResolver, isolatedRunAt, isolatedWorktreeLists, runIsolation, type IsolatedRunsOfRepository, type RunIsolation } from "../core/worktrees";
 import type { IsolatedRun } from "../core/engineFormats";
 import { WorktreeProbe } from "./worktreeProbe";
 import { IsolatedRunsProbe, engineRunsReader } from "./isolatedRunsProbe";
@@ -423,6 +423,11 @@ export class SparringController implements vscode.Disposable {
     }
     const found = isolatedRunAt(this.isolatedReports, run.runKey, run.location.projectDir);
     return found ? { ...found, primaryCheckout: this.repositoryFamily(found.repoRoot) } : undefined;
+  }
+
+  /** Whether the engine's record establishes `run` as isolated, in this checkout, or neither (worktrees.ts: runIsolation). */
+  runIsolation(run: PlanRunSnapshot): RunIsolation {
+    return runIsolation(this.isolatedReports, run.runKey, run.location.projectDir, run.location.repoRoot, (root) => this.repositoryFamily(root));
   }
 
   /** Run Plan's last choice for this repository, if it made one. */
