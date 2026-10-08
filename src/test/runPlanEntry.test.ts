@@ -122,7 +122,7 @@ describe("Run Plan classifies the document before asking anything", () => {
     assert.ok(isStartPlanMessage({ type: "startPlan", action: "prepareIntake" }));
   });
 
-  it("a staged-looking document check-plan cannot run directly (e.g. '## Stage S1') still offers the engine's intake, with check-plan's reason in view", () => {
+  it("a staged-looking document check-plan cannot run directly (e.g. '## Stage S1') still offers the engine's intake, calmly, with check-plan's reason under Technical details", () => {
     // start-plan routes any document that is not a direct plan to its intake,
     // so a check-plan refusal is not a dead end (sporely-py's 2026-10-07 plan).
     const reason = "line 143 looks like a stage heading but does not follow the convention '## Stage <n> — <title>': '## Stage S1 — Orchestration completion design'";
@@ -135,7 +135,13 @@ describe("Run Plan classifies the document before asking anything", () => {
     assert.ok(html.includes(`data-startplan="prepareIntake"`), "Prepare intake is offered");
     assert.ok(html.includes(`data-action="makePlanFromThis"`), "Make Plan… stays optional");
     const technical = html.indexOf("<summary>Technical details</summary>");
-    assert.ok(html.indexOf("Stage S1 — Orchestration completion design") < technical, "the reason is in view, not only under Technical details");
+    assert.ok(html.indexOf("Stage S1 — Orchestration completion design") > technical, "check-plan's words are kept under Technical details");
+    const card = html.slice(html.indexOf('<section class="card planning-input">'), technical);
+    assert.ok(card.includes("read through intake rather than run directly"), "the lead says what happens, in plain words");
+    assert.ok(!card.includes('class="icon'), "no warning icons: nothing here is wrong");
+    assert.ok(card.includes(`data-startplan="dismiss"`), "Close sits with the other choices");
+    assert.equal((html.match(/data-startplan="dismiss"/g) ?? []).length, 1, "and only once");
+    assert.ok(!html.includes("Engine command"), "no second command block");
     assert.ok(!html.includes("Refused by the engine"));
   });
 });

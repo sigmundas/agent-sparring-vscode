@@ -22,11 +22,13 @@ export const MAKE_PLAN_TITLE = "Turn an idea, INBOX or notes into a staged plan 
  * requirement that follows from the missing headings.
  */
 export const PLANNING_INPUT_TITLE = "This is planning input, ready for Agent Sparring intake.";
-export const PLANNING_INPUT_LEAD = "It will be analyzed into runnable stages before anything executes. Nothing has been prepared, approved or run yet.";
+export const PLANNING_INPUT_LEAD = "It will be analyzed into runnable stages before anything executes.";
+/** For a staged document check-plan cannot run directly (e.g. `## Stage S1`). */
+export const STAGED_INTAKE_LEAD = "Its stages are read through intake rather than run directly, and nothing executes before you confirm.";
 export const PREPARE_INTAKE = "Prepare intake (recommended)";
 export const PREPARE_INTAKE_TITLE = "Prepare an intake with the engine's start-plan: it analyzes this document into runnable stages and asks its decisions. Nothing runs until you press Start.";
 export const MAKE_PLAN_AGAIN = "Make Plan…";
-export const MAKE_PLAN_AGAIN_NOTE = "Run another planning/audit pass on this document first. Optional.";
+export const MAKE_PLAN_AGAIN_NOTE = "Optional: run another planning/audit pass on this document first.";
 
 /**
  * Said, not hidden: the engine's `start-plan --managed` runs only `## Stage`
@@ -35,4 +37,4 @@ export const MAKE_PLAN_AGAIN_NOTE = "Run another planning/audit pass on this doc
  * becomes the default here and this goes away.
  */
 export const MANAGED_INTAKE_LIMITATION =
-  "An intake-based plan cannot yet run in its own workspace: the engine's start-plan --managed accepts only '## Stage' plans. Prepare intake therefore runs in this checkout and asks for a feature branch when you choose it.";
+  "Intake runs in this checkout for now (not yet in its own workspace), so you will be asked for a feature branch.";
