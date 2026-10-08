@@ -40,6 +40,8 @@ import { actionWord, presentStage, stageDisplayName, type StagePresentation } fr
 import { freshSessionOffers, generationLabel, providerPauseCard, type FreshSessionOffer, type ProviderPauseCard } from "./freshSession";
 import { ambiguousRunRows, type AmbiguousRunRow } from "./runPick";
 import { hasSessions, planAction, stageActions, type PlanAction, type StageRunAction } from "./runner";
+import type { IsolatedRun } from "./engineFormats";
+import { readyToMerge } from "./finishRun";
 import { branchNotice, branchStateLabel, reportFor, type BranchNotice, type SliceBranchReport } from "./sliceBranch";
 import { QUIET_AFTER_MS, formatAge } from "./status";
 import type { StartPlanStatus } from "./startPlan";
@@ -374,6 +376,12 @@ export interface OverviewArtifacts {
    * offers the way back to the run instead.
    */
   managedPlanRun?: ManagedPlanRun;
+  /**
+   * The engine's record of this plan run when it runs in its own workspace
+   * (`sparring runs --json`), with the engine's finish dry run for the
+   * state it listed. Undefined for every other run.
+   */
+  isolatedRun?: IsolatedRun;
   /**
    * Stage ids the engine has already created in this project. Start next
    * stage is not offered for one of them: `sparring new-stage` refuses an
@@ -1038,6 +1046,12 @@ export interface OverviewModel {
    * test.
    */
   pushAuthorization?: PushAuthorization;
+  /**
+   * A complete run in its own workspace: Merge & clean up is offered.
+   * `ready` only when the engine's own dry run for the listed state said
+   * the run can be merged and cleaned up — never because it is complete.
+   */
+  finishRun?: FinishRunOffer;
   /**
    * This run already has run-scoped push authorization recorded, so it will
    * not stop to ask again. Shown quietly, and read from the engine's own run
@@ -1812,6 +1826,7 @@ function buildScreen(
   // whatever else it happens to be stopped on, and a note that disappears
   // when another panel opens is a note that cannot be relied on.
   model.deferredNote = deferredNote(run, outcome);
+  model.finishRun = finishRunOffer(run, artifacts);
   model.pushAuthorization = pushAuthorization(run, artifacts, model, branchGuard, liveness);
   if (model.pushAuthorization) {
     // The run is stopped on a permission, not on a review. Nothing that would
@@ -1912,6 +1927,35 @@ export function branchMismatch(run: RunSnapshot, artifacts: OverviewArtifacts): 
  * while the branch is wrong (the engine refuses the resume outright), and
  * while a stage-accept operation of this window is in flight.
  */
+export interface FinishRunOffer {
+  ready: boolean;
+  text: string;
+  detail: string;
+}
+
+/**
+ * Merge & clean up, for a complete plan run whose workspace the engine
+ * created and has not finished with. Whether it can actually go ahead is
+ * the engine's dry run's to say, when the button is pressed.
+ */
+function finishRunOffer(run: RunSnapshot, artifacts: OverviewArtifacts): FinishRunOffer | undefined {
+  const isolated = artifacts.isolatedRun;
+  if (run.kind !== "plan" || run.state.status !== "complete" || !isolated) {
+    return undefined;
+  }
+  if (isolated.lifecycle === "creating" || isolated.lifecycle === "creation_failed" || isolated.lifecycle === "finished") {
+    return undefined;
+  }
+  const ready = readyToMerge(isolated.finish);
+  return {
+    ready,
+    text: ready
+      ? `The engine reports this run can be merged into ${isolated.targetBranch} and its workspace cleaned up.`
+      : `This run is complete. Merge & clean up asks the engine whether its work can be merged into ${isolated.targetBranch}, and shows you what would happen before anything changes.`,
+    detail: `sparring finish-run --run-key ${isolated.runKey} --dry-run first; nothing is merged or removed until you confirm.`,
+  };
+}
+
 function pushAuthorization(
   run: RunSnapshot,
   artifacts: OverviewArtifacts,

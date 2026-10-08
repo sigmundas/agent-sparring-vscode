@@ -110,3 +110,30 @@ export function engineRunsReader(configured: () => string): RunsReader {
     });
   };
 }
+
+/**
+ * Run a read-only engine query (`finish-run … --dry-run --json`) without a
+ * terminal and return its exit code and stdout. A non-zero exit is an
+ * answer too (`3`: refused by its checks); only a command that could not
+ * run at all, or the shell-only executable, is no answer.
+ */
+export async function engineReadOnlyQuery(configured: string, args: string[], cwd: string): Promise<{ ok: true; exitCode: number; stdout: string } | { ok: false; reason: string }> {
+  const planned = await planExecutable(configured, hostEnv(cwd), false);
+  if (!planned.ok || planned.plan.kind === "shell") {
+    return { ok: false, reason: "the sparring executable is resolved only by the shell; set agentSparring.executable to its full path" };
+  }
+  const file = planned.plan.path;
+  return new Promise((resolve) => {
+    execFile(file, args, { cwd, timeout: 60_000, maxBuffer: 4 * 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
+      if (!error) {
+        resolve({ ok: true, exitCode: 0, stdout });
+        return;
+      }
+      if (typeof error.code === "number") {
+        resolve({ ok: true, exitCode: error.code, stdout: stdout || String(stderr) });
+        return;
+      }
+      resolve({ ok: false, reason: String(stderr || error.message).trim().split("\n")[0] });
+    });
+  });
+}

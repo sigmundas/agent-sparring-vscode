@@ -1177,6 +1177,11 @@ export interface IsolatedRun {
   lifecycle: IsolatedRunLifecycle;
   /** The run state's status, or `missing` / `unreadable`; presentation reads the run state itself. */
   runStatus: string;
+  /**
+   * The engine's own finish dry run for the run's state as listed, when it
+   * gave one this version reads. The only source of "Ready to merge".
+   */
+  finish?: FinishCheck;
 }
 
 export type IsolatedRunsReport = { kind: "runs"; runs: IsolatedRun[] } | { kind: "version-mismatch"; version: unknown };
@@ -1224,7 +1229,160 @@ export function parseIsolatedRuns(text: string): IsolatedRunsReport {
         targetBranch: requireString(raw, "target_branch"),
         lifecycle: lifecycle as IsolatedRunLifecycle,
         runStatus: requireString(raw, "run_status"),
+        ...listedFinish(raw["finish"]),
       };
     }),
   };
+}
+
+/**
+ * A run's embedded `finish` object, read as strictly as a dry run's own
+ * output — but a missing, unknown-version or malformed one only withholds
+ * "Ready to merge"; it never hides the run.
+ */
+function listedFinish(raw: unknown): { finish?: FinishCheck } {
+  if (!isRecord(raw)) {
+    return {};
+  }
+  try {
+    const report = finishCheckFrom(raw);
+    return report.kind === "finish" ? { finish: report.finish } : {};
+  } catch {
+    return {};
+  }
+}
+
+// ---------------------------------------------------------------------------
+// `sparring finish-run --json`  (managed_finish.py; reference.md
+// "Managed-run JSON"). The dry run says whether, and how, a run in its own
+// workspace can be merged and cleaned up; execution says how far it got.
+// ---------------------------------------------------------------------------
+
+/** The only `finish-run --json` schema this extension reads. */
+export const FINISH_RUN_SCHEMA_VERSION = 1;
+
+export type FinishMergeMode = "already_merged" | "fast_forward" | "merge_commit";
+
+const FINISH_MERGE_MODES: ReadonlySet<string> = new Set<FinishMergeMode>(["already_merged", "fast_forward", "merge_commit"]);
+
+export interface FinishCheckItem {
+  code: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface FinishKept {
+  action: string;
+  code: string;
+  detail: string;
+}
+
+/** `finish-run --dry-run --json`: the engine's verdict; nothing here is decided by the extension. */
+export interface FinishCheck {
+  runKey: string;
+  eligible: { merge: boolean; cleanup: boolean };
+  mergeMode: FinishMergeMode | null;
+  actions: string[];
+  checks: FinishCheckItem[];
+  deletedIgnoredPaths: string[];
+  kept: FinishKept[];
+  summary: string;
+}
+
+/** `finish-run --json` (execution). `stoppedAt` null means every planned step completed. */
+export interface FinishResult {
+  runKey: string;
+  completedSteps: string[];
+  stoppedAt: string | null;
+  reason: string | null;
+  remaining: string[];
+  deletedIgnoredPaths: string[];
+  kept: FinishKept[];
+}
+
+export type FinishCheckReport = { kind: "finish"; finish: FinishCheck } | { kind: "version-mismatch"; version: unknown };
+export type FinishResultReport = { kind: "result"; result: FinishResult } | { kind: "version-mismatch"; version: unknown };
+
+/** Parse `finish-run --dry-run --json`. Unknown version: a mismatch, never guessed at. */
+export function parseFinishCheck(text: string): FinishCheckReport {
+  return finishCheckFrom(parseJsonObject(text, "finish-run dry run"));
+}
+
+function finishCheckFrom(payload: Record<string, unknown>): FinishCheckReport {
+  if (payload["schema_version"] !== FINISH_RUN_SCHEMA_VERSION) {
+    return { kind: "version-mismatch", version: payload["schema_version"] };
+  }
+  const eligible = payload["eligible"];
+  if (!isRecord(eligible) || typeof eligible["merge"] !== "boolean" || typeof eligible["cleanup"] !== "boolean") {
+    throw new EngineFormatError('field "eligible" must be {"merge": bool, "cleanup": bool}');
+  }
+  const mode = payload["merge_mode"];
+  if (mode !== null && mode !== undefined && (typeof mode !== "string" || !FINISH_MERGE_MODES.has(mode))) {
+    throw new EngineFormatError(`unknown merge_mode ${JSON.stringify(mode)}`);
+  }
+  const checks = requireList(payload, "checks").map((raw): FinishCheckItem => {
+    if (!isRecord(raw) || typeof raw["ok"] !== "boolean") {
+      throw new EngineFormatError('each check must be {"code", "ok", "detail"}');
+    }
+    return { code: requireString(raw, "code"), ok: raw["ok"], detail: requireString(raw, "detail") };
+  });
+  return {
+    kind: "finish",
+    finish: {
+      runKey: requireString(payload, "run_key"),
+      eligible: { merge: eligible["merge"], cleanup: eligible["cleanup"] },
+      mergeMode: (mode ?? null) as FinishMergeMode | null,
+      actions: requireStringList(payload, "actions"),
+      checks,
+      deletedIgnoredPaths: requireStringList(payload, "deleted_ignored_paths"),
+      kept: requireKept(payload),
+      summary: requireString(payload, "summary"),
+    },
+  };
+}
+
+/** Parse `finish-run --json` (execution). */
+export function parseFinishResult(text: string): FinishResultReport {
+  const payload = parseJsonObject(text, "finish-run report");
+  if (payload["schema_version"] !== FINISH_RUN_SCHEMA_VERSION) {
+    return { kind: "version-mismatch", version: payload["schema_version"] };
+  }
+  return {
+    kind: "result",
+    result: {
+      runKey: requireString(payload, "run_key"),
+      completedSteps: requireStringList(payload, "completed_steps"),
+      stoppedAt: optionalString(payload, "stopped_at"),
+      reason: optionalString(payload, "reason"),
+      remaining: requireStringList(payload, "remaining"),
+      deletedIgnoredPaths: requireStringList(payload, "deleted_ignored_paths"),
+      kept: requireKept(payload),
+    },
+  };
+}
+
+function requireList(payload: Record<string, unknown>, key: string): unknown[] {
+  const value = payload[key];
+  if (!Array.isArray(value)) {
+    throw new EngineFormatError(`field ${JSON.stringify(key)} must be a list`);
+  }
+  return value;
+}
+
+function requireStringList(payload: Record<string, unknown>, key: string): string[] {
+  return requireList(payload, key).map((item) => {
+    if (typeof item !== "string") {
+      throw new EngineFormatError(`field ${JSON.stringify(key)} must be a list of strings`);
+    }
+    return item;
+  });
+}
+
+function requireKept(payload: Record<string, unknown>): FinishKept[] {
+  return requireList(payload, "kept").map((raw) => {
+    if (!isRecord(raw)) {
+      throw new EngineFormatError('each "kept" entry must be a JSON object');
+    }
+    return { action: requireString(raw, "action"), code: requireString(raw, "code"), detail: requireString(raw, "detail") };
+  });
 }

@@ -64,6 +64,11 @@
         "category": "Agent Sparring"
       },
       {
+        "command": "agentSparring.mergeCleanUp",
+        "title": "Merge & Clean Up Run",
+        "category": "Agent Sparring"
+      },
+      {
         "command": "agentSparring.openOverview",
         "title": "Open Overview",
         "category": "Agent Sparring"

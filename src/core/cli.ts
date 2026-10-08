@@ -421,6 +421,26 @@ export function buildRunsArgs(repoRoot: string): string[] {
   return ["runs", "--repo-root", repoRoot, "--json"];
 }
 
+/**
+ * `sparring finish-run --repo-root ROOT --run-key K … --json`. The dry run
+ * is read-only; without `dryRun` the engine merges and cleans up, and the
+ * two optional flags are passed only when the person chose them.
+ */
+export function buildFinishRunArgs(invocation: { repoRoot: string; runKey: string; dryRun?: boolean; pushTarget?: boolean; allowMergeCommit?: boolean }): string[] {
+  const args = ["finish-run", "--repo-root", invocation.repoRoot, "--run-key", invocation.runKey];
+  if (invocation.dryRun) {
+    args.push("--dry-run");
+  }
+  if (invocation.pushTarget) {
+    args.push("--push-target");
+  }
+  if (invocation.allowMergeCommit) {
+    args.push("--allow-merge-commit");
+  }
+  args.push("--json");
+  return args;
+}
+
 function globalArgs(invocation: { repoRoot: string; sparringDir?: string }): string[] {
   if (!invocation.sparringDir) {
     return [];

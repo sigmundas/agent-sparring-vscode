@@ -31,7 +31,7 @@ import {
 } from "./effectiveConfig";
 import { CHECK_OUTCOMES, isCheckKey, isDraftKey, type CheckItem, type CheckOutcome } from "./humanChecks";
 import { checkName, humanTask, splitPassCriteria } from "./humanTask";
-import { RUN_KIND, TIMELINE_STATE_WORD, shortStageLabel, timelineGroups, type ActionRequired, type AgentConfigSection, type BranchGuard, type ActorCard, type BudgetGauge, type HistoryEntry, type OverviewModel, type PushAuthorization, type StartPlanView, type TimelineItem, type WhatsNext } from "./overviewModel";
+import { RUN_KIND, TIMELINE_STATE_WORD, shortStageLabel, timelineGroups, type ActionRequired, type AgentConfigSection, type BranchGuard, type ActorCard, type BudgetGauge, type FinishRunOffer, type HistoryEntry, type OverviewModel, type PushAuthorization, type StartPlanView, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { ProviderPauseCard } from "./freshSession";
 import type { MatchSource } from "./planAssociation";
 import type { PromptView, PromptViewSection } from "./promptInspector";
@@ -59,6 +59,7 @@ export type OverviewAction =
   | "makePlan"
   | "makePlanFromThis"
   | "resumePlan"
+  | "mergeCleanUp"
   | "freshSparrer"
   | "freshStageAgent"
   | "freshSparrerOtherProvider"
@@ -411,6 +412,7 @@ export const OVERVIEW_ACTIONS: readonly OverviewAction[] = [
   "makePlan",
   "makePlanFromThis",
   "resumePlan",
+  "mergeCleanUp",
   "freshSparrer",
   "freshStageAgent",
   "freshSparrerOtherProvider",
@@ -659,6 +661,9 @@ ${intake.command ? `<details class="intake-command"><summary>Engine command</sum
   } else if (model.banner) {
     parts.push(`<div class="banner ${model.banner.kind}">${escapeHtml(model.banner.text)}</div>`);
   }
+  if (model.finishRun) {
+    parts.push(renderFinishRun(model.finishRun));
+  }
   if (model.timeline && model.timeline.length > 0) {
     parts.push(renderJourney(model.timeline));
   } else if (model.timelineNote) {
@@ -872,6 +877,18 @@ function renderProviderPause(card: ProviderPauseCard): string {
 <div class="actionhead"><h2>${icon("warn", "needs_you")}${escapeHtml(card.title)}</h2>
 <p class="summary">${escapeHtml(card.detail)}</p></div>
 <div class="actions">${buttons.join("")}</div>
+</section>`;
+}
+
+/**
+ * Merge & clean up for a complete run in its own workspace. "Ready to merge"
+ * appears only when the engine's dry run said so for the state listed.
+ */
+function renderFinishRun(offer: FinishRunOffer): string {
+  const badge = offer.ready ? `<p class="ready">${icon("check", "good")}Ready to merge</p>` : "";
+  return `<section class="card finishrun">
+${badge}<p>${escapeHtml(offer.text)}</p>
+<div class="actions">${button("mergeCleanUp", "Merge & clean up", true, offer.detail, "primary")}</div>
 </section>`;
 }
 

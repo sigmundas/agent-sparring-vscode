@@ -457,6 +457,7 @@ export class OverviewPanelManager implements vscode.Disposable {
         siblingRepositories: this.siblingRepositories(run, run.kind === "plan" ? planText : associatedText, briefText, association?.match),
         manifestStages: await this.manifestStages(run),
         managedPlanRun: await this.managedPlanRun(run),
+        isolatedRun: this.controller.isolatedRunFor(run)?.run,
         existingStageIds: this.existingStageIds(run),
         guardedOperationId: guard?.id,
         // Read once, here, with the id above: what this surface offers has

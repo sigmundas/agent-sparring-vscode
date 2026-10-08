@@ -86,6 +86,8 @@ import { currentBranch, knownRepositories, pendingChanges } from "./git";
 import { evaluateStartPlan, manifestSupport, resetManifestSupportCache, startPlanSupport } from "./engineProbe";
 import { openCandidateDiff } from "./overview/gitDiff";
 import { configuredExecutable } from "./engineExecutable";
+import { engineReadOnlyQuery } from "./isolatedRunsProbe";
+import { mergeAndCleanUp, type FinishNotice } from "../core/finishRun";
 import { disposeMakePlanWatchers, makePlanCommand, type MakePlanDeps } from "./makePlan";
 import { settingsTarget } from "../core/settingsTarget";
 import { fixSetup, readEffectiveConfig, readModelChoices, readOverriddenConfig, resetModelChoicesCache } from "./configProbe";
@@ -128,6 +130,11 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
     vscode.commands.registerCommand("agentSparring.makePlan", () => makePlanCommand(makePlanDeps(controller, overview))),
     new vscode.Disposable(disposeMakePlanWatchers),
     vscode.commands.registerCommand("agentSparring.resumePlan", () => resumePlanCommand(controller)),
+    vscode.commands.registerCommand("agentSparring.mergeCleanUp", async () => {
+      const selected = controller.currentSelection.selected;
+      await mergeCleanUpCommand(controller, selected?.kind === "plan" ? selected : undefined);
+      await overview.update();
+    }),
     vscode.commands.registerCommand("agentSparring.runStage", () => runStageCommand(controller)),
     vscode.commands.registerCommand("agentSparring.acceptStage", () => acceptStageCommand(controller, overview)),
     vscode.commands.registerCommand("agentSparring.choosePlan", () => associatePlanCommand(controller, overview)),
@@ -1131,6 +1138,10 @@ async function handleOverviewAction(controller: SparringController, overview: Ov
     }
     case "resumePlan":
       await resumePlanCommand(controller, run?.kind === "plan" ? run : undefined);
+      await overview.update();
+      return;
+    case "mergeCleanUp":
+      await mergeCleanUpCommand(controller, run?.kind === "plan" ? run : undefined);
       await overview.update();
       return;
     case "freshSparrer":
@@ -3093,6 +3104,70 @@ function planContinuationMode(): PlanContinuation {
  * / running runs are offered. A current stage that is already accepted is
  * advanced past by the engine, so the same command is "Continue plan".
  */
+// ---------------------------------------------------------------- Merge & clean up
+
+/**
+ * Merge & clean up a complete run in its own workspace (core/finishRun.ts).
+ * The engine's dry run, read here without a terminal, decides whether and
+ * how; the confirmed `finish-run` goes through the tracked command runner
+ * from the repository's primary checkout. The cockpit then reads the
+ * engine's state again, and follows the primary checkout once the run's
+ * workspace is gone.
+ */
+async function mergeCleanUpCommand(controller: SparringController, run: PlanRunSnapshot | undefined): Promise<void> {
+  const isolated = run ? controller.isolatedRunFor(run) : undefined;
+  if (!run || !isolated) {
+    void vscode.window.showInformationMessage("Agent Sparring: Merge & clean up applies to a plan run in its own workspace. Select one first.");
+    return;
+  }
+  const repoRoot = isolated.primaryCheckout;
+  const target = { repoRoot, runKey: isolated.run.runKey, targetBranch: isolated.run.targetBranch, branch: isolated.run.branch, planLabel: run.state.plan };
+  const outcome = await mergeAndCleanUp(target, {
+    dryRun: (args) => engineReadOnlyQuery(configuredExecutable(), args, repoRoot),
+    choose: async (prompt) => {
+      const picked = await vscode.window.showWarningMessage(prompt.message, { modal: true, detail: prompt.detail }, ...prompt.choices.map((choice) => choice.label));
+      return prompt.choices.find((choice) => choice.label === picked);
+    },
+    run: async (args) => {
+      controller.log(`Merge & clean up: sparring ${args.join(" ")}`);
+      const result = await controller.runCommand({ configured: configuredExecutable(), args, cwd: repoRoot, name: `Merge & clean up: ${target.planLabel}`, operation: { subcommand: "finish-run", target: target.runKey }, repoRoot });
+      return result.ok ? { ok: true, exitCode: result.outcome.exitCode, output: result.outcome.output } : { ok: false, reason: result.error };
+    },
+    notify: (notice) => showFinishNotice(controller, notice),
+  });
+  if (outcome.kind === "cancelled" || outcome.kind === "ineligible") {
+    return;
+  }
+  await controller.rediscoverWorktrees();
+  if (outcome.kind === "finished") {
+    await controller.chooseRepository(repoRoot);
+  }
+}
+
+async function showFinishNotice(controller: SparringController, notice: FinishNotice): Promise<void> {
+  controller.log(`Merge & clean up: ${notice.message}`);
+  switch (notice.kind) {
+    case "ineligible":
+      for (const line of notice.technical) {
+        controller.log(`  ${line}`);
+      }
+      await vscode.window.showWarningMessage(notice.message, { modal: true, detail: notice.reasons.map((reason) => `• ${reason}`).join("\n") });
+      return;
+    case "stopped": {
+      const lines = [notice.reason ? `Reason: ${notice.reason}` : undefined, notice.remaining.length > 0 ? `Still to do:\n${notice.remaining.map((item) => `• ${item}`).join("\n")}` : undefined].filter((line): line is string => line !== undefined);
+      controller.log(`  stopped_at ${notice.stoppedAt}${notice.reason ? `: ${notice.reason}` : ""}; remaining: ${notice.remaining.join(", ") || "nothing"}`);
+      await vscode.window.showWarningMessage(notice.message, { modal: true, detail: lines.join("\n\n") });
+      return;
+    }
+    case "error":
+      void vscode.window.showErrorMessage(`Agent Sparring: ${notice.message}`);
+      return;
+    case "finished":
+      void vscode.window.showInformationMessage(`Agent Sparring: ${notice.message}`);
+      return;
+  }
+}
+
 async function resumePlanCommand(controller: SparringController, preselected?: PlanRunSnapshot): Promise<void> {
   const plans = controller.currentDiscovery.runs.filter((run): run is PlanRunSnapshot => run.kind === "plan" && run.state.status !== "complete");
   if (plans.length === 0) {
