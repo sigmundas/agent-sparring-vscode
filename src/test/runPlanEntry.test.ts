@@ -230,3 +230,18 @@ describe("an older plan's intake cannot stand in for the plan just chosen", () =
     assert.ok(html.includes(`Plan intake of <strong class="intake-source">${file}</strong>`), "in the header, beside the state");
   });
 });
+
+describe("the Run Plan picker lists plan-like documents, newest first", () => {
+  it("offers '## Stage S1' plans and planning input under plans/, newest first, and skips other Markdown", async () => {
+    const { planPickerEntries } = await import("../core/runPlanEntry");
+    const entries = planPickerEntries([
+      { file: "/r/docs/plans/active/2026-08-23-cloud-sync-extraction.md", relative: "docs/plans/active/2026-08-23-cloud-sync-extraction.md", text: "# Old\n\n## Stage 1 — A\n", mtimeMs: Date.parse("2026-08-23T10:00:00Z") },
+      { file: "/r/docs/plans/active/2026-10-07-cloud-sync.md", relative: "docs/plans/active/2026-10-07-cloud-sync.md", text: "# New\n\n## Stage S1 — Design\n\n## Stage S2 — Baseline\n", mtimeMs: Date.parse("2026-10-08T09:00:00Z") },
+      { file: "/r/docs/plans/ideas.md", relative: "docs/plans/ideas.md", text: "# Ideas\n\nprose\n", mtimeMs: Date.parse("2026-09-01T00:00:00Z") },
+      { file: "/r/README.md", relative: "README.md", text: "# Readme\n\n```md\n## Stage 1 — Example\n```\n", mtimeMs: Date.parse("2026-10-08T12:00:00Z") },
+    ]);
+    assert.deepEqual(entries.map((entry) => entry.label), ["2026-10-07-cloud-sync.md", "ideas.md", "2026-08-23-cloud-sync-extraction.md"]);
+    assert.match(entries[0].detail, /^2 stage sections · modified 2026-10-08 09:00$/);
+    assert.match(entries[1].detail, /no stage sections \(planning input\)/);
+  });
+});

@@ -176,3 +176,33 @@ export function featureBranchPrompt(current: string | undefined): { value: strin
     placeholder: "feature/…",
   };
 }
+
+/** One Markdown file the Run Plan picker considered. */
+export interface PlanFileCandidate {
+  file: string;
+  /** Repository-relative path, `/`-separated. */
+  relative: string;
+  text: string;
+  mtimeMs: number;
+}
+
+/**
+ * What the Run Plan picker lists: plan-like documents, newest first. The
+ * engine classifies whatever is chosen, so nothing is filtered on whether
+ * the extension could parse it as a direct plan — a `## Stage S1` plan or
+ * planning input under a `plans/` folder is offered like any other.
+ * Plan-like: stage-like sections outside fences, or a file under a `plans`
+ * directory.
+ */
+export function planPickerEntries(candidates: readonly PlanFileCandidate[]): { file: string; label: string; description: string; detail: string }[] {
+  return candidates
+    .map((candidate) => ({ candidate, stages: countStageHeadings(candidate.text) }))
+    .filter(({ candidate, stages }) => stages > 0 || candidate.relative.split("/").slice(0, -1).includes("plans"))
+    .sort((a, b) => b.candidate.mtimeMs - a.candidate.mtimeMs || a.candidate.relative.localeCompare(b.candidate.relative))
+    .map(({ candidate, stages }) => ({
+      file: candidate.file,
+      label: candidate.relative.split("/").pop() ?? candidate.relative,
+      description: candidate.relative,
+      detail: `${stages > 0 ? `${stages} stage section${stages === 1 ? "" : "s"}` : "no stage sections (planning input)"} · modified ${new Date(candidate.mtimeMs).toISOString().slice(0, 16).replace("T", " ")}`,
+    }));
+}

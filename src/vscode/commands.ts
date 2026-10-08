@@ -59,7 +59,7 @@ import { stageScopeOf } from "../core/stageScope";
 import { CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
 import { applyFeatureBranch, inspectFeatureBranch } from "../core/featureBranch";
-import { classifyPlanDocument, countStageHeadings, featureBranchPrompt, type CheckPlanQuery, type PlanClassification } from "../core/runPlanEntry";
+import { classifyPlanDocument, countStageHeadings, featureBranchPrompt, planPickerEntries, type PlanFileCandidate, type CheckPlanQuery, type PlanClassification } from "../core/runPlanEntry";
 import { GETTING_STARTED } from "../core/gettingStarted";
 import { DEFERRED_VERIFICATION_REQUIRED, parseHandoffBranch, parsePlanStages, type PlanRunSource } from "../core/engineFormats";
 import { appendHumanEvidence, OUTCOME_WORDS, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
@@ -2371,34 +2371,35 @@ const isInside = isInsidePath;
 async function pickPlanDocument(location: SparringLocation): Promise<string | undefined> {
   const active = vscode.window.activeTextEditor?.document;
   if (active && active.languageId === "markdown" && active.uri.scheme === "file" && isInside(active.uri.fsPath, location.repoRoot)) {
-    if (await looksLikePlan(active.uri.fsPath)) {
+    // An open plan-like document is the one meant; the engine classifies it next.
+    if (countStageHeadings(active.getText()) > 0) {
       return active.uri.fsPath;
     }
   }
   // Relative to the repository itself, so a nested project is not searched
   // through its whole parent workspace folder.
   const pattern = new vscode.RelativePattern(vscode.Uri.file(location.repoRoot), "**/*.md");
-  const candidates = await vscode.workspace.findFiles(pattern, "**/{node_modules,.git,.sparring,dist,out,.venv}/**", 400);
-  const plans: { label: string; description: string; detail?: string; file: string }[] = [];
-  for (const uri of candidates) {
-    const stages = await planStageCount(uri.fsPath);
-    if (stages && stages > 0) {
-      plans.push({
-        label: path.basename(uri.fsPath),
-        description: path.relative(location.repoRoot, uri.fsPath),
-        detail: `${stages} stage(s)`,
-        file: uri.fsPath,
-      });
+  const found = await vscode.workspace.findFiles(pattern, "**/{node_modules,.git,.sparring,dist,out,.venv}/**", 2000);
+  const candidates: PlanFileCandidate[] = [];
+  for (const uri of found) {
+    try {
+      const [text, stat] = await Promise.all([fs.readFile(uri.fsPath, "utf8"), fs.stat(uri.fsPath)]);
+      candidates.push({ file: uri.fsPath, relative: path.relative(location.repoRoot, uri.fsPath).split(path.sep).join("/"), text, mtimeMs: stat.mtimeMs });
+    } catch {
+      // gone or unreadable since it was listed; not offered
     }
   }
-  plans.sort((a, b) => a.description.localeCompare(b.description));
+  // Newest first; the engine classifies whatever is chosen.
+  const plans = planPickerEntries(candidates);
   const picked = await vscode.window.showQuickPick(
     [...plans, { label: "$(folder-opened) Browse…", description: "choose another Markdown file", file: "" }],
     {
       placeHolder:
         plans.length > 0
-          ? "Which reviewed plan should run? (plans are Markdown files with '## Stage <n> — <title>' headings)"
+          ? "Which plan or planning input? Newest first; the engine checks it before anything is asked."
           : `No staged plan in ${location.folderName}. ${GETTING_STARTED}`,
+      matchOnDescription: true,
+      matchOnDetail: true,
     },
   );
   if (!picked) {
@@ -2414,22 +2415,6 @@ async function pickPlanDocument(location: SparringLocation): Promise<string | un
     openLabel: "Run plan",
   });
   return chosen?.[0]?.fsPath;
-}
-
-async function planStageCount(file: string): Promise<number | undefined> {
-  try {
-    const text = await fs.readFile(file, "utf8");
-    if (!/^##\s+stage\b/im.test(text)) {
-      return 0;
-    }
-    return parsePlanStages(text).length;
-  } catch {
-    return undefined; // malformed for the engine too; not offered
-  }
-}
-
-async function looksLikePlan(file: string): Promise<boolean> {
-  return ((await planStageCount(file)) ?? 0) > 0;
 }
 
 /**
