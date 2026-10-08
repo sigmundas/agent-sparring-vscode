@@ -105,6 +105,14 @@ A real reload remains a manual check; see [Manual verification](runners.md#manua
 Recorded rather than fixed, so they are visible without being smuggled into an
 unrelated change:
 
+- **Progress while `start-plan` prepares an intake.** The Run Plan screen
+  shows only "The engine is preparing the plan…" for what can be a long
+  provider turn. There is no elapsed time, no phase, and no sign that the
+  provider is still working. The extension can add elapsed time and process
+  liveness on its own. Real phases (reading the plan, the provider turn,
+  validating, writing the intake) need the engine to report progress, for
+  example as JSON lines on stderr or a progress file in the intake directory,
+  because `start-plan --json` prints a single status only at the end.
 - **Engine: `start-plan --managed` for intake-based planning input.** Today
   `--managed` accepts only `## Stage` plans (engine `plan_start.evaluate`), so
   Run Plan's planning-input screen prepares an intake in this checkout. It asks
