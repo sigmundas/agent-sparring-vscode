@@ -5,7 +5,7 @@
  */
 
 
-import { START_PLAN_RUNS_KEY, readStartPlanRuns, reconcileStartedRuns, type LaunchEvidence, type PendingStartedRun, type StartPlanRuns } from "../core/startPlanBinding";
+import { START_PLAN_RUNS_KEY, readStartPlanRuns, reconcileStartedRuns, unfollowedStartMessage, type LaunchEvidence, type PendingStartedRun, type StartPlanRuns } from "../core/startPlanBinding";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { ActivityTailer } from "../core/activityTailer";
@@ -246,7 +246,7 @@ export class SparringController implements vscode.Disposable {
     // so it is a rediscovery like any other authoritative change.
     this.activeRepository = new ActiveRepositoryTracker((message) => this.log(message));
     this.worktreeProbe = new WorktreeProbe((message) => this.log(message));
-    this.isolatedRunsProbe = new IsolatedRunsProbe((message) => this.log(message), engineRunsReader(configuredExecutable));
+    this.isolatedRunsProbe = new IsolatedRunsProbe((message) => this.log(message), engineRunsReader(configuredExecutable), (message) => void vscode.window.showWarningMessage(message));
     this.disposables.push(this.activeRepository, this.activeRepository.onDidChange(() => this.scheduleRefresh()));
     this.disposables.push(
       this.tracker,
@@ -1423,19 +1423,27 @@ export class SparringController implements vscode.Disposable {
     }
     // Retired only on a successful post-exit report for the start's own
     // repository; a failed read keeps it waiting for the next attempt.
-    const freshFor = (pending: PendingStartedRun): boolean => {
-      const picked = this.allLocations().find((location) => samePath(location.sparringDir, pending.sparringDir));
-      if (!ended || !picked) {
+    // A read that gave no answer counts towards giving up on following it.
+    const freshFor = (pending: PendingStartedRun): boolean | "unanswered" => {
+      if (!ended) {
         return false;
       }
+      const picked = this.allLocations().find((location) => samePath(location.sparringDir, pending.sparringDir));
+      if (!picked) {
+        return "unanswered";
+      }
       const family = this.repositoryFamily(picked.repoRoot);
-      return this.isolatedReports.some((report) => report.ok && samePath(this.repositoryFamily(report.repoRoot), family));
+      const reports = this.isolatedReports.filter((report) => samePath(this.repositoryFamily(report.repoRoot), family));
+      return reports.some((report) => report.ok) ? true : "unanswered";
     };
     const result = reconcileStartedRuns(state, this.discovery.runs, evidence, (run) => this.isolatedRunFor(run) !== undefined, freshFor);
     for (const note of result.notes) {
       this.log(`start-plan: ${note}`);
     }
     await this.context.workspaceState.update(START_PLAN_RUNS_KEY, result.state);
+    for (const pending of result.unfollowed) {
+      void vscode.window.showWarningMessage(unfollowedStartMessage(pending));
+    }
     const show = result.bound.find((entry) => entry.pending.show)?.runId;
     if (show) {
       await this.context.workspaceState.update(SELECTED_RUN_KEY, show);

@@ -26,10 +26,13 @@ export type RunsReader = (repoRoot: string) => Promise<{ ok: true; stdout: strin
 export class IsolatedRunsProbe {
   private readonly cache = new Map<string, { atMs: number; ok: boolean; runs: IsolatedRun[] }>();
   private readonly reported = new Set<string>();
+  private readonly mismatchShown = new Set<string>();
 
   constructor(
     private readonly log: (message: string) => void,
     private readonly read: RunsReader,
+    /** Shows an engine/extension mismatch to the person (non-modal); called once per reported version per session. */
+    private readonly showMismatch: (message: string) => void = () => undefined,
   ) {}
 
   /** Drop cached answers, so the next {@link list} asks the engine again. */
@@ -69,6 +72,13 @@ export class IsolatedRunsProbe {
           `${root}: schema ${String(report.version)}`,
           `engine/extension mismatch: sparring runs --json for ${root} reported schema_version ${JSON.stringify(report.version)}, and this extension reads only ${ISOLATED_RUNS_SCHEMA_VERSION}. Runs in their own workspaces are not associated with their worktrees until the two agree.`,
         );
+        const shown = String(report.version);
+        if (!this.mismatchShown.has(shown)) {
+          this.mismatchShown.add(shown);
+          this.showMismatch(
+            `Agent Sparring: the engine and this extension do not match — the engine's list of runs uses a format (schema_version ${JSON.stringify(report.version)}) this extension does not read. Runs in their own workspaces are not followed until the two are updated to match.`,
+          );
+        }
         return { ok: false, runs: [] };
       }
       // Stamped on receipt: "Ready to merge" is shown only while this answer is fresh.
@@ -101,9 +111,11 @@ export class IsolatedRunsProbe {
  */
 export function engineRunsReader(configured: () => string): RunsReader {
   return async (repoRoot) => {
+    // As a direct launch resolves it: the configured path, or a bare name
+    // along this host's PATH. Only the terminal's shell PATH is out of reach.
     const planned = await planExecutable(configured(), hostEnv(repoRoot), false);
     if (!planned.ok || planned.plan.kind === "shell") {
-      return { ok: false, reason: "the sparring executable is resolved only by the shell" };
+      return { ok: false, reason: planned.ok ? "the sparring executable is resolved only by the shell" : planned.error };
     }
     const file = planned.plan.path;
     return new Promise((resolve) => {

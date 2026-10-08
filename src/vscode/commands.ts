@@ -3706,6 +3706,16 @@ async function planInvocationFor(controller: SparringController, run: PlanRunSna
   if ("file" in held) {
     return { manifest: held.file, source: "manifest", runKey: run.runKey };
   }
+  // A run in its own workspace was recorded with the manifest at the path it
+  // was started from; a rebuild lands at another path, which the engine
+  // refuses as an input mismatch. Refuse here instead, before any command.
+  if (controller.isolatedRunFor(run)) {
+    void vscode.window.showWarningMessage(
+      `Agent Sparring: this run in its own workspace was started from an execution manifest that is now missing (${held.refusal}). It can only be continued from that recorded manifest, so nothing was started.`,
+      { modal: true },
+    );
+    return undefined;
+  }
   const markdown = await readOptional(run.planPath);
   if (markdown === undefined) {
     void vscode.window.showWarningMessage(`Agent Sparring: this run was started from an execution manifest built from ${path.basename(run.planPath)}. That plan can no longer be read, and no stored manifest matches the run (${held.refusal}). Restore the plan, then continue.`, { modal: true });

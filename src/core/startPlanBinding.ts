@@ -35,7 +35,23 @@ export interface PendingStartedRun {
    * engine's own record names (`sparring runs --json`) — never by plan label.
    */
   runKey?: string;
+  /**
+   * For a run started in its own workspace whose execution has ended: when
+   * this window first saw it ended, and how many reads of the engine's
+   * record after that gave no answer. Stored, so the bound on following it
+   * survives a reload.
+   */
+  endedSeenAtMs?: number;
+  unansweredAfterEnd?: number;
 }
+
+/**
+ * How long, and through how many unanswered reads of the engine's record, an
+ * ended isolated start is followed before it is given up on. Giving up
+ * claims nothing about the run: the person is told to find it in "Runs…".
+ */
+export const UNFOLLOWED_AFTER_MS = 60_000;
+export const UNFOLLOWED_AFTER_READS = 5;
 
 export interface StartPlanRuns {
   pending: PendingStartedRun[];
@@ -83,7 +99,9 @@ export function readStartPlanRuns(value: unknown): StartPlanRuns {
           typeof entry.planLabel === "string" &&
           Array.isArray(entry.before) &&
           typeof entry.launchedAtMs === "number" &&
-          (entry.runKey === undefined || typeof entry.runKey === "string"),
+          (entry.runKey === undefined || typeof entry.runKey === "string") &&
+          (entry.endedSeenAtMs === undefined || typeof entry.endedSeenAtMs === "number") &&
+          (entry.unansweredAfterEnd === undefined || typeof entry.unansweredAfterEnd === "number"),
       )
     : [];
   const bindings: Record<string, string> = {};
@@ -108,6 +126,8 @@ export type LaunchEvidence = "running" | "submitted" | "ended" | "none";
 export interface Reconciled {
   state: StartPlanRuns;
   bound: { pending: PendingStartedRun; runId: string }[];
+  /** Isolated starts given up on without a run: the person must be told to look in "Runs…". */
+  unfollowed: PendingStartedRun[];
   notes: string[];
 }
 
@@ -131,15 +151,27 @@ export function reconcileStartedRuns(
    * isolated start that ended may have recorded its run just before exiting;
    * a record read earlier, or a read that failed, cannot show it, so without
    * such a read the start keeps waiting instead of retiring.
+   * `"unanswered"`: the record was asked after the end and gave no answer
+   * this version reads; counted towards {@link UNFOLLOWED_AFTER_READS}.
    */
-  isolatedRecordFresh: (pending: PendingStartedRun) => boolean = () => false,
+  isolatedRecordFresh: (pending: PendingStartedRun) => boolean | "unanswered" = () => false,
+  nowMs: number = Date.now(),
 ): Reconciled {
   const alreadyBound = new Set(Object.keys(state.bindings));
   const notes: string[] = [];
   const retired = new Set<PendingStartedRun>();
+  const unfollowed: PendingStartedRun[] = [];
+  const updated = new Map<PendingStartedRun, PendingStartedRun>();
   const claims = new Map<string, PendingStartedRun[]>();
   for (const pending of state.pending) {
     const launch = evidence(pending.provisionalRunId);
+    if (launch === "none" && pending.runKey !== undefined && pending.endedSeenAtMs !== undefined) {
+      // Seen ended before, and this window no longer has its execution (a reload): never a bound-less wait.
+      retired.add(pending);
+      unfollowed.push(pending);
+      notes.push(`the run started in its own workspace as ${pending.runKey} could not be followed automatically after its launch ended; it is not attributed to any run.`);
+      continue;
+    }
     if (launch === "none") {
       retired.add(pending);
       notes.push(`the confirmation ${pending.provisionalRunId} was never started, so it claims no run of ${pending.planLabel}.`);
@@ -151,12 +183,25 @@ export function reconcileStartedRuns(
     } else if (outcome.kind === "ambiguous") {
       retired.add(pending);
       notes.push(`more than one new run of ${pending.planLabel} was recorded (${outcome.runIds.join(", ")}); none is attributed to the confirmation ${pending.provisionalRunId}.`);
-    } else if (launch === "ended" && (pending.runKey === undefined || isolatedRecordFresh(pending))) {
-      retired.add(pending);
-      notes.push(`the confirmation ${pending.provisionalRunId} ended and the engine recorded no new run of ${pending.planLabel}.`);
+    } else if (launch === "ended") {
+      const read = pending.runKey === undefined ? true : isolatedRecordFresh(pending);
+      if (read === true) {
+        retired.add(pending);
+        notes.push(`the confirmation ${pending.provisionalRunId} ended and the engine recorded no new run of ${pending.planLabel}.`);
+        continue;
+      }
+      const seen = pending.endedSeenAtMs ?? nowMs;
+      const unanswered = (pending.unansweredAfterEnd ?? 0) + (read === "unanswered" ? 1 : 0);
+      if (unanswered >= UNFOLLOWED_AFTER_READS || nowMs - seen >= UNFOLLOWED_AFTER_MS) {
+        retired.add(pending);
+        unfollowed.push(pending);
+        notes.push(`the run started in its own workspace as ${pending.runKey} could not be followed automatically: its launch ended and the engine's record of runs gave no answer (${unanswered} reads); it is not attributed to any run.`);
+        continue;
+      }
+      updated.set(pending, { ...pending, endedSeenAtMs: seen, unansweredAfterEnd: unanswered });
     }
   }
-  let next: StartPlanRuns = { ...state, pending: state.pending.filter((entry) => !retired.has(entry)) };
+  let next: StartPlanRuns = { ...state, pending: state.pending.filter((entry) => !retired.has(entry)).map((entry) => updated.get(entry) ?? entry) };
   const bound: Reconciled["bound"] = [];
   for (const [runId, claimants] of claims) {
     if (claimants.length !== 1) {
@@ -168,5 +213,17 @@ export function reconcileStartedRuns(
     bound.push({ pending: claimants[0], runId });
     notes.push(`the run started as ${claimants[0].provisionalRunId} is ${runId}, the only new run of ${claimants[0].planLabel} the engine recorded.`);
   }
-  return { state: next, bound, notes };
+  return { state: next, bound, unfollowed, notes };
+}
+
+/**
+ * What the person is told when an isolated start is given up on. Plain
+ * words, no paths; it claims nothing about whether the run exists.
+ */
+export function unfollowedStartMessage(pending: PendingStartedRun): string {
+  return (
+    `The plan run started in its own workspace (${pending.planLabel}) could not be followed automatically: ` +
+    `its launch ended and the engine's list of runs could not be read. Use "History / Runs…" to find it once the list can be read, or open its workspace folder. ` +
+    `The list is read without your terminal's shell, so if agentSparring.executable is a command only your terminal finds, set it to the full path of sparring.`
+  );
 }

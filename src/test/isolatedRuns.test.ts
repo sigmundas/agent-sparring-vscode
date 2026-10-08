@@ -19,7 +19,7 @@ import { autoPushScope } from "../core/presentation";
 import { ManifestReader } from "../vscode/manifestReader";
 import { ManifestStore, Workspace, recordPlanDigest } from "./fixtures";
 import { parseIsolatedRuns, EngineFormatError, type IsolatedRun } from "../core/engineFormats";
-import { readStartPlanRuns, reconcileStartedRuns, type PendingStartedRun } from "../core/startPlanBinding";
+import { UNFOLLOWED_AFTER_MS, UNFOLLOWED_AFTER_READS, readStartPlanRuns, reconcileStartedRuns, unfollowedStartMessage, type PendingStartedRun } from "../core/startPlanBinding";
 import { externalWorktrees, isolatedRunAt, isolatedWorktreeLists, parseWorktreeList, type IsolatedRunsOfRepository } from "../core/worktrees";
 import type { IsolatedRunsProbe as Probe } from "../vscode/isolatedRunsProbe";
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -279,6 +279,49 @@ describe("review fixes", () => {
     assert.deepEqual(fresh.bound.map((entry) => entry.runId), [`/wt|plan:${KEY}`]);
     // A fresh read that still lists nothing: the engine refused it.
     assert.equal(reconcileStartedRuns({ pending: [pending], bindings: {} }, [], () => "ended", () => true, () => true).state.pending.length, 0);
+  });
+
+  it("an ended isolated start whose record never answers is given up on after bounded reads, also across a reload", () => {
+    const pending: PendingStartedRun = { provisionalRunId: "/repo|plan:" + KEY, sparringDir: "/repo/.sparring", planLabel: "docs/plans/demo.md", before: [], launchedAtMs: 0, show: true, runKey: KEY };
+    let state = { pending: [pending], bindings: {} };
+    for (let read = 1; read < UNFOLLOWED_AFTER_READS; read++) {
+      const step = reconcileStartedRuns(readStartPlanRuns(JSON.parse(JSON.stringify(state))), [], () => "ended", () => true, () => "unanswered", 1_000);
+      assert.equal(step.state.pending.length, 1, `still followed after ${read} unanswered reads`);
+      assert.equal(step.state.pending[0].unansweredAfterEnd, read);
+      assert.deepEqual(step.unfollowed, []);
+      state = step.state;
+    }
+    const last = reconcileStartedRuns(readStartPlanRuns(JSON.parse(JSON.stringify(state))), [], () => "ended", () => true, () => "unanswered", 1_000);
+    assert.equal(last.state.pending.length, 0, "retired");
+    assert.deepEqual(last.bound, [], "no ownership inferred");
+    assert.deepEqual(last.unfollowed.map((entry) => entry.runKey), [KEY]);
+    assert.match(unfollowedStartMessage(last.unfollowed[0]), /could not be followed automatically.*History \/ Runs…/s);
+  });
+
+  it("an ended isolated start is given up on after a bounded time, and after a reload that lost its execution", () => {
+    const pending: PendingStartedRun = { provisionalRunId: "/repo|plan:" + KEY, sparringDir: "/repo/.sparring", planLabel: "docs/plans/demo.md", before: [], launchedAtMs: 0, show: true, runKey: KEY };
+    const first = reconcileStartedRuns({ pending: [pending], bindings: {} }, [], () => "ended", () => true, () => false, 10_000);
+    assert.equal(first.state.pending[0].endedSeenAtMs, 10_000);
+    const early = reconcileStartedRuns(first.state, [], () => "ended", () => true, () => false, 10_000 + UNFOLLOWED_AFTER_MS - 1);
+    assert.equal(early.state.pending.length, 1);
+    const late = reconcileStartedRuns(first.state, [], () => "ended", () => true, () => false, 10_000 + UNFOLLOWED_AFTER_MS);
+    assert.deepEqual(late.unfollowed.map((entry) => entry.runKey), [KEY]);
+    const reloaded = reconcileStartedRuns(readStartPlanRuns(JSON.parse(JSON.stringify(first.state))), [], () => "none", () => true, () => false, 10_001);
+    assert.equal(reloaded.state.pending.length, 0);
+    assert.deepEqual(reloaded.unfollowed.map((entry) => entry.runKey), [KEY], "the person is told");
+    // A run that is still running is never given up on by time.
+    const running = reconcileStartedRuns({ pending: [pending], bindings: {} }, [], () => "running", () => true, () => "unanswered", Number.MAX_SAFE_INTEGER);
+    assert.equal(running.state.pending.length, 1);
+  });
+
+  it("an unknown runs --json schema is shown once per session as a mismatch, not only logged", async () => {
+    const shown: string[] = [];
+    const probe = new IsolatedRunsProbe(() => undefined, async () => ({ ok: true, stdout: JSON.stringify({ schema_version: 99, runs: [] }) }), (message) => shown.push(message));
+    assert.deepEqual(await probe.list(["/repo", "/other"]), [{ repoRoot: "/repo", ok: false, runs: [] }, { repoRoot: "/other", ok: false, runs: [] }]);
+    probe.invalidate();
+    await probe.list(["/repo"]);
+    assert.equal(shown.length, 1);
+    assert.match(shown[0], /do not match.*schema_version 99/);
   });
 
   it("presentation and resume read the manifest written for the checkout the run was started from", async () => {
