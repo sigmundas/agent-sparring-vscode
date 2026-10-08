@@ -59,7 +59,7 @@ import { stageScopeOf } from "../core/stageScope";
 import { CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
 import { applyFeatureBranch, inspectFeatureBranch } from "../core/featureBranch";
-import { classifyPlanDocument, countStageHeadings, featureBranchPrompt, planPickerEntries, type PlanFileCandidate, type CheckPlanQuery, type PlanClassification } from "../core/runPlanEntry";
+import { classifyPlanDocument, countStageHeadings, featureBranchPrompt, PLAN_PICKER_LIMITS, planCandidatesToRead, planPickerItems, type PlanFileCandidate, type CheckPlanQuery, type PlanClassification } from "../core/runPlanEntry";
 import { GETTING_STARTED } from "../core/gettingStarted";
 import { DEFERRED_VERIFICATION_REQUIRED, parseHandoffBranch, parsePlanStages, type PlanRunSource } from "../core/engineFormats";
 import { appendHumanEvidence, OUTCOME_WORDS, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
@@ -2368,6 +2368,17 @@ async function pickLocation(controller: SparringController): Promise<SparringLoc
 
 const isInside = isInsidePath;
 
+async function readHead(file: string, bytes: number): Promise<string> {
+  const handle = await fs.open(file, "r");
+  try {
+    const buffer = Buffer.alloc(bytes);
+    const { bytesRead } = await handle.read(buffer, 0, bytes, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
 async function pickPlanDocument(location: SparringLocation): Promise<string | undefined> {
   const active = vscode.window.activeTextEditor?.document;
   if (active && active.languageId === "markdown" && active.uri.scheme === "file" && isInside(active.uri.fsPath, location.repoRoot)) {
@@ -2379,29 +2390,41 @@ async function pickPlanDocument(location: SparringLocation): Promise<string | un
   // Relative to the repository itself, so a nested project is not searched
   // through its whole parent workspace folder.
   const pattern = new vscode.RelativePattern(vscode.Uri.file(location.repoRoot), "**/*.md");
-  const found = await vscode.workspace.findFiles(pattern, "**/{node_modules,.git,.sparring,dist,out,.venv}/**", 2000);
-  const candidates: PlanFileCandidate[] = [];
-  for (const uri of found) {
-    try {
-      const [text, stat] = await Promise.all([fs.readFile(uri.fsPath, "utf8"), fs.stat(uri.fsPath)]);
-      candidates.push({ file: uri.fsPath, relative: path.relative(location.repoRoot, uri.fsPath).split(path.sep).join("/"), text, mtimeMs: stat.mtimeMs });
-    } catch {
-      // gone or unreadable since it was listed; not offered
-    }
-  }
-  // Newest first; the engine classifies whatever is chosen.
-  const plans = planPickerEntries(candidates);
-  const picked = await vscode.window.showQuickPick(
-    [...plans, { label: "$(folder-opened) Browse…", description: "choose another Markdown file", file: "" }],
-    {
-      placeHolder:
-        plans.length > 0
-          ? "Which plan or planning input? Newest first; the engine checks it before anything is asked."
-          : `No staged plan in ${location.folderName}. ${GETTING_STARTED}`,
-      matchOnDescription: true,
-      matchOnDetail: true,
-    },
-  );
+  const found = await vscode.workspace.findFiles(pattern, "**/{node_modules,.git,.sparring,dist,out,.venv}/**", PLAN_PICKER_LIMITS.listed);
+  // Stat everything (cheap), read only a bounded head of the likeliest few.
+  // Discovery only: no engine call here; check-plan classifies the choice.
+  const listed = (
+    await Promise.all(
+      found.map(async (uri) => {
+        try {
+          const stat = await fs.stat(uri.fsPath);
+          return { file: uri.fsPath, relative: path.relative(location.repoRoot, uri.fsPath).split(path.sep).join("/"), mtimeMs: stat.mtimeMs };
+        } catch {
+          return undefined; // gone since it was listed
+        }
+      }),
+    )
+  ).filter((entry): entry is { file: string; relative: string; mtimeMs: number } => entry !== undefined);
+  const candidates = (
+    await Promise.all(
+      planCandidatesToRead(listed).map(async (entry): Promise<PlanFileCandidate | undefined> => {
+        try {
+          return { ...entry, text: await readHead(entry.file, PLAN_PICKER_LIMITS.headBytes) };
+        } catch {
+          return undefined; // unreadable; not offered
+        }
+      }),
+    )
+  ).filter((entry): entry is PlanFileCandidate => entry !== undefined);
+  const items = planPickerItems(candidates, Date.now());
+  const picked = await vscode.window.showQuickPick(items, {
+    placeHolder:
+      items.length > 1
+        ? "Which plan or planning input? Newest first; the engine checks it before anything is asked."
+        : `No staged plan in ${location.folderName}. ${GETTING_STARTED}`,
+    matchOnDescription: true,
+    matchOnDetail: true,
+  });
   if (!picked) {
     return undefined;
   }

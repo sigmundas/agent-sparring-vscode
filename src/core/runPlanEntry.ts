@@ -182,27 +182,101 @@ export interface PlanFileCandidate {
   file: string;
   /** Repository-relative path, `/`-separated. */
   relative: string;
+  /** The file's head (at most {@link PLAN_PICKER_LIMITS.headBytes}), not necessarily all of it. */
   text: string;
   mtimeMs: number;
 }
 
+/** Bounds that keep the picker responsive in a large repository. */
+export const PLAN_PICKER_LIMITS = {
+  /** Markdown files listed (stat only). */
+  listed: 2000,
+  /** Newest files whose head is read. */
+  read: 200,
+  /** Bytes read from each file's head. */
+  headBytes: 64 * 1024,
+  /** Entries shown before Browse…. */
+  shown: 50,
+} as const;
+
 /**
- * What the Run Plan picker lists: plan-like documents, newest first. The
- * engine classifies whatever is chosen, so nothing is filtered on whether
- * the extension could parse it as a direct plan — a `## Stage S1` plan or
- * planning input under a `plans/` folder is offered like any other.
- * Plan-like: stage-like sections outside fences, or a file under a `plans`
- * directory.
+ * Of the listed Markdown files, the ones worth reading: likely plan
+ * locations first, then newest, capped at `limit`. Only paths and mtimes
+ * are used, so nothing is read and nothing asks the engine.
  */
-export function planPickerEntries(candidates: readonly PlanFileCandidate[]): { file: string; label: string; description: string; detail: string }[] {
-  return candidates
-    .map((candidate) => ({ candidate, stages: countStageHeadings(candidate.text) }))
-    .filter(({ candidate, stages }) => stages > 0 || candidate.relative.split("/").slice(0, -1).includes("plans"))
-    .sort((a, b) => b.candidate.mtimeMs - a.candidate.mtimeMs || a.candidate.relative.localeCompare(b.candidate.relative))
+export function planCandidatesToRead<T extends { relative: string; mtimeMs: number }>(files: readonly T[], limit: number = PLAN_PICKER_LIMITS.read): T[] {
+  return [...files]
+    .sort((a, b) => planLocationRank(b.relative) - planLocationRank(a.relative) || b.mtimeMs - a.mtimeMs)
+    .slice(0, limit);
+}
+
+/**
+ * 2 under an `active` folder of a `plans` folder (wherever that sits), 1
+ * under another `plans/` folder, else 0. A ranking hint only: no plan
+ * directory is assumed to exist.
+ */
+export function planLocationRank(relative: string): number {
+  const dirs = relative.split("/").slice(0, -1);
+  if (dirs.some((dir, i) => dir === "plans" && dirs[i + 1] === "active")) {
+    return 2;
+  }
+  return dirs.includes("plans") ? 1 : 0;
+}
+
+/** How much a likely plan location counts for, as if this much newer. */
+const LOCATION_BONUS_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * What the Run Plan picker lists, newest first, then **Browse…** last.
+ * Discovery only — a cheap local heuristic, never a runnability verdict: the
+ * engine classifies whatever is chosen. Plan-like: stage-like sections
+ * outside fences (`## Stage 1`, `## Stage S1`, …), or a file under a `plans`
+ * directory. A likely plan location wins over a file modified within a few
+ * hours of it. `now` makes the human-readable time testable.
+ */
+export function planPickerItems(
+  candidates: readonly PlanFileCandidate[],
+  now: number,
+  limit: number = PLAN_PICKER_LIMITS.shown,
+): { file: string; label: string; description: string; detail: string }[] {
+  const plans = candidates
+    .map((candidate) => ({ candidate, stages: countStageHeadings(candidate.text), rank: planLocationRank(candidate.relative) }))
+    .filter(({ stages, rank }) => stages > 0 || rank > 0)
+    .sort(
+      (a, b) =>
+        b.candidate.mtimeMs + b.rank * LOCATION_BONUS_MS - (a.candidate.mtimeMs + a.rank * LOCATION_BONUS_MS) ||
+        a.candidate.relative.localeCompare(b.candidate.relative),
+    )
+    .slice(0, limit)
     .map(({ candidate, stages }) => ({
       file: candidate.file,
       label: candidate.relative.split("/").pop() ?? candidate.relative,
       description: candidate.relative,
-      detail: `${stages > 0 ? `${stages} stage section${stages === 1 ? "" : "s"}` : "no stage sections (planning input)"} · modified ${new Date(candidate.mtimeMs).toISOString().slice(0, 16).replace("T", " ")}`,
+      detail: `${stages > 0 ? `${stages} stage section${stages === 1 ? "" : "s"}` : "no stage sections (planning input)"} · modified ${modifiedAgo(candidate.mtimeMs, now)}`,
     }));
+  return [...plans, { file: "", label: "$(folder-opened) Browse…", description: "choose another Markdown file", detail: "" }];
+}
+
+/** "just now", "5 minutes ago", "3 hours ago", "yesterday", "4 days ago", or a local date. */
+export function modifiedAgo(mtimeMs: number, now: number): string {
+  const minutes = Math.floor((now - mtimeMs) / 60_000);
+  if (minutes < 1) {
+    return "just now";
+  }
+  if (minutes < 60) {
+    return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  }
+  const days = Math.floor(hours / 24);
+  if (days === 1) {
+    return "yesterday";
+  }
+  if (days < 7) {
+    return `${days} days ago`;
+  }
+  const d = new Date(mtimeMs);
+  return `on ${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }

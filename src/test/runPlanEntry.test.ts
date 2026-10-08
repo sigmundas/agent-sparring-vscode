@@ -238,16 +238,61 @@ describe("an older plan's intake cannot stand in for the plan just chosen", () =
 });
 
 describe("the Run Plan picker lists plan-like documents, newest first", () => {
-  it("offers '## Stage S1' plans and planning input under plans/, newest first, and skips other Markdown", async () => {
-    const { planPickerEntries } = await import("../core/runPlanEntry");
-    const entries = planPickerEntries([
-      { file: "/r/docs/plans/active/2026-08-23-cloud-sync-extraction.md", relative: "docs/plans/active/2026-08-23-cloud-sync-extraction.md", text: "# Old\n\n## Stage 1 — A\n", mtimeMs: Date.parse("2026-08-23T10:00:00Z") },
-      { file: "/r/docs/plans/active/2026-10-07-cloud-sync.md", relative: "docs/plans/active/2026-10-07-cloud-sync.md", text: "# New\n\n## Stage S1 — Design\n\n## Stage S2 — Baseline\n", mtimeMs: Date.parse("2026-10-08T09:00:00Z") },
-      { file: "/r/docs/plans/ideas.md", relative: "docs/plans/ideas.md", text: "# Ideas\n\nprose\n", mtimeMs: Date.parse("2026-09-01T00:00:00Z") },
-      { file: "/r/README.md", relative: "README.md", text: "# Readme\n\n```md\n## Stage 1 — Example\n```\n", mtimeMs: Date.parse("2026-10-08T12:00:00Z") },
-    ]);
-    assert.deepEqual(entries.map((entry) => entry.label), ["2026-10-07-cloud-sync.md", "ideas.md", "2026-08-23-cloud-sync-extraction.md"]);
-    assert.match(entries[0].detail, /^2 stage sections · modified 2026-10-08 09:00$/);
-    assert.match(entries[1].detail, /no stage sections \(planning input\)/);
+  const now = Date.parse("2026-10-08T12:00:00Z");
+  const hour = 60 * 60 * 1000;
+  const doc = (relative: string, text: string, mtimeMs: number) => ({ file: `/r/${relative}`, relative, text, mtimeMs });
+
+  it("offers '## Stage S1' plans and planning input under plans/, newest first, Browse… last, and skips unrelated Markdown", async () => {
+    const { planPickerItems } = await import("../core/runPlanEntry");
+    const items = planPickerItems(
+      [
+        doc("docs/plans/active/2026-08-23-cloud-sync-extraction.md", "# Old\n\n## Stage 1 — A\n", now - 40 * 24 * hour),
+        doc("docs/plans/active/2026-10-07-cloud-sync.md", "# New\n\n## Stage S1 — Design\n\n## Stage S2 — Baseline\n", now - 3 * hour),
+        doc("docs/plans/ideas.md", "# Ideas\n\nprose\n", now - 2 * 24 * hour),
+        doc("notes/staged.md", "## Stage 1 — X\n", now - 30 * 24 * hour),
+        doc("README.md", "# Readme\n\n```md\n## Stage 1 — Example\n```\n", now - 1000),
+        doc("CHANGELOG.md", "# Changelog\n\n## 1.0\n", now - 1000),
+      ],
+      now,
+    );
+    assert.deepEqual(
+      items.map((item) => item.description),
+      ["docs/plans/active/2026-10-07-cloud-sync.md", "docs/plans/ideas.md", "notes/staged.md", "docs/plans/active/2026-08-23-cloud-sync-extraction.md", "choose another Markdown file"],
+    );
+    assert.equal(items[0].detail, "2 stage sections · modified 3 hours ago");
+    assert.equal(items[1].detail, "no stage sections (planning input) · modified 2 days ago");
+    assert.equal(items.at(-1)?.file, "", "Browse… is last");
+    assert.match(items.at(-1)?.label ?? "", /Browse…/);
+  });
+
+  it("prefers docs/plans/active over other plans/ folders and elsewhere when modified within hours, not days", async () => {
+    const { planPickerItems } = await import("../core/runPlanEntry");
+    const close = planPickerItems([doc("x/stage.md", "## Stage 1 — a\n", now - hour), doc("plans/p.md", "", now - 2 * hour), doc("docs/plans/active/a.md", "", now - 5 * hour)], now);
+    assert.deepEqual(close.slice(0, -1).map((item) => item.description), ["docs/plans/active/a.md", "plans/p.md", "x/stage.md"]);
+    const far = planPickerItems([doc("x/stage.md", "## Stage 1 — a\n", now - hour), doc("docs/plans/active/a.md", "", now - 3 * 24 * hour)], now);
+    assert.deepEqual(far.slice(0, -1).map((item) => item.description), ["x/stage.md", "docs/plans/active/a.md"]);
+  });
+
+  it("bounds the entries shown and the files read", async () => {
+    const { planPickerItems, planCandidatesToRead } = await import("../core/runPlanEntry");
+    const many = Array.from({ length: 80 }, (_, i) => doc(`plans/p${i}.md`, "", now - i * hour));
+    const items = planPickerItems(many, now, 50);
+    assert.equal(items.length, 51);
+    assert.equal(items[49].description, "plans/p49.md");
+    assert.equal(items[50].file, "");
+    const read = planCandidatesToRead([...many, doc("README.md", "", now), doc("docs/plans/active/old.md", "", 0)], 3);
+    assert.deepEqual(read.map((entry) => entry.relative), ["docs/plans/active/old.md", "plans/p0.md", "plans/p1.md"]);
+  });
+
+  it("says when a file was modified in human terms, against an injected clock", async () => {
+    const { modifiedAgo } = await import("../core/runPlanEntry");
+    assert.equal(modifiedAgo(now - 10_000, now), "just now");
+    assert.equal(modifiedAgo(now - 60_000, now), "1 minute ago");
+    assert.equal(modifiedAgo(now - 25 * 60_000, now), "25 minutes ago");
+    assert.equal(modifiedAgo(now - hour, now), "1 hour ago");
+    assert.equal(modifiedAgo(now - 30 * hour, now), "yesterday");
+    assert.equal(modifiedAgo(now - 6 * 24 * hour, now), "6 days ago");
+    const old = new Date(2026, 0, 5, 12).getTime();
+    assert.equal(modifiedAgo(old, now), "on 2026-01-05");
   });
 });
