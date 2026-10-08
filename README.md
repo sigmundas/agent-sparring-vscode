@@ -57,16 +57,25 @@ cannot find `sparring`.
 1. Write a staged plan, or use **Agent Sparring: Make Plan…** with an idea or
    notes file. Make Plan needs the optional [planning plugin](docs/setup.md#steps).
    Review the plan before running it.
-2. Choose **Agent Sparring: Run Plan**, select the document and confirm the branch.
-3. Answer any decisions the engine asks, review the proposed stages and gates,
-   and press **Start**. Preparation may use a read-only provider turn before
-   this confirmation.
-4. Follow the Overview. The engine runs implementation and independent review,
-   advances through accepted stages, and pauses when it needs you.
+*Pick plan → Run → watch → Merge & clean up:*
 
-This is the recommended path with an engine that supports `start-plan`.
-[Workflow details](docs/workflows.md#two-ways-to-progress-a-plan) cover the
-preparation flow, older engines and stage-by-stage continuation.
+1. Choose **Agent Sparring: Run Plan**, select the document and choose
+   **Run in its own workspace (recommended)**. The engine makes a separate
+   workspace and branch for the run; your checkout is not switched or changed,
+   and no worktree has to be created or opened by hand.
+2. Watch the Overview. It follows the run by its run key wherever the engine
+   put it. The engine runs implementation and independent review, advances
+   through accepted stages, and pauses when it needs you.
+3. When the run is complete, press **Merge & clean up**. The engine checks
+   first and the extension shows what would happen — what is merged into which
+   branch, how, and which ignored files go with the workspace — before
+   anything changes. Confirm, and the engine merges, removes the workspace and
+   deletes the run's local branch.
+
+**Run in this checkout** is the advanced path: the run works on the branch
+checked out here, with the confirmation and preparation described in
+[Workflow details](docs/workflows.md#two-ways-to-progress-a-plan), which also
+cover older engines and stage-by-stage continuation.
 
 ### Respond to a paused review
 

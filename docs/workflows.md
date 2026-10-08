@@ -3,6 +3,7 @@
 [Documentation index](README.md) · [Extension overview](../README.md)
 
 - [What the words mean](#what-the-words-mean)
+- [Run in its own workspace, then Merge & clean up](#run-in-its-own-workspace-then-merge--clean-up)
 - [Two ways to progress a plan](#two-ways-to-progress-a-plan)
 - [When a deferred check fails](#when-a-deferred-check-fails)
 - [Push authorization](#push-authorization)
@@ -24,6 +25,61 @@ words stay in tooltips, the metadata footer and the Output Channel.
 | **Finalizing stage…** | The moment between the two acceptance steps. If it persists, *Finalizing did not complete. Use Accept stage to finish it.* (re-freezing is allowed by the engine). | stage `frozen` |
 | **Accepted** — *Stage complete.* | Nothing further runs for this stage; **What's next** says what to do now (see [after acceptance](runs.md#after-acceptance-whats-next)). | stage `accepted` |
 | **Stopped** — *The last run was interrupted.* | The runner ended mid-turn (Ctrl-C, crash, reload); **Resume stage** returns. | [runner liveness](runners.md#runner-lifecycle) |
+
+## Run in its own workspace, then Merge & clean up
+
+The usual path is *pick plan → Run → watch → Merge & clean up*. **Run Plan**
+asks where the run goes:
+
+- **Run in its own workspace (recommended)** — the engine creates a Git
+  worktree and branch for the run from the branch checked out where you picked
+  the plan (`run-plan … --managed --target-branch <that branch>`), with the
+  same plan input, run key, push choice and provider settings as a run in this
+  checkout and no `--expected-branch`. Your checkout is not switched or
+  changed. This route goes straight to `run-plan`, not through `start-plan`'s
+  preparation: an intake run cannot run in its own workspace.
+- **Run in this checkout** — the advanced path, unchanged: the run works on
+  the branch checked out here, as described under
+  [Two ways to progress a plan](#two-ways-to-progress-a-plan).
+
+The last answer is offered first next time, per repository. No branch or path
+is asked for; the engine decides both.
+
+**Watch.** The extension reads `sparring runs --json` for each known
+repository on refresh. Each run listed there adds its worktree as a location
+of that repository, even outside the workspace, and the cockpit follows the
+new run by its run key as soon as the engine lists it — no folder has to be
+opened. **Runs…** lists these runs with the others, and Running / Paused /
+Needs you / Complete mean exactly what they mean for any plan run. Resume,
+evidence and the other plan actions continue such a run from the
+repository's primary checkout with `resume-plan --run-key <key>` and the
+recorded input; the engine reads the branch and worktree from its record.
+
+**Merge & clean up.** For a complete run in its own workspace the Overview
+offers **Merge & clean up** (also the command
+`Agent Sparring: Merge & Clean Up Run`). Pressing it:
+
+1. runs `finish-run --run-key <key> --dry-run --json` without a terminal —
+   read-only; the engine decides whether and how the run can be merged;
+2. if the engine says it cannot, shows each failing check as a sentence (an
+   unknown check shows the engine's own wording) and issues nothing;
+3. if the target branch moved on and only a merge commit would do, says so and
+   asks before checking again with a merge commit allowed;
+4. otherwise asks for confirmation in plain words: what is merged into which
+   branch, fast-forward or merge commit, which ignored files are deleted with
+   the workspace, and that the run's remote branch is kept. **Merge & clean
+   up**, and when the run has a remote branch **Merge, push <target> & clean
+   up** (`--push-target`);
+5. runs the confirmed `finish-run` through the tracked command runner, then
+   refreshes from the engine. On success the cockpit follows the repository's
+   primary checkout; if the engine stopped part-way, its `stopped_at`,
+   `reason` and remaining steps are shown, and running it again continues.
+
+**Ready to merge** is shown only when the engine's own finish check, for the
+run's current listed state and seconds old, says it can be merged and cleaned
+up — never because the run is complete. The extension never creates, merges
+or removes a worktree or branch itself. Branch names, worktree paths, SHAs and
+check codes go to the Output Channel (**Show Log**), not the dialogs.
 
 ## Two ways to progress a plan
 

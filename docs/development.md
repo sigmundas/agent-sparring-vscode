@@ -11,7 +11,7 @@ npm install
 npm run build      # typecheck + esbuild bundle to dist/
 npm test           # node:test unit tests against fake .sparring fixtures
 npm run lint
-npm run test:integration   # downloads VS Code once, opens a generated multi-root workspace, asserts discovery, runner lifecycle, bare-`sparring` resolution by the shell, command-not-found, Accept stage and plan association with a fake `sparring`; then opens an empty repository and asserts that invoking a command activates the extension
+npm run test:integration   # downloads VS Code once, opens a generated multi-root workspace, asserts discovery, runner lifecycle, bare-`sparring` resolution by the shell, command-not-found, Accept stage and plan association with a fake `sparring`; then opens an empty repository and asserts that invoking a command activates the extension; then opens a real Git repository whose run lives in a sibling worktree and asserts, against a fake engine, its discovery, the Run Plan workspace choice (`--managed --target-branch` vs `--expected-branch`) and Merge & clean up's dry run → confirm → `finish-run` path, including that cancelling issues nothing
 npm run test:smoke         # the empty-repository activation check alone, at the declared minimum (VS Code 1.93.1) and at the current stable release
 ```
 

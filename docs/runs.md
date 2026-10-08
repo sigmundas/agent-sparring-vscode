@@ -17,6 +17,17 @@
   recorded Markdown, and after the current stage is accepted **Continue plan** calls
   `sparring resume-plan`, which advances past the accepted stage and starts
   the next one (paused runs get **Resume plan**).
+- A **run in its own workspace** is a managed plan run the engine started in a
+  worktree it created (`run-plan --managed`). Which runs those are, and where
+  their worktrees are, comes only from `sparring runs --json`: a worktree
+  that `git worktree list` shows but the engine's record does not name is not
+  treated as a run's workspace, and a folder or branch name never makes it
+  one. Such a worktree is added as a location of its repository even outside
+  the workspace, the cockpit follows the run by its run key, and it is resumed
+  from the primary checkout with `resume-plan --run-key`. Once complete it is
+  finished with **Merge & clean up**
+  ([details](workflows.md#run-in-its-own-workspace-then-merge--clean-up)).
+  **Run in this checkout** runs stay exactly as described here.
 - A **standalone stage** has no machine-readable plan. **Choose plan…** lets
   you pick any Markdown file (no directory convention is assumed). The
   association is VS Code workspace state keyed by repository + stage id;
@@ -188,7 +199,8 @@ A plan document is an *input* to a run, not the run's identity. Each run has a
 **run key** of its own. On the `start-plan` route, the engine supplies the
 identity: an intake slice reports its key before launch, while a direct run
 is discovered after the engine records it. In the legacy fallback, the
-extension mints a key (`<plan key>-<8 hex>`), names the stage ids with it
+extension mints a key (`<plan key>-<8 hex>`) — as it does for a run in its
+own workspace, which is launched with `run-plan` directly —, names the stage ids with it
 (`<run key>-stage-1-foundation`) and passes it as `--run-key`.
 
 So Run Plan starts new work even when the repository, the branch and the plan

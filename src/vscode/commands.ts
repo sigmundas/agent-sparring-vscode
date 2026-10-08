@@ -160,6 +160,8 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
       await controller.chooseRun(controller.currentDiscovery.runs.find((run) => run.id === runId), "explicit");
       return controller.currentSelection.selected?.id;
     }),
+    // Every discovered run's id, external worktrees included (Diagnose covers workspace folders only).
+    vscode.commands.registerCommand("agentSparring._test.runIds", () => controller.currentDiscovery.runs.map((run) => run.id)),
     vscode.commands.registerCommand("agentSparring._test.selectedRun", () => controller.currentSelection.selected?.id),
     vscode.commands.registerCommand("agentSparring._test.liveness", (runId: string) => {
       const liveness = controller.livenessFor(runId);
@@ -358,7 +360,17 @@ export function registerCommands(context: vscode.ExtensionContext, controller: S
       await beginStartPlan(controller, overview, { location, planPath, label: planLabel(planPath, location.repoRoot), expectedBranch }, {});
       return { support, session: overview.startPlanSession };
     }),
-    vscode.commands.registerCommand("agentSparring._test.startPlanMessage", async (message: StartPlanMessage) => {
+    // Run Plan for a given project and plan without the location and plan
+    // pickers; the "where should this plan run?" choice is still asked.
+    vscode.commands.registerCommand("agentSparring._test.runPlan", async (projectDir: string, planPath: string) => {
+      const location = controller.currentDiscovery.locations.find((candidate) => samePath(candidate.projectDir, projectDir));
+      if (!location) {
+        return false;
+      }
+      await runPlanCommand(controller, overview, { location, planPath });
+      return true;
+    }),
+    vscode.commands.registerCommand("agentSparring._test.startPlanMessage",async (message: StartPlanMessage) => {
       await handleStartPlanMessage(controller, overview, message);
       return overview.startPlanSession;
     }),
