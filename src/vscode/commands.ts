@@ -58,8 +58,8 @@ import { checkedOutBranch, checkRepositoryMapping } from "../core/repositoryMapp
 import { stageScopeOf } from "../core/stageScope";
 import { CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
-import { applyFeatureBranch, inspectFeatureBranch } from "../core/featureBranch";
-import { classifyPlanDocument, countStageHeadings, featureBranchPrompt, PLAN_PICKER_LIMITS, planCandidatesToRead, planPickerItems, type PlanFileCandidate, type CheckPlanQuery, type PlanClassification } from "../core/runPlanEntry";
+import { applyFeatureBranch, inspectFeatureBranch, recentLocalBranches } from "../core/featureBranch";
+import { classifyPlanDocument, countStageHeadings, featureBranchChoices, featureBranchPrompt, PLAN_PICKER_LIMITS, planCandidatesToRead, planPickerItems, type PlanFileCandidate, type CheckPlanQuery, type PlanClassification } from "../core/runPlanEntry";
 import { GETTING_STARTED } from "../core/gettingStarted";
 import { DEFERRED_VERIFICATION_REQUIRED, parseHandoffBranch, parsePlanStages, type PlanRunSource } from "../core/engineFormats";
 import { appendHumanEvidence, OUTCOME_WORDS, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
@@ -2459,13 +2459,32 @@ async function resolveExpectedBranch(location: SparringLocation, recorded?: stri
     return decision.branch;
   }
   if (decision.kind === "ask") {
-    return askBranch(decision.current);
+    return askBranch(location.repoRoot, decision.current);
   }
   await explainWrongBranch(decision, "this plan run was started for");
   return undefined;
 }
 
-async function askBranch(current?: string): Promise<string | undefined> {
+/**
+ * The feature branch for a run in this checkout: a picker whose first row,
+ * the one Enter takes, names a new branch; the checked-out branch and other
+ * recent local branches follow as deliberate choices.
+ */
+async function askBranch(repoRoot: string, current?: string): Promise<string | undefined> {
+  const choices = featureBranchChoices(current, await recentLocalBranches(repoRoot));
+  const picked = await vscode.window.showQuickPick(choices, {
+    title: "Agent Sparring: feature branch",
+    placeHolder: current ? `Checked out now: ${current}. Which branch should this plan run on?` : "Which branch should this plan run on?",
+    ignoreFocusOut: true,
+    matchOnDescription: true,
+  });
+  if (!picked) {
+    return undefined;
+  }
+  return picked.branch ?? (await askNewBranch(current));
+}
+
+async function askNewBranch(current?: string): Promise<string | undefined> {
   const prompt = featureBranchPrompt(current);
   const value = await vscode.window.showInputBox({
     title: "Agent Sparring: feature branch",

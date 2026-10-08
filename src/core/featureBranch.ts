@@ -188,3 +188,9 @@ export async function applyFeatureBranch(
   }
   return { ok: true };
 }
+
+/** Local branch names, most recently committed first; empty when git cannot say. */
+export async function recentLocalBranches(repoRoot: string, git: GitRunner = runGit, count = 15): Promise<string[]> {
+  const result = await git(repoRoot, ["for-each-ref", "--sort=-committerdate", `--count=${count}`, "--format=%(refname:short)", "refs/heads"]);
+  return result.code === 0 ? result.stdout.split("\n").map((line) => line.trim()).filter(Boolean) : [];
+}

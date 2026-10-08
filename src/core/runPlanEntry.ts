@@ -281,3 +281,30 @@ export function modifiedAgo(mtimeMs: number, now: number): string {
   const d = new Date(mtimeMs);
   return `on ${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
+
+/** One row of the feature-branch picker. `branch` undefined: name a new one. */
+export interface FeatureBranchChoice {
+  label: string;
+  description?: string;
+  detail?: string;
+  branch?: string;
+}
+
+/**
+ * The feature-branch picker for a run in this checkout. "New feature
+ * branch…" is first, so Enter never confirms an existing branch — the one
+ * checked out may be protected (the engine's policy, not repeated here).
+ * The checked-out branch is the next row, one deliberate step away, then
+ * other recent local branches. Whatever is chosen still goes to the engine,
+ * whose branch guard decides.
+ */
+export function featureBranchChoices(current: string | undefined, recent: readonly string[], limit = 10): FeatureBranchChoice[] {
+  const choices: FeatureBranchChoice[] = [{ label: "$(add) New feature branch…", detail: "Name a branch; if it does not exist, Agent Sparring creates it from the current commit." }];
+  if (current) {
+    choices.push({ label: `$(check) ${current}`, description: "checked out now", detail: "Use this branch as it is. The engine refuses a protected branch such as main.", branch: current });
+  }
+  for (const branch of recent.filter((name) => name && name !== current).slice(0, limit)) {
+    choices.push({ label: `$(git-branch) ${branch}`, description: "local branch", branch });
+  }
+  return choices;
+}

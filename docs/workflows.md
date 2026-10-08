@@ -73,9 +73,12 @@ names the source plan file.
 
 The managed run is always listed first and is what Enter picks; the last
 choice is marked "last used here". A managed run asks for no branch or path;
-the engine decides both. In this checkout, the feature-branch field starts
-empty and names the branch checked out only as context. A protected branch
-typed anyway is refused by the engine's branch guard.
+the engine decides both. In this checkout (and for Prepare intake), a picker
+asks for the feature branch. Its first row, the one Enter takes, is **New
+feature branch…**, which opens an empty name field. The branch checked out
+now comes next, then other recent local branches, so continuing on a feature
+branch is one deliberate choice and Enter never confirms `main`. A protected
+branch chosen or typed anyway is refused by the engine's branch guard.
 
 **Watch.** The extension reads `sparring runs --json` for each known
 repository on refresh. Each run listed there adds its worktree as a location

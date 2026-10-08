@@ -83,7 +83,8 @@ function stubDialogs(pick: string | undefined, confirm: string | undefined, type
   const picks: string[][] = [];
   window["showQuickPick"] = async (items: readonly vscode.QuickPickItem[]) => {
     picks.push(items.map((item) => item.label));
-    return items.find((item) => item.label === pick);
+    // The feature-branch picker, unless `pick` names a row: Enter, which takes its first row ("New feature branch…").
+    return items.find((item) => item.label === pick) ?? (items[0]?.label.includes("New feature branch") ? items[0] : undefined);
   };
   // An input box is answered with what the person types (`typed`), else with what it proposes.
   window["showInputBox"] = async (options?: vscode.InputBoxOptions) => {
@@ -135,7 +136,10 @@ async function runPlanChoiceAssertions(): Promise<void> {
     if (managed) {
       assert.equal(dialogs.inputs.length, 0, `a managed run asks for no branch: ${JSON.stringify(dialogs.asked)}`);
     } else {
-      assert.equal(dialogs.inputs.length, 1, "this checkout asks for the feature branch");
+      const branchPick = dialogs.picks.find((labels) => labels[0]?.includes("New feature branch"));
+      assert.ok(branchPick, `this checkout offers the feature-branch picker: ${JSON.stringify(dialogs.picks)}`);
+      assert.equal(branchPick[1], "$(check) main", "the checked-out branch is offered, but not as the row Enter takes");
+      assert.equal(dialogs.inputs.length, 1, "naming a new branch asks for it");
       assert.equal(dialogs.inputs[0].value, "", "the checked-out branch (main) is never proposed as the feature branch");
       assert.match(dialogs.inputs[0].prompt ?? "", /Checked out now: main\./, "it is named as context");
     }

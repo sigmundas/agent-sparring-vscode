@@ -314,3 +314,25 @@ describe("the Run Plan picker lists plan-like documents, newest first", () => {
     assert.equal(modifiedAgo(old, now), "on 2026-01-05");
   });
 });
+
+describe("the feature-branch picker", () => {
+  it("puts New feature branch… first, then the checked-out branch, then other recent local branches", async () => {
+    const { featureBranchChoices } = await import("../core/runPlanEntry");
+    const choices = featureBranchChoices("main", ["main", "feature/a", "feature/b"]);
+    assert.equal(choices[0].branch, undefined, "Enter names a new branch, never confirms an existing one");
+    assert.match(choices[0].label, /New feature branch…/);
+    assert.deepEqual(choices.slice(1).map((choice) => choice.branch), ["main", "feature/a", "feature/b"]);
+    assert.equal(choices[1].description, "checked out now");
+    assert.deepEqual(featureBranchChoices(undefined, ["x"]).map((choice) => choice.branch), [undefined, "x"], "detached HEAD: no checked-out row");
+    assert.equal(featureBranchChoices("main", Array.from({ length: 30 }, (_, i) => `b${i}`)).length, 12, "bounded");
+  });
+
+  it("reads recent local branches newest first, and nothing when git cannot say", async () => {
+    const { recentLocalBranches } = await import("../core/featureBranch");
+    const calls: string[][] = [];
+    const ok = await recentLocalBranches("/r", async (_root, args) => (calls.push(args), { code: 0, stdout: "feature/new\nmain\n", stderr: "" }));
+    assert.deepEqual(ok, ["feature/new", "main"]);
+    assert.ok(calls[0].includes("--sort=-committerdate"));
+    assert.deepEqual(await recentLocalBranches("/r", async () => ({ code: 128, stdout: "", stderr: "not a repo" })), []);
+  });
+});
