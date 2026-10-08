@@ -17,7 +17,7 @@ import { describe, it } from "node:test";
 import { buildCheckPlanArgs } from "../core/cli";
 import { discoverRuns, type SparringLocation } from "../core/discovery";
 import { decideExpectedBranch } from "../core/expectedBranch";
-import { MANAGED_INTAKE_LIMITATION, PLANNING_INPUT_TITLE, PREPARE_INTAKE } from "../core/gettingStarted";
+import { MANAGED_INTAKE_LIMITATION, PLANNING_INPUT_TITLE, PREPARE_INTAKE, STAGED_FIX_NOTE } from "../core/gettingStarted";
 import { isStartPlanMessage } from "../core/overviewHtml";
 import { renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel, runPlanClosedModel, startPlanView, type StartPlanSession } from "../core/overviewModel";
@@ -139,10 +139,18 @@ describe("Run Plan classifies the document before asking anything", () => {
     const card = html.slice(html.indexOf('<section class="card planning-input">'), technical);
     assert.ok(card.includes("read through intake rather than run directly"), "the lead says what happens, in plain words");
     assert.ok(!card.includes('class="icon'), "no warning icons: nothing here is wrong");
+    assert.ok(card.includes("staged-fix") && STAGED_FIX_NOTE.includes("fix the plan"), "a direct plan with a defect is told it can be fixed, not only sent to intake");
     assert.ok(card.includes(`data-startplan="dismiss"`), "Close sits with the other choices");
     assert.equal((html.match(/data-startplan="dismiss"/g) ?? []).length, 1, "and only once");
     assert.ok(!html.includes("Engine command"), "no second command block");
     assert.ok(!html.includes("Refused by the engine"));
+  });
+
+  it("planning input with no stage sections is not told to fix a plan it never claimed to be", () => {
+    const view = startPlanView(classifiedSession("planning-input", "no stages"));
+    const html = renderOverviewHtml({ kind: "startPlan", title: view.planName, startPlan: view }, "n", "vscode-resource:");
+    assert.ok(html.includes(`data-startplan="prepareIntake"`));
+    assert.ok(!html.includes("staged-fix"));
   });
 });
 

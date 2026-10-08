@@ -60,7 +60,10 @@ with `check-plan --manifest --json` against that manifest before the plan is
 refused. A plan refused both ways, for example one with `## Stage S1 — …`
 sections, is not one `start-plan` runs directly, but its intake route can still
 analyze it. So the same screen offers **Prepare intake** and **Make Plan…**,
-with the reason from `check-plan` in view. When the engine
+with the reason from `check-plan` under Technical details. Such a document may
+instead be a direct plan with a defect (a duplicate stage, say); only its author
+can tell, so the screen also says that fixing it and choosing Run Plan again
+runs it directly. When the engine
 cannot classify the document at all (not reachable, no `check-plan`, or an
 answer it cannot read), Run Plan stops with that reason and asks nothing else.
 **Close** returns to

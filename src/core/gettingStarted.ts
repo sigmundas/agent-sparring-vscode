@@ -25,6 +25,8 @@ export const PLANNING_INPUT_TITLE = "This is planning input, ready for Agent Spa
 export const PLANNING_INPUT_LEAD = "It will be analyzed into runnable stages before anything executes.";
 /** For a staged document check-plan cannot run directly (e.g. `## Stage S1`). */
 export const STAGED_INTAKE_LEAD = "Its stages are read through intake rather than run directly, and nothing executes before you confirm.";
+/** For the same document: it may be a direct plan with a defect, which only its author can tell. */
+export const STAGED_FIX_NOTE = "If it is meant to run directly as written, check-plan's reason is under Technical details: fix the plan and choose Run Plan again.";
 export const PREPARE_INTAKE = "Prepare intake (recommended)";
 export const PREPARE_INTAKE_TITLE = "Prepare an intake with the engine's start-plan: it analyzes this document into runnable stages and asks its decisions. Nothing runs until you press Start.";
 export const MAKE_PLAN_AGAIN = "Make Plan…";

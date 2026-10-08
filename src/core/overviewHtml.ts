@@ -16,7 +16,7 @@
  */
 
 import { formatElapsed } from "./activeOperation";
-import { MAKE_PLAN_AGAIN, MAKE_PLAN_AGAIN_NOTE, MAKE_PLAN_TITLE, STAGED_INTAKE_LEAD, MANAGED_INTAKE_LIMITATION, PLANNING_INPUT_LEAD, PLANNING_INPUT_TITLE, PREPARE_INTAKE, PREPARE_INTAKE_TITLE } from "./gettingStarted";
+import { MAKE_PLAN_AGAIN, MAKE_PLAN_AGAIN_NOTE, MAKE_PLAN_TITLE, STAGED_INTAKE_LEAD, STAGED_FIX_NOTE, MANAGED_INTAKE_LIMITATION, PLANNING_INPUT_LEAD, PLANNING_INPUT_TITLE, PREPARE_INTAKE, PREPARE_INTAKE_TITLE } from "./gettingStarted";
 import { ACTIVE_CONTEXT_HEADLINE, CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, SELECT_RUN_LABEL } from "./activeRepository";
 import {
   CONFIG_FIELDS,
@@ -2189,7 +2189,7 @@ function renderPlanningInput(input: { reason: string; staged?: boolean }, comman
   return `<section class="card planning-input">
 <h2>${escapeHtml(PLANNING_INPUT_TITLE)}</h2>
 <p>${escapeHtml(input.staged ? STAGED_INTAKE_LEAD : PLANNING_INPUT_LEAD)}</p>
-<p class="muted small">${escapeHtml(MANAGED_INTAKE_LIMITATION)}</p>
+${input.staged ? `<p class="muted small staged-fix">${escapeHtml(STAGED_FIX_NOTE)}</p>\n` : ""}<p class="muted small">${escapeHtml(MANAGED_INTAKE_LIMITATION)}</p>
 <div class="actions"><button type="button" class="primary" data-startplan="prepareIntake" title="${escapeHtml(PREPARE_INTAKE_TITLE)}">${escapeHtml(PREPARE_INTAKE)}</button>${button("makePlanFromThis", MAKE_PLAN_AGAIN, true, MAKE_PLAN_AGAIN_NOTE)}<button type="button" data-startplan="dismiss">Close</button></div>
 <details class="tech"><summary>Technical details</summary><pre class="command">${escapeHtml(technical)}</pre></details>
 </section>`;
