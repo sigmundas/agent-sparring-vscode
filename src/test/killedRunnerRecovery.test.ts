@@ -209,6 +209,25 @@ describe("a plan runner killed mid-turn", () => {
     assert.deepEqual(probeRunnerProcesses([...NO_RUNNER, elsewhere], ws.location), { kind: "none" });
   });
 
+  it("6b. a managed runner rooted at the main checkout is found by its run key, not its repo root", async () => {
+    const ws = await interrupted();
+    const picked = await selection(ws);
+    const run = picked.selected as PlanRunSnapshot;
+    // As `ps` shows it: the manifest path's space is unquoted, and --repo-root
+    // is the main checkout, not the worktree the run lives in.
+    const managed = (runKey: string): ProcessInfo => ({
+      pid: 811,
+      ppid: 700,
+      command: `/opt/homebrew/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python /venv/bin/sparring run-plan --manifest /Users/me/Library/Application Support/Code/manifests/${runKey}.manifest.json --repo-root /some/main/checkout --run-key ${runKey} --managed --target-branch main`,
+    });
+    assert.equal(probeRunnerProcesses([...NO_RUNNER, managed(PLAN_KEY)], ws.location, run.id).kind, "alive");
+    assert.deepEqual(
+      probeRunnerProcesses([...NO_RUNNER, managed("some-other-run-0000")], ws.location, run.id),
+      { kind: "none" },
+      "another run's key is not this run's runner",
+    );
+  });
+
   it("7. a runner that names no project concludes nothing: unknown is still the honest answer", async () => {
     const ws = await interrupted();
     const anonymous: ProcessInfo = { pid: 900, ppid: 1, command: "sparring run-plan docs/plans/active/reported-statistics.md" };
