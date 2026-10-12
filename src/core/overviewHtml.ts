@@ -245,7 +245,7 @@ export interface IntakeActionMessage {
 export type StartPlanMessage =
   | { type: "startPlan"; action: "answer"; answers: Record<string, string> }
   | { type: "startPlan"; action: "start"; token: string }
-  | { type: "startPlan"; action: "openReport" | "retry" | "dismiss" | "prepareIntake" };
+  | { type: "startPlan"; action: "openReport" | "retry" | "dismiss" | "prepareIntake" | "selectRepository" };
 
 export function isStartPlanMessage(message: unknown): message is StartPlanMessage {
   const record = asRecord(message);
@@ -260,7 +260,7 @@ export function isStartPlanMessage(message: unknown): message is StartPlanMessag
   if (action === "start") {
     return typeof record["token"] === "string" && record["token"] !== "";
   }
-  return action === "openReport" || action === "retry" || action === "dismiss" || action === "prepareIntake";
+  return action === "openReport" || action === "retry" || action === "dismiss" || action === "prepareIntake" || action === "selectRepository";
 }
 
 /** A row on the ambiguity screen was chosen: pin this run, if it is still one of those offered. */
@@ -2182,7 +2182,7 @@ function operationTechnical(model: OverviewModel, which: string, lines: readonly
  * choices — the engine's intake, or another planning pass — and the one
  * limitation of the intake route, stated rather than hidden.
  */
-function renderPlanningInput(input: { reason: string; staged?: boolean }, command?: string): string {
+function renderPlanningInput(input: { reason: string; staged?: boolean }, command?: string, missing?: string[]): string {
   // Kept to what the choice needs; check-plan's own words and the command
   // stay one click away under Technical details.
   const technical = [`check-plan: ${input.reason}`, ...(command ? ["", command] : [])].join("\n");
@@ -2190,8 +2190,22 @@ function renderPlanningInput(input: { reason: string; staged?: boolean }, comman
 <h2>${escapeHtml(PLANNING_INPUT_TITLE)}</h2>
 <p>${escapeHtml(input.staged ? STAGED_INTAKE_LEAD : PLANNING_INPUT_LEAD)}</p>
 ${input.staged ? `<p class="muted small staged-fix">${escapeHtml(STAGED_FIX_NOTE)}</p>\n` : ""}<p class="muted small">${escapeHtml(MANAGED_INTAKE_LIMITATION)}</p>
-<div class="actions"><button type="button" class="primary" data-startplan="prepareIntake" title="${escapeHtml(PREPARE_INTAKE_TITLE)}">${escapeHtml(PREPARE_INTAKE)}</button>${button("makePlanFromThis", MAKE_PLAN_AGAIN, true, MAKE_PLAN_AGAIN_NOTE)}<button type="button" data-startplan="dismiss">Close</button></div>
+${missing && missing.length > 0 ? `<p>${escapeHtml(missingRepositoryLead(missing))}</p>\n` : ""}<div class="actions"><button type="button" class="primary" data-startplan="prepareIntake" title="${escapeHtml(PREPARE_INTAKE_TITLE)}">${escapeHtml(missing && missing.length > 0 ? `Select ${missing.join(", ")} and prepare intake` : PREPARE_INTAKE)}</button>${button("makePlanFromThis", MAKE_PLAN_AGAIN, true, MAKE_PLAN_AGAIN_NOTE)}<button type="button" data-startplan="dismiss">Close</button></div>
 <details class="tech"><summary>Technical details</summary><pre class="command">${escapeHtml(technical)}</pre></details>
+</section>`;
+}
+
+/** What is missing, in plain words: the plan is fine, the repository was not given. */
+function missingRepositoryLead(names: string[]): string {
+  const list = names.join(", ");
+  return `This plan also reads ${list}, which Run Plan has not given to the engine yet. The plan does not need editing: select ${names.length === 1 ? "the repository" : "each repository"} and preparation runs with ${names.length === 1 ? "it" : "them"}, read-only.`;
+}
+
+function renderMissingRepositories(missing: { names: string[]; relatedFindings: number }): string {
+  return `<section class="card missing-repository">
+<h2>${escapeHtml(`Repository needed: ${missing.names.join(", ")}`)}</h2>
+<p>${escapeHtml(missingRepositoryLead(missing.names))}</p>
+<div class="actions"><button type="button" class="primary" data-startplan="selectRepository">Select repository and retry</button></div>
 </section>`;
 }
 
@@ -2215,7 +2229,7 @@ ${decision.options
     .join("\n");
   const findings =
     view.findings.length > 0
-      ? `<details class="start-findings"${view.decisions.length > 0 || view.refusal ? " open" : ""}><summary>Findings (${view.findings.length})</summary><ul>${view.findings
+      ? `<details class="start-findings"${(view.decisions.length > 0 || view.refusal) && !view.missingRepositories ? " open" : ""}><summary>Findings (${view.findings.length}${view.missingRepositories?.relatedFindings ? `, ${view.missingRepositories.relatedFindings} from the missing repository` : ""})</summary><ul>${view.findings
           .map((finding) => `<li><strong>${escapeHtml(finding.severity)}</strong> <code>${escapeHtml(finding.code)}</code> ${escapeHtml(finding.message)}${finding.stages.length > 0 ? ` <span class="muted">(${escapeHtml(finding.stages.join(", "))})</span>` : ""}</li>`)
           .join("")}</ul></details>`
       : "";
@@ -2233,14 +2247,16 @@ ${view.summary.laterSlices.map((line) => `<p class="muted">${escapeHtml(line)}</
     view.start ? `<button type="button" class="primary" data-startplan="start" data-token="${escapeHtml(view.start.token)}" title="${escapeHtml(view.start.detail)}">${escapeHtml(view.start.label)}</button>` : "",
     view.decisions.length > 0 ? `<button type="button" class="primary" data-startplan="answer"${view.canAnswer ? "" : " disabled"} title="Reruns start-plan with your answers as --answer. Nothing is approved or run.">Answer and prepare again</button>` : "",
     view.intake ? `<button type="button" data-startplan="openReport">Open intake report</button>` : "",
-    !view.preparing && !view.start && view.decisions.length === 0 && !view.planningInput ? `<button type="button" data-startplan="retry">Check again</button>` : "",
+    !view.preparing && !view.start && view.decisions.length === 0 && !view.planningInput && !view.missingRepositories ? `<button type="button" data-startplan="retry">Check again</button>` : "",
     `<button type="button" data-startplan="dismiss"${view.preparing ? " disabled" : ""}>Close</button>`,
   ].join("");
   return `<header class="top"><div><h1>${escapeHtml(view.planName)}</h1><div class="run muted">Run plan · ${escapeHtml(view.stateLabel)}</div></div></header>
 ${view.providerTurnNotice ? `<p class="muted start-notice">${escapeHtml(view.providerTurnNotice)}</p>` : ""}
 ${view.preparing ? `<p class="start-preparing">${icon("sync")}The engine is preparing the plan…</p>` : ""}
 ${view.intake ? `<p>${escapeHtml(view.intake.line)}</p>` : view.route === "direct" ? "<p>Direct route: the plan's own stages run as written.</p>" : ""}
-${view.planningInput ? renderPlanningInput(view.planningInput, view.command) : view.refusal ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}Refused by the engine. Nothing was approved or run.</p><pre class="engineerror">${escapeHtml(view.refusal)}</pre></div>` : ""}
+${view.contextLines.length > 0 ? `<p class="muted small">Context repositories: ${escapeHtml(view.contextLines.join("; "))}</p>` : ""}
+${view.missingRepositories && !view.planningInput ? renderMissingRepositories(view.missingRepositories) : ""}
+${view.planningInput ? renderPlanningInput(view.planningInput, view.command, view.missingRepositories?.names) : view.refusal && view.missingRepositories ? `<details class="tech"><summary>Technical details</summary><pre class="engineerror">${escapeHtml(view.refusal)}</pre></details>` : view.refusal ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}Refused by the engine. Nothing was approved or run.</p><pre class="engineerror">${escapeHtml(view.refusal)}</pre></div>` : ""}
 ${view.failure ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}start-plan did not report a status.</p><pre class="engineerror">${escapeHtml(view.failure)}</pre></div>` : ""}
 ${decisions}
 ${findings}

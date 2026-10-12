@@ -54,7 +54,13 @@ intake-based plans, and the screen says so. Prepare intake therefore runs in
 this checkout, on the feature branch already checked out (it asks for one only
 when you are on `main`/`master` or a detached HEAD, and only once you choose it); closing
 the screen or choosing another document while it is pending stops it before any
-branch is changed or `start-plan` runs. Stage headings inside fenced examples do
+branch is changed or `start-plan` runs. When the engine reports that the plan
+names a repository it was not given (`sibling_not_supplied`), the screen says
+which one and offers **Select repository and retry**: an open repository whose
+engine identity (`project.toml`'s `project`, else its folder name) is exactly
+that name is proposed for confirmation, several are listed, and otherwise you
+select its folder. The confirmed path is passed as `--context-repository
+NAME=PATH` to every later preparation and to Start for that plan in this window. Stage headings inside fenced examples do
 not count as stage sections. In automatic mode a staged plan runs as the
 execution manifest the extension builds, so a Markdown refusal is checked again
 with `check-plan --manifest --json` against that manifest before the plan is
