@@ -27,7 +27,7 @@ import { intakeContinuation, intakeNextAction, intakeStateLabel, isExecutionGrou
 import { activeDurationMs, commandInFlight as anyCommandInFlight, formatDuration, providerDisplayName, quietSince, type ActorBudget, type ActorLive, type LiveState, type MeaningfulEvent } from "./liveState";
 import { DEFERRED_VERIFICATION_REQUIRED, PUSH_AUTHORIZATION_REQUIRED, obligationFailed, obligationResolved, parseHandoffBranch, type DeferredObligation, type PlanRunState, type RoutingAction, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
 import type { DeclaredRepository } from "./stageRepositories";
-import { deriveDeferredVerification, deriveVerification, draftKeyFor, HUMAN_FEEDBACK_HEADING, parseHumanEvidence, parseHumanFeedback, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
+import { deriveDeferredVerification, deriveVerification, draftKeyFor, HUMAN_FEEDBACK_HEADING, isPlanDecision, parseHumanEvidence, parseHumanFeedback, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
 import { categoryWord, checkNameList } from "./humanTask";
 import { SUBMISSION_PRESERVED, SUBMISSION_UNRESOLVED, type SubmissionRecord } from "./submission";
 import { sameStageScope, stageScopeOf } from "./stageScope";
@@ -619,6 +619,8 @@ export interface DeferredGroup {
   promoted: boolean;
   /** The draft keys of this obligation's checks, in the reviewer's order. */
   checkKeys: string[];
+  /** A plan-declared go-ahead: answered Continue / Not now, not as a check. */
+  decision?: boolean;
 }
 
 export interface ActionRequired extends VerificationView {
@@ -2120,7 +2122,11 @@ function deferredVerification(
     rationale: obligation.rationale,
     promoted: obligation.promoted,
     checkKeys: obligation.gate.checks.map((check) => draftKeyFor(check.id, obligation.gate.instanceId)),
+    decision: isPlanDecision(obligation),
   }));
+  // Only decisions outstanding: the engine asks a go-ahead after the checks
+  // it depends on have passed, so this is a choice, not verification.
+  const decisionsOnly = groups.every((group) => group.decision);
   // What is still owed, not what was ever deferred. A check answered at an
   // earlier visit to this checkpoint is done, and counting it here would ask
   // a person to account for work they have already accounted for; it stays
@@ -2157,13 +2163,17 @@ function deferredVerification(
     submitDetail = blockedDetail(model);
   } else {
     submitEnabled = true;
-    submitDetail =
-      `Records each result against the asking it answers (sparring resume-plan --deferred-result) and ${finishes ? "lets the engine finish the plan" : "resumes the plan: once every check passes, the next stage starts and its agents run"}. A Pass resolves its check; a Fail keeps the plan open and is written into the stage that raised it; Can't test records that no result could be obtained, which resolves nothing.`;
+    submitDetail = decisionsOnly
+      ? `Records your decision against the asking it answers (sparring resume-plan --deferred-result). Continue ${finishes ? "lets the engine finish the plan" : "resumes the plan and starts the next stage"}; Not now records that you have not authorized it and keeps the run stopped.`
+      : `Records each result against the asking it answers (sparring resume-plan --deferred-result) and ${finishes ? "lets the engine finish the plan" : "resumes the plan: once every check passes, the next stage starts and its agents run"}. A Pass resolves its check; a Fail keeps the plan open and is written into the stage that raised it; Can't test records that no result could be obtained, which resolves nothing.`;
   }
 
-  const headline = total === 1 ? "Manual verification required" : `Manual verification required — ${total} deferred checks`;
-  const subtitle =
-    awaiting.reason === "promoted"
+  const headline = decisionsOnly
+    ? total === 1 ? "Decision required" : `Decisions required — ${total}`
+    : total === 1 ? "Manual verification required" : `Manual verification required — ${total} deferred checks`;
+  const subtitle = decisionsOnly
+    ? `The plan asks for your go-ahead before ${finishes ? "the run completes" : "its next stage"}. Continue authorizes only what ${total === 1 ? "the decision" : "each decision"} describes; Not now keeps the run stopped.`
+    : awaiting.reason === "promoted"
       ? `A later review decided ${stages.size === 1 ? "this check" : "these checks"} can wait no longer. The run stopped before the next stage.`
       : awaiting.reason === "before_stage"
         ? `The plan requires ${total === 1 ? "this check" : `these ${total} checks`} before its next stage. The run stopped there; answering resumes it.`
@@ -2172,7 +2182,7 @@ function deferredVerification(
   return {
     ...view,
     kind: "deferred_verification",
-    word: "Verification owed",
+    word: decisionsOnly ? "Decision owed" : "Verification owed",
     deferredGroups: groups,
     headline,
     subtitle,
@@ -2184,7 +2194,11 @@ function deferredVerification(
       ...groups.map((group) => ({ label: `Gate instance (${group.stageId})`, value: group.instanceId })),
       { label: "What submitting does", value: `sparring resume-plan … --deferred-result '<gate instance>:<check id>=<pass|fail|blocked>[=note]'. The engine records it in its own ledger and in the originating stage's notes.md; ${finishes ? "the plan completes only once every obligation passes" : "once every obligation passes, the run continues with the next stage"}.` },
     ],
-    submit: { label: finishes ? "Submit verification and finish" : "Submit verification and continue", enabled: submitEnabled, detail: submitDetail },
+    submit: {
+      label: decisionsOnly ? (finishes ? "Submit decision and finish" : "Submit decision") : finishes ? "Submit verification and finish" : "Submit verification and continue",
+      enabled: submitEnabled,
+      detail: submitDetail,
+    },
     repair: repairOffer(run, obligations, { branchGuard, submitting, model }),
     feedback: {
       draft: artifacts.humanFeedback?.trim() ? artifacts.humanFeedback : undefined,

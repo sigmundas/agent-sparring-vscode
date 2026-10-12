@@ -29,7 +29,7 @@ import {
   type ConfigField,
   type ConfigRole,
 } from "./effectiveConfig";
-import { CHECK_OUTCOMES, isCheckKey, isDraftKey, type CheckItem, type CheckOutcome } from "./humanChecks";
+import { CHECK_OUTCOMES, DECISION_OUTCOMES, isCheckKey, isDraftKey, type CheckItem, type CheckOutcome } from "./humanChecks";
 import { checkName, humanTask, splitPassCriteria } from "./humanTask";
 import { RUN_KIND, TIMELINE_STATE_WORD, shortStageLabel, timelineGroups, type ActionRequired, type AgentConfigSection, type BranchGuard, type ActorCard, type BudgetGauge, type FinishRunOffer, type HistoryEntry, type OverviewModel, type PushAuthorization, type StartPlanView, type TimelineItem, type WhatsNext } from "./overviewModel";
 import type { ProviderPauseCard } from "./freshSession";
@@ -1132,7 +1132,7 @@ function renderDeferredChecks(panel: ActionRequired, scope: string): string {
     return `<div class="part deferredgroup">
 <h4>${escapeHtml(group.title)}</h4>
 <p class="muted small">${escapeHtml(group.category)} · raised by ${escapeHtml(group.stageId)}</p>
-<p class="criterion parent">Deferred by the reviewer: ${escapeHtml(group.rationale)}</p>
+<p class="criterion parent">${group.decision ? "Why the plan asks" : "Deferred by the reviewer"}: ${escapeHtml(group.rationale)}</p>
 ${promoted}
 ${list}
 </div>`;
@@ -1237,11 +1237,14 @@ function renderRecordControls(item: CheckItem): string {
   // storing under the bare check id would offer the previous asking's unsent
   // answer as this one's.
   const key = escapeHtml(item.draftKey);
-  const choices = CHECK_OUTCOMES.map(
+  const decision = item.decision === true;
+  const titles = decision ? DECISION_TITLES : OUTCOME_TITLES;
+  const choices = (decision ? DECISION_OUTCOMES : CHECK_OUTCOMES).map(
     (candidate) =>
-      `<button type="button" class="choice ${candidate}${outcome === candidate ? " on" : ""}" data-check="${key}" data-outcome="${candidate}" aria-pressed="${outcome === candidate}" title="${escapeHtml(OUTCOME_TITLES[candidate])}">${OUTCOME_LABELS[candidate]}</button>`,
+      `<button type="button" class="choice ${candidate}${outcome === candidate ? " on" : ""}" data-check="${key}" data-outcome="${candidate}" aria-pressed="${outcome === candidate}" title="${escapeHtml(titles[candidate])}">${outcomeLabel(candidate, decision)}</button>`,
   ).join("");
-  return `<div class="record"><span class="choices">${choices}</span><textarea class="note" data-check="${key}" rows="1" placeholder="Evidence or note (optional)">${escapeHtml(item.record?.note ?? "")}</textarea></div>`;
+  const placeholder = decision ? "Note (optional)" : "Evidence or note (optional)";
+  return `<div class="record"><span class="choices">${choices}</span><textarea class="note" data-check="${key}" rows="1" placeholder="${placeholder}">${escapeHtml(item.record?.note ?? "")}</textarea></div>`;
 }
 
 /**
@@ -1260,7 +1263,7 @@ function renderEarlierAnswers(item: CheckItem): string {
   }
   const rows = item.previous
     .map((entry) => {
-      const word = entry.outcome ? `<span class="outcome ${entry.outcome}">${OUTCOME_LABELS[entry.outcome]}</span> ` : "";
+      const word = entry.outcome ? `<span class="outcome ${entry.outcome}">${outcomeLabel(entry.outcome, item.decision === true)}</span> ` : "";
       return `<li>${word}<span class="muted">${escapeHtml(entry.excerpt)}</span></li>`;
     })
     .join("");
@@ -1303,6 +1306,22 @@ const PREVIOUS_TITLE_UNATTRIBUTED =
  * able to tell them apart at a glance.
  */
 export const OUTCOME_LABELS: Record<CheckOutcome, string> = { pass: "Pass", fail: "Fail", blocked: "Can't test" };
+
+/**
+ * A decision is not a test, so it is never offered as one: the same engine
+ * values, worded as what the person is choosing. `fail` is not offered.
+ */
+export const DECISION_LABELS: Record<CheckOutcome, string> = { pass: "Continue", fail: "Fail", blocked: "Not now" };
+
+const DECISION_TITLES: Record<CheckOutcome, string> = {
+  pass: "Authorize exactly what this decision describes; the run continues",
+  fail: "",
+  blocked: "Do not authorize it now; the run stays stopped here and nothing else is affected (recorded as Blocked)",
+};
+
+export function outcomeLabel(outcome: CheckOutcome, decision: boolean): string {
+  return (decision ? DECISION_LABELS : OUTCOME_LABELS)[outcome];
+}
 
 const OUTCOME_TITLES: Record<CheckOutcome, string> = {
   pass: "The check was performed and met its criteria",

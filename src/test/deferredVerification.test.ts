@@ -601,3 +601,99 @@ describe("repairing a deferred check that failed", () => {
     );
   });
 });
+
+/**
+ * A plan-declared go-ahead (engine category AUTHORIZATION) is a decision, not
+ * a test. The engine asks it only after the verification it depends on has
+ * passed, as with the ingestion plan's G1 then G1C.
+ */
+describe("a plan-declared go-ahead", () => {
+  const G1_INSTANCE = "g1aaaa11";
+  const G1C_INSTANCE = "g1cbbb22";
+  const gateOf = (instanceId: string, category: string, id: string, title: string, instruction: string) => ({
+    category,
+    title,
+    checks: [{ id, instruction, pass_criteria: "criteria", source: null }],
+    instance_id: instanceId,
+  });
+  const g1 = gateOf(G1_INSTANCE, "OTHER", "G1", "API and access checks", "Confirm the plan-declared manual gate 'API and access checks' is satisfied.");
+  const g1c = gateOf(G1C_INSTANCE, "AUTHORIZATION", "G1C", "Permission to continue with image ingestion", "Decide whether to authorize continuing into Stage 2: Permission to continue with image ingestion.");
+
+  async function before(entries: { gate: ReturnType<typeof gateOf>; results?: unknown[] }[], instanceIds: string[]) {
+    const ws = await Workspace.create();
+    await ws.writePlan(FOO_PLAN_LABEL, FOO_PLAN_MARKDOWN);
+    await ws.writePlanRun(FOO_PLAN_KEY, {
+      plan: FOO_PLAN_LABEL,
+      status: "paused",
+      current_stage_index: 1,
+      current_stage: STAGE_2,
+      awaiting: { kind: DEFERRED_VERIFICATION_REQUIRED, reason: "before_stage", instance_ids: instanceIds },
+      deferred_human_checks: entries.map((entry) => ({
+        stage_id: STAGE_1,
+        gate: entry.gate,
+        rationale: "why",
+        checkpoint: `before_stage:${STAGE_2}`,
+        promoted: false,
+        results: entry.results ?? [],
+        manifest_gate: true,
+      })),
+    });
+    await ws.writeStage(STAGE_1, { status: "accepted", candidate_sha: "a".repeat(40) });
+    return render(ws);
+  }
+
+  it("G1 not yet passed: a verification with Pass / Fail / Can't test", async () => {
+    const { model, html } = await before([{ gate: g1 }], [G1_INSTANCE]);
+    assert.equal(model.actionRequired!.headline, "Manual verification required");
+    assert.equal(model.actionRequired!.required[0].decision, false);
+    assert.match(html, />Pass</);
+    assert.match(html, />Fail</);
+    assert.match(html, />Can't test</);
+    assert.ok(!html.includes(">Continue<"));
+  });
+
+  it("G1 passed: G1C is one decision with Continue / Not now and no Fail", async () => {
+    const { model, html } = await before(
+      [{ gate: g1, results: [{ check_id: "G1", outcome: "pass" }] }, { gate: g1c }],
+      [G1C_INSTANCE],
+    );
+    const panel = model.actionRequired!;
+    assert.equal(panel.headline, "Decision required");
+    assert.equal(panel.word, "Decision owed");
+    assert.match(panel.subtitle ?? "", /go-ahead before its next stage/);
+    assert.equal(panel.required.length, 1);
+    assert.equal(panel.required[0].decision, true);
+    assert.equal(panel.deferredGroups![0].decision, true);
+    assert.match(html, />Continue</);
+    assert.match(html, />Not now</);
+    assert.ok(!html.includes(">Fail<"), "a decision cannot fail");
+    assert.ok(!html.includes(">Can't test<"), "a decision is not a test");
+    assert.ok(!html.includes("Manual verification required"));
+    assert.match(html, /Why the plan asks: why/);
+  });
+
+  it("a reviewer's deferral is a check whatever its category says", async () => {
+    const ws = await Workspace.create();
+    await ws.writePlan(FOO_PLAN_LABEL, FOO_PLAN_MARKDOWN);
+    await ws.writePlanRun(FOO_PLAN_KEY, {
+      plan: FOO_PLAN_LABEL,
+      status: "paused",
+      current_stage_index: 1,
+      current_stage: STAGE_2,
+      awaiting: { kind: DEFERRED_VERIFICATION_REQUIRED, reason: "promoted", instance_ids: [G1C_INSTANCE] },
+      deferred_human_checks: [{ stage_id: STAGE_1, gate: g1c, rationale: "why", checkpoint: "before_plan_completion", promoted: true, results: [] }],
+    });
+    await ws.writeStage(STAGE_1, { status: "accepted", candidate_sha: "a".repeat(40) });
+    const { model, html } = await render(ws);
+    assert.equal(model.actionRequired!.required[0].decision, false);
+    assert.match(html, />Fail</);
+    assert.match(html, /Deferred by the reviewer/);
+  });
+
+  it("Continue and Not now send the engine's own pass and blocked", async () => {
+    const { model } = await before([{ gate: g1c }], [G1C_INSTANCE]);
+    const html = renderOverviewHtml(model, "n", "c");
+    assert.match(html, /data-outcome="pass"[^>]*>Continue</);
+    assert.match(html, /data-outcome="blocked"[^>]*>Not now</);
+  });
+});

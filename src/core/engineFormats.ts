@@ -137,6 +137,8 @@ export interface DeferredObligation {
   checkpoint: string;
   /** A later reviewer decided this can wait no longer. Same asking, due sooner. */
   promoted: boolean;
+  /** Minted by the engine for a plan-declared manifest gate, not a reviewer's deferral. */
+  manifestGate?: boolean;
   results: DeferredCheckResult[];
 }
 
@@ -298,6 +300,7 @@ function parseDeferredObligations(raw: unknown): DeferredObligation[] {
       rationale,
       checkpoint: text(value, "checkpoint") ?? "before_plan_completion",
       promoted: value["promoted"] === true,
+      manifestGate: value["manifest_gate"] === true,
       results: parseDeferredResults(value["results"]),
     });
   }
