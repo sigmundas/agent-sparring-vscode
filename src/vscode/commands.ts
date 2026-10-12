@@ -59,7 +59,7 @@ import { stageScopeOf } from "../core/stageScope";
 import { CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
 import { applyFeatureBranch, inspectFeatureBranch } from "../core/featureBranch";
-import { classifyPlanDocument, countStageHeadings, featureBranchPrompt, PLAN_PICKER_LIMITS, planCandidatesToRead, planPickerItems, type PlanFileCandidate, type CheckPlanQuery, type PlanClassification } from "../core/runPlanEntry";
+import { classifyPlanDocument, countStageHeadings, featureBranchForNewRun, featureBranchPrompt, PLAN_PICKER_LIMITS, planCandidatesToRead, planPickerItems, type PlanFileCandidate, type CheckPlanQuery, type PlanClassification } from "../core/runPlanEntry";
 import { GETTING_STARTED } from "../core/gettingStarted";
 import { DEFERRED_VERIFICATION_REQUIRED, parseHandoffBranch, parsePlanStages, type PlanRunSource } from "../core/engineFormats";
 import { appendHumanEvidence, OUTCOME_WORDS, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
@@ -2459,7 +2459,10 @@ async function resolveExpectedBranch(location: SparringLocation, recorded?: stri
     return decision.branch;
   }
   if (decision.kind === "ask") {
-    return askBranch(decision.current);
+    // Nothing recorded: a feature branch already checked out is used as it
+    // is; only a protected branch or a detached HEAD asks for a name.
+    const forNewRun = featureBranchForNewRun(decision.current);
+    return forNewRun.kind === "use" ? forNewRun.branch : askBranch(forNewRun.current);
   }
   await explainWrongBranch(decision, "this plan run was started for");
   return undefined;

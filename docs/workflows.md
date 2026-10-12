@@ -51,7 +51,8 @@ asks its decisions before anything runs. It also offers **Make Plan…** as an
 optional further planning or audit pass. Nothing about a workspace or branch is
 asked on that screen. The engine's `start-plan --managed` does not yet accept
 intake-based plans, and the screen says so. Prepare intake therefore runs in
-this checkout and asks for the feature branch only once you choose it; closing
+this checkout, on the feature branch already checked out (it asks for one only
+when you are on `main`/`master` or a detached HEAD, and only once you choose it); closing
 the screen or choosing another document while it is pending stops it before any
 branch is changed or `start-plan` runs. Stage headings inside fenced examples do
 not count as stage sections. In automatic mode a staged plan runs as the
