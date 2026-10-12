@@ -395,6 +395,14 @@ export type CheckOutcome = "pass" | "fail" | "blocked";
 
 export const CHECK_OUTCOMES: readonly CheckOutcome[] = ["pass", "fail", "blocked"];
 
+/** The answers a decision takes: Continue and Not now. A decision cannot fail. */
+export const DECISION_OUTCOMES: readonly CheckOutcome[] = ["pass", "blocked"];
+
+/** The engine's category for a plan-declared go-ahead, which is a decision rather than a check. */
+export function isDecisionCategory(category: string | undefined): boolean {
+  return category === "AUTHORIZATION";
+}
+
 /** The words written into notes.md. The engine's vocabulary, not the panel's. */
 export const OUTCOME_WORDS: Record<CheckOutcome, string> = { pass: "Pass", fail: "Fail", blocked: "Blocked" };
 
@@ -867,6 +875,12 @@ export interface CheckItem {
    */
   owedUntilPassed?: boolean;
   /**
+   * The obligation is a decision (engine category `AUTHORIZATION`, a
+   * plan-declared go-ahead), not a verification: it is answered Continue
+   * (`pass`) or Not now (`blocked`), never Fail or Can't test.
+   */
+  decision?: boolean;
+  /**
    * The stage whose review raised this check, for a deferred obligation.
    *
    * Absent for an immediate gate, where the check belongs to the stage in
@@ -1067,6 +1081,7 @@ export function deriveDeferredVerification(
     rendered.forEach((item, index) => {
       item.originStageId = obligation.stageId;
       item.owedUntilPassed = true;
+      item.decision = isDecisionCategory(obligation.gate.category);
       wireId.set(item.draftKey, obligation.gate.checks[index].id);
       const recorded = obligation.results.find((result) => result.checkId === obligation.gate.checks[index].id);
       if (recorded?.outcome === "pass") {
