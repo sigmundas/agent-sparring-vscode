@@ -76,6 +76,8 @@ describe("a repository the plan names but Run Plan did not supply", () => {
     const view = startPlanView(refusedSession([siblingNotSupplied], { "sporely-py": "/py" }));
     assert.equal(view.missingRepositories, undefined);
     assert.deepEqual(view.contextLines, ["sporely-py: /py (read-only)"]);
+    const html = renderOverviewHtml({ kind: "startPlan", title: view.planName, startPlan: view }, "n", "vscode-resource:");
+    assert.ok(html.includes("Change repository…"), "a confirmed repository the engine refused can be changed");
   });
 
   it("relabels Prepare intake on the planning-input screen when this plan is known to need a repository", () => {

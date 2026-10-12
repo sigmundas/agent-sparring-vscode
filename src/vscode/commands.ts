@@ -3069,6 +3069,14 @@ function planContextSession(location: SparringLocation, planPath: string): Pick<
   return { ...(Object.keys(entry.confirmed).length > 0 ? { contextRepositories: { ...entry.confirmed } } : {}), ...(missing.length > 0 ? { missingRepositories: missing } : {}) };
 }
 
+async function realPath(file: string): Promise<string> {
+  try {
+    return await fs.realpath(file);
+  } catch {
+    return path.resolve(file);
+  }
+}
+
 async function readTextOrUndefined(file: string): Promise<string | undefined> {
   try {
     return await fs.readFile(file, "utf8");
@@ -3088,10 +3096,10 @@ async function readTextOrUndefined(file: string): Promise<string | undefined> {
  */
 async function selectContextRepositories(controller: SparringController, location: SparringLocation, planPath: string, names: readonly string[]): Promise<boolean> {
   const entry = planContextOf(location, planPath);
-  const primary = path.resolve(location.repoRoot);
+  const primary = await realPath(location.repoRoot);
   const candidates: RepositoryIdentity[] = [];
   for (const candidate of await controller.launchRepositories()) {
-    if (path.resolve(candidate.location.repoRoot) !== primary) {
+    if ((await realPath(candidate.location.repoRoot)) !== primary) {
       candidates.push(await repositoryIdentity(candidate.location.repoRoot, readTextOrUndefined, candidate.location.sparringDir));
     }
   }
@@ -3105,7 +3113,7 @@ async function selectContextRepositories(controller: SparringController, locatio
       void vscode.window.showErrorMessage(`Agent Sparring: ${chosen} cannot be used as ${name}: ${check.reason}.`);
       return false;
     }
-    if (path.resolve(chosen) === primary) {
+    if ((await realPath(chosen)) === primary) {
       void vscode.window.showErrorMessage(`Agent Sparring: ${chosen} is the repository this plan runs in, not ${name}.`);
       return false;
     }
@@ -3338,7 +3346,9 @@ async function handleStartPlanMessage(controller: SparringController, overview: 
       // as it was: the person selects the repository, then it runs again.
       const missing = session.status ? missingContextRepositories(session.status.findings, planContextOf(context.location, context.planPath).confirmed) : [];
       if (missing.length > 0 || message.action === "selectRepository") {
-        if (missing.length === 0 || !(await selectContextRepositories(controller, context.location, context.planPath, missing)) || overview.startPlanSession !== session) {
+        // Nothing missing: Change repository… asks again for those confirmed.
+        const names = missing.length > 0 ? missing : Object.keys(session.contextRepositories ?? {}).sort();
+        if (names.length === 0 || !(await selectContextRepositories(controller, context.location, context.planPath, names)) || overview.startPlanSession !== session) {
           return;
         }
         await beginStartPlan(controller, overview, context, session.answers);

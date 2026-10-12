@@ -2254,7 +2254,7 @@ ${view.summary.laterSlices.map((line) => `<p class="muted">${escapeHtml(line)}</
 ${view.providerTurnNotice ? `<p class="muted start-notice">${escapeHtml(view.providerTurnNotice)}</p>` : ""}
 ${view.preparing ? `<p class="start-preparing">${icon("sync")}The engine is preparing the plan…</p>` : ""}
 ${view.intake ? `<p>${escapeHtml(view.intake.line)}</p>` : view.route === "direct" ? "<p>Direct route: the plan's own stages run as written.</p>" : ""}
-${view.contextLines.length > 0 ? `<p class="muted small">Context repositories: ${escapeHtml(view.contextLines.join("; "))}</p>` : ""}
+${view.contextLines.length > 0 ? `<p class="muted small">Context repositories: ${escapeHtml(view.contextLines.join("; "))}${view.refusal && !view.preparing ? ` <button type="button" data-startplan="selectRepository">Change repository…</button>` : ""}</p>` : ""}
 ${view.missingRepositories && !view.planningInput ? renderMissingRepositories(view.missingRepositories) : ""}
 ${view.planningInput ? renderPlanningInput(view.planningInput, view.command, view.missingRepositories?.names) : view.refusal && view.missingRepositories ? `<details class="tech"><summary>Technical details</summary><pre class="engineerror">${escapeHtml(view.refusal)}</pre></details>` : view.refusal ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}Refused by the engine. Nothing was approved or run.</p><pre class="engineerror">${escapeHtml(view.refusal)}</pre></div>` : ""}
 ${view.failure ? `<div class="subfail"><p class="preserved">${icon("warn", "escalate")}start-plan did not report a status.</p><pre class="engineerror">${escapeHtml(view.failure)}</pre></div>` : ""}
