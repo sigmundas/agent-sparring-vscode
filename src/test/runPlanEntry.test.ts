@@ -21,7 +21,7 @@ import { MANAGED_INTAKE_LIMITATION, PLANNING_INPUT_TITLE, PREPARE_INTAKE, STAGED
 import { isStartPlanMessage } from "../core/overviewHtml";
 import { renderOverviewHtml } from "../core/overviewHtml";
 import { buildOverviewModel, runPlanClosedModel, startPlanView, type StartPlanSession } from "../core/overviewModel";
-import { classifyPlanDocument, countStageHeadings, featureBranchPrompt, runPlanClosedHolds, type CheckPlanQuery } from "../core/runPlanEntry";
+import { classifyPlanDocument, countStageHeadings, featureBranchForNewRun, featureBranchPrompt, runPlanClosedHolds, type CheckPlanQuery } from "../core/runPlanEntry";
 import { parseStartPlanStatus } from "../core/startPlan";
 
 const VALID = { ok: true as const, exitCode: 0, stdout: JSON.stringify({ valid: true, kind: "markdown", label: "plan.md", stages: [], error: null }) };
@@ -151,6 +151,40 @@ describe("Run Plan classifies the document before asking anything", () => {
     const html = renderOverviewHtml({ kind: "startPlan", title: view.planName, startPlan: view }, "n", "vscode-resource:");
     assert.ok(html.includes(`data-startplan="prepareIntake"`));
     assert.ok(!html.includes("staged-fix"));
+  });
+});
+
+describe("a new run on the feature branch already checked out does not ask for its name", () => {
+  it("uses a checked-out feature branch, and asks only on a protected branch or a detached HEAD", () => {
+    assert.deepEqual(featureBranchForNewRun("feature/photo-provenance"), { kind: "use", branch: "feature/photo-provenance" });
+    assert.deepEqual(featureBranchForNewRun("main"), { kind: "ask", current: "main" });
+    assert.deepEqual(featureBranchForNewRun("master"), { kind: "ask", current: "master" });
+    assert.deepEqual(featureBranchForNewRun(undefined), { kind: "ask" });
+    assert.deepEqual(featureBranchForNewRun("  "), { kind: "ask" });
+  });
+
+  it("in a real repository: the checked-out feature branch passes through unchanged; on main a named new branch is still created", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const { checkedOutBranch } = await import("../core/repositoryMapping");
+    const { inspectFeatureBranch } = await import("../core/featureBranch");
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), "sparring-branch-"));
+    const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+    try {
+      git("init", "-q", "-b", "main");
+      git("-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "--allow-empty", "-m", "init");
+      const onMain = featureBranchForNewRun(await checkedOutBranch(repo));
+      assert.equal(onMain.kind, "ask", "main still requires a feature branch");
+      assert.equal((await inspectFeatureBranch(repo, "feature/new")).kind, "create", "explicit new-branch creation still works");
+      git("checkout", "-q", "-b", "feature/photo-provenance");
+      const onFeature = featureBranchForNewRun(await checkedOutBranch(repo));
+      assert.deepEqual(onFeature, { kind: "use", branch: "feature/photo-provenance" });
+      assert.equal((await inspectFeatureBranch(repo, "feature/photo-provenance")).kind, "checked-out", "never creates another branch");
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
   });
 });
 

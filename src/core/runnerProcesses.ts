@@ -26,7 +26,7 @@
  */
 
 import * as path from "node:path";
-import type { SparringLocation } from "./discovery";
+import { runIdFor, type SparringLocation } from "./discovery";
 import type { ProcessInfo } from "./processTree";
 import { parseSparringCommand } from "./sparringCommand";
 
@@ -43,13 +43,22 @@ export type RunnerProbe =
  * `--sparring-dir` values attribute a command line: `ps` reports no working
  * directory, so a relative path cannot be resolved and the process stays
  * unattributable rather than being assigned to a guess.
+ *
+ * A managed plan runner (`--managed`) is the exception to path attribution:
+ * its `--repo-root` names the main checkout, while the run lives in a
+ * worktree the engine created, so the paths never match the worktree's
+ * project. Its `--run-key` names the run exactly, so when it is `runId`'s
+ * key the runner is this run's, wherever its repo root points.
  */
-export function probeRunnerProcesses(processes: ProcessInfo[], location: SparringLocation): RunnerProbe {
+export function probeRunnerProcesses(processes: ProcessInfo[], location: SparringLocation, runId?: string): RunnerProbe {
   let unattributable: ProcessInfo | undefined;
   for (const process of processes) {
     const parsed = parseSparringCommand(process.command);
     if (!parsed) {
       continue;
+    }
+    if (runId !== undefined && parsed.runKey !== undefined && runIdFor(location, "plan", parsed.runKey) === runId) {
+      return { kind: "alive", process };
     }
     const repoRoot = absolute(parsed.repoRoot);
     const sparringDir = absolute(parsed.sparringDir);

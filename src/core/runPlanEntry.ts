@@ -162,11 +162,33 @@ export function runPlanClosedHolds(closed: RunPlanClosed, now: { followed: strin
 }
 
 /**
- * The feature-branch prompt for a new run in this checkout. The checked-out
- * branch is named as context and never filled in: it may be a protected
- * branch (the engine's policy, not repeated here), and a field labelled
- * "Feature branch" must not offer one to confirm with Enter. Whatever is
- * typed still goes to the engine, whose branch guard decides.
+ * The engine's default protected branches (`branch_guard.py`'s
+ * `DEFAULT_PROTECTED_BRANCHES`). A hint for whether to ask at all, never the
+ * policy: whatever branch is passed on, the engine's branch guard decides.
+ */
+export const DEFAULT_PROTECTED_BRANCHES: readonly string[] = ["main", "master"];
+
+/**
+ * Whether a new run in this checkout needs to ask for its feature branch.
+ * A checked-out branch that is not one of the engine's default protected
+ * branches is the answer: the person is already on it, and typing its name
+ * again adds nothing. A detached HEAD or a protected branch is a question —
+ * the run needs a feature branch the person names.
+ */
+export function featureBranchForNewRun(current: string | undefined): { kind: "use"; branch: string } | { kind: "ask"; current?: string } {
+  const branch = current?.trim();
+  if (branch && !DEFAULT_PROTECTED_BRANCHES.includes(branch)) {
+    return { kind: "use", branch };
+  }
+  return { kind: "ask", ...(branch ? { current: branch } : {}) };
+}
+
+/**
+ * The feature-branch prompt, asked only when the checked-out branch cannot
+ * be used ({@link featureBranchForNewRun}): a detached HEAD or a protected
+ * branch. The checked-out branch is named as context and never filled in, so
+ * Enter cannot confirm `main`. Whatever is typed still goes to the engine,
+ * whose branch guard decides.
  */
 export function featureBranchPrompt(current: string | undefined): { value: string; prompt: string; placeholder: string } {
   const where = current ? `Checked out now: ${current}. ` : "";

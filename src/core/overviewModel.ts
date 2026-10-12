@@ -45,6 +45,7 @@ import { readyToMerge } from "./finishRun";
 import { branchNotice, branchStateLabel, reportFor, type BranchNotice, type SliceBranchReport } from "./sliceBranch";
 import { QUIET_AFTER_MS, formatAge } from "./status";
 import type { StartPlanStatus } from "./startPlan";
+import { followsFromMissingRepository, missingContextRepositories } from "./contextRepositories";
 
 export type TimelineState = "accepted" | "finalizing" | "active" | "paused" | "working" | "future";
 
@@ -3640,6 +3641,10 @@ export interface StartPlanSession {
    * asked or start-plan ran: the engine's reason, verbatim. No status then.
    */
   classification?: { kind: "planning-input" | "invalid"; reason: string };
+  /** Read-only sibling repositories this preparation gives the engine, name → path, as the person confirmed them. */
+  contextRepositories?: Record<string, string>;
+  /** Repositories an earlier preparation of this plan reported as not supplied and still unconfirmed. */
+  missingRepositories?: string[];
 }
 
 export interface StartPlanView {
@@ -3670,6 +3675,13 @@ export interface StartPlanView {
   };
   /** The engine's refusal, verbatim. */
   refusal?: string;
+  /**
+   * Repositories the plan names that Run Plan did not give the engine: the
+   * one input to supply, with the findings that follow from it counted.
+   */
+  missingRepositories?: { names: string[]; relatedFindings: number };
+  /** The read-only context repositories given to the engine, one line each. */
+  contextLines: string[];
   /** check-plan classified the document as planning input: Prepare intake or Make Plan…, with check-plan's reason. */
   /**
    * Not a direct plan by check-plan: Prepare intake or Make Plan…, with
@@ -3713,6 +3725,9 @@ export function startPlanView(session: StartPlanSession): StartPlanView {
     decisions: [],
     findings: [],
     canAnswer: false,
+    contextLines: Object.keys(session.contextRepositories ?? {})
+      .sort()
+      .map((name) => `${name}: ${session.contextRepositories![name]} (read-only)`),
     ...(session.command ? { command: session.command } : {}),
   };
   if (session.failure) {
@@ -3729,6 +3744,10 @@ export function startPlanView(session: StartPlanSession): StartPlanView {
     } else {
       view.stateLabel = "Not a direct staged plan";
       view.planningInput = { reason: session.classification.reason, staged: true };
+    }
+    const known = (session.missingRepositories ?? []).filter((name) => !(name in (session.contextRepositories ?? {})));
+    if (known.length > 0) {
+      view.missingRepositories = { names: known, relatedFindings: 0 };
     }
     return view;
   }
@@ -3747,6 +3766,10 @@ export function startPlanView(session: StartPlanSession): StartPlanView {
     };
   }
   view.findings = status.findings.map((finding) => ({ severity: finding.severity, code: finding.code, message: finding.message, stages: finding.stages, disposition: finding.disposition }));
+  const missing = preparing ? [] : missingContextRepositories(status.findings, session.contextRepositories);
+  if (missing.length > 0) {
+    view.missingRepositories = { names: missing, relatedFindings: status.findings.filter((finding) => followsFromMissingRepository(finding.code)).length };
+  }
   if (status.status === "refused") {
     view.refusal = status.error ?? "The engine refused without saying why.";
     return view;

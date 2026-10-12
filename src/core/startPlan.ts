@@ -13,6 +13,7 @@
  * No dependency on the vscode API.
  */
 
+import { contextRepositoryArgs } from "./contextRepositories";
 import { buildRunPlanArgs } from "./cli";
 import type { ManifestGate } from "./manifest";
 
@@ -218,11 +219,13 @@ export interface StartPlanInvocation {
   /** Decision id → option id, every one a person chose (or the engine recorded). */
   answers?: Record<string, string>;
   allowPushForRun?: boolean;
+  /** Read-only sibling repositories, name → path, as the person confirmed them. */
+  contextRepositories?: Record<string, string>;
 }
 
 /**
  * `sparring [--sparring-dir DIR] start-plan PLAN --repo-root ROOT
- * --expected-branch BRANCH [--answer ID=OPTION …] (--json | --confirm TOKEN)
+ * --expected-branch BRANCH [--context-repository NAME=PATH …] [--answer ID=OPTION …] (--json | --confirm TOKEN)
  * [--allow-push-for-run]`.
  *
  * The evaluation and the confirmation are the same command apart from
@@ -235,6 +238,7 @@ export function buildStartPlanArgs(invocation: StartPlanInvocation & ({ json: tr
   const base = buildRunPlanArgs({ planPath: invocation.planPath, repoRoot: invocation.repoRoot, expectedBranch: invocation.expectedBranch, sparringDir: invocation.sparringDir });
   const at = base.indexOf("run-plan");
   base[at] = "start-plan";
+  base.push(...contextRepositoryArgs(invocation.contextRepositories));
   for (const id of Object.keys(invocation.answers ?? {}).sort()) {
     base.push("--answer", `${id}=${invocation.answers![id]}`);
   }

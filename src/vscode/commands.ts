@@ -59,7 +59,7 @@ import { stageScopeOf } from "../core/stageScope";
 import { CHOOSE_REPOSITORY_LABEL, FOLLOW_ACTIVE_LABEL, FOLLOW_EDITOR_LABEL, describeRepositoryContext } from "../core/activeRepository";
 import { decideExpectedBranch } from "../core/expectedBranch";
 import { applyFeatureBranch, inspectFeatureBranch } from "../core/featureBranch";
-import { classifyPlanDocument, countStageHeadings, featureBranchPrompt, PLAN_PICKER_LIMITS, planCandidatesToRead, planPickerItems, type PlanFileCandidate, type CheckPlanQuery, type PlanClassification } from "../core/runPlanEntry";
+import { classifyPlanDocument, countStageHeadings, featureBranchForNewRun, featureBranchPrompt, PLAN_PICKER_LIMITS, planCandidatesToRead, planPickerItems, type PlanFileCandidate, type CheckPlanQuery, type PlanClassification } from "../core/runPlanEntry";
 import { GETTING_STARTED } from "../core/gettingStarted";
 import { DEFERRED_VERIFICATION_REQUIRED, parseHandoffBranch, parsePlanStages, type PlanRunSource } from "../core/engineFormats";
 import { appendHumanEvidence, OUTCOME_WORDS, renderHumanEvidence, renderHumanFeedback, submittableChecks } from "../core/humanChecks";
@@ -97,6 +97,7 @@ import { askFreshSession, describeAgent, freshRefusedByPause, otherAgentLabel, r
 import type { SessionRole } from "../core/engineFormats";
 import { CUSTOM_MODEL_LABEL, describeRole, exactModelProblem } from "../core/effectiveConfig";
 import { buildStartPlanArgs } from "../core/startPlan";
+import { missingContextRepositories, repositoriesNamed, repositoryIdentity, type RepositoryIdentity } from "../core/contextRepositories";
 import type { StartPlanSession } from "../core/overviewModel";
 import type { StartPlanMessage } from "../core/overviewHtml";
 import { OverviewPanelManager } from "./overview/overviewPanel";
@@ -2453,13 +2454,20 @@ async function pickPlanDocument(location: SparringLocation): Promise<string | un
  * Returns undefined when the caller should stop: either the person
  * cancelled, or the mismatch has already been explained to them.
  */
-async function resolveExpectedBranch(location: SparringLocation, recorded?: string): Promise<string | undefined> {
+async function resolveExpectedBranch(location: SparringLocation, recorded?: string, newRun = false): Promise<string | undefined> {
   const decision = decideExpectedBranch(recorded, await currentBranch(location.repoRoot));
   if (decision.kind === "use") {
     return decision.branch;
   }
   if (decision.kind === "ask") {
-    return askBranch(decision.current);
+    // A new run uses a feature branch already checked out as it is; only a
+    // protected branch or a detached HEAD asks for a name. A run resumed
+    // with no recorded branch still asks.
+    if (!newRun) {
+      return askBranch(decision.current);
+    }
+    const forNewRun = featureBranchForNewRun(decision.current);
+    return forNewRun.kind === "use" ? forNewRun.branch : askBranch(forNewRun.current);
   }
   await explainWrongBranch(decision, "this plan run was started for");
   return undefined;
@@ -2783,7 +2791,7 @@ async function runPlanCommand(controller: SparringController, overview: Overview
   }
   // The feature branch is created here when it does not exist yet; the
   // engine still receives it, unchanged, as --expected-branch.
-  const expectedBranch = await resolveExpectedBranch(location);
+  const expectedBranch = await resolveExpectedBranch(location, undefined, true);
   if (!expectedBranch || !(await ensureFeatureBranch(controller, location, expectedBranch))) {
     return;
   }
@@ -2892,6 +2900,7 @@ async function showPlanClassification(
     phase: "shown",
     answers: {},
     classification: { kind: classification.kind, reason: classification.reason },
+    ...planContextSession(context.location, context.planPath),
     command: `sparring ${buildCheckPlanArgs({ planPath: context.planPath, repoRoot: context.location.repoRoot, sparringDir: context.location.sparringDir }).join(" ")}`,
     ...(classification.kind === "planning-input" ? { planningInput: true } : {}),
   });
@@ -3028,6 +3037,147 @@ interface StartPlanContext {
 /** What the Run Plan on screen was started with; paired with the Overview's session. */
 let startPlanContext: StartPlanContext | undefined;
 
+/**
+ * Per plan in this window: the read-only context repositories a person
+ * confirmed, and those the engine last reported as not supplied. Kept so
+ * Check again, Prepare intake and Start reuse a confirmed repository instead
+ * of rerunning the command the engine just refused for lacking it.
+ */
+const planContexts = new Map<string, { confirmed: Record<string, string>; missing: string[] }>();
+
+function planContextKey(location: SparringLocation, planPath: string): string {
+  return `${path.resolve(location.repoRoot)}\n${path.resolve(planPath)}`;
+}
+
+function planContextOf(location: SparringLocation, planPath: string): { confirmed: Record<string, string>; missing: string[] } {
+  const key = planContextKey(location, planPath);
+  let entry = planContexts.get(key);
+  if (!entry) {
+    entry = { confirmed: {}, missing: [] };
+    planContexts.set(key, entry);
+  }
+  return entry;
+}
+
+/** The context fields of a Run Plan screen for this plan. */
+function planContextSession(location: SparringLocation, planPath: string): Pick<StartPlanSession, "contextRepositories" | "missingRepositories"> {
+  const entry = planContexts.get(planContextKey(location, planPath));
+  if (!entry) {
+    return {};
+  }
+  const missing = entry.missing.filter((name) => !(name in entry.confirmed));
+  return { ...(Object.keys(entry.confirmed).length > 0 ? { contextRepositories: { ...entry.confirmed } } : {}), ...(missing.length > 0 ? { missingRepositories: missing } : {}) };
+}
+
+async function realPath(file: string): Promise<string> {
+  try {
+    return await fs.realpath(file);
+  } catch {
+    return path.resolve(file);
+  }
+}
+
+async function readTextOrUndefined(file: string): Promise<string | undefined> {
+  try {
+    return await fs.readFile(file, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Ask the person for each named context repository, and record each one
+ * confirmed for this plan. Open repositories are matched by the identity the
+ * engine gives them (project.toml's `project`, else the folder name); one
+ * match is proposed for confirmation, several are listed, none opens a folder
+ * dialog. A selected folder must be a git repository root other than this
+ * one; one whose identity differs from the name is used only when the person
+ * says so. Returns false when cancelled or refused (with the reason shown).
+ */
+async function selectContextRepositories(controller: SparringController, location: SparringLocation, planPath: string, names: readonly string[]): Promise<boolean> {
+  const entry = planContextOf(location, planPath);
+  const primary = await realPath(location.repoRoot);
+  const candidates: RepositoryIdentity[] = [];
+  for (const candidate of await controller.launchRepositories()) {
+    if ((await realPath(candidate.location.repoRoot)) !== primary) {
+      candidates.push(await repositoryIdentity(candidate.location.repoRoot, readTextOrUndefined, candidate.location.sparringDir));
+    }
+  }
+  for (const name of names) {
+    const chosen = await chooseContextRepository(name, repositoriesNamed(name, candidates), entry.confirmed[name]);
+    if (!chosen) {
+      return false;
+    }
+    const check = await checkRepositoryMapping(name, chosen, undefined);
+    if (!check.valid) {
+      void vscode.window.showErrorMessage(`Agent Sparring: ${chosen} cannot be used as ${name}: ${check.reason}.`);
+      return false;
+    }
+    if ((await realPath(chosen)) === primary) {
+      void vscode.window.showErrorMessage(`Agent Sparring: ${chosen} is the repository this plan runs in, not ${name}.`);
+      return false;
+    }
+    const identity = await repositoryIdentity(chosen, readTextOrUndefined);
+    if (identity.name !== name) {
+      const useAnyway = `Use as ${name}`;
+      const answer = await vscode.window.showWarningMessage(
+        `Agent Sparring: ${chosen} is named ${identity.name} (from its ${identity.source}), not ${name}.`,
+        { modal: true, detail: `The plan names ${name}. Use this folder as ${name} only if it really is that repository. The engine still checks it.` },
+        useAnyway,
+      );
+      if (answer !== useAnyway) {
+        return false;
+      }
+    }
+    entry.confirmed[name] = chosen;
+    controller.log(`Run plan: context repository ${name}=${chosen} confirmed for ${path.basename(planPath)}.`);
+  }
+  return true;
+}
+
+/** One repository for `name`: confirm a single match, pick among several, else select a folder. */
+async function chooseContextRepository(name: string, matches: RepositoryIdentity[], previous: string | undefined): Promise<string | undefined> {
+  const browse = "Select folder…";
+  if (matches.length === 1 && (!previous || path.resolve(previous) === path.resolve(matches[0].path))) {
+    const use = "Use this repository";
+    const answer = await vscode.window.showInformationMessage(
+      `Agent Sparring: use ${name} at ${matches[0].path}?`,
+      { modal: true, detail: `The plan reads ${name}. It is given to the engine read-only, as --context-repository ${name}=${matches[0].path}.` },
+      use,
+      browse,
+    );
+    return answer === use ? matches[0].path : answer === browse ? browseForRepository(name) : undefined;
+  }
+  if (matches.length > 0 || previous) {
+    const rows = [
+      ...(previous && !matches.some((match) => path.resolve(match.path) === path.resolve(previous)) ? [{ label: name, description: "confirmed earlier", detail: previous, repoPath: previous }] : []),
+      ...matches.map((match) => ({ label: match.name, description: `from ${match.source}`, detail: match.path, repoPath: match.path as string | undefined })),
+      { label: `$(folder) ${browse}`, description: "", detail: "", repoPath: undefined as string | undefined },
+    ];
+    const picked = await vscode.window.showQuickPick(rows, {
+      title: `Agent Sparring: which repository is ${name}?`,
+      placeHolder: `More than one open repository could be ${name}. It is given to the engine read-only.`,
+      ignoreFocusOut: true,
+    });
+    if (!picked) {
+      return undefined;
+    }
+    return picked.repoPath ?? browseForRepository(name);
+  }
+  return browseForRepository(name);
+}
+
+async function browseForRepository(name: string): Promise<string | undefined> {
+  const chosen = await vscode.window.showOpenDialog({
+    canSelectFiles: false,
+    canSelectFolders: true,
+    canSelectMany: false,
+    title: `Select the ${name} repository (read-only context for this plan)`,
+    openLabel: `Use as ${name}`,
+  });
+  return chosen?.[0]?.fsPath;
+}
+
 /** The roles as the engine's `show-config` reports them, for the summary; nothing when it gave no report. */
 async function startPlanModels(location: SparringLocation): Promise<StartPlanSession["models"]> {
   try {
@@ -3051,6 +3201,7 @@ async function startPlanModels(location: SparringLocation): Promise<StartPlanSes
  */
 async function beginStartPlan(controller: SparringController, overview: OverviewPanelManager, context: StartPlanContext, answers: Record<string, string>): Promise<void> {
   const { location, planPath, label, expectedBranch } = context;
+  const contextRepositories = { ...planContextOf(location, planPath).confirmed };
   // Claimed before the first await: a preparation may spend a provider turn
   // and writes an intake, so one worktree prepares one plan at a time, and a
   // second click or a second Run Plan finds the claim rather than racing it.
@@ -3062,7 +3213,7 @@ async function beginStartPlan(controller: SparringController, overview: Overview
   }
   preparingWorktrees.add(worktree);
   try {
-    const args = buildStartPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir, answers, json: true });
+    const args = buildStartPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir, answers, contextRepositories, json: true });
     const preparing: StartPlanSession = {
       planName: path.basename(planPath),
       planLabel: label,
@@ -3070,6 +3221,7 @@ async function beginStartPlan(controller: SparringController, overview: Overview
       expectedBranch,
       phase: "preparing",
       answers,
+      ...(Object.keys(contextRepositories).length > 0 ? { contextRepositories } : {}),
       command: `sparring ${args.join(" ")}`,
     };
     startPlanContext = context;
@@ -3087,6 +3239,7 @@ async function beginStartPlan(controller: SparringController, overview: Overview
       return; // closed, or replaced by another Run Plan, while the engine worked
     }
     if (result.status) {
+      planContextOf(location, planPath).missing = missingContextRepositories(result.status.findings, contextRepositories);
       controller.log(`Run plan: start-plan reported ${result.status.status}${result.status.error ? ` — ${result.status.error}` : ""}`);
     } else {
       controller.log(`Run plan: start-plan reported no status — ${result.output}`);
@@ -3131,7 +3284,7 @@ async function prepareIntakeInCheckout(controller: SparringController, overview:
       void vscode.window.showWarningMessage("Agent Sparring: the installed engine has no start-plan, so it cannot prepare an intake from this document. Update the engine, or use Make Plan….");
       return;
     }
-    const expectedBranch = await resolveExpectedBranch(location);
+    const expectedBranch = await resolveExpectedBranch(location, undefined, true);
     if (!expectedBranch || superseded()) {
       return;
     }
@@ -3139,6 +3292,12 @@ async function prepareIntakeInCheckout(controller: SparringController, overview:
       return;
     }
     if ((await blockedByObsoleteSettings(controller, location)) || superseded()) {
+      return;
+    }
+    // Repositories an earlier preparation of this plan lacked are selected
+    // first, so the refused command is not repeated unchanged.
+    const missing = planContextSession(location, context.planPath).missingRepositories ?? [];
+    if (missing.length > 0 && (!(await selectContextRepositories(controller, location, context.planPath, missing)) || superseded())) {
       return;
     }
     await beginStartPlan(controller, overview, { ...context, expectedBranch }, {});
@@ -3181,7 +3340,20 @@ async function handleStartPlanMessage(controller: SparringController, overview: 
         await prepareIntakeInCheckout(controller, overview, context);
       }
       return;
-    case "retry":
+    case "selectRepository":
+    case "retry": {
+      // A refusal for a repository Run Plan did not supply is not repeated
+      // as it was: the person selects the repository, then it runs again.
+      const missing = session.status ? missingContextRepositories(session.status.findings, planContextOf(context.location, context.planPath).confirmed) : [];
+      if (missing.length > 0 || message.action === "selectRepository") {
+        // Nothing missing: Change repository… asks again for those confirmed.
+        const names = missing.length > 0 ? missing : Object.keys(session.contextRepositories ?? {}).sort();
+        if (names.length === 0 || !(await selectContextRepositories(controller, context.location, context.planPath, names)) || overview.startPlanSession !== session) {
+          return;
+        }
+        await beginStartPlan(controller, overview, context, session.answers);
+        return;
+      }
       if (session.classification) {
         // Classified, never prepared: check the document again from the start.
         await runPlanCommand(controller, overview, { location: context.location, planPath: context.planPath });
@@ -3189,6 +3361,7 @@ async function handleStartPlanMessage(controller: SparringController, overview: 
       }
       await beginStartPlan(controller, overview, context, session.answers);
       return;
+    }
     case "answer": {
       const status = session.status;
       if (session.phase !== "shown" || status?.status !== "needs_decision") {
@@ -3219,7 +3392,8 @@ async function handleStartPlanMessage(controller: SparringController, overview: 
       }
       overview.setStartPlanSession({ ...session, phase: "started" });
       const { location, planPath, expectedBranch, label } = context;
-      const args = buildStartPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir, answers: session.answers, confirm: status.confirmToken });
+      // The same context the evaluation carried: the engine's token covers it.
+      const args = buildStartPlanArgs({ planPath, repoRoot: location.repoRoot, expectedBranch, sparringDir: location.sparringDir, answers: session.answers, contextRepositories: session.contextRepositories, confirm: status.confirmToken });
       // An intake slice's run key is known now. A direct route's is minted by
       // the engine, so the confirmation is filed under a provisional id of its
       // own and bound to the run the engine records (core/startPlanBinding.ts).

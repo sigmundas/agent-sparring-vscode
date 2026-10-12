@@ -1407,7 +1407,7 @@ export class ExecutionTracker implements vscode.Disposable {
     }
     let probe: RunnerProbe;
     try {
-      probe = probeRunnerProcesses(await this.probeProcesses(), location);
+      probe = probeRunnerProcesses(await this.probeProcesses(), location, runId);
     } catch (error) {
       this.log(`could not read the process table for ${location.projectDir}: ${(error as Error).message}`);
       return false;
@@ -1457,7 +1457,7 @@ export class ExecutionTracker implements vscode.Disposable {
     }
     let probe: RunnerProbe;
     try {
-      probe = probeRunnerProcesses(await this.probeProcesses(), location);
+      probe = probeRunnerProcesses(await this.probeProcesses(), location, item.record.runId);
     } catch {
       return; // A transient `ps` failure is not evidence that anything ended.
     }
