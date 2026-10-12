@@ -27,7 +27,7 @@ import { intakeContinuation, intakeNextAction, intakeStateLabel, isExecutionGrou
 import { activeDurationMs, commandInFlight as anyCommandInFlight, formatDuration, providerDisplayName, quietSince, type ActorBudget, type ActorLive, type LiveState, type MeaningfulEvent } from "./liveState";
 import { DEFERRED_VERIFICATION_REQUIRED, PUSH_AUTHORIZATION_REQUIRED, obligationFailed, obligationResolved, parseHandoffBranch, type DeferredObligation, type PlanRunState, type RoutingAction, type SparringOutcome, type StageStatus, type StateRepository } from "./engineFormats";
 import type { DeclaredRepository } from "./stageRepositories";
-import { deriveDeferredVerification, deriveVerification, draftKeyFor, HUMAN_FEEDBACK_HEADING, isDecisionCategory, parseHumanEvidence, parseHumanFeedback, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
+import { deriveDeferredVerification, deriveVerification, draftKeyFor, HUMAN_FEEDBACK_HEADING, isPlanDecision, parseHumanEvidence, parseHumanFeedback, planChecks, type CheckRecord, type VerificationView } from "./humanChecks";
 import { categoryWord, checkNameList } from "./humanTask";
 import { SUBMISSION_PRESERVED, SUBMISSION_UNRESOLVED, type SubmissionRecord } from "./submission";
 import { sameStageScope, stageScopeOf } from "./stageScope";
@@ -2122,7 +2122,7 @@ function deferredVerification(
     rationale: obligation.rationale,
     promoted: obligation.promoted,
     checkKeys: obligation.gate.checks.map((check) => draftKeyFor(check.id, obligation.gate.instanceId)),
-    decision: isDecisionCategory(obligation.gate.category),
+    decision: isPlanDecision(obligation),
   }));
   // Only decisions outstanding: the engine asks a go-ahead after the checks
   // it depends on have passed, so this is a choice, not verification.

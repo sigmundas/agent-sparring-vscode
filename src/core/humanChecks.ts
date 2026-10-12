@@ -403,6 +403,14 @@ export function isDecisionCategory(category: string | undefined): boolean {
   return category === "AUTHORIZATION";
 }
 
+/**
+ * Only a plan-declared gate the engine minted is a decision. A reviewer's
+ * deferral is a check whatever its category says, so it keeps Fail.
+ */
+export function isPlanDecision(obligation: { gate: { category?: string }; manifestGate?: boolean }): boolean {
+  return obligation.manifestGate === true && isDecisionCategory(obligation.gate.category);
+}
+
 /** The words written into notes.md. The engine's vocabulary, not the panel's. */
 export const OUTCOME_WORDS: Record<CheckOutcome, string> = { pass: "Pass", fail: "Fail", blocked: "Blocked" };
 
@@ -1067,6 +1075,7 @@ export function deriveDeferredVerification(
     stageId: string;
     gate: HumanGate;
     results: { checkId: string; outcome: CheckOutcome; note?: string }[];
+    manifestGate?: boolean;
   }[],
   drafts: Record<string, CheckRecord>,
 ): VerificationView {
@@ -1081,7 +1090,7 @@ export function deriveDeferredVerification(
     rendered.forEach((item, index) => {
       item.originStageId = obligation.stageId;
       item.owedUntilPassed = true;
-      item.decision = isDecisionCategory(obligation.gate.category);
+      item.decision = isPlanDecision(obligation);
       wireId.set(item.draftKey, obligation.gate.checks[index].id);
       const recorded = obligation.results.find((result) => result.checkId === obligation.gate.checks[index].id);
       if (recorded?.outcome === "pass") {

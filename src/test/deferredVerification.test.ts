@@ -672,6 +672,24 @@ describe("a plan-declared go-ahead", () => {
     assert.match(html, /Why the plan asks: why/);
   });
 
+  it("a reviewer's deferral is a check whatever its category says", async () => {
+    const ws = await Workspace.create();
+    await ws.writePlan(FOO_PLAN_LABEL, FOO_PLAN_MARKDOWN);
+    await ws.writePlanRun(FOO_PLAN_KEY, {
+      plan: FOO_PLAN_LABEL,
+      status: "paused",
+      current_stage_index: 1,
+      current_stage: STAGE_2,
+      awaiting: { kind: DEFERRED_VERIFICATION_REQUIRED, reason: "promoted", instance_ids: [G1C_INSTANCE] },
+      deferred_human_checks: [{ stage_id: STAGE_1, gate: g1c, rationale: "why", checkpoint: "before_plan_completion", promoted: true, results: [] }],
+    });
+    await ws.writeStage(STAGE_1, { status: "accepted", candidate_sha: "a".repeat(40) });
+    const { model, html } = await render(ws);
+    assert.equal(model.actionRequired!.required[0].decision, false);
+    assert.match(html, />Fail</);
+    assert.match(html, /Deferred by the reviewer/);
+  });
+
   it("Continue and Not now send the engine's own pass and blocked", async () => {
     const { model } = await before([{ gate: g1c }], [G1C_INSTANCE]);
     const html = renderOverviewHtml(model, "n", "c");
