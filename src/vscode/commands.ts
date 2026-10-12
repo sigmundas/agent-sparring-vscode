@@ -2453,14 +2453,18 @@ async function pickPlanDocument(location: SparringLocation): Promise<string | un
  * Returns undefined when the caller should stop: either the person
  * cancelled, or the mismatch has already been explained to them.
  */
-async function resolveExpectedBranch(location: SparringLocation, recorded?: string): Promise<string | undefined> {
+async function resolveExpectedBranch(location: SparringLocation, recorded?: string, newRun = false): Promise<string | undefined> {
   const decision = decideExpectedBranch(recorded, await currentBranch(location.repoRoot));
   if (decision.kind === "use") {
     return decision.branch;
   }
   if (decision.kind === "ask") {
-    // Nothing recorded: a feature branch already checked out is used as it
-    // is; only a protected branch or a detached HEAD asks for a name.
+    // A new run uses a feature branch already checked out as it is; only a
+    // protected branch or a detached HEAD asks for a name. A run resumed
+    // with no recorded branch still asks.
+    if (!newRun) {
+      return askBranch(decision.current);
+    }
     const forNewRun = featureBranchForNewRun(decision.current);
     return forNewRun.kind === "use" ? forNewRun.branch : askBranch(forNewRun.current);
   }
@@ -2786,7 +2790,7 @@ async function runPlanCommand(controller: SparringController, overview: Overview
   }
   // The feature branch is created here when it does not exist yet; the
   // engine still receives it, unchanged, as --expected-branch.
-  const expectedBranch = await resolveExpectedBranch(location);
+  const expectedBranch = await resolveExpectedBranch(location, undefined, true);
   if (!expectedBranch || !(await ensureFeatureBranch(controller, location, expectedBranch))) {
     return;
   }
@@ -3134,7 +3138,7 @@ async function prepareIntakeInCheckout(controller: SparringController, overview:
       void vscode.window.showWarningMessage("Agent Sparring: the installed engine has no start-plan, so it cannot prepare an intake from this document. Update the engine, or use Make Plan….");
       return;
     }
-    const expectedBranch = await resolveExpectedBranch(location);
+    const expectedBranch = await resolveExpectedBranch(location, undefined, true);
     if (!expectedBranch || superseded()) {
       return;
     }
